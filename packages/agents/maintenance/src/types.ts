@@ -1,0 +1,1 @@
+// @openharness/agents-maintenance — types

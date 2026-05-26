@@ -1,0 +1,1 @@
+// @openharness/agents-generate — types

@@ -1,0 +1,1 @@
+// @openharness/adapter-oracle — types

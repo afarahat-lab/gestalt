@@ -1,0 +1,70 @@
+{
+  "name": "openharness",
+  "version": "0.1.0",
+  "tier": "tier1",
+  "templateId": "platform-self",
+  "contextFiles": [
+    "AGENTS.md",
+    "docs/ARCHITECTURE.md",
+    "docs/DECISIONS.md",
+    "docs/DOMAIN.md",
+    "docs/GOLDEN_PRINCIPLES.md"
+  ],
+  "stack": {
+    "language": "typescript",
+    "runtime": "node20",
+    "packageManager": "pnpm",
+    "backend": "fastify",
+    "frontend": "react",
+    "testFramework": "vitest",
+    "linter": "eslint"
+  },
+  "adapters": {
+    "database": {
+      "type": "postgres",
+      "configKey": "DATABASE_URL"
+    },
+    "queue": {
+      "type": "bullmq",
+      "configKey": "REDIS_URL"
+    },
+    "llm": {
+      "type": "openai-compatible",
+      "configKey": "LLM_BASE_URL"
+    }
+  },
+  "qualityGate": {
+    "required": [
+      "lint",
+      "typecheck",
+      "unit-tests",
+      "integration-tests",
+      "constraint-check",
+      "security-scan"
+    ],
+    "blockingSignals": [
+      "GOLDEN_PRINCIPLE_BREACH",
+      "CONSTRAINT_VIOLATION"
+    ],
+    "autoResolvableSignals": [
+      "LINT_FAILURE",
+      "TEST_FAILURE"
+    ],
+    "maxRetries": 3
+  },
+  "maintenance": {
+    "driftCheck": {
+      "enabled": true,
+      "scheduleUtc": "0 2 * * *"
+    },
+    "alignmentCheck": {
+      "enabled": true,
+      "scheduleUtc": "0 3 * * *"
+    },
+    "gcCheck": {
+      "enabled": true,
+      "scheduleUtc": "0 4 * * 5"
+    }
+  },
+  "updatedAt": "2026-05-01T00:00:00Z"
+}
