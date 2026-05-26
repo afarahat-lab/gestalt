@@ -1,1 +1,1 @@
-// @openharness/adapter-mssql — implementation coming in Phase 2
+// @agentforge-sdlc/adapter-mssql — implementation coming in Phase 2

@@ -1,1 +1,1 @@
-// @openharness/cli — types
+// @agentforge-sdlc/cli — types

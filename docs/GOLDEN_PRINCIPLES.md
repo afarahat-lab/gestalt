@@ -1,6 +1,6 @@
-# Golden Principles — OpenHarness
+# Golden Principles — AgentForge SDLC
 
-These are the non-negotiable invariants for the OpenHarness platform itself.
+These are the non-negotiable invariants for the AgentForge SDLC platform itself.
 Violations of any principle below are classified as `GOLDEN_PRINCIPLE_BREACH` and
 require human review before any merge. They are never auto-resolved.
 
@@ -11,12 +11,12 @@ and explicit human approval.
 
 ## GP-001 — No data leaves the server perimeter
 
-OpenHarness is a self-hosted platform. No telemetry, no analytics, no LLM calls, and no
+AgentForge SDLC is a self-hosted platform. No telemetry, no analytics, no LLM calls, and no
 data of any kind may be sent to any external endpoint not explicitly configured by the
 operator at init time.
 
 **Enforcement:** Network egress in agent code is blocked except through
-`@openharness/core/llm` and `@openharness/core/repository`. Any direct `fetch`, `axios`,
+`@agentforge-sdlc/core/llm` and `@agentforge-sdlc/core/repository`. Any direct `fetch`, `axios`,
 or DB call outside these modules is a breach.
 
 ---
@@ -66,7 +66,7 @@ Type safety is a first-class constraint, not a suggestion.
 ## GP-006 — LLM calls go through core only
 
 No agent or adapter may import an LLM provider SDK directly. All LLM calls go through
-`@openharness/core/llm`. This ensures provider swapping, rate limiting, cost tracking,
+`@agentforge-sdlc/core/llm`. This ensures provider swapping, rate limiting, cost tracking,
 and audit logging are applied uniformly.
 
 **Enforcement:** ESLint import rule banning direct imports of known provider packages

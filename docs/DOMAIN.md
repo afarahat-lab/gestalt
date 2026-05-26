@@ -1,13 +1,13 @@
-# Domain Model — OpenHarness
+# Domain Model — AgentForge SDLC
 
-This document describes the core domain model of the OpenHarness platform itself.
+This document describes the core domain model of the AgentForge SDLC platform itself.
 
 ---
 
 ## Core entities
 
 ### Project
-A software project managed by OpenHarness. Has a harness, a git repository, and a set of environments.
+A software project managed by AgentForge SDLC. Has a harness, a git repository, and a set of environments.
 
 ```
 Project {

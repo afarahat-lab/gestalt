@@ -1,1 +1,1 @@
-// @openharness/adapter-postgres — types
+// @agentforge-sdlc/adapter-postgres — types

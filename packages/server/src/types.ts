@@ -1,1 +1,1 @@
-// @openharness/server — types
+// @agentforge-sdlc/server — types

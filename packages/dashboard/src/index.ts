@@ -1,1 +1,1 @@
-// @openharness/dashboard — implementation coming in Phase 2
+// @agentforge-sdlc/dashboard — implementation coming in Phase 2

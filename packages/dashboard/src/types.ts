@@ -1,1 +1,1 @@
-// @openharness/dashboard — types
+// @agentforge-sdlc/dashboard — types

@@ -1,5 +1,5 @@
 {
-  "name": "@openharness/server",
+  "name": "@agentforge-sdlc/server",
   "version": "0.1.0",
   "private": true,
   "description": "Self-hosted Fastify server — orchestration, REST API, dashboard serving",

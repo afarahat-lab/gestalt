@@ -1,5 +1,5 @@
 {
-  "name": "@openharness/agents-deploy",
+  "name": "@agentforge-sdlc/agents-deploy",
   "version": "0.1.0",
   "private": true,
   "description": "Deploy layer agents — PR, pipeline, promotion",

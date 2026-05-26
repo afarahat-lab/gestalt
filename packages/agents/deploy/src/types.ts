@@ -1,1 +1,1 @@
-// @openharness/agents-deploy — types
+// @agentforge-sdlc/agents-deploy — types

@@ -1,1 +1,1 @@
-// @openharness/agents-generate — implementation coming in Phase 2
+// @agentforge-sdlc/agents-generate — implementation coming in Phase 2

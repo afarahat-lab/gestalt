@@ -1,1 +1,1 @@
-// @openharness/agents-maintenance — types
+// @agentforge-sdlc/agents-maintenance — types

@@ -1,5 +1,5 @@
 {
-  "name": "@openharness/agents-generate",
+  "name": "@agentforge-sdlc/agents-generate",
   "version": "0.1.0",
   "private": true,
   "description": "Generate layer agents — design, context, code, test, lint-config",

@@ -1,5 +1,5 @@
 {
-  "name": "@openharness/core",
+  "name": "@agentforge-sdlc/core",
   "version": "0.1.0",
   "private": true,
   "description": "Core harness engine — context management, agent protocol, feedback signals, LLM abstraction, repository interface",

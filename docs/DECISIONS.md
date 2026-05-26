@@ -1,6 +1,6 @@
-# Architecture Decision Records — OpenHarness
+# Architecture Decision Records — AgentForge SDLC
 
-This file records all significant architectural decisions made for the OpenHarness platform.
+This file records all significant architectural decisions made for the AgentForge SDLC platform.
 Every decision includes context, the options considered, the choice made, and the rationale.
 
 Agents must not modify existing ADRs. New decisions are appended at the bottom.
@@ -95,7 +95,7 @@ Corporate clients use different LLM providers based on compliance and data resid
 2. Thin abstraction in core with provider-specific config
 3. Full plugin system
 
-**Decision:** Thin abstraction in `@openharness/core/llm` (option 2).
+**Decision:** Thin abstraction in `@agentforge-sdlc/core/llm` (option 2).
 
 **Rationale:** A full plugin system adds complexity before it's needed. A thin abstraction covers the real requirement: swap providers via config at init time. Supported providers at launch: Azure OpenAI, Ollama, vLLM, and any OpenAI-compatible endpoint.
 

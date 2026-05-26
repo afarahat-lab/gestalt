@@ -1,5 +1,5 @@
 {
-  "name": "@openharness/dashboard",
+  "name": "@agentforge-sdlc/dashboard",
   "version": "0.1.0",
   "private": true,
   "description": "React oversight dashboard — intent history, agent activity, alerts",

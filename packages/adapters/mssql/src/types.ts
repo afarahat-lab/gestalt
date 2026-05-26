@@ -1,1 +1,1 @@
-// @openharness/adapter-mssql — types
+// @agentforge-sdlc/adapter-mssql — types

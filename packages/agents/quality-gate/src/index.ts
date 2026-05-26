@@ -1,1 +1,1 @@
-// @openharness/agents-quality-gate — implementation coming in Phase 2
+// @agentforge-sdlc/agents-quality-gate — implementation coming in Phase 2

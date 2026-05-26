@@ -1,1 +1,1 @@
-// @openharness/adapter-oracle — types
+// @agentforge-sdlc/adapter-oracle — types

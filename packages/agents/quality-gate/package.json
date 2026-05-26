@@ -1,5 +1,5 @@
 {
-  "name": "@openharness/agents-quality-gate",
+  "name": "@agentforge-sdlc/agents-quality-gate",
   "version": "0.1.0",
   "private": true,
   "description": "Quality gate agents — constraint, test-runner, lint, security, review",

@@ -1,1 +1,1 @@
-// @openharness/agents-generate — types
+// @agentforge-sdlc/agents-generate — types

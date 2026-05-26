@@ -1,8 +1,8 @@
 {
-  "name": "@openharness/cli",
+  "name": "@agentforge-sdlc/cli",
   "version": "0.1.0",
   "private": true,
-  "description": "Developer-facing CLI tool — harness init, run, status, logs, dashboard",
+  "description": "Developer-facing CLI tool — agentforge init, run, status, logs, dashboard",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {

@@ -1,8 +1,9 @@
 {
-  "name": "openharness",
+  "name": "agentforge-sdlc",
   "version": "0.1.0",
   "tier": "tier1",
   "templateId": "platform-self",
+  "repository": "https://github.com/afarahat-lab/agentforge-sdlc",
   "contextFiles": [
     "AGENTS.md",
     "docs/ARCHITECTURE.md",
@@ -32,6 +33,63 @@
       "type": "openai-compatible",
       "configKey": "LLM_BASE_URL"
     }
+  },
+  "initializer": {
+    "version": "1.0",
+    "mode": "intent-first",
+    "phases": [
+      {
+        "phase": 0,
+        "name": "llm-bootstrap",
+        "description": "Configure LLM provider before anything else",
+        "requiresLLM": false
+      },
+      {
+        "phase": 1,
+        "name": "intent-capture",
+        "description": "Natural language project description, LLM extracts structured answers",
+        "requiresLLM": true
+      },
+      {
+        "phase": 2,
+        "name": "harness-generation",
+        "description": "LLM generates all harness artifacts from structured answers",
+        "requiresLLM": true,
+        "outputs": [
+          "AGENTS.md",
+          "ARCHITECTURE.md",
+          "DOMAIN.md",
+          "DECISIONS.md",
+          "GOLDEN_PRINCIPLES.md",
+          "HARNESS.json",
+          "folder-structure",
+          "tsconfig.json",
+          "eslint-config",
+          "ci-pipeline-config",
+          "docker-compose.dev.yml"
+        ]
+      },
+      {
+        "phase": 3,
+        "name": "harness-validation",
+        "description": "Validate coherence and completeness before marking project ready",
+        "requiresLLM": false
+      }
+    ],
+    "extractedFields": [
+      "projectName",
+      "purpose",
+      "targetUsers",
+      "frontend",
+      "backend",
+      "database",
+      "complianceFrameworks",
+      "authMethod",
+      "architectureStyle",
+      "cicdSystem",
+      "multiTenancy",
+      "deploymentTarget"
+    ]
   },
   "qualityGate": {
     "required": [

@@ -1,5 +1,5 @@
 {
-  "name": "@openharness/adapter-mssql",
+  "name": "@agentforge-sdlc/adapter-mssql",
   "version": "0.1.0",
   "private": true,
   "description": "SQL Server repository adapter",

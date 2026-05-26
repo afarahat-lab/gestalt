@@ -1,1 +1,1 @@
-// @openharness/core — implementation coming in Phase 2
+// @agentforge-sdlc/core — implementation coming in Phase 2

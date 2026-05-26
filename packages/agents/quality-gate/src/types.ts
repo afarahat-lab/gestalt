@@ -1,1 +1,1 @@
-// @openharness/agents-quality-gate — types
+// @agentforge-sdlc/agents-quality-gate — types

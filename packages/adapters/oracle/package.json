@@ -1,5 +1,5 @@
 {
-  "name": "@openharness/adapter-oracle",
+  "name": "@agentforge-sdlc/adapter-oracle",
   "version": "0.1.0",
   "private": true,
   "description": "Oracle repository adapter",
