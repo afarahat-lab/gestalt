@@ -1,0 +1,36 @@
+node_modules/
+dist/
+.env
+*.local
+
+# pnpm
+.pnpm-store/
+
+# Build outputs
+packages/*/dist/
+packages/*/build/
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# TypeScript
+*.tsbuildinfo
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.docker/
+
+# Logs
+logs/
+*.log
+npm-debug.log*

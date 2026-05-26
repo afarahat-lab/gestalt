@@ -140,3 +140,65 @@ The Tier 1 standard library harness needs to be domain-specific enough to be gen
 **Decision:** Initial Tier 1 targets corporate operations web and mobile applications.
 
 **Rationale:** This domain has strong recurring patterns (approval workflows, RBAC, audit trails, enterprise integrations) and is underserved by current AI coding tools precisely because cross-cutting concerns require coordinated enforcement — exactly what a harness provides.
+
+---
+
+## ADR-009 — Generate layer: fixed execution graph with skip logic
+
+**Date:** 2026-05
+**Status:** Accepted
+
+**Context:**
+The generate layer needs to orchestrate multiple specialist agents in the right order.
+Two options: a fixed dependency graph, or an LLM-planned dynamic graph.
+
+**Options considered:**
+1. Fixed dependency-ordered graph with skip logic
+2. LLM-planned dynamic graph per intent
+
+**Decision:** Fixed graph (option 1). Agents declare `SKIPPED` when their artifact
+type is not needed for a given intent.
+
+**Rationale:** Predictable and debuggable. Dynamic graphs add a failure mode where
+the plan itself is wrong. Skip logic handles flexibility without dynamic planning.
+Revisit for v2 if fixed graph proves too rigid.
+
+---
+
+## ADR-010 — IntentSpec as the inter-agent contract
+
+**Date:** 2026-05
+**Status:** Accepted
+
+**Context:**
+Downstream agents need a consistent, structured understanding of what an intent
+is asking for. Passing raw intent text to each agent leads to independent
+interpretation and incoherent artifacts.
+
+**Decision:** `intent-agent` always runs first and produces a structured `IntentSpec`.
+All downstream agents receive the `IntentSpec` — never the raw intent text.
+
+**Rationale:** The intent spec is the single source of truth for a generation cycle.
+Success criteria in the spec map directly to test cases, closing the loop between
+intent and verification. Ambiguities surface early, before any generation begins.
+
+---
+
+## ADR-011 — High-impact ambiguity stops the loop
+
+**Date:** 2026-05
+**Status:** Accepted
+
+**Context:**
+Some intents are genuinely ambiguous in ways that would lead to wrong code.
+Generating against an ambiguous spec wastes tokens and produces artifacts that
+fail quality gates for the wrong reasons.
+
+**Decision:** High-impact ambiguities detected by `intent-agent` emit a `CONTEXT_GAP`
+signal, pause the cycle, and escalate to the human operator before any generation
+begins. Low-impact ambiguities are resolved conservatively and documented in the
+intent spec's `outOfScope` field.
+
+**Rationale:** Stopping early is cheaper than retrying downstream. Human clarification
+at intent time costs seconds; discovering the wrong interpretation after code generation
+costs multiple agent cycles.
