@@ -124,5 +124,84 @@
       "scheduleUtc": "0 4 * * 5"
     }
   },
-  "updatedAt": "2026-05-01T00:00:00Z"
+  "updatedAt": "2026-05-01T00:00:00Z",
+  "identity": {
+    "providers": [
+      {
+        "type": "windows-kerberos",
+        "enabled": false,
+        "spn": "HTTP/agentforge.company.com",
+        "realm": "COMPANY.COM",
+        "kdcHostname": "${KDC_HOSTNAME}"
+      },
+      {
+        "type": "saml",
+        "enabled": false,
+        "entryPoint": "${SAML_ENTRY_POINT}",
+        "issuer": "agentforge-sdlc",
+        "cert": "${SAML_IDP_CERT}",
+        "callbackUrl": "${SERVER_BASE_URL}/auth/saml/callback"
+      },
+      {
+        "type": "oidc",
+        "enabled": false,
+        "issuer": "${OIDC_ISSUER}",
+        "clientId": "${OIDC_CLIENT_ID}",
+        "clientSecret": "${OIDC_CLIENT_SECRET}",
+        "callbackUrl": "${SERVER_BASE_URL}/auth/oidc/callback",
+        "scopes": [
+          "openid",
+          "profile",
+          "email",
+          "groups"
+        ]
+      },
+      {
+        "type": "local",
+        "enabled": true,
+        "warningBanner": true,
+        "allowedInProduction": false
+      }
+    ],
+    "roleMapping": [
+      {
+        "idpGroup": "AgentForge-Admins",
+        "platformRole": "admin"
+      },
+      {
+        "idpGroup": "AgentForge-Operators",
+        "platformRole": "operator"
+      },
+      {
+        "idpGroup": "AgentForge-Viewers",
+        "platformRole": "viewer"
+      }
+    ],
+    "defaultRole": null,
+    "sessionTtlMinutes": 480
+  },
+  "oversight": {
+    "alertRoutes": [
+      {
+        "signalType": "GOLDEN_PRINCIPLE_BREACH",
+        "severity": "critical",
+        "channels": [
+          "dashboard",
+          "slack"
+        ],
+        "assignee": "security-team"
+      },
+      {
+        "signalType": "CONTEXT_GAP",
+        "severity": "high",
+        "channels": [
+          "dashboard",
+          "email"
+        ]
+      }
+    ],
+    "defaultChannels": [
+      "dashboard"
+    ]
+  }
 }

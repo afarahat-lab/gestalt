@@ -159,3 +159,71 @@ additional proxy configuration in many enterprise environments.
 The React dashboard is compiled to static assets and served by the Fastify server.
 This keeps the self-hosted install story clean: one docker-compose up, one URL.
 No separate frontend deployment for corporate IT to manage.
+
+---
+
+## Identity and authentication (added)
+
+### Three auth modes
+
+| Mode | When used | User experience |
+|---|---|---|
+| Windows Kerberos | Domain-joined Windows machines | No login screen — fully seamless |
+| SAML 2.0 | On-premise ADFS, any SAML IdP | Redirect to corporate IdP login page |
+| OIDC | Azure AD/Entra ID, Okta | Redirect to corporate IdP login page |
+| Local fallback | Development, pre-IdP adoption | Username/password form, warning banner |
+
+**Priority order:** Kerberos → SAML/OIDC → local (fixed — all downstream code is auth-mode agnostic)
+
+### Windows Kerberos prerequisites
+
+One-time IT setup required:
+```
+# Register the server as an SPN in Active Directory
+setspn -A HTTP/agentforge.company.com DOMAIN\serviceagentforgesvc
+
+# DNS A record
+agentforge.company.com → <server IP>
+```
+
+After setup: all domain-joined Windows users see no login prompt. Browser
+handles Kerberos ticket exchange transparently.
+
+### Role mapping
+
+IdP group memberships → platform roles. Configured in HARNESS.json:
+
+```json
+"roleMapping": [
+  { "idpGroup": "AgentForge-Admins",    "platformRole": "admin" },
+  { "idpGroup": "AgentForge-Operators", "platformRole": "operator" },
+  { "idpGroup": "AgentForge-Viewers",   "platformRole": "viewer" }
+]
+```
+
+Users with no matching group are denied access (defaultRole: null).
+Setting defaultRole: "viewer" grants read access to all authenticated corporate users.
+
+### Local fallback
+
+- Enabled at init time for development environments
+- Shows non-production warning banner in dashboard
+- Hard-blocked in production (NODE_ENV=production) unless explicitly overridden
+- First admin created via: `agentforge init local-admin`
+
+### Implementation file map (auth)
+
+```
+packages/server/src/auth/
+├── types.ts               ✅ complete — all identity and auth types
+├── auth-manager.ts        ✅ complete — provider orchestration + session creation
+├── role-mapper.ts         ✅ complete — group → role resolution, permission check
+├── session.ts             ✅ complete (jwt stub for Phase 2)
+├── middleware.ts           ✅ complete (jwt verify stub for Phase 2)
+├── routes.ts              ✅ complete (handlers stubbed for Phase 2)
+└── providers/
+    ├── kerberos.ts        ✅ complete (SPNEGO implementation stub for Phase 2)
+    ├── saml.ts            🔲 stub
+    ├── oidc.ts            🔲 stub
+    └── local.ts           🔲 stub
+```

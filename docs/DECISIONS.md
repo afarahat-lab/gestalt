@@ -334,3 +334,47 @@ costs multiple agent cycles.
 **Decision:** The React dashboard is compiled to static assets and served by the Fastify server at the root path. No separate frontend deployment.
 
 **Rationale:** Minimises corporate IT deployment complexity. One docker-compose up, one security review, one URL. Separate frontend deployment would require a second service, second SSL certificate, and CORS configuration — all friction in enterprise environments.
+
+---
+
+## ADR-024 — Three auth modes: Kerberos, IdP (SAML/OIDC), local fallback
+
+**Date:** 2026-05
+**Status:** Accepted
+
+**Decision:** The platform supports three authentication modes in fixed priority order: Windows Kerberos/SPNEGO (1st), corporate IdP via SAML 2.0 or OIDC (2nd), local username/password fallback (3rd). All modes produce a normalised VerifiedIdentity — downstream code is auth-mode agnostic.
+
+**Rationale:** GCC/MENA enterprise environments primarily use Windows AD domains and ADFS/AAD. Windows Kerberos enables seamless SSO for domain-joined users — the dominant use case. SAML/OIDC covers non-Windows and cloud IdP scenarios. Local fallback enables adoption before IT approval of IdP integration.
+
+---
+
+## ADR-025 — Local auth is non-production only
+
+**Date:** 2026-05
+**Status:** Accepted
+
+**Decision:** Local auth provider will not start if NODE_ENV=production unless allowedInProduction: true is explicitly set in HARNESS.json. A warning banner is shown in the dashboard when local auth is active.
+
+**Rationale:** Local password auth in a corporate context creates a shadow identity silo that bypasses corporate access policies, audit requirements, and deprovisioning workflows. It exists solely to enable early adoption and development. Production environments must use a corporate IdP.
+
+---
+
+## ADR-026 — PlatformUser is a shadow record, never the identity source of truth
+
+**Date:** 2026-05
+**Status:** Accepted
+
+**Decision:** The local PlatformUser record stores only the platform role assignment, display name, and session metadata. Identity and group membership are always re-verified on login from the IdP. Deprovisioning a user in the corporate IdP automatically blocks access — no synchronisation needed.
+
+**Rationale:** Maintaining a separate user database in sync with the corporate IdP is an operational burden and a source of security gaps (stale access after offboarding). The shadow record approach gives the platform the minimum local state it needs without owning the identity lifecycle.
+
+---
+
+## ADR-027 — Windows Kerberos requires SPN registration (one-time IT setup)
+
+**Date:** 2026-05
+**Status:** Accepted
+
+**Decision:** Windows Kerberos SSO requires the server to be registered as a Service Principal Name in Active Directory. This is a one-time IT setup step documented in the deployment guide. The init wizard detects if Kerberos is configured and provides the exact setspn command for IT.
+
+**Rationale:** Kerberos authentication cannot work without SPN registration. Documenting this as a known prerequisite prevents deployment failures. The IT setup cost is low (single command) and the user experience benefit (no login screen) is significant for the target market.
