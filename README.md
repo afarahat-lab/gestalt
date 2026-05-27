@@ -159,3 +159,29 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how to contribute harness patterns an
 ## License
 
 MIT
+
+---
+
+## Documentation
+
+### Getting started
+- [Quick Start](docs/guides/quick-start.md) — running in under 10 minutes
+- [Deployment Guide](docs/guides/deployment.md) — production install for corporate IT
+
+### Identity integration
+- [Overview](docs/guides/identity/overview.md) — choose your integration method
+- [Windows Kerberos SSO](docs/guides/identity/kerberos.md) — seamless Windows domain login
+- [SAML 2.0 / ADFS](docs/guides/identity/saml-adfs.md) — Active Directory Federation Services
+- [Azure AD / Entra ID](docs/guides/identity/azure-ad.md) — Microsoft Azure Active Directory
+
+### Reference
+- [HARNESS.json Configuration](docs/reference/harness-config.md) — complete config reference
+
+### Operations
+- [Common Issues Runbook](docs/runbooks/common-issues.md) — troubleshooting guide
+
+### Architecture
+- [Architecture](docs/ARCHITECTURE.md) — system design
+- [Architecture Decisions](docs/DECISIONS.md) — all ADRs
+- [Domain Model](docs/DOMAIN.md) — platform entities
+- [Golden Principles](docs/GOLDEN_PRINCIPLES.md) — non-negotiable invariants
