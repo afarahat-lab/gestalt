@@ -301,3 +301,36 @@ costs multiple agent cycles.
 **Decision:** evaluation-agent never calls monitoring systems directly. All calls go through a typed MonitoringAdapter interface, resolved from HARNESS.json at startup. Supported: Prometheus, Datadog, Azure Monitor.
 
 **Rationale:** Same principle as pipeline and scanner adapters. Client monitoring platforms vary — the adapter pattern keeps agent code system-agnostic. Threshold logic lives in the agent, not the adapter.
+
+---
+
+## ADR-021 — Four typed intervention actions only
+
+**Date:** 2026-05
+**Status:** Accepted
+
+**Decision:** Human interventions are typed from a fixed enum of four actions. Free-form text is limited to the mandatory 'notes' field on acknowledge-breach. No open-ended intervention types.
+
+**Rationale:** Typed interventions enable precise server-side validation, routing, and audit logging. Free-form interventions are ambiguous to route and audit. The four types cover all scenarios where human action is required by design.
+
+---
+
+## ADR-022 — SSE over WebSocket for live dashboard events
+
+**Date:** 2026-05
+**Status:** Accepted
+
+**Decision:** The live event stream uses Server-Sent Events (SSE) rather than WebSocket.
+
+**Rationale:** SSE is unidirectional (server→client only) which matches the use case. It works through standard HTTP proxies without special configuration — critical in GCC/MENA corporate environments where WebSocket connections are often blocked by proxies and firewalls. Simpler to implement and debug.
+
+---
+
+## ADR-023 — Dashboard served by the server, not separately deployed
+
+**Date:** 2026-05
+**Status:** Accepted
+
+**Decision:** The React dashboard is compiled to static assets and served by the Fastify server at the root path. No separate frontend deployment.
+
+**Rationale:** Minimises corporate IT deployment complexity. One docker-compose up, one security review, one URL. Separate frontend deployment would require a second service, second SSL certificate, and CORS configuration — all friction in enterprise environments.
