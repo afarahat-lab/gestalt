@@ -1,0 +1,16 @@
+{
+  "name": "@agentforge-sdlc/registry",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Harness registry client, validator, and promotion engine",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "lint": "eslint src/",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  }
+}

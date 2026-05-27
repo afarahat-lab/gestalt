@@ -378,3 +378,36 @@ costs multiple agent cycles.
 **Decision:** Windows Kerberos SSO requires the server to be registered as a Service Principal Name in Active Directory. This is a one-time IT setup step documented in the deployment guide. The init wizard detects if Kerberos is configured and provides the exact setspn command for IT.
 
 **Rationale:** Kerberos authentication cannot work without SPN registration. Documenting this as a known prerequisite prevents deployment failures. The IT setup cost is low (single command) and the user experience benefit (no login screen) is significant for the target market.
+
+---
+
+## ADR-028 — Registry is a metadata service, not a file host
+
+**Date:** 2026-05
+**Status:** Accepted
+
+**Decision:** The registry stores metadata (slug, name, type, tier, git URL, checksum). Entry files are served from their source git repositories, not from registry infrastructure. Tier 1 entries are bundled with the platform.
+
+**Rationale:** Minimises registry infrastructure requirements. Air-gapped environments work by mirroring source repos. Entries are always served from their source of truth — no synchronisation lag.
+
+---
+
+## ADR-029 — Promotion thresholds are fixed in code
+
+**Date:** 2026-05
+**Status:** Accepted
+
+**Decision:** Promotion thresholds (minimum downloads, active projects, rating, production projects) are defined as constants in the promotion engine source code. They cannot be configured or overridden at runtime.
+
+**Rationale:** The thresholds define the quality signal. Making them configurable would allow maintainers to lower the bar for political or convenience reasons, eroding the trust the tiers are designed to establish. Changes require a code change and a new ADR — visible, auditable, deliberate.
+
+---
+
+## ADR-030 — Tier 1 entries ship bundled — no registry call needed
+
+**Date:** 2026-05
+**Status:** Accepted
+
+**Decision:** Tier 1 entries (standard library) are bundled with the platform in the `templates/` directory. The registry is called for version checking only. Air-gapped deployments never need registry access for Tier 1.
+
+**Rationale:** Tier 1 is the most critical dependency. Requiring a registry call to use the standard library would create a runtime dependency on an external service — unacceptable for air-gapped corporate deployments.
