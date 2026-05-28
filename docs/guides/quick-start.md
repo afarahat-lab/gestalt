@@ -9,12 +9,14 @@ For production deployments with corporate identity integration, see the [Deploym
 
 | Requirement | Minimum version | Notes |
 |---|---|---|
-| Docker | 24.0+ | |
-| Docker Compose | 2.20+ | Usually bundled with Docker Desktop |
+| Docker Desktop | 4.25+ | macOS/Windows: [download here](https://www.docker.com/products/docker-desktop/). Must be running before `docker-compose up`. |
+| Docker Compose | 2.20+ | Bundled with Docker Desktop |
 | Git | 2.38+ | |
 | LLM endpoint | — | Azure OpenAI, Ollama, vLLM, or compatible |
 
 No Node.js installation required — the platform runs entirely in Docker.
+
+> **macOS / Windows:** Open Docker Desktop and wait for the whale icon in the menu bar to stop animating before running any `docker` commands.
 
 ---
 

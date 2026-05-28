@@ -13,8 +13,8 @@ For production corporate deployment, see [Deployment Guide](./deployment.md).
 |---|---|---|
 | Node.js | 20+ | |
 | pnpm | 9+ | `npm install -g pnpm` |
-| Docker | 24.0+ | For PostgreSQL and Redis only |
-| Docker Compose | 2.20+ | |
+| Docker | 24.0+ | Docker Desktop for macOS/Windows — must be running before `docker-compose up` |
+| Docker Compose | 2.20+ | Bundled with Docker Desktop |
 | Git | 2.38+ | |
 
 ---

@@ -1,5 +1,3 @@
-version: '3.9'
-
 services:
   server:
     build:
@@ -9,12 +7,16 @@ services:
       - '${SERVER_PORT:-3000}:3000'
     environment:
       - NODE_ENV=production
-      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-gestalt}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-gestalt}
       - REDIS_URL=redis://redis:6379
       - LLM_BASE_URL=${LLM_BASE_URL}
       - LLM_API_KEY=${LLM_API_KEY}
       - LLM_MODEL=${LLM_MODEL}
+      - LLM_TIMEOUT_MS=${LLM_TIMEOUT_MS:-120000}
       - JWT_SECRET=${JWT_SECRET}
+      - SERVER_BASE_URL=${SERVER_BASE_URL:-http://localhost:3000}
+      - SESSION_TTL_MINUTES=${SESSION_TTL_MINUTES:-480}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
     depends_on:
       postgres:
         condition: service_healthy

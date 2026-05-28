@@ -4,6 +4,43 @@ Common issues and resolution steps for platform operators.
 
 ---
 
+## Docker issues
+
+### `dial unix /var/run/docker.sock: connect: no such file or directory`
+
+Docker Desktop is not running.
+
+**macOS:** Open Docker Desktop from Applications (or Spotlight: `Cmd+Space` → "Docker"). Wait for the whale icon in the menu bar to stop animating before running any `docker` commands.
+
+**Linux:**
+```bash
+sudo systemctl start docker
+sudo systemctl enable docker   # auto-start on boot
+docker info                    # verify daemon is running
+```
+
+### `the attribute version is obsolete` warning
+
+Not an error — safely ignored. The `version:` field in `docker-compose.yml` is deprecated in Docker Compose V2. The updated file in this repo has already removed it.
+
+### `unable to get image` / `pull access denied`
+
+Docker cannot reach Docker Hub. In air-gapped environments:
+```bash
+# Mirror required images to your internal registry first
+docker pull postgres:15-alpine
+docker tag postgres:15-alpine registry.company.com/mirror/postgres:15-alpine
+docker push registry.company.com/mirror/postgres:15-alpine
+
+docker pull redis:7-alpine
+docker tag redis:7-alpine registry.company.com/mirror/redis:7-alpine
+docker push registry.company.com/mirror/redis:7-alpine
+```
+Then update `docker-compose.yml` image references to your internal registry.
+See the [Deployment Guide](../guides/deployment.md#step-3) for full instructions.
+
+---
+
 ## Authentication issues
 
 ### Users cannot log in — Kerberos

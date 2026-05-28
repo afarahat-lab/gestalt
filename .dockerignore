@@ -1,0 +1,14 @@
+node_modules
+**/node_modules
+**/dist
+**/.turbo
+**/*.log
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+docs
+templates
+*.md
+!packages/*/README.md
