@@ -81,8 +81,6 @@ export class LLMClient {
         await sleep(backoffMs);
       }
 
-      const startedAt = Date.now();
-
       try {
         const response = await this.callProvider(request, childLog);
         childLog.info(
@@ -124,7 +122,7 @@ export class LLMClient {
 
   // ─── Internal ─────────────────────────────────────────────────────────────
 
-  private async callProvider(request: LLMRequest, childLog: ReturnType<typeof createContextLogger>): Promise<LLMResponse> {
+  private async callProvider(request: LLMRequest, _childLog: ReturnType<typeof createContextLogger>): Promise<LLMResponse> {
     const startedAt = Date.now();
 
     const body = {
