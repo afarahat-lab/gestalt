@@ -49,3 +49,7 @@ export { getRepositories, setRepositories } from './repository/index';
 // Harness
 export type { HarnessConfig, ContextSnapshot, HarnessValidationResult } from './harness/index';
 export { HarnessEngine, createHarnessEngine, REQUIRED_CONTEXT_FILES } from './harness/index';
+
+// Events
+export type { LiveEventType, LiveEvent, EventSubscriber, EventBus } from './events/index';
+export { eventBus, emitLiveEvent } from './events/index';

@@ -51,29 +51,7 @@ export interface PaginatedResponse<T> {
 }
 
 // ─── Event bus (for SSE) ──────────────────────────────────────────────────────
-
-export type LiveEventType =
-  | 'intent.created'
-  | 'intent.status-changed'
-  | 'agent.started'
-  | 'agent.completed'
-  | 'signal.emitted'
-  | 'gate.completed'
-  | 'deployment.updated'
-  | 'alert.created'
-  | 'alert.acknowledged'
-  | 'maintenance.run-completed';
-
-export interface LiveEvent {
-  type: LiveEventType;
-  correlationId: string;
-  payload: unknown;
-  timestamp: string;
-}
-
-export type EventSubscriber = (event: LiveEvent) => void;
-
-export interface EventBus {
-  emit(event: LiveEvent): void;
-  subscribe(subscriber: EventSubscriber): () => void;  // returns unsubscribe fn
-}
+// Canonical definition lives in @gestalt/core/events so the orchestrator
+// worker can publish on the same singleton. Re-exported here for callers
+// that already import from server-local types.
+export type { LiveEventType, LiveEvent, EventSubscriber, EventBus } from '@gestalt/core';

@@ -8,15 +8,18 @@
  * the cycle can be resumed after a crash or clarification pause.
  */
 
-import { mkdtemp, rm } from 'fs/promises';
-import { join } from 'path';
+import { mkdtemp, mkdir, rm, writeFile } from 'fs/promises';
+import { dirname, join } from 'path';
 import { tmpdir } from 'os';
-import { simpleGit } from 'simple-git';
+import { simpleGit, type SimpleGit } from 'simple-git';
 import {
   createWorker, dispatch, getRepositories, getLLMClient,
-  createContextLogger, QUEUE_NAMES,
+  createContextLogger, emitLiveEvent, QUEUE_NAMES,
 } from '@gestalt/core';
-import type { TaskMessage, TaskResult, QueueConfig } from '@gestalt/core';
+import type {
+  TaskMessage, TaskResult, QueueConfig,
+  Artifact, PlatformSignal, ExecutionStatus,
+} from '@gestalt/core';
 import { buildExecutionPlan, getReadySteps, isPlanComplete, hasPlanFailed } from './plan-builder';
 import { assembleContext } from './context-assembler';
 import { routeFeedback, requiresEscalation } from './feedback-router';
@@ -79,12 +82,35 @@ export function startOrchestratorWorker(queueConfig: QueueConfig): void {
 }
 
 /**
+ * Set the intent's status, persist it, and broadcast the transition over
+ * the in-process event bus so the SSE route (`/events`) fans it out to
+ * connected dashboard / CLI clients.
+ */
+async function transitionIntent(
+  intentId: string,
+  correlationId: string,
+  status: 'generating' | 'in-review' | 'failed' | 'waiting-for-clarification',
+): Promise<void> {
+  const { intents } = getRepositories();
+  await intents.updateStatus(intentId, status);
+  emitLiveEvent('intent.status-changed', correlationId, { intentId, status });
+}
+
+/**
  * Handles a single intent task through the full execution graph.
  *
  * ADR-032: the orchestrator clones the project's Git repo into a fresh
  * temp directory for every cycle, runs the plan against that working
- * tree, and removes it in the finally block. Any files agents write are
- * thrown away unless a later step commits + pushes them (deploy layer).
+ * tree, commits any generated artifacts back to `defaultBranch` if the
+ * cycle succeeded, and removes the temp dir in the finally block.
+ *
+ * Persistence + observability (per the 2026-05-29 orchestrator-observability
+ * session):
+ *  - one `agent_executions` row per step (created `running`, updated to
+ *    `completed` / `failed` / `skipped` with tokens + duration)
+ *  - every `result.signals` row saved into `signals`
+ *  - every `result.artifacts` row saved into `artifacts`
+ *  - SSE events emitted on the in-process bus at every state change
  */
 async function handleIntentTask(
   message: TaskMessage<IntentTaskPayload>,
@@ -103,20 +129,20 @@ async function handleIntentTask(
   // Resolve projectRoot via Git clone unless the caller supplied one.
   let projectRoot = payload.projectRoot ?? null;
   let workDir: string | null = null;
+  let project: Awaited<ReturnType<typeof projects.findById>> | null = null;
 
   try {
+    project = await projects.findById(payload.projectId);
+    if (!project) {
+      throw new Error(
+        `Project ${payload.projectId} not found — register it first via POST /projects`,
+      );
+    }
+
     if (!projectRoot) {
-      const project = await projects.findById(payload.projectId);
-      if (!project) {
-        throw new Error(
-          `Project ${payload.projectId} not found — register it first via POST /projects`,
-        );
-      }
       const token = await projects.getCredential(project.id);
       if (!token) {
-        throw new Error(
-          `Project ${project.name} has no Git credential on file`,
-        );
+        throw new Error(`Project ${project.name} has no Git credential on file`);
       }
 
       workDir = await mkdtemp(join(tmpdir(), `gestalt-cycle-${correlationId}-`));
@@ -141,23 +167,45 @@ async function handleIntentTask(
       projectRoot = workDir;
     }
 
-    // Update intent status
-    await intents.updateStatus(payload.intentId, 'generating');
+    await transitionIntent(payload.intentId, correlationId, 'generating');
 
     // Drive the plan to completion
-    await drivePlan(plan, projectRoot, queueConfigFromEnv(), childLog);
+    await drivePlan(plan, projectRoot, payload.intentId, childLog);
 
     if (hasPlanFailed(plan)) {
-      await intents.updateStatus(payload.intentId, 'failed');
+      await transitionIntent(payload.intentId, correlationId, 'failed');
       return buildResult(correlationId, 'failed', plan);
     }
 
-    // All steps completed — dispatch to quality gate
-    childLog.info('All generate steps complete, dispatching to quality gate');
-    await intents.updateStatus(payload.intentId, 'in-review');
+    if (plan.state === 'waiting_for_clarification') {
+      // Intent-agent flagged a high-impact ambiguity; we have already
+      // transitioned the intent to waiting-for-clarification inside the
+      // step. Stop here — no artifacts to push, gate not yet appropriate.
+      return buildResult(correlationId, 'completed', plan);
+    }
 
-    const allArtifacts = plan.steps
-      .flatMap((s) => s.result?.artifacts ?? []);
+    // All generate steps completed — commit + push artifacts to the project
+    // repo so developers can `git pull` to receive them, then hand off to
+    // the quality gate.
+    const allArtifacts = plan.steps.flatMap((s) => s.result?.artifacts ?? []);
+
+    if (allArtifacts.length > 0 && project) {
+      const intentText = (payload.text ?? '').trim().split('\n')[0]?.slice(0, 72) ?? '';
+      await commitAndPushArtifacts({
+        workDir: projectRoot,
+        defaultBranch: project.defaultBranch,
+        commitMessage: intentText
+          ? `feat: ${intentText} [gestalt ${correlationId.slice(0, 8)}]`
+          : `feat: generated artifacts [gestalt ${correlationId.slice(0, 8)}]`,
+        artifacts: allArtifacts,
+        childLog,
+      });
+    } else {
+      childLog.info('No artifacts produced — skipping commit/push');
+    }
+
+    childLog.info('All generate steps complete, dispatching to quality gate');
+    await transitionIntent(payload.intentId, correlationId, 'in-review');
 
     await dispatch({
       id: crypto.randomUUID(),
@@ -175,7 +223,7 @@ async function handleIntentTask(
 
   } catch (err) {
     childLog.error({ err }, 'Orchestrator error');
-    await intents.updateStatus(payload.intentId, 'failed').catch(() => {});
+    await transitionIntent(payload.intentId, correlationId, 'failed').catch(() => {});
     throw err;
   } finally {
     if (workDir) {
@@ -186,17 +234,31 @@ async function handleIntentTask(
 
 /**
  * Drives the execution plan step by step until all steps are done or failed.
+ *
+ * Each step's lifecycle:
+ *   1. Create an `agent_executions` row (status=running) + emit `agent.started`
+ *   2. Run the specialist agent against the assembled ContextSnapshot
+ *   3. Persist every `result.signals` entry to `signals` + emit `signal.emitted`
+ *   4. Persist every `result.artifacts` entry to `artifacts`
+ *   5. Update the execution row to `completed` / `failed` / `skipped` with
+ *      tokens + duration, and emit `agent.completed`
+ *
+ * If the intent-agent emits a CONTEXT_GAP, the plan state flips to
+ * `waiting_for_clarification`, the intent transitions, and the loop bails
+ * — no downstream steps run (handleIntentTask is responsible for noticing
+ * the flag and skipping the gate dispatch).
  */
 async function drivePlan(
   plan: ExecutionPlan,
   projectRoot: string,
-  queueConfig: QueueConfig,
+  intentId: string,
   childLog: ReturnType<typeof createContextLogger>,
 ): Promise<void> {
   const MAX_ITERATIONS = 20;  // safety limit
   let iterations = 0;
 
   while (!isPlanComplete(plan) && !hasPlanFailed(plan)) {
+    if (plan.state === 'waiting_for_clarification') return;
     if (++iterations > MAX_ITERATIONS) {
       throw new Error('Plan exceeded maximum iteration limit');
     }
@@ -204,18 +266,44 @@ async function drivePlan(
     const readySteps = getReadySteps(plan);
     if (readySteps.length === 0) break;
 
-    // Execute ready steps (parallel steps run concurrently)
+    // Execute ready steps (parallel steps run concurrently). Each step
+    // owns its own DB rows + SSE events so concurrency is safe.
     await Promise.all(
       readySteps.map(async (step) => {
+        const agentRole = step.agentRole as AgentRole;
+        const taskType = `generate:${agentRole}`;
+        const executionId = crypto.randomUUID();
+        const startedAt = new Date();
+        const { executions, signals, artifacts } = getRepositories();
+
         step.status = 'running';
-        childLog.info({ agentRole: step.agentRole }, 'Running agent step');
+        childLog.info({ agentRole }, 'Running agent step');
+
+        await executions.create({
+          id: executionId,
+          correlationId: plan.correlationId,
+          intentId,
+          agentRole,
+          taskType,
+          status: 'running',
+          tokensUsed: 0,
+          durationMs: null,
+          startedAt,
+          completedAt: null,
+        });
+        emitLiveEvent('agent.started', plan.correlationId, {
+          executionId,
+          agentRole,
+          taskType,
+          startedAt: startedAt.toISOString(),
+        });
 
         try {
-          const context = await assembleContext(projectRoot, plan, step.agentRole as AgentRole);
+          const context = await assembleContext(projectRoot, plan, agentRole);
           const task = {
             taskId: crypto.randomUUID(),
             correlationId: plan.correlationId,
-            agentRole: step.agentRole as AgentRole,
+            agentRole,
             contextSnapshot: context,
             maxRetries: 2,
           };
@@ -230,31 +318,130 @@ async function drivePlan(
             return result.value.content;
           };
 
-          const result = await runAgent(step.agentRole as AgentRole, task, llmCall);
+          const result = await runAgent(agentRole, task, llmCall);
 
-          step.status = result.status === 'skipped' ? 'skipped' : 'completed';
+          const stepStatus: ExecutionStatus =
+            result.status === 'skipped' ? 'skipped'
+              : result.status === 'failed' ? 'failed'
+              : 'completed';
+          step.status = result.status === 'skipped' ? 'skipped'
+            : result.status === 'failed' ? 'failed' : 'completed';
           step.result = result;
+
+          // Persist signals first so the dashboard sees a CONTEXT_GAP before
+          // the agent.completed event (UX detail; either order is correct).
+          for (const sig of result.signals ?? []) {
+            await signals.save(sig as unknown as PlatformSignal);
+            emitLiveEvent('signal.emitted', plan.correlationId, {
+              executionId,
+              agentRole,
+              type: sig.type,
+              severity: sig.severity,
+              sourceAgent: sig.sourceAgent,
+              message: sig.message,
+            });
+          }
+          for (const art of result.artifacts ?? []) {
+            await artifacts.save(art as unknown as Artifact);
+          }
+
+          const completedAt = new Date();
+          await executions.updateStatus(executionId, stepStatus, {
+            tokensUsed: result.tokensUsed,
+            durationMs: completedAt.getTime() - startedAt.getTime(),
+            startedAt,
+            completedAt,
+          });
+          emitLiveEvent('agent.completed', plan.correlationId, {
+            executionId,
+            agentRole,
+            status: stepStatus,
+            tokensUsed: result.tokensUsed,
+            durationMs: completedAt.getTime() - startedAt.getTime(),
+            artifactCount: result.artifacts?.length ?? 0,
+            signalCount: result.signals?.length ?? 0,
+          });
 
           // Check for high-impact ambiguity (CONTEXT_GAP from intent-agent)
           const hasContextGap = result.signals.some(
-            (s) => s.type === 'CONTEXT_GAP' && step.agentRole === 'intent-agent',
+            (s) => s.type === 'CONTEXT_GAP' && agentRole === 'intent-agent',
           );
           if (hasContextGap) {
             childLog.warn('High-impact ambiguity detected — waiting for clarification');
             plan.state = 'waiting_for_clarification';
-            await getRepositories().intents.updateStatus(plan.intentId, 'waiting-for-clarification');
-            return;
+            await transitionIntent(intentId, plan.correlationId, 'waiting-for-clarification');
           }
 
         } catch (err) {
-          childLog.error({ err, agentRole: step.agentRole }, 'Agent step failed');
+          childLog.error({ err, agentRole }, 'Agent step failed');
           step.status = 'failed';
+          const completedAt = new Date();
+          await executions.updateStatus(executionId, 'failed', {
+            durationMs: completedAt.getTime() - startedAt.getTime(),
+            startedAt,
+            completedAt,
+          }).catch(() => undefined);
+          emitLiveEvent('agent.completed', plan.correlationId, {
+            executionId,
+            agentRole,
+            status: 'failed',
+            error: err instanceof Error ? err.message : String(err),
+          });
         }
       }),
     );
 
     plan.updatedAt = new Date();
   }
+}
+
+/**
+ * Writes generated artifacts to the working tree, commits, and pushes to
+ * the project's default branch. Always run after a successful generate
+ * cycle so `git pull` on the developer's machine yields the changes.
+ *
+ * Note: the design destination for these commits is a side branch + PR
+ * created by the deploy-layer pr-agent once the quality gate has passed.
+ * The pr-agent does not exist yet, so for now the orchestrator pushes
+ * straight to defaultBranch to make the cycle visible. When deploy lands,
+ * move this commit/push into the pr-agent and have the orchestrator hand
+ * off the in-memory artifact set instead.
+ */
+async function commitAndPushArtifacts(args: {
+  workDir: string;
+  defaultBranch: string;
+  commitMessage: string;
+  artifacts: Array<{ path: string; content: string }>;
+  childLog: ReturnType<typeof createContextLogger>;
+}): Promise<void> {
+  const { workDir, defaultBranch, commitMessage, artifacts, childLog } = args;
+  const repo: SimpleGit = simpleGit(workDir);
+
+  for (const artifact of artifacts) {
+    const fullPath = join(workDir, artifact.path);
+    await mkdir(dirname(fullPath), { recursive: true });
+    await writeFile(fullPath, artifact.content, 'utf8');
+  }
+
+  // Author identity is fixed so commits are clearly machine-made.
+  await repo.addConfig('user.name', 'Gestalt Platform');
+  await repo.addConfig('user.email', 'platform@gestalt.local');
+
+  await repo.add('.');
+
+  // status.files is empty when artifacts overwrote files with identical content.
+  const status = await repo.status();
+  if (status.files.length === 0) {
+    childLog.info('Working tree clean after writing artifacts — skipping commit');
+    return;
+  }
+
+  const commit = await repo.commit(commitMessage);
+  await repo.push('origin', defaultBranch);
+  childLog.info(
+    { commitSha: commit.commit, branch: defaultBranch, fileCount: artifacts.length },
+    'Generated artifacts committed and pushed',
+  );
 }
 
 /**

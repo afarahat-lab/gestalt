@@ -389,7 +389,7 @@ Operator caveats:
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-29 (Claude Code — ADR-032 project registration + Git)
+**Last updated:** 2026-05-29 (Claude Code — orchestrator observability + Git push-back)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -409,6 +409,21 @@ Operator caveats:
 - `gestalt projects list` and `gestalt projects use <name>` working
 - `gestalt run` queues intent → orchestrator picks up → clones project
   repo fresh per cycle → runs generate loop against cloned harness files
+- Generate-layer cycles are fully observable and write to Git:
+  - one `agent_executions` row per step (`running` → `completed` /
+    `failed` / `skipped`) with `tokensUsed` + `durationMs`
+  - every `result.signals` saved to `signals`; every `result.artifacts`
+    saved to `artifacts`
+  - SSE events emitted on the in-process bus at every transition —
+    `intent.status-changed`, `agent.started`, `agent.completed`,
+    `signal.emitted` — verified by tapping `GET /events?token=…` during a
+    real submission
+  - on a successful cycle the orchestrator writes artifacts into the
+    cloned tree, commits `feat: <intent> [gestalt <corr8>]`, and pushes
+    to `defaultBranch`; developers `git pull` to receive
+  - the event bus lives in `@gestalt/core/events` so both the server SSE
+    route and the orchestrator publish on the same singleton without an
+    agents → server dep cycle
 - `gestalt init local-admin` (old broken syntax) now fails fast with a
   clear error (`allowExcessArguments(false)` on init command)
 - `GET /status`, `GET /status/agents`, `GET /intents`, `GET /intents/:id`
@@ -449,6 +464,17 @@ Operator caveats:
 8. `gestalt run "<intent>"` — submit work to agents
 
 **Pending enhancements (design in chat first):**
+- **Move the artifact push from generate-orchestrator to pr-agent.**
+  Per the original design, the orchestrator hands an in-memory artifact
+  set to the deploy-layer pr-agent, which opens a PR rather than pushing
+  to `defaultBranch`. The orchestrator currently pushes straight to
+  `defaultBranch` because pr-agent does not exist yet. When pr-agent
+  lands, move the commit/push logic there and have the orchestrator
+  pass artifacts via the gate handoff
+- **Intent-agent prompt / validator drift.** Live LLM responses against
+  `gpt-4o` produce JSON that the validator rejects with `IntentSpec
+  missing rawIntent` after 3 retries. The prompt or `validateIntentSpec`
+  needs to be reconciled with what the model actually returns
 - **Encrypt Git PATs at rest.** `project_git_credentials.token` is plain
   text. Documented TODO in `repositories/projects.ts`. Pick a key-management
   approach before any shared/production use
@@ -456,7 +482,9 @@ Operator caveats:
   for `LLM_MODEL`. Worth adding a startup-time ping or clear error path
 - Non-interactive mode for `gestalt init-admin` (--email/--password flags)
   for scripted use — current implementation is TTY-only
-- Quality-gate, deploy, and maintenance agent full implementations
+- Quality-gate, deploy, and maintenance agent full implementations +
+  workers wired into server startup (same pattern as
+  `startOrchestratorWorker`)
 
 **Known architectural constraints Claude Code must respect:**
 - pnpm 9.x only (Node 20 compatibility)
@@ -471,3 +499,78 @@ Operator caveats:
 - Temp dirs must be cleaned in a finally block — always, even on error
 - Migration files must NOT contain CREATE TABLE schema_migrations or INSERT
   INTO schema_migrations — the runner handles that
+
+---
+
+### Session 2026-05-29 — Claude Code (orchestrator observability + Git push-back)
+
+After ADR-032 wired Git as the project filesystem, `gestalt run` cycles
+ran end-to-end but produced no visible outcome: `agent_executions` /
+`signals` / `artifacts` stayed empty, the SSE stream was silent, and
+generated files never reached the project repo. The orchestrator was
+keeping every result in memory, then discarding it. Four pieces wired:
+
+Changed:
+- `packages/core/src/events/index.ts` (new): canonical in-process event
+  bus. `LiveEventType` / `LiveEvent` / `EventBus` / `EventSubscriber`
+  types + the `eventBus` singleton + `emitLiveEvent` helper moved here
+  so the orchestrator can publish on the same bus the SSE route
+  subscribes to. `packages/core/src/index.ts` re-exports
+- `packages/server/src/events.ts`: now a 1-line re-export of
+  `@gestalt/core` (preserves existing `import { eventBus, emitLiveEvent }
+  from '../events'` paths). `packages/server/src/types.ts`: re-exports
+  the event types from core
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  - new `transitionIntent(intentId, correlationId, status)` helper —
+    `intents.updateStatus` + `emitLiveEvent('intent.status-changed')`
+  - `drivePlan` now creates an `agent_executions` row at step start
+    (status='running'), saves every `result.signals` + `result.artifacts`
+    via the postgres repos, updates the execution row at end with
+    `tokensUsed` + `durationMs`, and emits `agent.started`,
+    `signal.emitted`, `agent.completed` events at the right boundaries
+  - new `commitAndPushArtifacts({ workDir, defaultBranch, commitMessage,
+    artifacts, childLog })` helper: writes each artifact to its `path`
+    inside the cloned working tree, `git add . && git commit`
+    (`feat: <intent text> [gestalt <corr8>]`) and `git push origin
+    <defaultBranch>`. Called from `handleIntentTask` after a successful
+    plan, before the gate dispatch
+  - fixed a latent bug: `drivePlan` now bails out as soon as
+    `plan.state === 'waiting_for_clarification'`. Previously the CONTEXT_GAP
+    branch only returned from the inner `Promise.all` callback, so the
+    loop kept finding ready steps and running them
+
+Verified live against the running container:
+- Built `pnpm -r build` clean across all 12 packages
+- `docker-compose up -d --build server` healthy
+- Submitted an intent against the existing `trackeros` project, tapped
+  `GET /events?token=…` in parallel: SSE captured the full sequence —
+  `intent.created` → `intent.status-changed=generating` →
+  `agent.started{agentRole: intent-agent}` → `signal.emitted{CONTEXT_GAP}`
+  → `agent.completed{status=failed, durationMs=11172, signalCount=1}` →
+  `intent.status-changed=waiting-for-clarification` →
+  `intent.status-changed=failed`
+- `agent_executions` and `signals` tables both populated with one row
+  matching the SSE payloads
+- `artifacts` and the git-push path were not exercised this cycle
+  (intent-agent's JSON parsing failed before any artifacts existed) —
+  the code path is structurally identical to the harness-init route
+  that already pushes to the same real repo
+
+Decisions made:
+- **Push straight to `defaultBranch` for now**, not a side branch + PR.
+  The original ADR-032 design has the deploy-layer pr-agent open a PR,
+  but pr-agent does not exist. Listed under Pending enhancements as
+  "Move artifact push from orchestrator to pr-agent." Direct push gives
+  the operator something to `git pull` today
+- **Event bus moved into core, not duplicated**, because the orchestrator
+  needs to publish on the same singleton the SSE route subscribes to.
+  Putting it in core avoids both an agents → server dep cycle and the
+  bug of having two unrelated EventEmitter instances
+- **One commit per successful intent cycle**, message `feat: <intent
+  text> [gestalt <corr8>]`. Truncated to 72 chars + uses only the first
+  line of the intent so multi-line intents do not blow out the subject
+
+Build status: All 12 packages compile clean. SSE end-to-end confirmed
+via live `/events` tap. Unresolved issue surfaced (intent-agent prompt /
+validator mismatch — `IntentSpec missing rawIntent`) tracked under
+Pending enhancements.
