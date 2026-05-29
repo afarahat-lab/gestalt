@@ -50,9 +50,19 @@ gestalt login
 
 ### 4. Set up a project
 
+Per [ADR-032](docs/DECISIONS.md), Gestalt delivers harness files and agent-generated
+code through Git. Create an empty repo on your Git host first (GitHub / GitLab /
+Azure DevOps) and a personal access token with read+write on it.
+
 ```bash
-mkdir my-project && cd my-project
-gestalt init        # LLM-powered wizard generates your project harness
+gestalt init
+# Prompts: project name, Git URL, default branch, Git token, description.
+# The server registers the project, clones the repo, writes the harness
+# files, commits with "chore: initialise project harness [gestalt]",
+# and pushes to the default branch.
+
+cd /path/to/your/local/clone
+git pull        # AGENTS.md, HARNESS.json, docs/* arrive locally
 ```
 
 ### 5. Submit your first intent
@@ -62,6 +72,9 @@ gestalt run "Set up the initial project scaffold"
 gestalt status
 gestalt dashboard   # opens http://localhost:3000
 ```
+
+Agent-generated changes are committed and pushed back to the same Git repo —
+`git pull` again to receive them.
 
 **Full walkthrough:** [docs/guides/quick-start.md](docs/guides/quick-start.md)
 

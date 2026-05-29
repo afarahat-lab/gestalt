@@ -209,7 +209,7 @@ Setting defaultRole: "viewer" grants read access to all authenticated corporate 
 - Enabled at init time for development environments
 - Shows non-production warning banner in dashboard
 - Hard-blocked in production (NODE_ENV=production) unless explicitly overridden
-- First admin created via: `gestalt init local-admin`
+- First admin created via: `gestalt init-admin` (zero-user-guarded `POST /auth/admin/setup`)
 
 ### Implementation file map (auth)
 
