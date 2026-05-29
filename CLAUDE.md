@@ -258,7 +258,7 @@ Next task for Claude Code:
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-29 (Claude Code — bootstrap smoke test + fixes)
+**Last updated:** 2026-05-29 (Claude Code — BullMQ queue-name fix)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -274,11 +274,25 @@ Next task for Claude Code:
   → 201 + JWT, second call → 403 `ADMIN_ALREADY_EXISTS`, `POST /auth/login`
   with correct creds → 200 + JWT (role 'admin' preserved), wrong password →
   401 `PROVIDER_ERROR`, `GET /auth/me` with token → 200
+- `gestalt init-admin` exercised in a real terminal — admin created, JWT
+  stored in `~/.gestalt/config.json`
+- `POST /intents` (which `gestalt run` calls) accepted and BullMQ-queued.
+  Job lands at `bull:gestalt-generate:*` in Redis. **No worker is registered
+  yet** to drain the queue, so submitted intents sit in `generating` status
+  forever until the generate-orchestrator runtime is wired up at server
+  startup
 - CLI installed via `pnpm --filter @gestalt/cli build && cd packages/cli && npm link`
 - `gestalt init-admin` is **TTY-only** — `prompt`/`promptSecret` use readline
   + raw-mode stdin, so the command cannot be driven from piped input. Works
   fine in a real terminal; would need a non-interactive `--email/--password`
   mode for scripted use (not implemented)
+- Old broken command `gestalt init local-admin` is still accepted because
+  Commander silently ignores extra positionals on a no-arg `init` command.
+  It runs the project-init wizard (which writes `AGENTS.md` / `HARNESS.json`
+  / etc. into `cwd`), never prompts for credentials. Users coming from the
+  old docs hit this — they get no admin and no token, then `gestalt run`
+  responds "Not authenticated". A `program.command('init').allowExcessArguments(false)`
+  or an explicit error-on-extra-arg would surface the typo
 
 **What is not yet built:**
 - `@gestalt/agents-quality-gate` — stubs only
@@ -311,6 +325,13 @@ Next task for Claude Code:
 - Non-interactive mode for `gestalt init-admin` (CLI flags or stdin JSON) so
   it can be scripted. Current implementation is TTY-only by design of
   `promptSecret`
+- Generate-orchestrator worker registration at server startup. The intents
+  route dispatches `generate:*` task messages to BullMQ but no consumer
+  exists, so cycles never progress past `generating`. `@gestalt/agents-generate`
+  exports the orchestrator; the wiring lives in `server.ts` between
+  "Auth manager ready" and "Fastify app"
+- `init` command should reject extra positionals so `gestalt init local-admin`
+  fails fast instead of running the project wizard with the arg ignored
 
 **Known architectural constraints Claude Code must respect:**
 - pnpm 9.x only (Node 20 compatibility)
@@ -585,3 +606,66 @@ Operator caveat:
 - The smoke test left one admin in the DB (`tty-admin@example.com`). Anyone
   running `gestalt init-admin` against this same stack now will hit 403.
   Run `docker-compose down -v` first to reset (this destroys all data)
+
+---
+
+### Session 2026-05-29 — Claude Code (BullMQ queue-name fix)
+
+The user ran `gestalt run` against a working admin session and got
+`API error 500: Queue name cannot contain :`. Pre-existing bug — would
+have crashed the first dispatch on any deployment. Not a regression from
+the bootstrap work; the queue path was never exercised before.
+
+Changed:
+- `packages/core/src/queue/index.ts`: `QUEUE_NAMES` constants flipped from
+  `gestalt:{layer}` → `gestalt-{layer}` (generate / gate / deploy /
+  maintenance). BullMQ 5.x rejects queue names containing `:` because it
+  reserves the colon for its own Redis key prefix (`bull:<queue>:<key>`).
+  Also updated the docstring at the top of the file to describe the new
+  naming and call out the BullMQ constraint
+- `docs/runbooks/common-issues.md`: the diagnostic
+  `redis-cli LLEN bull:generate:wait` was already wrong (it would have
+  returned 0 even before this bug because BullMQ's full key is
+  `bull:<queue>:wait`, not `bull:generate:wait`). Fixed to
+  `bull:gestalt-generate:wait`
+
+Verified:
+- Rebuilt core + server image, restarted server. `POST /intents` with a
+  real JWT now returns 201 instead of 500, and `redis-cli --scan --pattern
+  'bull:*'` shows the expected `bull:gestalt-generate:id`,
+  `bull:gestalt-generate:meta`, `bull:gestalt-generate:prioritized`, etc.
+  keys getting populated
+
+Decisions made:
+- **Hyphen over BullMQ's `prefix` option.** BullMQ offers a `prefix`
+  QueueOptions field that adds a Redis-key prefix without restricting
+  what's in the queue name. That would have preserved the colons in
+  developer-facing constants, but it adds a second indirection (key
+  pattern is then `<prefix>:<queue>:*`) and existing log lines / runbook
+  entries reference the queue name directly. Hyphen is the cheapest
+  change with the smallest mental model
+- **Did not add a sanity check at queue construction time.** The new
+  pattern is locked in `QUEUE_NAMES` and that's the only authority. A
+  future regression would surface immediately on first dispatch, same as
+  this one did
+
+Build status:
+- `pnpm --filter @gestalt/core build` — clean
+- `docker-compose up -d --build server` — server `Up (healthy)`
+- Verified `POST /intents` returns 201 with token, queue keys created in
+  Redis
+
+Known follow-ups (not addressed this session, listed under **Pending
+enhancements** in **Current state**):
+- No worker is registered for `gestalt-generate`. Submitted intents queue
+  but never get drained. Server startup needs to import and start the
+  generate orchestrator from `@gestalt/agents-generate` between
+  "Auth manager ready" and "Fastify app"
+- `gestalt init local-admin` (old broken syntax from the original task
+  brief) silently runs the project-init wizard because Commander accepts
+  unknown positionals. Worth a `.allowExcessArguments(false)` on the
+  `init` command to fail fast
+- `gestalt init`'s project slug logic produced `currentProjectId:
+  "generate-a-full-stack,"` (trailing comma from user description). The
+  init command mocks the LLM anyway, so the whole slug-builder will be
+  rewritten when init is reimplemented

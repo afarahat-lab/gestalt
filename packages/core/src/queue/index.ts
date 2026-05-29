@@ -4,11 +4,14 @@
  * BullMQ wrappers for the platform message queue.
  * All inter-agent communication goes through this module.
  *
- * Queue names follow the pattern: gestalt:{layer}
- *   gestalt:generate    — generate layer tasks
- *   gestalt:gate        — quality gate tasks
- *   gestalt:deploy      — deploy layer tasks
- *   gestalt:maintenance — maintenance agent tasks
+ * Queue names follow the pattern: gestalt-{layer}
+ *   gestalt-generate    — generate layer tasks
+ *   gestalt-gate        — quality gate tasks
+ *   gestalt-deploy      — deploy layer tasks
+ *   gestalt-maintenance — maintenance agent tasks
+ *
+ * Hyphens (not colons) because BullMQ 5.x rejects queue names containing
+ * ':' — it reserves the colon for its own Redis key separator.
  */
 
 import { Queue, Worker, QueueEvents } from 'bullmq';
@@ -22,10 +25,10 @@ const log = createContextLogger({ module: 'queue' });
 // ─── Queue names ──────────────────────────────────────────────────────────────
 
 export const QUEUE_NAMES = {
-  generate:    'gestalt:generate',
-  gate:        'gestalt:gate',
-  deploy:      'gestalt:deploy',
-  maintenance: 'gestalt:maintenance',
+  generate:    'gestalt-generate',
+  gate:        'gestalt-gate',
+  deploy:      'gestalt-deploy',
+  maintenance: 'gestalt-maintenance',
 } as const;
 
 export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];

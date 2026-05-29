@@ -201,7 +201,7 @@ gestalt debug llm-ping
 
 **Check queue:**
 ```bash
-docker-compose exec redis redis-cli LLEN bull:generate:wait
+docker-compose exec redis redis-cli LLEN bull:gestalt-generate:wait
 # If very high number: queue is backed up
 ```
 
