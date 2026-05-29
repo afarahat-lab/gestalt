@@ -258,7 +258,7 @@ Next task for Claude Code:
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-29 (Claude Code — BullMQ queue-name fix)
+**Last updated:** 2026-05-29 (Claude Code — postgres repo stubs implemented)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -281,6 +281,10 @@ Next task for Claude Code:
   yet** to drain the queue, so submitted intents sit in `generating` status
   forever until the generate-orchestrator runtime is wired up at server
   startup
+- `GET /status`, `GET /status/agents`, `GET /intents`, `GET /intents/:id`
+  all return 200 (verified with curl). Previously `/status` and intent
+  detail returned 500 because `executions`, `artifacts`, and `signals`
+  were stub repos in the postgres adapter — now real PG implementations
 - CLI installed via `pnpm --filter @gestalt/cli build && cd packages/cli && npm link`
 - `gestalt init-admin` is **TTY-only** — `prompt`/`promptSecret` use readline
   + raw-mode stdin, so the command cannot be driven from piped input. Works
@@ -301,6 +305,16 @@ Next task for Claude Code:
 - `@gestalt/adapter-oracle` — stub
 - `@gestalt/adapter-mssql` — stub
 - `@gestalt/registry` — types and client only
+
+**Postgres adapter repository coverage (all real, no remaining stubs):**
+- `intents`     — full CRUD + list with paging
+- `executions`  — create, updateStatus, findByCorrelationId, findActive
+- `artifacts`   — save, findByCorrelationId (typed filter), findById
+- `signals`     — save, findByCorrelationId, findUnresolved, markResolved
+  (with GOLDEN_PRINCIPLE_BREACH human-only guard)
+- `audit`       — append-only, query with filters
+- `users`       — upsert, findById, findByIdpSubject, list, count
+- `localAuth`   — create, findByEmail
 
 **CLI install:**
 - `@gestalt/cli` is private — not on npm
@@ -669,3 +683,83 @@ enhancements** in **Current state**):
   "generate-a-full-stack,"` (trailing comma from user description). The
   init command mocks the LLM anyway, so the whole slug-builder will be
   rewritten when init is reimplemented
+
+---
+
+### Session 2026-05-29 — Claude Code (postgres repo stubs implemented)
+
+The user ran `gestalt status` against a freshly-rebuilt stack and got
+`API error 500: Not yet implemented`. Source: `packages/adapters/postgres/src/index.ts`
+had three inline stub literals — `executions`, `artifacts`, `signals` —
+whose methods all threw on call. `GET /status` and `GET /status/agents`
+both hit `executions.findActive()`. Intent detail (`GET /intents/:id`)
+hit all three. The PR description on `844abba` flagged "all other repos
+remain stubs" but the gap was unaddressed; `gestalt status` was the
+first end-user-facing command that exercised them.
+
+Changed:
+- `packages/adapters/postgres/src/repositories/executions.ts` (new):
+  `PostgresAgentExecutionRepository` — `create`, `updateStatus`
+  (`COALESCE`-merges optional `tokensUsed` / `durationMs` / `startedAt` /
+  `completedAt` so partial updates do not clobber existing values),
+  `findByCorrelationId`, `findActive` (status IN ('queued', 'running'))
+- `packages/adapters/postgres/src/repositories/artifacts.ts` (new):
+  `PostgresArtifactRepository` — `save`, `findByCorrelationId` with
+  optional `ArtifactType` filter, `findById`
+- `packages/adapters/postgres/src/repositories/signals.ts` (new):
+  `PostgresSignalRepository` — `save`, `findByCorrelationId`,
+  `findUnresolved`, `markResolved`. `location` is stored as JSONB and
+  hydrated back into `CodeLocation`. `markResolved` enforces the platform
+  invariant that `GOLDEN_PRINCIPLE_BREACH` signals can only be resolved by
+  a human — refuses any non-human `resolvedBy`
+- `packages/adapters/postgres/src/index.ts`: removed the inline stub
+  literals and the `stub = () => { throw … }` factory; wired the three new
+  repos into the registry returned by `createPostgresAdapter`. Deleted the
+  outdated "implemented in full Phase 2 build" comment
+
+Verified:
+- `pnpm --filter @gestalt/adapter-postgres build` + `pnpm --filter
+  @gestalt/server build` — clean
+- `docker-compose up -d --build server` — server `Up (healthy)`
+- `GET /status` → 200 `{"data":{"activeAgents":0,…}}`
+- `GET /status/agents` → 200 `{"data":[]}`
+- `GET /intents?projectId=smoke` → 200 `{"data":[],"total":0,…}`
+- `POST /intents` then `GET /intents/:id` → 200 with `agentExecutions:
+  []`, `signals: []`, `artifacts: []` (all three new repos called inside
+  `Promise.all([...]) in `packages/server/src/routes/intents.ts:137`)
+
+Decisions made:
+- **Implemented the full interface for each repo, not just the methods
+  `gestalt status` happens to need.** `findActive` alone would have fixed
+  the immediate 500, but the next CLI path (`gestalt status --id <id>` →
+  intent detail) would have failed on `findByCorrelationId` for all three.
+  Implementing the whole repo is the same amount of effort and removes the
+  next class of bug
+- **`COALESCE` on `updateStatus`** for `agent_executions` — workers will
+  call it multiple times per task lifecycle (start → running →
+  finished), and the contract says `fields` is `Partial<AgentExecutionRecord>`.
+  Without COALESCE, omitted fields would null out previously-set values
+- **Enforced GOLDEN_PRINCIPLE_BREACH human-only resolution at the
+  repository layer**, not just convention. This is one of the invariants
+  listed under "Architecture decisions to respect" in CLAUDE.md and one
+  of the platform's golden principles per AGENTS.md. Putting it here
+  means any future caller (route, agent, script) is bound by it without
+  having to re-implement the check
+- **`location` stored as JSON-stringified JSONB and parsed on read.**
+  postgres.js auto-parses JSONB columns, so the round-trip is `null` or
+  `CodeLocation` — `rowToSignal` handles both. Did not lift a generic
+  helper because this is the only column that needs it
+- **Did not touch the audit / users / localAuth / intents repos.** They
+  were already real. The session log on `844abba` already covers them
+
+Build status:
+- `pnpm -r build` — all 12 buildable packages compile clean
+- `docker-compose up -d --build server` — server healthy
+- Repo coverage table added to **Current state** so future agents do not
+  re-stub these
+
+Operator note:
+- Existing DB state survives. The user's admin (`amr.farahat@gmail.com`)
+  and JWT are untouched — the volume rebuild was server-only via
+  `docker-compose up -d --build server`. No `docker-compose down -v`
+  required to pick up the fix
