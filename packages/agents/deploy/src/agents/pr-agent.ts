@@ -1,183 +1,196 @@
 /**
- * PR agent — creates and merges pull requests.
+ * PR agent — opens the merge request that proposes the cycle's changes.
  *
- * Responsibilities:
- * - Creates a PR with a structured summary of the intent cycle
- * - Attaches quality gate result, success criteria, artifact list
- * - Auto-merges when all conditions are met
+ * Triggered by the gate dispatching `deploy:pr` on a `pass` verdict.
+ * Clones the project, creates a feature branch
+ * (`gestalt/<corr8>-<intent-slug>`), writes all artifacts produced by
+ * the generate cycle, commits + pushes that branch, then calls
+ * `PipelineAdapter.createPullRequest` (ADR-033 — never a direct API
+ * call). On success, appends a `pr-opened` row to `deployment_events`,
+ * emits a `deployment.updated` SSE event, and dispatches
+ * `deploy:pipeline` so the pipeline-agent can take over.
  *
- * Must never:
- * - Merge with an open GOLDEN_PRINCIPLE_BREACH signal
- * - Merge without a passing pipeline run
- * - Create a PR if the gate verdict is not 'pass'
+ * On failure the deploy-orchestrator catches the throw and transitions
+ * the intent to `failed`.
  */
 
-import type { DeployTask, DeployAgentResult, PullRequest, PRSummary } from '../types';
+import { mkdtemp, mkdir, rm, writeFile } from 'fs/promises';
+import { dirname, join } from 'path';
+import { tmpdir } from 'os';
+import { simpleGit, type SimpleGit } from 'simple-git';
+import {
+  getRepositories, createContextLogger, emitLiveEvent,
+} from '@gestalt/core';
+import { resolvePipelineAdapter } from '../adapters/resolver';
+import { authenticatedGitUrl, branchNameFor } from './util';
 
-/**
- * Runs the PR agent for the given deploy task.
- * Creates a PR and returns it for the pipeline-agent to use.
- */
-export async function runPRAgent(
-  task: DeployTask,
-  gitClient: GitClient,
-): Promise<{ result: DeployAgentResult; pr: PullRequest | null }> {
-  const startedAt = Date.now();
+const log = createContextLogger({ module: 'pr-agent' });
 
-  // Hard stop — never create a PR if gate did not pass
-  if (task.gateResult.verdict !== 'pass') {
-    return {
-      result: {
-        agentRole: 'pr-agent',
-        status: 'failed',
-        signals: [{
-          id: crypto.randomUUID(),
-          correlationId: task.correlationId,
-          type: 'CONSTRAINT_VIOLATION',
-          severity: 'high',
-          sourceAgent: 'pr-agent',
-          message: `PR creation blocked: gate verdict is '${task.gateResult.verdict}', not 'pass'`,
-          autoResolvable: false,
-        }],
-        durationMs: Date.now() - startedAt,
-      },
-      pr: null,
-    };
+export interface PRAgentInput {
+  correlationId: string;
+  intentId: string;
+  projectId: string;
+  intentText: string;
+  artifacts: Array<{ path: string; content: string }>;
+}
+
+export interface PRAgentResult {
+  prUrl: string;
+  prNumber: number;
+  branch: string;
+  commitSha: string;
+}
+
+export async function runPRAgent(input: PRAgentInput): Promise<PRAgentResult> {
+  const { intents, projects, deploymentEvents } = getRepositories();
+  const project = await projects.findById(input.projectId);
+  if (!project) {
+    throw new Error(`Project ${input.projectId} not found`);
+  }
+  const token = await projects.getCredential(project.id);
+  if (!token) {
+    throw new Error(`Project ${project.name} has no Git credential on file`);
   }
 
+  // pr-agent owns the transition `approved → deploying` — first deploy-
+  // layer step to do real work.
+  await intents.updateStatus(input.intentId, 'deploying');
+  emitLiveEvent('intent.status-changed', input.correlationId, {
+    intentId: input.intentId,
+    status: 'deploying',
+  });
+
+  const workDir = await mkdtemp(join(tmpdir(), `gestalt-pr-${input.correlationId}-`));
   try {
-    const summary = buildPRSummary(task);
-    const pr = await gitClient.createPR({
-      title: buildPRTitle(task),
-      body: renderPRBody(summary),
-      branch: task.branch,
-      targetBranch: 'main',
-    });
+    const cloneUrl = authenticatedGitUrl(project.gitUrl, token);
+    log.info({ correlationId: input.correlationId, workDir }, 'Cloning project repo for PR');
+    await simpleGit().clone(cloneUrl, workDir);
 
-    return {
-      result: {
-        agentRole: 'pr-agent',
-        status: 'completed',
-        signals: [],
-        durationMs: Date.now() - startedAt,
-      },
-      pr,
-    };
-  } catch (err) {
-    return {
-      result: {
-        agentRole: 'pr-agent',
-        status: 'failed',
-        signals: [{
-          id: crypto.randomUUID(),
-          correlationId: task.correlationId,
-          type: 'CONTEXT_GAP',
-          severity: 'high',
-          sourceAgent: 'pr-agent',
-          message: `PR creation failed: ${err instanceof Error ? err.message : String(err)}`,
-          autoResolvable: false,
-        }],
-        durationMs: Date.now() - startedAt,
-      },
-      pr: null,
-    };
+    const repo: SimpleGit = simpleGit(workDir);
+    // Land on the project default branch first, then cut the feature
+    // branch from there. New repos may not have it yet — fall back to
+    // whatever the clone landed on.
+    try {
+      await repo.checkout(project.defaultBranch);
+    } catch {
+      // Branch may not exist on the remote yet — proceed on current HEAD.
+    }
+
+    const branch = branchNameFor(input.correlationId, input.intentText);
+    await repo.checkoutLocalBranch(branch);
+
+    // Write every artifact at its declared path. mkdir -p the dirname
+    // each time — the path may be several levels deep.
+    for (const artifact of input.artifacts) {
+      const full = join(workDir, artifact.path);
+      await mkdir(dirname(full), { recursive: true });
+      await writeFile(full, artifact.content, 'utf8');
+    }
+
+    await repo.addConfig('user.name', 'Gestalt Platform');
+    await repo.addConfig('user.email', 'platform@gestalt.local');
+    await repo.add('.');
+
+    const status = await repo.status();
+    if (status.files.length === 0) {
+      // No diff vs the current default-branch tip — the artifact set was
+      // already on main (e.g. the generate orchestrator's transitional
+      // direct-push). Synthesise an empty commit so the PR isn't blank.
+      const commit = await repo.commit(commitMessageFor(input), undefined, {
+        '--allow-empty': null,
+      });
+      await repo.push('origin', branch, ['--set-upstream']);
+      return await openPR(input, project, branch, commit.commit, token, workDir, deploymentEvents);
+    }
+
+    const commit = await repo.commit(commitMessageFor(input));
+    await repo.push('origin', branch, ['--set-upstream']);
+    return await openPR(input, project, branch, commit.commit, token, workDir, deploymentEvents);
+  } finally {
+    await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 
-/**
- * Merges an approved PR. Hard-checks for GOLDEN_PRINCIPLE_BREACH before proceeding.
- * Called by pipeline-agent after a successful pipeline run.
- */
-export async function mergePR(
-  pr: PullRequest,
-  task: DeployTask,
-  gitClient: GitClient,
-): Promise<DeployAgentResult> {
-  const startedAt = Date.now();
+async function openPR(
+  input: PRAgentInput,
+  project: { id: string; gitUrl: string; defaultBranch: string },
+  branch: string,
+  commitSha: string,
+  token: string,
+  workDir: string,
+  deploymentEvents: ReturnType<typeof getRepositories>['deploymentEvents'],
+): Promise<PRAgentResult> {
+  const adapter = await resolvePipelineAdapter({
+    projectRoot: workDir,
+    projectGitUrl: project.gitUrl,
+    token,
+    correlationId: input.correlationId,
+  });
 
-  // GP-003: never merge with a GOLDEN_PRINCIPLE_BREACH
-  const hasBreach = task.gateResult.signals?.some(
-    (s) => s.type === 'GOLDEN_PRINCIPLE_BREACH',
+  const { prUrl, prNumber } = await adapter.createPullRequest({
+    projectId: project.id,
+    title: titleFor(input.intentText),
+    body: bodyFor(input),
+    head: branch,
+    base: project.defaultBranch,
+  });
+
+  await deploymentEvents.append({
+    correlationId: input.correlationId,
+    intentId: input.intentId,
+    eventType: 'pr-opened',
+    environment: null,
+    prUrl,
+    prNumber,
+    runId: null,
+    deploymentUrl: null,
+    metadata: { branch, commitSha, adapter: adapter.type },
+  });
+
+  emitLiveEvent('deployment.updated', input.correlationId, {
+    intentId: input.intentId,
+    status: 'pr-open',
+    prUrl,
+    prNumber,
+    branch,
+    adapter: adapter.type,
+  });
+
+  log.info(
+    { correlationId: input.correlationId, prUrl, prNumber, branch, adapter: adapter.type },
+    'PR opened',
   );
-  if (hasBreach) {
-    return {
-      agentRole: 'pr-agent',
-      status: 'failed',
-      signals: [{
-        id: crypto.randomUUID(),
-        correlationId: task.correlationId,
-        type: 'GOLDEN_PRINCIPLE_BREACH',
-        severity: 'critical',
-        sourceAgent: 'pr-agent',
-        message: 'Merge blocked: GOLDEN_PRINCIPLE_BREACH signal present. Human approval required.',
-        autoResolvable: false,
-      }],
-      durationMs: Date.now() - startedAt,
-    };
-  }
 
-  await gitClient.mergePR(pr.externalPrId);
-
-  return {
-    agentRole: 'pr-agent',
-    status: 'completed',
-    signals: [],
-    durationMs: Date.now() - startedAt,
-  };
+  return { prUrl, prNumber, branch, commitSha };
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function buildPRTitle(task: DeployTask): string {
-  const intentPreview = task.gateResult.correlationId.slice(0, 8);
-  return `feat: agent-generated changes [${intentPreview}]`;
+function titleFor(intentText: string): string {
+  const t = intentText.trim().split('\n')[0] ?? intentText;
+  return t.length > 72 ? `${t.slice(0, 69)}...` : t;
 }
 
-function buildPRSummary(task: DeployTask): PRSummary {
-  return {
-    intentText: '',  // populated from intent spec in Phase 2
-    successCriteria: [],
-    artifactPaths: task.artifactPaths,
-    gateResult: {
-      verdict: task.gateResult.verdict,
-      signalCount: task.gateResult.signals.length,
-      durationMs: task.gateResult.durationMs,
-    },
-    agentExecutionLog: [],
-  };
+function commitMessageFor(input: PRAgentInput): string {
+  const intentLine = (input.intentText ?? '').trim().split('\n')[0]?.slice(0, 72) ?? '';
+  return intentLine
+    ? `feat: ${intentLine} [gestalt ${input.correlationId.slice(0, 8)}]`
+    : `feat: generated artifacts [gestalt ${input.correlationId.slice(0, 8)}]`;
 }
 
-function renderPRBody(summary: PRSummary): string {
-  return [
-    '## Gestalt — Generated PR',
+function bodyFor(input: PRAgentInput): string {
+  const lines = [
+    '## Intent',
     '',
-    `**Intent:** ${summary.intentText || '_see intent spec_'}`,
+    input.intentText,
     '',
-    '### Success criteria',
-    summary.successCriteria.length
-      ? summary.successCriteria.map((c) => `- ${c}`).join('\n')
-      : '_See intent spec_',
+    '## Artifacts produced',
     '',
-    '### Quality gate',
-    `- Verdict: **${summary.gateResult.verdict}**`,
-    `- Signals: ${summary.gateResult.signalCount}`,
-    `- Duration: ${summary.gateResult.durationMs}ms`,
+    ...input.artifacts.map((a) => `- \`${a.path}\``),
     '',
-    '### Changed files',
-    summary.artifactPaths.map((p) => `- \`${p}\``).join('\n'),
+    '## Correlation',
     '',
-    '_Generated by Gestalt_',
-  ].join('\n');
-}
-
-// ─── Git client interface (implemented per VCS in Phase 2) ───────────────────
-
-export interface GitClient {
-  createPR(params: {
-    title: string;
-    body: string;
-    branch: string;
-    targetBranch: string;
-  }): Promise<PullRequest>;
-  mergePR(externalPrId: string): Promise<void>;
+    `gestalt-${input.correlationId}`,
+    '',
+    '> Generated automatically by the Gestalt platform.',
+  ];
+  return lines.join('\n');
 }

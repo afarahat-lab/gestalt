@@ -1,207 +1,209 @@
 /**
- * Pipeline agent — triggers CI/CD pipelines, monitors stage results,
- * maps outcomes to platform signals.
+ * Pipeline agent — triggers the project's CI/CD pipeline and polls until
+ * it reaches a terminal status.
  *
- * Uses the pipeline adapter pattern for CI/CD system abstraction.
- * Uses the scanner interpreter pattern for enterprise security tool results.
- *
- * Never executes builds or scans directly — coordinates external systems only.
+ * Triggered by `deploy:pipeline` after pr-agent has opened the PR.
+ * Calls `PipelineAdapter.triggerPipeline`, then polls
+ * `PipelineAdapter.getPipelineStatus` every 15 seconds up to
+ * `timeoutMs` (default 10 minutes). On `passed`, the orchestrator
+ * dispatches `deploy:promotion` with `targetEnvironment: 'staging'`. On
+ * `failed` or `cancelled`, returns a `TEST_FAILURE` signal and lets the
+ * orchestrator mark the intent `failed`. On timeout, returns a
+ * `CONTEXT_GAP` signal so the operator can investigate.
  */
 
-import type {
-  DeployTask, DeployAgentResult, DeploySignal,
-  PipelineRun, StageResult, ScannerResult,
-  PipelineAdapter, ScannerInterpreter,
-} from '../types';
+import { mkdtemp, rm } from 'fs/promises';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import { simpleGit } from 'simple-git';
+import {
+  getRepositories, createContextLogger, emitLiveEvent,
+} from '@gestalt/core';
+import type { PlatformSignal, SignalType } from '@gestalt/core';
+import { resolvePipelineAdapter } from '../adapters/resolver';
+import { authenticatedGitUrl } from './util';
 
-// Polling interval and timeout for pipeline status
-const POLL_INTERVAL_MS = 15_000;   // 15 seconds
-const PIPELINE_TIMEOUT_MS = 3_600_000;  // 1 hour
+const log = createContextLogger({ module: 'pipeline-agent' });
 
-/**
- * Runs the pipeline agent.
- * Triggers the configured CI/CD pipeline, polls until completion,
- * interprets results, and returns typed signals.
- */
-export async function runPipelineAgent(
-  task: DeployTask,
-  pipelineAdapter: PipelineAdapter,
-  scannerInterpreter: ScannerInterpreter | null,
-): Promise<{ result: DeployAgentResult; pipelineRun: PipelineRun | null }> {
-  const startedAt = Date.now();
-  const signals: DeploySignal[] = [];
+const POLL_INTERVAL_MS = 15_000;
+const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 
-  let pipelineRun: PipelineRun | null = null;
+export interface PipelineAgentInput {
+  correlationId: string;
+  intentId: string;
+  projectId: string;
+  branch: string;
+  prUrl: string;
+  prNumber: number;
+  timeoutMs?: number;
+}
 
+export type PipelineAgentOutcome =
+  | { kind: 'passed'; runId: string }
+  | { kind: 'failed'; runId: string; reason: string }
+  | { kind: 'cancelled'; runId: string }
+  | { kind: 'timeout'; runId: string };
+
+export interface PipelineAgentResult {
+  outcome: PipelineAgentOutcome;
+  signals: PlatformSignal[];
+}
+
+export async function runPipelineAgent(input: PipelineAgentInput): Promise<PipelineAgentResult> {
+  const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const { projects, deploymentEvents } = getRepositories();
+  const project = await projects.findById(input.projectId);
+  if (!project) throw new Error(`Project ${input.projectId} not found`);
+  const token = await projects.getCredential(project.id);
+  if (!token) throw new Error(`Project ${project.name} has no Git credential`);
+
+  // Shallow clone so the resolver can read the project's HARNESS.json.
+  // The pipeline runs inside the operator's CI/CD system, not here.
+  const workDir = await mkdtemp(join(tmpdir(), `gestalt-pipeline-${input.correlationId}-`));
   try {
-    // Trigger the pipeline
-    pipelineRun = await pipelineAdapter.trigger({
-      adapter: task.harnessConfig.pipeline.adapter,
-      connectionConfig: task.harnessConfig.pipeline.triggerConfig,
-      pipelineId: task.harnessConfig.pipeline.triggerConfig['pipelineId'] ?? '',
-      branch: task.branch,
-      commitSha: task.commitSha,
-    });
-
-    // Poll until completion or timeout
-    const finalStatus = await pollUntilComplete(
-      pipelineRun.id,
-      pipelineAdapter,
-      POLL_INTERVAL_MS,
-      PIPELINE_TIMEOUT_MS,
+    await simpleGit().clone(
+      authenticatedGitUrl(project.gitUrl, token),
+      workDir,
+      ['--depth', '1'],
     );
 
-    if (finalStatus === 'cancelled') {
-      signals.push(buildSignal(task.correlationId, 'CONSTRAINT_VIOLATION', 'medium',
-        'Pipeline was cancelled externally', false));
-      return { result: failed(signals, startedAt), pipelineRun };
+    const adapter = await resolvePipelineAdapter({
+      projectRoot: workDir,
+      projectGitUrl: project.gitUrl,
+      token,
+      correlationId: input.correlationId,
+    });
+
+    const { runId } = await adapter.triggerPipeline({
+      projectId: project.id,
+      branch: input.branch,
+      correlationId: input.correlationId,
+    });
+
+    await deploymentEvents.append({
+      correlationId: input.correlationId,
+      intentId: input.intentId,
+      eventType: 'pipeline-triggered',
+      environment: null,
+      prUrl: input.prUrl,
+      prNumber: input.prNumber,
+      runId,
+      deploymentUrl: null,
+      metadata: { branch: input.branch, adapter: adapter.type },
+    });
+    emitLiveEvent('deployment.updated', input.correlationId, {
+      intentId: input.intentId,
+      status: 'pipeline-triggered',
+      runId,
+      branch: input.branch,
+      adapter: adapter.type,
+    });
+
+    log.info(
+      { correlationId: input.correlationId, runId, adapter: adapter.type },
+      'Pipeline triggered — polling for terminal status',
+    );
+
+    const startedAt = Date.now();
+    let lastStatus = 'running';
+    while (Date.now() - startedAt < timeoutMs) {
+      const { status } = await adapter.getPipelineStatus({ runId });
+      if (status !== lastStatus) {
+        log.info({ correlationId: input.correlationId, runId, status }, 'Pipeline status update');
+        lastStatus = status;
+      }
+      if (status === 'passed') {
+        await deploymentEvents.append({
+          correlationId: input.correlationId,
+          intentId: input.intentId,
+          eventType: 'pipeline-passed',
+          environment: null,
+          prUrl: input.prUrl,
+          prNumber: input.prNumber,
+          runId,
+          deploymentUrl: null,
+          metadata: { adapter: adapter.type },
+        });
+        emitLiveEvent('deployment.updated', input.correlationId, {
+          intentId: input.intentId,
+          status: 'pipeline-passed',
+          runId,
+          adapter: adapter.type,
+        });
+        return { outcome: { kind: 'passed', runId }, signals: [] };
+      }
+      if (status === 'failed' || status === 'cancelled') {
+        await deploymentEvents.append({
+          correlationId: input.correlationId,
+          intentId: input.intentId,
+          eventType: 'pipeline-failed',
+          environment: null,
+          prUrl: input.prUrl,
+          prNumber: input.prNumber,
+          runId,
+          deploymentUrl: null,
+          metadata: { adapter: adapter.type, status },
+        });
+        const reason = `Pipeline ${status}`;
+        emitLiveEvent('deployment.updated', input.correlationId, {
+          intentId: input.intentId,
+          status: 'pipeline-failed',
+          runId,
+          adapter: adapter.type,
+        });
+        const signal = buildSignal({
+          correlationId: input.correlationId,
+          type: 'TEST_FAILURE',
+          severity: 'high',
+          message: `${reason} — runId=${runId}`,
+        });
+        return {
+          outcome: status === 'cancelled'
+            ? { kind: 'cancelled', runId }
+            : { kind: 'failed', runId, reason },
+          signals: [signal],
+        };
+      }
+      await sleep(POLL_INTERVAL_MS);
     }
 
-    if (finalStatus === 'failed') {
-      const stageResults = await pipelineAdapter.getStageResults(pipelineRun.id);
-      const stageSignals = interpretStageResults(
-        task.correlationId, stageResults, scannerInterpreter,
-        task.harnessConfig.pipeline.securityScanner,
-      );
-      signals.push(...stageSignals);
-      return { result: failed(signals, startedAt), pipelineRun };
-    }
-
-    // Pipeline succeeded
-    return {
-      result: { agentRole: 'pipeline-agent', status: 'completed', signals: [], durationMs: Date.now() - startedAt },
-      pipelineRun,
-    };
-
-  } catch (err) {
-    signals.push(buildSignal(task.correlationId, 'CONTEXT_GAP', 'high',
-      `Pipeline agent error: ${err instanceof Error ? err.message : String(err)}`, false));
-    return { result: failed(signals, startedAt), pipelineRun };
+    // Polling exhausted without a terminal status.
+    const timeoutSignal = buildSignal({
+      correlationId: input.correlationId,
+      type: 'CONTEXT_GAP',
+      severity: 'high',
+      message: `Pipeline run ${runId} did not reach a terminal status within ${Math.round(timeoutMs / 1000)}s`,
+    });
+    emitLiveEvent('deployment.updated', input.correlationId, {
+      intentId: input.intentId,
+      status: 'pipeline-timeout',
+      runId,
+      adapter: adapter.type,
+    });
+    return { outcome: { kind: 'timeout', runId }, signals: [timeoutSignal] };
+  } finally {
+    await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
   }
-}
-
-/**
- * Polls pipeline status until it reaches a terminal state or times out.
- */
-async function pollUntilComplete(
-  runId: string,
-  adapter: PipelineAdapter,
-  intervalMs: number,
-  timeoutMs: number,
-): Promise<'succeeded' | 'failed' | 'cancelled'> {
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() < deadline) {
-    const status = await adapter.getStatus(runId);
-
-    if (status === 'succeeded') return 'succeeded';
-    if (status === 'failed')    return 'failed';
-    if (status === 'cancelled') return 'cancelled';
-
-    await sleep(intervalMs);
-  }
-
-  // Timeout — treat as failure
-  await adapter.cancel(runId).catch(() => { /* best effort */ });
-  return 'failed';
-}
-
-/**
- * Interprets stage results and maps failures to typed platform signals.
- * Security stage failures are routed through the scanner interpreter.
- */
-function interpretStageResults(
-  correlationId: string,
-  stages: StageResult[],
-  scannerInterpreter: ScannerInterpreter | null,
-  _scannerConfig: DeployTask['harnessConfig']['pipeline']['securityScanner'],
-): DeploySignal[] {
-  const signals: DeploySignal[] = [];
-
-  for (const stage of stages) {
-    if (stage.status !== 'failed') continue;
-
-    if (stage.isSecurityStage && scannerInterpreter) {
-      // Enterprise scanner stage — use interpreter for precise signal mapping
-      const scannerResult = scannerInterpreter.interpret(stage.rawOutput);
-      signals.push(...mapScannerResult(correlationId, scannerResult));
-    } else {
-      // Non-security stage failure — CONSTRAINT_VIOLATION
-      signals.push(buildSignal(
-        correlationId, 'CONSTRAINT_VIOLATION', 'high',
-        `Pipeline stage '${stage.name}' failed. Check pipeline logs for details.`,
-        true,
-      ));
-    }
-  }
-
-  return signals;
-}
-
-/**
- * Maps a ScannerResult to platform signals.
- * HIGH/CRITICAL findings → GOLDEN_PRINCIPLE_BREACH (GP-007).
- */
-function mapScannerResult(
-  correlationId: string,
-  result: ScannerResult,
-): DeploySignal[] {
-  if (result.passed) return [];
-
-  const criticalFindings = result.findings.filter(
-    (f) => f.severity === 'CRITICAL' || f.severity === 'HIGH',
-  );
-  const otherFindings = result.findings.filter(
-    (f) => f.severity === 'MEDIUM' || f.severity === 'LOW' || f.severity === 'INFO',
-  );
-
-  const signals: DeploySignal[] = [];
-
-  if (criticalFindings.length > 0) {
-    signals.push(buildSignal(
-      correlationId, 'GOLDEN_PRINCIPLE_BREACH', 'critical',
-      `[${result.scannerType.toUpperCase()}] ${criticalFindings.length} CRITICAL/HIGH finding(s). ` +
-      criticalFindings.map((f) => `${f.title}${f.cwe ? ` (${f.cwe})` : ''}`).join('; '),
-      false,  // GOLDEN_PRINCIPLE_BREACH is never auto-resolvable
-    ));
-  }
-
-  if (otherFindings.length > 0) {
-    signals.push(buildSignal(
-      correlationId, 'CONSTRAINT_VIOLATION', 'medium',
-      `[${result.scannerType.toUpperCase()}] ${otherFindings.length} MEDIUM/LOW finding(s). ` +
-      otherFindings.map((f) => f.title).join('; '),
-      true,
-    ));
-  }
-
-  return signals;
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function buildSignal(
-  correlationId: string,
-  type: DeploySignal['type'],
-  severity: DeploySignal['severity'],
-  message: string,
-  autoResolvable: boolean,
-): DeploySignal {
-  return {
-    id: crypto.randomUUID(),
-    correlationId,
-    type,
-    severity,
-    sourceAgent: 'pipeline-agent',
-    message,
-    autoResolvable,
-  };
-}
-
-function failed(signals: DeploySignal[], startedAt: number): DeployAgentResult {
-  return { agentRole: 'pipeline-agent', status: 'failed', signals, durationMs: Date.now() - startedAt };
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+function buildSignal(params: {
+  correlationId: string;
+  type: SignalType;
+  severity: PlatformSignal['severity'];
+  message: string;
+}): PlatformSignal {
+  return {
+    id: crypto.randomUUID(),
+    correlationId: params.correlationId,
+    type: params.type,
+    severity: params.severity,
+    sourceAgent: 'pipeline-agent',
+    message: params.message,
+    autoResolvable: false,
+    createdAt: new Date(),
+  };
 }

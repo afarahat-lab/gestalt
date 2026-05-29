@@ -19,6 +19,7 @@
     "@gestalt/adapter-postgres": "workspace:*",
     "@gestalt/agents-generate": "workspace:*",
     "@gestalt/agents-quality-gate": "workspace:*",
+    "@gestalt/agents-deploy": "workspace:*",
     "@gestalt/core": "workspace:*",
     "bcrypt": "^5.1.1",
     "fastify": "^4.27.0",

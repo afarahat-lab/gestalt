@@ -3,3 +3,4 @@
 // @gestalt/core surfaces as a build error here, not at runtime.
 
 export { OracleProjectRepository } from './repositories/projects';
+export { OracleDeploymentEventRepository } from './repositories/deployment-events';

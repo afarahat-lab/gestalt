@@ -329,6 +329,13 @@ function buildHarnessJson({ projectName, projectDescription }: HarnessInputs): s
       autoResolvableSignals: ['LINT_FAILURE', 'TEST_FAILURE'],
       maxRetries: 3,
     },
+    // Deploy layer — pipeline adapter (ADR-033). Defaults to `noop` so the
+    // deploy chain runs end-to-end on a fresh project without real CI/CD.
+    // Change to `github-actions` (or another future adapter) once a
+    // pipeline workflow is in place in the repo.
+    pipeline: {
+      adapter: 'noop',
+    },
     maintenance: {
       driftCheck:     { enabled: true, scheduleUtc: '0 2 * * *' },
       alignmentCheck: { enabled: true, scheduleUtc: '0 3 * * *' },

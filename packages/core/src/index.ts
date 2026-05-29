@@ -38,11 +38,12 @@ export type {
   UserRecord,
   LocalAuthRecord,
   ProjectRecord,
+  DeploymentEventRecord, DeploymentEventType,
   RepositoryRegistry,
   IntentRepository, AgentExecutionRepository,
   ArtifactRepository, SignalRepository,
   AuditRepository, UserRepository, LocalAuthRepository,
-  ProjectRepository,
+  ProjectRepository, DeploymentEventRepository,
 } from './repository/index';
 export { getRepositories, setRepositories } from './repository/index';
 

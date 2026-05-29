@@ -205,6 +205,12 @@ All ADRs are in `docs/DECISIONS.md`. Key ones:
 - ADR-032: Git repository is the project filesystem — server clones per cycle,
   agents commit and push, developers git pull. `projectRoot` in
   `ContextSnapshot` is the temp clone path, not the developer's local machine
+- ADR-033: Deploy layer pipeline adapter pattern — all CI/CD calls go
+  through `PipelineAdapter`; resolved per-task from HARNESS.json;
+  `NoOpPipelineAdapter` is the fallback so the deploy chain always runs
+- ADR-034: Production promotion requires a confirmed staging
+  `promoted-staging` event for the same correlationId. Unconditional;
+  cannot be bypassed by adapter / config / operator override
 
 ---
 
@@ -389,7 +395,7 @@ Operator caveats:
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-29 (Claude Code — gate ↔ generate feedback loop)
+**Last updated:** 2026-05-30 (Claude Code — deploy layer v1)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -397,8 +403,8 @@ Operator caveats:
 - All 8 architecture layers fully designed and documented
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
-- All three migrations apply on startup: `001_initial`, `002_local_auth`,
-  `003_projects`
+- All four migrations apply on startup: `001_initial`, `002_local_auth`,
+  `003_projects`, `004_deployments`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
 - First-boot bootstrap verified end-to-end: `gestalt init-admin` creates
@@ -409,6 +415,42 @@ Operator caveats:
 - `gestalt projects list` and `gestalt projects use <name>` working
 - `gestalt run` queues intent → orchestrator picks up → clones project
   repo fresh per cycle → runs generate loop against cloned harness files
+- **Deploy layer v1 wired end-to-end (ADR-033, ADR-034).** A `pass`
+  verdict on the quality gate now dispatches `deploy:pr` to the new
+  deploy-orchestrator (`startDeployWorker` registered at server.ts
+  step 8). The deploy worker drains `bull:gestalt-deploy:*` and chains
+  three agents:
+  - **pr-agent** — clones the project, cuts
+    `gestalt/<corr8>-<slug>` (intent's first 5 words, kebab-cased,
+    capped at 40 chars), writes artifacts, commits + pushes, opens a
+    PR via the resolved `PipelineAdapter`. Transitions intent
+    `approved → deploying`. Writes a `pr-opened` row to
+    `deployment_events`, emits `deployment.updated` with `prUrl` +
+    `prNumber`
+  - **pipeline-agent** — triggers the adapter's pipeline, polls
+    `getPipelineStatus` every 15s (up to 10 min). On `passed` writes
+    `pipeline-passed`. On `failed`/`cancelled` emits `TEST_FAILURE`;
+    on timeout emits `CONTEXT_GAP`
+  - **promotion-agent** — promotes staging then production. **ADR-034
+    is enforced here**: production refused unless a
+    `promoted-staging` row exists for the same correlationId (emits
+    `GOLDEN_PRINCIPLE_BREACH`, deploy-orchestrator transitions to
+    `escalated`). On success writes `promoted-staging` /
+    `promoted-production` rows
+  - Final transition: intent → `deployed` after production promote.
+    All temp clones cleaned in `finally`
+  - PipelineAdapter (ADR-033) abstraction: `createPullRequest`,
+    `triggerPipeline`, `getPipelineStatus`, `promoteToEnvironment`.
+    `GitHubActionsAdapter` (REST API + PAT from `project_git_credentials`)
+    and `NoOpPipelineAdapter` (immediate plausible fakes with a 500ms
+    pipeline-status delay so dashboards see the `running → passed`
+    transition) included. Resolved per-task from `HARNESS.json`
+    `pipeline.adapter`; absent or unrecognised → NoOp
+  - First live cycle (`8f53b75d`, string-case utility module): 30s
+    total — generate 17s → gate 2s → deploy 6s (PR open 2.5s,
+    pipeline 1.9s, staging promote 1.0s, production promote 0.9s);
+    intent → `deployed`. Branch `origin/gestalt/8f53b75d-add-a-string-case-utility-module`
+    pushed to GitHub; deployment_events has all 5 expected rows
 - **Gate ↔ generate feedback loop wired.** A `fail` verdict (auto-resolvable
   signals, no GP_BREACH) dispatches a `generate:intent` task back to the
   generate queue with `retryCount + 1` and the signals routed to the
@@ -477,10 +519,11 @@ Operator caveats:
 **What is not yet built:**
 - `@gestalt/agents-quality-gate` — constraint-agent + llm-review-agent +
   gate orchestrator implemented (above). lint-agent / security-agent /
-  test-runner-agent still stubs (need pnpm-install-in-clone pipeline);
-  no feedback-loop-back-to-generate yet (failed verdicts mark the intent
-  `failed` instead of dispatching a regenerate)
-- `@gestalt/agents-deploy` — stubs only
+  test-runner-agent still stubs (need pnpm-install-in-clone pipeline)
+- `@gestalt/agents-deploy` — pr-agent + pipeline-agent + promotion-agent
+  + deploy orchestrator + PipelineAdapter (`GitHubActions` + `NoOp`)
+  implemented (above). Azure DevOps / GitLab CI / Jenkins adapters not
+  implemented — the brief's scope was one concrete adapter
 - `@gestalt/agents-maintenance` — stubs only
 - `@gestalt/adapter-oracle` — stub (builds, ProjectRepository throws)
 - `@gestalt/adapter-mssql` — stub (builds, ProjectRepository throws)
@@ -497,6 +540,9 @@ Operator caveats:
 - `localAuth`   — create, findByEmail
 - `projects`    — create, findById, findByName, list, saveCredential,
   getCredential (token stored plain — TODO: encrypt at rest)
+- `deploymentEvents` — append, findByCorrelationId,
+  findStagingPromotion. Append-only (DB-level REVOKE UPDATE, DELETE).
+  ADR-034 enforcement runs through `findStagingPromotion`
 
 **CLI install:**
 - `@gestalt/cli` is private — not on npm
@@ -534,6 +580,27 @@ Operator caveats:
   an optimisation, not a correctness gap
 - **Read `qualityGate.maxRetries` from the project's HARNESS.json** —
   currently hardcoded to 3 in both the gate and generate orchestrators
+- **Generate orchestrator still direct-pushes to `defaultBranch`.** The
+  pr-agent now also pushes the same artifact set to
+  `gestalt/<corr8>-<slug>` and opens a PR, which is the correct
+  long-term home for the commit. The dual-push leaves two commits with
+  the same content on different refs (`main` and the PR branch). When
+  the deploy layer is treated as authoritative, stop the
+  generate-orchestrator commit/push and forward artifacts only via the
+  gate payload — pr-agent already accepts them
+- **Real CI in `pipeline-agent`** — today most cycles use
+  `NoOpPipelineAdapter` (default in the harness template). Once
+  projects opt into `pipeline.adapter: github-actions`, the project
+  repo must contain `.github/workflows/gestalt.yml` with a
+  `workflow_dispatch` trigger; that workflow file is not generated by
+  `init-harness` today and the harness should grow a template for it
+- **Other PipelineAdapter implementations** (Azure DevOps, GitLab CI,
+  Jenkins). The interface is in place; only `GitHubActions` + `NoOp`
+  are implemented today
+- **Promotion strategy beyond auto.** Today both staging → production
+  fires unconditionally on a passed pipeline. The `EnvironmentStrategy`
+  type already supports `trigger: 'manual'` + `approvals: N`; wire that
+  through promotion-agent once a human-approval UI exists
 - **Real-tooling gate agents** (typecheck via `tsc`, lint via ESLint,
   tests via `vitest`). Each needs the project's deps installed in the
   cloned tree — likely a `pnpm install --frozen-lockfile` step before
@@ -872,3 +939,181 @@ Build status: All 12 packages compile clean. Both orchestrators
 register at startup. Feedback loop verified end-to-end with both a
 budget-exhaustion failure case (`2a57b087`, 4 cycles → `failed`) and a
 clean-first-try success case (`66891cc2`, 1 cycle → `approved`).
+
+---
+
+### Session 2026-05-30 — Claude Code (deploy layer v1)
+
+Implements ADR-033 (pipeline adapter pattern) and ADR-034 (production
+requires staging). After a gate `pass`, the new deploy-orchestrator
+worker chains pr-agent → pipeline-agent → promotion-agent (staging →
+production) and transitions the intent to `deployed`.
+
+Changed:
+- `packages/adapters/postgres/src/migrations/004_deployments.sql` (new):
+  `deployment_event_type` enum + `deployment_events` table (PK,
+  correlation_id, intent_id FK, event_type, environment, pr_url,
+  pr_number, run_id, deployment_url, metadata, created_at). Append-only
+  at the DB layer via `REVOKE UPDATE, DELETE ON … FROM current_user`
+  inside a DO block (same pattern as `audit_log`)
+- `packages/core/src/repository/index.ts`: `DeploymentEventRecord`,
+  `DeploymentEventType`, and `DeploymentEventRepository` (append +
+  findByCorrelationId + findStagingPromotion). Added
+  `deploymentEvents` to `RepositoryRegistry`
+- `packages/core/src/index.ts`: re-exports the new types + repo
+- `packages/adapters/postgres/src/repositories/deployment-events.ts`
+  (new): `PostgresDeploymentEventRepository`. Wired into
+  `createPostgresAdapter`
+- `packages/adapters/{oracle,mssql}/src/repositories/deployment-events.ts`
+  (new): throw-stubs so adding methods to the interface forces a build
+  break across all adapters (same pattern as the project stubs from the
+  ADR-032 session)
+- `packages/agents/deploy/src/adapters/pipeline-adapter.ts` (new):
+  `PipelineAdapter` interface — four methods (`createPullRequest`,
+  `triggerPipeline`, `getPipelineStatus`, `promoteToEnvironment`),
+  `PipelineStatus` union, `PipelineAdapterType` (`github-actions` |
+  `azure-devops` | `gitlab-ci` | `jenkins` | `noop`)
+- `packages/agents/deploy/src/adapters/github-actions-adapter.ts` (new):
+  `GitHubActionsAdapter` — REST API client. `createPullRequest` posts
+  `/repos/{owner}/{repo}/pulls`; `triggerPipeline` dispatches the
+  `gestalt.yml` workflow then queries
+  `/actions/runs?branch=…&event=workflow_dispatch` to recover the
+  numeric runId; `getPipelineStatus` maps `status`/`conclusion` to
+  `running`/`passed`/`failed`/`cancelled`; `promoteToEnvironment`
+  dispatches the same workflow with `inputs.environment`. PAT comes
+  from `getRepositories().projects.getCredential(projectId)` — same
+  token used for clone + push. Includes `parseOwnerRepo(gitUrl)`
+  helper for the resolver
+- `packages/agents/deploy/src/adapters/noop-pipeline-adapter.ts` (new):
+  `NoOpPipelineAdapter` — immediate plausible fakes. PR numbers
+  deterministic from branch name (hash → mod 9000 + 1000). Pipeline
+  status simulates a 500 ms `running → passed` transition so dashboards
+  see the change rather than collapsing to an instant
+- `packages/agents/deploy/src/adapters/resolver.ts` (new):
+  `resolvePipelineAdapter` reads `pipeline.adapter` from
+  `HARNESS.json` in the cloned tree. `github-actions` + parseable
+  gitUrl → `GitHubActionsAdapter`; anything else or unparseable → log a
+  warning and fall back to `NoOpPipelineAdapter`
+- `packages/agents/deploy/src/agents/pr-agent.ts` (rewritten): clones
+  the project, transitions intent `approved → deploying`, cuts
+  `gestalt/<corr8>-<slug>` (slug = first 5 words, kebab-cased, capped
+  at 40 chars), writes artifacts, commits + pushes, calls
+  `adapter.createPullRequest`. Persists `pr-opened` to
+  `deployment_events`, emits `deployment.updated`. Temp dir cleaned in
+  `finally`
+- `packages/agents/deploy/src/agents/pipeline-agent.ts` (rewritten):
+  triggers the pipeline, polls `getPipelineStatus` on a 15 s tick up
+  to 10 min. Persists `pipeline-triggered` / `pipeline-passed` /
+  `pipeline-failed` rows + SSE. On `failed`/`cancelled` returns
+  `TEST_FAILURE` signal; on timeout `CONTEXT_GAP`. Outcome union typed
+- `packages/agents/deploy/src/agents/promotion-agent.ts` (rewritten):
+  **ADR-034 enforcement** — `targetEnvironment === 'production'` calls
+  `findStagingPromotion(correlationId)`; null → emit
+  `GOLDEN_PRINCIPLE_BREACH`, return `{ kind: 'blocked' }`. Otherwise
+  call `adapter.promoteToEnvironment`, persist `promoted-staging` /
+  `promoted-production`, emit `deployment.updated`
+- `packages/agents/deploy/src/agents/util.ts` (new): shared
+  `authenticatedGitUrl` + `branchNameFor` helpers (same auth contract
+  as generate/gate, but co-located so the agents don't depend on
+  other layers)
+- `packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`
+  (new): BullMQ worker on `gestalt-deploy`. Routes `deploy:pr` →
+  pr-agent → dispatch `deploy:pipeline`; `deploy:pipeline` →
+  pipeline-agent → dispatch `deploy:promotion` staging; `deploy:promotion`
+  → promotion-agent → dispatch staging-promotion follow-up OR mark
+  intent `deployed`. `blocked` outcome from promotion-agent →
+  `escalated`. Per-task observability mirrors the gate orchestrator
+  (agent_executions create → updateStatus, SSE `agent.started` /
+  `agent.completed` / `signal.emitted`)
+- `packages/agents/deploy/src/{index.ts,types.ts}`: rewrote to expose
+  the new surface (`startDeployWorker`, `runPRAgent`,
+  `runPipelineAgent`, `runPromotionAgent`, `GitHubActionsAdapter`,
+  `NoOpPipelineAdapter`, `resolvePipelineAdapter`, `PipelineAdapter`).
+  Old aspirational `PipelineAdapter` interface (which had `trigger` /
+  `getStageResults` / `cancel`) and the empty Azure/GitLab/Jenkins
+  + scanner stub files removed — they would have collided with the new
+  interface and don't match the ADR-033 contract
+- `packages/agents/deploy/package.json`: added `simple-git` runtime dep
+- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
+  on `pass` verdict, in addition to transitioning intent to
+  `approved`, now dispatches `deploy:pr` to the deploy queue with
+  `intentId`, `projectId`, `intentText`, and the full artifact set.
+  New `dispatchDeployPR` helper alongside `maybeDispatchRetry`
+- `packages/server/package.json`: added `@gestalt/agents-deploy`
+  workspace dep
+- `packages/server/src/server.ts`: imports `startDeployWorker`,
+  registers it as step 8 between the quality-gate worker and the
+  Fastify app. Startup-sequence comment renumbered
+- `packages/server/src/routes/projects.ts`: harness template gained
+  `pipeline: { adapter: 'noop' }` so freshly-registered projects can
+  run the deploy chain end-to-end without configuring real CI
+- `docs/DECISIONS.md`: appended ADR-033 (pipeline adapter pattern) and
+  ADR-034 (production requires confirmed staging) with full decision /
+  rationale / consequences sections
+
+Verified live against `trackeros` (correlationId `8f53b75d…`):
+- Intent: "Add a string-case utility module under
+  src/shared/utils/string-case with two pure functions"
+- Generate: 17 s, 6 agent executions, 5 artifacts
+- Gate: 2 s, constraint-agent + llm-review-agent both passed, verdict
+  `pass`
+- Deploy chain: pr-agent 2.5 s → pipeline-agent 1.9 s → promotion-agent
+  staging 1.0 s → promotion-agent production 0.9 s
+- Total wall-clock: 30 s; intent transitioned `generating → in-review
+  → deploying → deployed`
+- `deployment_events`: 5 rows in order (`pr-opened`,
+  `pipeline-triggered`, `pipeline-passed`, `promoted-staging`,
+  `promoted-production`) with the expected metadata
+- SSE: 5 `deployment.updated` events captured with the expected
+  payloads (prUrl, prNumber, runId, environment, deploymentUrl)
+- Git: branch
+  `origin/gestalt/8f53b75d-add-a-string-case-utility-module` pushed
+  with the artifact commit. Branch name matches the brief's
+  `gestalt/<corr8>-<slug>` format (slug = first 5 words, kebab-cased,
+  40-char cap)
+- Adapter used: `NoOpPipelineAdapter` (harness template default). The
+  500 ms simulated pipeline delay is visible in the SSE timestamps —
+  `pipeline-triggered` at 21:12:15.xxx, `pipeline-passed` at the same
+  second; dashboards will see the transition rather than instant
+  collapse
+
+Decisions made:
+- **`pipeline.adapter: noop` is the harness default.** A fresh project
+  has no CI/CD wired up yet; defaulting to `github-actions` would 500
+  every cycle on the dispatch call. NoOp lets the chain progress and
+  the operator opts into real CI by flipping a single field in
+  `HARNESS.json`
+- **The 500 ms NoOp pipeline delay is intentional.** Without it the
+  `running → passed` transition collapses to a single instant and the
+  dashboard never renders the in-progress state
+- **Resolved per-task, not per-server.** A single Gestalt deployment
+  can serve projects on different CI systems because the resolver
+  reads from each project's cloned `HARNESS.json`
+- **pr-agent transitions `approved → deploying`, not the gate.** The
+  gate dispatches `deploy:pr` and the orchestrator picks it up
+  asynchronously; the intent shows `approved` until the deploy worker
+  actually starts work, which is the right semantics — the deploy
+  could be queued for a while if many cycles are in flight
+- **ADR-034 enforcement lives in promotion-agent itself, not the
+  orchestrator.** A future direct-promotion endpoint or test harness
+  would still have to go through the agent, and putting the check in
+  the agent means the invariant holds regardless of caller. The
+  orchestrator just maps a `blocked` outcome to `escalated`
+- **`branchNameFor` slug derivation matches the brief exactly** (first
+  5 words, kebab-cased, max 40 chars, non-alphanumeric stripped).
+  Stable enough that re-running the same intent text produces the
+  same branch
+- **Removed old aspirational adapter stubs** (Azure DevOps / GitLab
+  CI / Jenkins / scanner files). They referenced a PipelineAdapter
+  shape that no longer matches the ADR-033 contract and would have
+  blocked the build. Their position in the design is preserved in
+  ADR-016 / the `PipelineAdapterType` union; rebuild them on demand
+- **`deployment_events` is append-only at the DB layer**, not just by
+  convention. Same `REVOKE` + `DO`-block pattern as `audit_log` so it
+  survives whatever role `POSTGRES_USER` resolves to
+
+Build status: All 12 packages compile clean. All four workers (gate +
+generate + deploy + Fastify routes) register at startup. Full SDLC
+slice — intent → design → code → test → gate → PR → pipeline →
+staging → production → `deployed` — verified end-to-end against the
+NoOp adapter.

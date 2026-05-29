@@ -1,126 +1,155 @@
 /**
- * Promotion agent — manages environment promotion after a successful pipeline.
+ * Promotion agent — moves a passed pipeline through staging, then
+ * production.
  *
- * Reads the promotion strategy from HARNESS.json.
- * Auto-promotes where strategy.trigger = 'auto'.
- * Creates a human approval request where strategy.trigger = 'manual'.
- * Never promotes to production without a successful staging run.
+ * Triggered by `deploy:promotion` with `targetEnvironment: 'staging' |
+ * 'production'`.
+ *
+ * ADR-034 (hard, unconditional, no override):
+ *   when `targetEnvironment === 'production'` the agent rejects the
+ *   promotion unless a `promoted-staging` row exists in
+ *   `deployment_events` for the same correlationId. The check is
+ *   enforced in the application layer here and re-enforced by the
+ *   `deployment_events` append-only DB grant — there is no
+ *   configuration knob that turns it off.
+ *
+ * On success the agent records a `promoted-staging` /
+ * `promoted-production` event, emits `deployment.updated`, and lets the
+ * orchestrator decide what to dispatch next (another promotion for
+ * staging, intent → `deployed` for production).
  */
 
-import type {
-  DeployTask, DeployAgentResult, PromotionEvent,
-  Environment,
-} from '../types';
+import { mkdtemp, rm } from 'fs/promises';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import { simpleGit } from 'simple-git';
+import {
+  getRepositories, createContextLogger, emitLiveEvent,
+} from '@gestalt/core';
+import type { PlatformSignal, SignalType, DeploymentEventType } from '@gestalt/core';
+import { resolvePipelineAdapter } from '../adapters/resolver';
+import { authenticatedGitUrl } from './util';
 
-/**
- * Runs the promotion agent for the target environment.
- * Creates a PromotionEvent and either executes or queues for human approval.
- */
-export async function runPromotionAgent(
-  task: DeployTask,
-  targetEnvironment: Environment,
-  createPromotionEvent: (event: Omit<PromotionEvent, 'id'>) => Promise<PromotionEvent>,
-  executePromotion: (event: PromotionEvent) => Promise<void>,
-): Promise<DeployAgentResult> {
-  const startedAt = Date.now();
-  const strategy = task.harnessConfig.promotion.strategy[targetEnvironment];
+const log = createContextLogger({ module: 'promotion-agent' });
 
-  // Safety check — never promote to production without staging
-  if (targetEnvironment === 'production') {
-    const stagingGuard = await checkStagingPassed(task.correlationId);
-    if (!stagingGuard) {
-      return {
-        agentRole: 'promotion-agent',
-        status: 'failed',
-        signals: [{
-          id: crypto.randomUUID(),
-          correlationId: task.correlationId,
-          type: 'CONSTRAINT_VIOLATION',
-          severity: 'high',
-          sourceAgent: 'promotion-agent',
-          message: 'Production promotion blocked: no successful staging run found for this correlationId.',
-          autoResolvable: false,
-        }],
-        durationMs: Date.now() - startedAt,
+export interface PromotionAgentInput {
+  correlationId: string;
+  intentId: string;
+  projectId: string;
+  targetEnvironment: 'staging' | 'production';
+}
+
+export type PromotionAgentOutcome =
+  | { kind: 'promoted'; environment: 'staging' | 'production'; deploymentUrl?: string }
+  | { kind: 'blocked'; reason: 'no-staging' };
+
+export interface PromotionAgentResult {
+  outcome: PromotionAgentOutcome;
+  signals: PlatformSignal[];
+}
+
+export async function runPromotionAgent(input: PromotionAgentInput): Promise<PromotionAgentResult> {
+  const { projects, deploymentEvents } = getRepositories();
+
+  // ADR-034 enforcement: production requires a prior successful staging
+  // PromotionEvent for the same correlationId. Unconditional, no override.
+  if (input.targetEnvironment === 'production') {
+    const stagingPromotion = await deploymentEvents.findStagingPromotion(input.correlationId);
+    if (!stagingPromotion) {
+      log.warn(
+        { correlationId: input.correlationId },
+        'Production promotion blocked — no staging PromotionEvent exists',
+      );
+      const signal: PlatformSignal = {
+        id: crypto.randomUUID(),
+        correlationId: input.correlationId,
+        type: 'GOLDEN_PRINCIPLE_BREACH' satisfies SignalType,
+        severity: 'critical',
+        sourceAgent: 'promotion-agent',
+        message:
+          'ADR-034: production promotion attempted without a confirmed staging deployment. ' +
+          'This is a non-negotiable invariant and cannot be bypassed.',
+        autoResolvable: false,
+        createdAt: new Date(),
       };
+      emitLiveEvent('deployment.updated', input.correlationId, {
+        intentId: input.intentId,
+        status: 'promotion-blocked',
+        environment: 'production',
+        reason: 'no-staging',
+      });
+      return { outcome: { kind: 'blocked', reason: 'no-staging' }, signals: [signal] };
     }
   }
 
-  const event = await createPromotionEvent({
-    correlationId: task.correlationId,
-    from: getPreviousEnvironment(targetEnvironment, task.harnessConfig.promotion.environments),
-    to: targetEnvironment,
-    status: strategy.trigger === 'auto' ? 'approved' : 'pending',
-    triggeredBy: 'agent',
-    triggeredAt: new Date(),
-    completedAt: null,
-  });
+  const project = await projects.findById(input.projectId);
+  if (!project) throw new Error(`Project ${input.projectId} not found`);
+  const token = await projects.getCredential(project.id);
+  if (!token) throw new Error(`Project ${project.name} has no Git credential`);
 
-  if (strategy.trigger === 'manual') {
-    // Queue for human approval — dashboard will show this as a pending action
-    return {
-      agentRole: 'promotion-agent',
-      status: 'completed',
-      signals: [{
-        id: crypto.randomUUID(),
-        correlationId: task.correlationId,
-        type: 'CONTEXT_GAP',
-        severity: 'low',
-        sourceAgent: 'promotion-agent',
-        message: `Promotion to '${targetEnvironment}' requires ${strategy.approvals} human approval(s). ` +
-                 `Promotion event ${event.id} is pending in the dashboard.`,
-        autoResolvable: false,
-      }],
-      durationMs: Date.now() - startedAt,
-    };
-  }
-
-  // Auto-promote
+  const workDir = await mkdtemp(join(tmpdir(), `gestalt-promo-${input.correlationId}-`));
   try {
-    await executePromotion(event);
+    await simpleGit().clone(
+      authenticatedGitUrl(project.gitUrl, token),
+      workDir,
+      ['--depth', '1'],
+    );
+
+    const adapter = await resolvePipelineAdapter({
+      projectRoot: workDir,
+      projectGitUrl: project.gitUrl,
+      token,
+      correlationId: input.correlationId,
+    });
+
+    const { deploymentUrl } = await adapter.promoteToEnvironment({
+      correlationId: input.correlationId,
+      environment: input.targetEnvironment,
+    });
+
+    const eventType: DeploymentEventType = input.targetEnvironment === 'staging'
+      ? 'promoted-staging'
+      : 'promoted-production';
+
+    await deploymentEvents.append({
+      correlationId: input.correlationId,
+      intentId: input.intentId,
+      eventType,
+      environment: input.targetEnvironment,
+      prUrl: null,
+      prNumber: null,
+      runId: null,
+      deploymentUrl: deploymentUrl ?? null,
+      metadata: { adapter: adapter.type },
+    });
+
+    emitLiveEvent('deployment.updated', input.correlationId, {
+      intentId: input.intentId,
+      status: 'promoted',
+      environment: input.targetEnvironment,
+      deploymentUrl,
+      adapter: adapter.type,
+    });
+
+    log.info(
+      {
+        correlationId: input.correlationId,
+        environment: input.targetEnvironment,
+        deploymentUrl,
+        adapter: adapter.type,
+      },
+      'Environment promotion complete',
+    );
+
     return {
-      agentRole: 'promotion-agent',
-      status: 'completed',
+      outcome: {
+        kind: 'promoted',
+        environment: input.targetEnvironment,
+        ...(deploymentUrl ? { deploymentUrl } : {}),
+      },
       signals: [],
-      durationMs: Date.now() - startedAt,
     };
-  } catch (err) {
-    return {
-      agentRole: 'promotion-agent',
-      status: 'failed',
-      signals: [{
-        id: crypto.randomUUID(),
-        correlationId: task.correlationId,
-        type: 'CONSTRAINT_VIOLATION',
-        severity: 'high',
-        sourceAgent: 'promotion-agent',
-        message: `Promotion to '${targetEnvironment}' failed: ${err instanceof Error ? err.message : String(err)}`,
-        autoResolvable: false,
-      }],
-      durationMs: Date.now() - startedAt,
-    };
+  } finally {
+    await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
   }
-}
-
-/**
- * Returns the previous environment in the promotion chain.
- * e.g. for 'staging' in ['dev','staging','production'] returns 'dev'.
- */
-function getPreviousEnvironment(
-  target: Environment,
-  environments: Environment[],
-): Environment | null {
-  const index = environments.indexOf(target);
-  return index > 0 ? environments[index - 1] : null;
-}
-
-/**
- * Checks that a successful staging deployment exists for this correlation chain.
- * Phase 2: query the repository for a completed staging PromotionEvent.
- */
-async function checkStagingPassed(_correlationId: string): Promise<boolean> {
-  // Phase 2: query repository
-  // const event = await repository.findPromotionEvent({ correlationId, to: 'staging', status: 'completed' });
-  // return event !== null;
-  return true;  // stub — always passes in Phase 1
 }

@@ -1,0 +1,348 @@
+/**
+ * Deploy-layer orchestrator — BullMQ worker.
+ *
+ * Drains `bull:gestalt-deploy:*`. Consumes three task types dispatched
+ * across the deploy lifecycle:
+ *
+ *   - `deploy:pr`         — gate dispatches this on a `pass` verdict.
+ *                           pr-agent clones, branches, pushes, opens PR.
+ *                           On success, this orchestrator dispatches
+ *                           `deploy:pipeline`.
+ *   - `deploy:pipeline`   — pipeline-agent triggers + polls CI. On
+ *                           `passed`, this orchestrator dispatches
+ *                           `deploy:promotion` (staging). On `failed`
+ *                           or `timeout`, intent → `failed`.
+ *   - `deploy:promotion`  — promotion-agent promotes to the requested
+ *                           environment. ADR-034: production requires a
+ *                           prior `promoted-staging` row. After staging
+ *                           we dispatch a second `deploy:promotion` for
+ *                           production; after production the intent
+ *                           transitions to `deployed`.
+ *
+ * Observability follows the same shape as the generate and gate
+ * orchestrators: one `agent_executions` row per agent task (running →
+ * completed/failed), signals saved to the `signals` table, SSE events
+ * for every transition (`agent.started`, `agent.completed`,
+ * `signal.emitted`, `deployment.updated`, `intent.status-changed`).
+ */
+
+import {
+  createWorker, dispatch, getRepositories,
+  createContextLogger, emitLiveEvent, QUEUE_NAMES,
+} from '@gestalt/core';
+import type {
+  TaskMessage, TaskResult, QueueConfig, TaskPriority,
+  PlatformSignal, ExecutionStatus, IntentStatus,
+} from '@gestalt/core';
+import { runPRAgent } from '../agents/pr-agent';
+import { runPipelineAgent } from '../agents/pipeline-agent';
+import { runPromotionAgent } from '../agents/promotion-agent';
+
+const log = createContextLogger({ module: 'deploy-orchestrator' });
+
+// ─── Task payload shapes ─────────────────────────────────────────────────────
+
+interface DeployPRPayload {
+  intentId: string;
+  projectId: string;
+  intentText: string;
+  artifacts: Array<{ id?: string; type?: string; path: string; content: string }>;
+}
+
+interface DeployPipelinePayload {
+  intentId: string;
+  projectId: string;
+  branch: string;
+  prUrl: string;
+  prNumber: number;
+}
+
+interface DeployPromotionPayload {
+  intentId: string;
+  projectId: string;
+  targetEnvironment: 'staging' | 'production';
+}
+
+type DeployPayload = DeployPRPayload | DeployPipelinePayload | DeployPromotionPayload;
+type DeployAgentRole = 'pr-agent' | 'pipeline-agent' | 'promotion-agent';
+
+// ─── Worker entry point ──────────────────────────────────────────────────────
+
+export function startDeployWorker(queueConfig: QueueConfig): void {
+  createWorker<DeployPayload>(
+    QUEUE_NAMES.deploy,
+    handleDeployTask,
+    queueConfig,
+    { concurrency: 2 },
+  );
+  log.info('Deploy worker started');
+}
+
+// ─── Routing + dispatch ──────────────────────────────────────────────────────
+
+async function handleDeployTask(
+  message: TaskMessage<DeployPayload>,
+): Promise<TaskResult> {
+  const { correlationId, type } = message;
+  const childLog = createContextLogger({ module: 'deploy-orchestrator', correlationId });
+  const startedAt = new Date();
+
+  childLog.info({ taskType: type }, 'Deploy orchestrator received task');
+
+  try {
+    if (type === 'deploy:pr') {
+      const payload = message.payload as DeployPRPayload;
+      const result = await runWithObservability(
+        'pr-agent',
+        'deploy:pr',
+        correlationId,
+        payload.intentId,
+        () => runPRAgent({
+          correlationId,
+          intentId: payload.intentId,
+          projectId: payload.projectId,
+          intentText: payload.intentText,
+          artifacts: payload.artifacts.map((a) => ({ path: a.path, content: a.content })),
+        }),
+        [],
+        childLog,
+      );
+      // Hand off to pipeline-agent.
+      await dispatch({
+        id: crypto.randomUUID(),
+        correlationId,
+        type: 'deploy:pipeline',
+        sourceAgent: 'pr-agent',
+        targetAgent: 'pipeline-agent',
+        priority: (message.priority ?? 'normal') as TaskPriority,
+        payload: {
+          intentId: payload.intentId,
+          projectId: payload.projectId,
+          branch: result.branch,
+          prUrl: result.prUrl,
+          prNumber: result.prNumber,
+        } satisfies DeployPipelinePayload,
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),
+      }, queueConfigFromEnv());
+      return buildTaskResult(message, 'completed', startedAt);
+    }
+
+    if (type === 'deploy:pipeline') {
+      const payload = message.payload as DeployPipelinePayload;
+      const result = await runWithObservability(
+        'pipeline-agent',
+        'deploy:pipeline',
+        correlationId,
+        payload.intentId,
+        () => runPipelineAgent({
+          correlationId,
+          intentId: payload.intentId,
+          projectId: payload.projectId,
+          branch: payload.branch,
+          prUrl: payload.prUrl,
+          prNumber: payload.prNumber,
+        }),
+        (r) => r.signals,
+        childLog,
+      );
+      if (result.outcome.kind !== 'passed') {
+        await transitionIntent(payload.intentId, correlationId, 'failed');
+        return buildTaskResult(message, 'failed', startedAt);
+      }
+      // Pass → dispatch staging promotion.
+      await dispatch({
+        id: crypto.randomUUID(),
+        correlationId,
+        type: 'deploy:promotion',
+        sourceAgent: 'pipeline-agent',
+        targetAgent: 'promotion-agent',
+        priority: (message.priority ?? 'normal') as TaskPriority,
+        payload: {
+          intentId: payload.intentId,
+          projectId: payload.projectId,
+          targetEnvironment: 'staging',
+        } satisfies DeployPromotionPayload,
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),
+      }, queueConfigFromEnv());
+      return buildTaskResult(message, 'completed', startedAt);
+    }
+
+    if (type === 'deploy:promotion') {
+      const payload = message.payload as DeployPromotionPayload;
+      const result = await runWithObservability(
+        'promotion-agent',
+        `deploy:promotion:${payload.targetEnvironment}`,
+        correlationId,
+        payload.intentId,
+        () => runPromotionAgent({
+          correlationId,
+          intentId: payload.intentId,
+          projectId: payload.projectId,
+          targetEnvironment: payload.targetEnvironment,
+        }),
+        (r) => r.signals,
+        childLog,
+      );
+      if (result.outcome.kind === 'blocked') {
+        // ADR-034 enforcement fired — escalate, do not retry.
+        await transitionIntent(payload.intentId, correlationId, 'escalated');
+        return buildTaskResult(message, 'failed', startedAt);
+      }
+      if (payload.targetEnvironment === 'staging') {
+        // Chain to production.
+        await dispatch({
+          id: crypto.randomUUID(),
+          correlationId,
+          type: 'deploy:promotion',
+          sourceAgent: 'promotion-agent',
+          targetAgent: 'promotion-agent',
+          priority: (message.priority ?? 'normal') as TaskPriority,
+          payload: {
+            intentId: payload.intentId,
+            projectId: payload.projectId,
+            targetEnvironment: 'production',
+          } satisfies DeployPromotionPayload,
+          createdAt: new Date(),
+          expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),
+        }, queueConfigFromEnv());
+      } else {
+        // Production promotion complete → intent is fully deployed.
+        await transitionIntent(payload.intentId, correlationId, 'deployed');
+      }
+      return buildTaskResult(message, 'completed', startedAt);
+    }
+
+    throw new Error(`Deploy orchestrator received unknown task type: ${type}`);
+  } catch (err) {
+    childLog.error({ err, taskType: type }, 'Deploy orchestrator error');
+    const payload = message.payload as { intentId?: string };
+    if (payload.intentId) {
+      await transitionIntent(payload.intentId, correlationId, 'failed').catch(() => undefined);
+    }
+    throw err;
+  }
+}
+
+// ─── Observability wrapper ───────────────────────────────────────────────────
+
+async function runWithObservability<T>(
+  agentRole: DeployAgentRole,
+  taskType: string,
+  correlationId: string,
+  intentId: string,
+  invoke: () => Promise<T>,
+  extractSignals: PlatformSignal[] | ((result: T) => PlatformSignal[]),
+  childLog: ReturnType<typeof createContextLogger>,
+): Promise<T> {
+  const { executions, signals } = getRepositories();
+  const executionId = crypto.randomUUID();
+  const startedAt = new Date();
+
+  await executions.create({
+    id: executionId,
+    correlationId,
+    intentId,
+    agentRole,
+    taskType,
+    status: 'running',
+    tokensUsed: 0,
+    durationMs: null,
+    startedAt,
+    completedAt: null,
+  });
+  emitLiveEvent('agent.started', correlationId, {
+    executionId,
+    agentRole,
+    taskType,
+    startedAt: startedAt.toISOString(),
+  });
+
+  let result: T;
+  try {
+    result = await invoke();
+  } catch (err) {
+    const completedAt = new Date();
+    await executions.updateStatus(executionId, 'failed', {
+      durationMs: completedAt.getTime() - startedAt.getTime(),
+      startedAt,
+      completedAt,
+    }).catch(() => undefined);
+    emitLiveEvent('agent.completed', correlationId, {
+      executionId,
+      agentRole,
+      status: 'failed',
+      error: err instanceof Error ? err.message : String(err),
+    });
+    childLog.error({ err, agentRole }, 'Deploy agent threw');
+    throw err;
+  }
+
+  const producedSignals = Array.isArray(extractSignals)
+    ? extractSignals
+    : extractSignals(result);
+
+  for (const sig of producedSignals) {
+    await signals.save(sig);
+    emitLiveEvent('signal.emitted', correlationId, {
+      executionId,
+      agentRole,
+      type: sig.type,
+      severity: sig.severity,
+      sourceAgent: sig.sourceAgent,
+      message: sig.message,
+    });
+  }
+
+  const completedAt = new Date();
+  const stepStatus: ExecutionStatus = producedSignals.length > 0 ? 'failed' : 'completed';
+  await executions.updateStatus(executionId, stepStatus, {
+    durationMs: completedAt.getTime() - startedAt.getTime(),
+    startedAt,
+    completedAt,
+  });
+  emitLiveEvent('agent.completed', correlationId, {
+    executionId,
+    agentRole,
+    status: stepStatus,
+    durationMs: completedAt.getTime() - startedAt.getTime(),
+    signalCount: producedSignals.length,
+  });
+
+  return result;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+async function transitionIntent(
+  intentId: string,
+  correlationId: string,
+  status: IntentStatus,
+): Promise<void> {
+  const { intents } = getRepositories();
+  await intents.updateStatus(intentId, status);
+  emitLiveEvent('intent.status-changed', correlationId, { intentId, status });
+}
+
+function buildTaskResult(
+  message: TaskMessage<DeployPayload>,
+  status: TaskResult['status'],
+  startedAt: Date,
+): TaskResult {
+  return {
+    taskId: message.id,
+    correlationId: message.correlationId,
+    agentRole: 'pr-agent',
+    status,
+    output: { taskType: message.type },
+    signals: [],
+    tokensUsed: 0,
+    durationMs: Date.now() - startedAt.getTime(),
+    completedAt: new Date(),
+  };
+}
+
+function queueConfigFromEnv(): QueueConfig {
+  return { redisUrl: process.env['REDIS_URL'] ?? 'redis://localhost:6379' };
+}

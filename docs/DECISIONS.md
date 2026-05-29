@@ -429,3 +429,37 @@ costs multiple agent cycles.
 - Each intent cycle does a fresh shallow-or-full clone into a temp dir, runs the plan, and removes the tree in a `finally` block.
 - Project credentials (Git PATs) are stored alongside the project record and never appear in API responses or logs. Encrypt-at-rest is deferred (see `TODO` in `repositories/projects.ts`).
 - `gestalt init` becomes a thin client over `POST /projects` + `POST /projects/:id/init-harness`. Developers run `git pull` locally to receive the harness.
+
+---
+
+## ADR-033 — Deploy layer: pipeline adapter pattern
+
+**Date:** 2026-05
+**Status:** Accepted
+
+**Decision:** All CI/CD calls go through a typed `PipelineAdapter` interface. The active adapter is resolved per deploy task from the project's `HARNESS.json` `pipeline.adapter` field. A `NoOpPipelineAdapter` is provided for projects without CI/CD configured. Agents never call CI/CD systems directly.
+
+**Rationale:** Same principle as the database (ADR-004) and scanner (ADR-016) adapter patterns. Client CI/CD platforms vary — GitHub Actions, GitLab CI, Jenkins, Azure DevOps, internal corporate Bamboo / Spinnaker. Adding a new system requires only a new adapter; the deploy-orchestrator and the pr / pipeline / promotion agents stay unchanged.
+
+**Consequences:**
+- Pipeline adapter interface lives in `packages/agents/deploy/src/adapters/pipeline-adapter.ts` with four methods: `createPullRequest`, `triggerPipeline`, `getPipelineStatus`, `promoteToEnvironment`.
+- Reference implementations today: `GitHubActionsAdapter` (REST API, PAT from `project_git_credentials`) and `NoOpPipelineAdapter` (immediate plausible fake responses so the chain can run end-to-end without real CI).
+- Resolution is per-task, not per-server, so a single Gestalt deployment can serve projects on different CI systems.
+- Missing `pipeline.adapter` or an unrecognised value falls back to `NoOpPipelineAdapter` rather than failing — the deploy layer always progresses to `deployed`.
+
+---
+
+## ADR-034 — Production promotion requires confirmed staging run
+
+**Date:** 2026-05
+**Status:** Accepted
+
+**Decision:** `promotion-agent` hard-blocks promotion to production if no successful `promoted-staging` event exists in `deployment_events` for the current `correlationId`. This check cannot be bypassed by adapter, agent configuration, harness flag, or operator override.
+
+**Rationale:** Promoting untested code to production is the deployment equivalent of a `GOLDEN_PRINCIPLE_BREACH`. The staging checkpoint is a non-negotiable invariant — every change must have been observed running in staging before it can run in production. Making this a hard agent-level invariant means a buggy harness, a misconfigured adapter, or a future direct-promotion shortcut cannot circumvent it.
+
+**Consequences:**
+- `promotion-agent` calls `getRepositories().deploymentEvents.findStagingPromotion(correlationId)` before any production promote. If the result is `null`, it emits a `GOLDEN_PRINCIPLE_BREACH` signal and refuses the promote.
+- The deploy-orchestrator interprets a `blocked` outcome from `promotion-agent` as escalation, not retry — the intent transitions to `escalated`.
+- `deployment_events` is append-only (DB-level `REVOKE UPDATE, DELETE`), so a stray write cannot fake a staging promotion after the fact.
+- The check applies to the automated promotion chain only. A future human-triggered emergency promote endpoint (out of scope today) would be a separate audited path with its own ADR.

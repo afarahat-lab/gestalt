@@ -80,6 +80,9 @@ importers:
       '@gestalt/core':
         specifier: workspace:*
         version: link:../../core
+      simple-git:
+        specifier: ^3.23.0
+        version: 3.36.0
     devDependencies:
       '@types/node':
         specifier: ^20.0.0
@@ -252,6 +255,9 @@ importers:
       '@gestalt/adapter-postgres':
         specifier: workspace:*
         version: link:../adapters/postgres
+      '@gestalt/agents-deploy':
+        specifier: workspace:*
+        version: link:../agents/deploy
       '@gestalt/agents-generate':
         specifier: workspace:*
         version: link:../agents/generate

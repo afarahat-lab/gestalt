@@ -191,6 +191,44 @@ export interface RepositoryRegistry {
   users: UserRepository;
   localAuth: LocalAuthRepository;
   projects: ProjectRepository;
+  deploymentEvents: DeploymentEventRepository;
+}
+
+// ─── Deployment event repository (ADR-033) ────────────────────────────────────
+
+export type DeploymentEventType =
+  | 'pr-opened'
+  | 'pipeline-triggered'
+  | 'pipeline-passed'
+  | 'pipeline-failed'
+  | 'promoted-staging'
+  | 'promoted-production';
+
+export interface DeploymentEventRecord {
+  id: string;
+  correlationId: string;
+  intentId: string;
+  eventType: DeploymentEventType;
+  environment: string | null;
+  prUrl: string | null;
+  prNumber: number | null;
+  runId: string | null;
+  deploymentUrl: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: Date;
+}
+
+/**
+ * Append-only log of every PR / pipeline / promotion event the deploy
+ * layer produces. `findStagingPromotion` is the enforcement hook for
+ * ADR-034 — the promotion-agent calls it to verify a successful staging
+ * deployment exists before allowing production promotion.
+ */
+export interface DeploymentEventRepository extends BaseRepository {
+  append(event: Omit<DeploymentEventRecord, 'id' | 'createdAt'>): Promise<DeploymentEventRecord>;
+  findByCorrelationId(correlationId: string): Promise<DeploymentEventRecord[]>;
+  /** Returns the most recent `promoted-staging` event for the cycle, or null. */
+  findStagingPromotion(correlationId: string): Promise<DeploymentEventRecord | null>;
 }
 
 let _registry: RepositoryRegistry | null = null;

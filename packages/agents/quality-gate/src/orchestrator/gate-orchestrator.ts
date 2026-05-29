@@ -278,13 +278,20 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
     });
 
     // Verdict dispatch:
-    //   pass     → intent becomes `approved` (terminal until deploy lands)
+    //   pass     → intent becomes `approved`; dispatch `deploy:pr` to the
+    //              deploy orchestrator (pr-agent flips it to `deploying`
+    //              when it starts work)
     //   escalate → intent becomes `escalated` (GP_BREACH, human review)
     //   fail     → either dispatch a retry to the generate queue, or
     //              transition to `failed` if max retries exhausted /
     //              no signal is auto-resolvable
     if (result.verdict === 'pass') {
       await transitionIntent(payload.intentId, correlationId, 'approved');
+      await dispatchDeployPR({
+        message,
+        payload,
+        childLog,
+      });
     } else if (result.verdict === 'escalate') {
       await transitionIntent(payload.intentId, correlationId, 'escalated');
     } else {
@@ -439,6 +446,65 @@ function gateSignalToPlatformSignal(s: GateSignal): PlatformSignal {
   };
   if (s.location) out.location = s.location;
   return out;
+}
+
+/**
+ * On a `pass` verdict, dispatch `deploy:pr` to the deploy orchestrator so
+ * pr-agent can open the PR and the deploy chain can proceed. The intent
+ * has already been transitioned to `approved`; pr-agent flips it to
+ * `deploying` when it picks up the task.
+ *
+ * If `projectId` / `intentText` / `artifacts` cannot be reconstructed
+ * (older-shape gate task), the deploy step is skipped — intent stays at
+ * `approved` and the operator can re-run the cycle.
+ */
+async function dispatchDeployPR(args: {
+  message: TaskMessage<GateTaskPayload>;
+  payload: GateTaskPayload;
+  childLog: ReturnType<typeof createContextLogger>;
+}): Promise<void> {
+  const { message, payload, childLog } = args;
+  const correlationId = message.correlationId;
+
+  const projectId = payload.projectId
+    ?? (await getRepositories().intents.findById(payload.intentId))?.projectId;
+  const intentText = payload.text
+    ?? (await getRepositories().intents.findById(payload.intentId))?.text;
+  if (!projectId || !intentText) {
+    childLog.warn('Gate pass — cannot reconstruct deploy payload; skipping deploy:pr');
+    return;
+  }
+  if (!payload.artifacts || payload.artifacts.length === 0) {
+    childLog.info('Gate pass — no artifacts in payload; skipping deploy:pr');
+    return;
+  }
+
+  await dispatch({
+    id: crypto.randomUUID(),
+    correlationId,
+    type: 'deploy:pr',
+    sourceAgent: 'review-agent',
+    targetAgent: 'pr-agent',
+    priority: (message.priority ?? 'normal') as TaskPriority,
+    payload: {
+      intentId: payload.intentId,
+      projectId,
+      intentText,
+      artifacts: payload.artifacts.map((a) => ({
+        id: a.id,
+        type: a.type,
+        path: a.path,
+        content: a.content,
+      })),
+    },
+    createdAt: new Date(),
+    expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),
+  }, queueConfigFromEnv());
+
+  childLog.info(
+    { intentId: payload.intentId, artifactCount: payload.artifacts.length },
+    'Gate pass — dispatched deploy:pr',
+  );
 }
 
 /**
