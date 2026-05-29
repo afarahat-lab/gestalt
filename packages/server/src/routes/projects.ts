@@ -272,6 +272,7 @@ function buildHarnessFiles(inputs: HarnessInputs): Record<string, string> {
     'docs/DOMAIN.md':             buildDomainMd(inputs),
     'docs/GOLDEN_PRINCIPLES.md':  buildGoldenPrinciplesMd(),
     'docs/DECISIONS.md':          buildDecisionsMd(inputs),
+    '.github/workflows/gestalt.yml': buildGestaltWorkflowYml(),
   };
 }
 
@@ -423,5 +424,81 @@ Decision: Project initialised via the Gestalt platform.
 Description: ${projectDescription}
 Stack: TypeScript / Node.js / React / PostgreSQL
 Architecture: Modular monolith (corporate-ops-web-mobile template, tier 1)
+`;
+}
+
+/**
+ * Default GitHub Actions workflow seeded by init-harness.
+ *
+ * This is the workflow file the GitHubActionsAdapter dispatches:
+ *   - \`pipeline-agent.triggerPipeline\` fires \`workflow_dispatch\` after
+ *     pr-agent has pushed a feature branch
+ *   - \`promotion-agent.promoteToEnvironment\` fires the same workflow
+ *     with the \`environment\` input set to \`staging\` or \`production\`
+ *
+ * The body is deliberately minimal — checkout, Node 20, pnpm install,
+ * pnpm test. Projects opting into real CI/CD will customise this file
+ * to add lint, build, deploy steps. Operators flip
+ * \`HARNESS.json\` \`pipeline.adapter\` from \`noop\` to \`github-actions\`
+ * to make the deploy layer use this workflow instead of the in-memory
+ * NoOp fakes.
+ *
+ * The \`environment\` input is typed as a string (not \`choice\`) because
+ * the deploy-orchestrator passes additional values (e.g. \`ci\`) on the
+ * trigger leg; constraining it to staging/production would reject those
+ * dispatches.
+ */
+function buildGestaltWorkflowYml(): string {
+  return `# Gestalt-managed pipeline (ADR-033).
+#
+# Dispatched by the platform on two occasions:
+#   1. pipeline-agent triggers it after pr-agent opens a PR
+#   2. promotion-agent triggers it on each environment promotion
+#      (\`environment\` input set to \`staging\` then \`production\`)
+#
+# Customise the steps for your project (build, lint, integration tests,
+# deploy commands) — checkout / Node setup / install / test is the
+# minimum the platform expects to be present.
+
+name: gestalt
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (staging | production). Other values are accepted on CI-only dispatches.'
+        required: false
+        default: 'staging'
+        type: string
+      correlationId:
+        description: 'Gestalt correlation id for this intent cycle.'
+        required: false
+        type: string
+      branch:
+        description: 'Source branch for the dispatched run.'
+        required: false
+        type: string
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 9
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests
+        run: pnpm test
 `;
 }

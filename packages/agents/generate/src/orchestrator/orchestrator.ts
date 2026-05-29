@@ -8,10 +8,10 @@
  * the cycle can be resumed after a crash or clarification pause.
  */
 
-import { mkdtemp, mkdir, rm, writeFile } from 'fs/promises';
-import { dirname, join } from 'path';
+import { mkdtemp, rm } from 'fs/promises';
+import { join } from 'path';
 import { tmpdir } from 'os';
-import { simpleGit, type SimpleGit } from 'simple-git';
+import { simpleGit } from 'simple-git';
 import {
   createWorker, dispatch, getRepositories, getLLMClient,
   createContextLogger, emitLiveEvent, QUEUE_NAMES,
@@ -213,30 +213,17 @@ async function handleIntentTask(
       return buildResult(correlationId, 'completed', plan);
     }
 
-    // All generate steps completed — commit + push artifacts to the project
-    // repo so developers can `git pull` to receive them, then hand off to
-    // the quality gate.
+    // All generate steps completed. The artifact set is forwarded in the
+    // gate dispatch payload below and eventually passed to pr-agent in
+    // the deploy:pr message; pr-agent owns the only commit + push (to a
+    // PR branch, not defaultBranch). The generate orchestrator therefore
+    // never mutates the project's Git tree.
     const allArtifacts = plan.steps.flatMap((s) => s.result?.artifacts ?? []);
 
-    if (allArtifacts.length > 0 && project) {
-      const intentText = (payload.text ?? '').trim().split('\n')[0]?.slice(0, 72) ?? '';
-      const retrySuffix = retryCount > 0 ? ` retry ${retryCount}/${MAX_GATE_RETRIES}` : '';
-      const verb = retryCount > 0 ? 'fix' : 'feat';
-      const subject = intentText
-        ? `${verb}: ${intentText} [gestalt ${correlationId.slice(0, 8)}${retrySuffix}]`
-        : `${verb}: generated artifacts [gestalt ${correlationId.slice(0, 8)}${retrySuffix}]`;
-      await commitAndPushArtifacts({
-        workDir: projectRoot,
-        defaultBranch: project.defaultBranch,
-        commitMessage: subject,
-        artifacts: allArtifacts,
-        childLog,
-      });
-    } else {
-      childLog.info('No artifacts produced — skipping commit/push');
-    }
-
-    childLog.info('All generate steps complete, dispatching to quality gate');
+    childLog.info(
+      { artifactCount: allArtifacts.length, retryCount },
+      'All generate steps complete, dispatching to quality gate',
+    );
     await transitionIntent(payload.intentId, correlationId, 'in-review');
 
     await dispatch({
@@ -452,54 +439,6 @@ async function drivePlan(
   }
 }
 
-/**
- * Writes generated artifacts to the working tree, commits, and pushes to
- * the project's default branch. Always run after a successful generate
- * cycle so `git pull` on the developer's machine yields the changes.
- *
- * Note: the design destination for these commits is a side branch + PR
- * created by the deploy-layer pr-agent once the quality gate has passed.
- * The pr-agent does not exist yet, so for now the orchestrator pushes
- * straight to defaultBranch to make the cycle visible. When deploy lands,
- * move this commit/push into the pr-agent and have the orchestrator hand
- * off the in-memory artifact set instead.
- */
-async function commitAndPushArtifacts(args: {
-  workDir: string;
-  defaultBranch: string;
-  commitMessage: string;
-  artifacts: Array<{ path: string; content: string }>;
-  childLog: ReturnType<typeof createContextLogger>;
-}): Promise<void> {
-  const { workDir, defaultBranch, commitMessage, artifacts, childLog } = args;
-  const repo: SimpleGit = simpleGit(workDir);
-
-  for (const artifact of artifacts) {
-    const fullPath = join(workDir, artifact.path);
-    await mkdir(dirname(fullPath), { recursive: true });
-    await writeFile(fullPath, artifact.content, 'utf8');
-  }
-
-  // Author identity is fixed so commits are clearly machine-made.
-  await repo.addConfig('user.name', 'Gestalt Platform');
-  await repo.addConfig('user.email', 'platform@gestalt.local');
-
-  await repo.add('.');
-
-  // status.files is empty when artifacts overwrote files with identical content.
-  const status = await repo.status();
-  if (status.files.length === 0) {
-    childLog.info('Working tree clean after writing artifacts — skipping commit');
-    return;
-  }
-
-  const commit = await repo.commit(commitMessage);
-  await repo.push('origin', defaultBranch);
-  childLog.info(
-    { commitSha: commit.commit, branch: defaultBranch, fileCount: artifacts.length },
-    'Generated artifacts committed and pushed',
-  );
-}
 
 /**
  * Routes a task to the correct specialist agent.
