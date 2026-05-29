@@ -170,7 +170,7 @@ async function handleIntentTask(
     await transitionIntent(payload.intentId, correlationId, 'generating');
 
     // Drive the plan to completion
-    await drivePlan(plan, projectRoot, payload.intentId, childLog);
+    await drivePlan(plan, projectRoot, payload.intentId, payload.text ?? '', childLog);
 
     if (hasPlanFailed(plan)) {
       await transitionIntent(payload.intentId, correlationId, 'failed');
@@ -252,6 +252,7 @@ async function drivePlan(
   plan: ExecutionPlan,
   projectRoot: string,
   intentId: string,
+  intentText: string,
   childLog: ReturnType<typeof createContextLogger>,
 ): Promise<void> {
   const MAX_ITERATIONS = 20;  // safety limit
@@ -299,7 +300,7 @@ async function drivePlan(
         });
 
         try {
-          const context = await assembleContext(projectRoot, plan, agentRole);
+          const context = await assembleContext(projectRoot, plan, agentRole, intentText);
           const task = {
             taskId: crypto.randomUUID(),
             correlationId: plan.correlationId,

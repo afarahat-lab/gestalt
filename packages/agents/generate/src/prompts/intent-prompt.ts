@@ -75,8 +75,12 @@ Produce a JSON object with this exact structure. Do not include any text outside
 }
 
 Rules:
-- successCriteria must have at least one entry
-- affectedDomains must reference domains that exist in the project context
+- successCriteria should have at least one entry when the intent is concrete
+  enough to define one; for purely exploratory intents an empty array is OK
+- affectedDomains references domains from the existing domain model. If the
+  project is greenfield (no existing domains listed above) or this intent
+  introduces a new domain, propose the new domain name(s) here — the
+  context-agent will reconcile them with the domain model later
 - constraints must include any golden principle that applies to this intent
 - If the intent is clear with no ambiguity, return an empty ambiguities array
 - Only mark impactIfWrong as "high" if choosing the wrong interpretation would

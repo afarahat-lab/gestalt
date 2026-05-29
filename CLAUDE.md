@@ -389,7 +389,7 @@ Operator caveats:
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-29 (Claude Code — orchestrator observability + Git push-back)
+**Last updated:** 2026-05-29 (Claude Code — first full cycle pushed to Git)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -409,6 +409,17 @@ Operator caveats:
 - `gestalt projects list` and `gestalt projects use <name>` working
 - `gestalt run` queues intent → orchestrator picks up → clones project
   repo fresh per cycle → runs generate loop against cloned harness files
+- **First full intent → code → push cycle verified end-to-end.** A real
+  intent ("Add a hello world endpoint at GET /hello") ran six agents
+  (intent / design completed, context + lint-config skipped, code +
+  test completed) in ~11 seconds against `gpt-4o`, produced 7 artifacts,
+  and the orchestrator committed + pushed `8938d51` to the project's
+  GitHub repo (commit subject `feat: Add a hello world endpoint at GET
+  /hello returning JSON {message:"hello" [gestalt 75000cb2]`). Files
+  landed at the expected paths (`src/modules/hello/...`,
+  `src/api/index.ts`, `src/shared/auth/rbac-middleware.ts`,
+  `__tests__/hello-routes.test.ts`, `.gestalt/{intent,design}-spec.json`).
+  `git pull` on the developer's local clone yields them
 - Generate-layer cycles are fully observable and write to Git:
   - one `agent_executions` row per step (`running` → `completed` /
     `failed` / `skipped`) with `tokensUsed` + `durationMs`
@@ -471,10 +482,6 @@ Operator caveats:
   `defaultBranch` because pr-agent does not exist yet. When pr-agent
   lands, move the commit/push logic there and have the orchestrator
   pass artifacts via the gate handoff
-- **Intent-agent prompt / validator drift.** Live LLM responses against
-  `gpt-4o` produce JSON that the validator rejects with `IntentSpec
-  missing rawIntent` after 3 retries. The prompt or `validateIntentSpec`
-  needs to be reconciled with what the model actually returns
 - **Encrypt Git PATs at rest.** `project_git_credentials.token` is plain
   text. Documented TODO in `repositories/projects.ts`. Pick a key-management
   approach before any shared/production use
@@ -574,3 +581,59 @@ Build status: All 12 packages compile clean. SSE end-to-end confirmed
 via live `/events` tap. Unresolved issue surfaced (intent-agent prompt /
 validator mismatch — `IntentSpec missing rawIntent`) tracked under
 Pending enhancements.
+
+---
+
+### Session 2026-05-29 — Claude Code (intent-agent: first end-to-end cycle)
+
+The follow-up to the orchestrator-observability session. Live runs against
+`gpt-4o` were failing at the intent-agent because (a) the operator's intent
+text never reached the prompt — `ContextSnapshot.intentSpec.rawIntent` was
+always `""` — and (b) the local validator required `affectedDomains.length
+> 0`, which is impossible to satisfy on a greenfield project where
+`docs/DOMAIN.md` has no entities yet.
+
+Changed:
+- `packages/agents/generate/src/orchestrator/context-assembler.ts`:
+  `assembleContext` now takes an `intentText: string` parameter and
+  populates `intentSpec.rawIntent` with it (preserving any non-empty
+  rawIntent from a prior intent-agent artifact for downstream agents)
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`: threads
+  `payload.text` from the BullMQ message → `drivePlan` → each
+  `assembleContext` call. Without this the LLM was being asked to parse
+  `"Intent to parse: ""`
+- `packages/agents/generate/src/agents/intent-agent.ts`:
+  - `parseIntentSpec` now takes `rawIntentText` and unconditionally
+    overwrites the parsed `rawIntent`. The LLM is not trusted to
+    round-trip the input verbatim
+  - The local `validateIntentSpec` now only checks `rawIntent` (which the
+    orchestrator guarantees). Empty `affectedDomains` and
+    `successCriteria` arrays are accepted — they are legitimate
+    greenfield outputs, and downstream agents already handle them
+- `packages/agents/generate/src/prompts/intent-prompt.ts`: rules block
+  rewritten — `affectedDomains` may now name new domains for greenfield
+  projects (previously the prompt required referencing existing ones,
+  which was impossible)
+
+Verified live against the running container, project `trackeros`:
+- Submitted intent "Add a hello world endpoint at GET /hello returning
+  JSON {message:'hello'}"
+- 6 agent_executions rows: `intent-agent` 3.0s ✓, `design-agent` 2.3s ✓,
+  `context-agent` / `lint-config-agent` correctly skipped, `code-agent`
+  5.6s ✓, `test-agent` 4.7s ✓
+- 0 signals (no problems), 7 artifacts (intent-spec, design-spec, 4 code
+  files, 1 test file)
+- Intent transitioned `generating → in-review` in 11 seconds
+- Orchestrator committed + pushed `8938d51` to
+  `github.com/afarahat-lab/trackeros.git` with the expected file paths
+  (`src/modules/hello/{routes/hello-routes.ts,index.ts}`,
+  `src/api/index.ts`, `src/shared/auth/rbac-middleware.ts`,
+  `src/modules/hello/__tests__/hello-routes.test.ts`,
+  `.gestalt/{intent,design}-spec.json`)
+- Verified the push by cloning the remote with a one-off temp clone; tip
+  shows the new commit on top of the harness-init commit
+
+Build status: All 12 packages compile clean. First end-to-end run-through
+the full SDLC slice (intent → design → code → test → commit → push) is
+functioning. The intent-agent prompt / validator entry under Pending
+enhancements is resolved.

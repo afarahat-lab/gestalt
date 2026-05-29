@@ -16,11 +16,20 @@ import type { AgentRole } from '@gestalt/core';
  * Assembles a ContextSnapshot for the given agent role.
  * Reads context files from the project harness and injects
  * all prior artifacts from the current execution plan.
+ *
+ * `intentText` is the operator's original intent string (`payload.text` on
+ * the BullMQ message). It is always populated on the snapshot's
+ * `intentSpec.rawIntent` so the intent-agent's prompt sees the real
+ * request even before any agent has produced an IntentSpec artifact. For
+ * downstream agents whose `intentSpec.rawIntent` came from the persisted
+ * artifact, the value is preserved; the operator's text is used as a
+ * fallback if the artifact's rawIntent is empty.
  */
 export async function assembleContext(
   projectRoot: string,
   plan: ExecutionPlan,
   forAgent: AgentRole,
+  intentText: string,
 ): Promise<ContextSnapshot> {
   const engine = createHarnessEngine(projectRoot);
   const baseSnapshot = await engine.buildSnapshot(plan.correlationId);
@@ -35,9 +44,15 @@ export async function assembleContext(
     (a) => a.path === '.gestalt/intent-spec.json',
   );
 
-  const intentSpec = intentSpecArtifact
+  const parsedSpec = intentSpecArtifact
     ? safeParseJson(intentSpecArtifact.content) as IntentSpec | null
     : null;
+
+  const baseSpec = parsedSpec ?? buildEmptyIntentSpec(plan.correlationId);
+  const intentSpec: IntentSpec = {
+    ...baseSpec,
+    rawIntent: baseSpec.rawIntent?.trim() ? baseSpec.rawIntent : intentText,
+  };
 
   return {
     projectRoot,
@@ -48,7 +63,7 @@ export async function assembleContext(
     domain: parseDomain(baseSnapshot.domainMd),
     goldenPrinciples: parseGoldenPrinciples(baseSnapshot.goldenPrinciplesMd),
     relevantDecisions: parseDecisions(baseSnapshot.relevantDecisions),
-    intentSpec: intentSpec ?? buildEmptyIntentSpec(plan.correlationId),
+    intentSpec,
     priorArtifacts,
   };
 }
