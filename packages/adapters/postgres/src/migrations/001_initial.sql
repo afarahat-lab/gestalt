@@ -91,8 +91,17 @@ CREATE TABLE audit_log (
   timestamp       TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Audit log is append-only — revoke UPDATE and DELETE from application user
-REVOKE UPDATE, DELETE ON audit_log FROM gestalt_app;
+-- Audit log is append-only — revoke UPDATE and DELETE from the connecting
+-- application role. Uses current_user so this works regardless of the
+-- POSTGRES_USER chosen at deployment.
+DO $$
+BEGIN
+  EXECUTE format('REVOKE UPDATE, DELETE ON audit_log FROM %I', current_user);
+EXCEPTION WHEN OTHERS THEN
+  -- Role does not exist or already lacks the privilege — safe to ignore.
+  NULL;
+END
+$$;
 
 CREATE INDEX idx_audit_entity    ON audit_log(entity_id);
 CREATE INDEX idx_audit_actor     ON audit_log(actor);
@@ -158,11 +167,8 @@ CREATE TABLE maintenance_runs (
   run_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- ─── Schema version ───────────────────────────────────────────────────────────
-
-CREATE TABLE schema_migrations (
-  version     TEXT PRIMARY KEY,
-  applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-INSERT INTO schema_migrations (version) VALUES ('001_initial');
+-- ─── Schema version ──────────────────────────────────────────────────────────
+-- The `schema_migrations` table is created by the migration runner itself
+-- (CREATE TABLE IF NOT EXISTS) before this file is applied, and the runner
+-- records the applied version after a successful transaction. Do not create
+-- or INSERT into the table from inside a migration — it conflicts.

@@ -258,7 +258,7 @@ Next task for Claude Code:
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-28 (Claude Code — CLAUDE.md status refresh)
+**Last updated:** 2026-05-29 (Claude Code — bootstrap smoke test + fixes)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -266,9 +266,19 @@ Next task for Claude Code:
 - All 8 architecture layers fully designed and documented
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
+- Database migrations apply on startup — `users`, `local_auth`, `audit_log`,
+  etc. all created; `schema_migrations` tracks `001_initial` + `002_local_auth`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
+- First-boot bootstrap verified end-to-end with curl: `POST /auth/admin/setup`
+  → 201 + JWT, second call → 403 `ADMIN_ALREADY_EXISTS`, `POST /auth/login`
+  with correct creds → 200 + JWT (role 'admin' preserved), wrong password →
+  401 `PROVIDER_ERROR`, `GET /auth/me` with token → 200
 - CLI installed via `pnpm --filter @gestalt/cli build && cd packages/cli && npm link`
+- `gestalt init-admin` is **TTY-only** — `prompt`/`promptSecret` use readline
+  + raw-mode stdin, so the command cannot be driven from piped input. Works
+  fine in a real terminal; would need a non-interactive `--email/--password`
+  mode for scripted use (not implemented)
 
 **What is not yet built:**
 - `@gestalt/agents-quality-gate` — stubs only
@@ -291,9 +301,16 @@ Next task for Claude Code:
   bcrypt.compare against local_auth.password_hash
 - AuthManager preserves the existing role for local-provider logins (so the
   first admin stays admin and is not downgraded to operator on next login)
+- **Operator setup requirement:** the local `.env` must set
+  `NODE_ENV=development`. docker-compose now reads `NODE_ENV=${NODE_ENV:-production}`
+  so production deployments are unchanged; local-only auth (ADR-025) refuses
+  to register the LocalProvider when NODE_ENV=production unless an operator
+  explicitly sets `allowedInProduction: true`
 
 **Pending enhancements (design in chat first):**
-- None yet
+- Non-interactive mode for `gestalt init-admin` (CLI flags or stdin JSON) so
+  it can be scripted. Current implementation is TTY-only by design of
+  `promptSecret`
 
 **Known architectural constraints Claude Code must respect:**
 - pnpm 9.x only (Node 20 compatibility)
@@ -481,3 +498,90 @@ Decisions made:
 
 Build status:
 - No source changes — TypeScript build is unaffected
+
+---
+
+### Session 2026-05-29 — Claude Code (bootstrap smoke test + fixes)
+
+Smoke-tested the first-boot admin path end-to-end inside Docker. The
+HTTP-level flow now works completely: 201 + JWT on first `POST
+/auth/admin/setup`, 403 `ADMIN_ALREADY_EXISTS` on a second call, 200 + JWT
+on `POST /auth/login` with the admin's role preserved as 'admin' (not
+downgraded to operator), 401 `PROVIDER_ERROR` on wrong password, 200 on
+`GET /auth/me`. Three pre-existing platform bugs blocked the smoke test
+and had to be fixed first — none were regressions from the
+`feat: first-boot admin setup` work; they prevented any Docker bootstrap
+from succeeding on a fresh volume.
+
+Changed:
+- `packages/adapters/postgres/package.json`: build script changed from
+  `tsc` to `tsc && mkdir -p dist/migrations && cp src/migrations/*.sql
+  dist/migrations/`. Without this, the compiled runner at
+  `dist/migrations/runner.js` finds zero `.sql` files (tsc does not copy
+  non-TS assets) and silently applies no schema — so the `users` table
+  never gets created at runtime, even though `pnpm -r build` succeeds. This
+  also makes the explicit `COPY ... src/migrations` line in
+  `packages/server/Dockerfile` (lines 81-82) redundant, but it was left in
+  place rather than touched in this session
+- `packages/adapters/postgres/src/migrations/001_initial.sql`: two fixes —
+  (a) the `REVOKE UPDATE, DELETE ON audit_log FROM gestalt_app;` statement
+  referenced a role that never exists (POSTGRES_USER defaults to `gestalt`),
+  so the migration transaction rolled back on every fresh start; wrapped in
+  a `DO $$ EXECUTE format('REVOKE … FROM %I', current_user) … EXCEPTION
+  WHEN OTHERS THEN NULL; END $$;` block so the audit-log protection is
+  applied to whichever role connects and is tolerant of the role being
+  absent. (b) Removed the file's own `CREATE TABLE schema_migrations` and
+  `INSERT INTO schema_migrations (version) VALUES ('001_initial');` — the
+  migration runner in `migrations/runner.ts` already does both inside the
+  same transaction, so the duplicates failed with a primary-key conflict
+  and an "already exists" error
+- `docker-compose.yml`: `NODE_ENV=production` → `NODE_ENV=${NODE_ENV:-production}`.
+  Production deployments are unchanged (still defaults to `production`); local
+  smoke-testing can now set `NODE_ENV=development` in `.env` to let the
+  AuthManager register the LocalProvider. ADR-025 (local auth non-production
+  only) is still enforced by the existing `allowedInProduction` check
+- `.env` (gitignored, local-only): added `NODE_ENV=development` with a
+  comment pointing to ADR-025. This file is not committed; documented here
+  so operators know what to set
+
+Decisions made:
+- **Fix migration packaging in the build script, not the Dockerfile.** The
+  build-script approach makes the SQL files land in `dist/migrations/` for
+  both dev (`pnpm dev`, `tsx`) and prod (Docker multi-stage). A Dockerfile-
+  only fix would have left non-Docker runners broken
+- **Use `current_user` in the REVOKE rather than hardcoding `gestalt` or
+  reading POSTGRES_USER.** Hardcoding couples 001 to one deployment;
+  reading env requires a templating step. `current_user` resolves at SQL
+  execution time and works for any operator-chosen role
+- **Strip the manual schema_migrations writes from 001** rather than
+  changing the runner to use `ON CONFLICT DO NOTHING`. The runner already
+  owns the version-tracking contract; migrations should be pure schema
+  changes. This convention is documented in a comment block where the
+  removed statements used to live, so 003+ authors do not re-introduce the
+  same bug
+- **Make NODE_ENV overridable in compose, not edit ADR-025.** The ADR's
+  intent ("local auth non-production only") is correct. The fix is just
+  giving the operator a way to set NODE_ENV per environment without
+  patching the compose file
+- Did not touch `packages/cli/src/ui/prompts.ts` to enable scripted CLI
+  use. The raw-mode `promptSecret` is intentionally interactive; a flag-
+  based non-interactive mode is now listed under **Pending enhancements**
+  in **Current state** instead of being smuggled in here
+
+Build status:
+- `pnpm -r build` — all 12 buildable packages compile clean
+- `docker-compose up -d` (after `docker-compose down -v` on prior failed
+  volumes) — server, postgres, redis all `Up (healthy)`
+- Both migrations apply on first start (visible in `docker-compose logs
+  server`: "Applying migration … 001_initial" → "Migration applied" →
+  "Applying migration … 002_local_auth" → "Migration applied")
+- End-to-end admin-setup + login smoke test via curl — all five cases
+  pass (see top of session note)
+- CLI `gestalt init-admin` — exits cleanly on TTY; cannot be piped (raw-
+  mode password prompt is TTY-only). Real-terminal interactive use is the
+  supported path
+
+Operator caveat:
+- The smoke test left one admin in the DB (`tty-admin@example.com`). Anyone
+  running `gestalt init-admin` against this same stack now will hit 403.
+  Run `docker-compose down -v` first to reset (this destroys all data)

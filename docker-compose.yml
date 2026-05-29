@@ -6,7 +6,7 @@ services:
     ports:
       - '${SERVER_PORT:-3000}:3000'
     environment:
-      - NODE_ENV=production
+      - NODE_ENV=${NODE_ENV:-production}
       - DATABASE_URL=postgresql://${POSTGRES_USER:-gestalt}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-gestalt}
       - REDIS_URL=redis://redis:6379
       - LLM_BASE_URL=${LLM_BASE_URL}
