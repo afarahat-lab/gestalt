@@ -17,7 +17,7 @@ export async function runCodeAgent(
 
   for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
     try {
-      const prompt = buildCodePrompt(task.contextSnapshot, attempt);
+      const prompt = buildCodePrompt(task.contextSnapshot, attempt, task.priorSignals);
       const raw = await llmCall(prompt);
       const codeFiles = parseCodeFiles(raw, task.correlationId);
       if (codeFiles.length === 0) throw new Error('LLM returned no code files');

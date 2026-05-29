@@ -389,7 +389,7 @@ Operator caveats:
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-29 (Claude Code — quality gate v1 live)
+**Last updated:** 2026-05-29 (Claude Code — gate ↔ generate feedback loop)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -409,6 +409,19 @@ Operator caveats:
 - `gestalt projects list` and `gestalt projects use <name>` working
 - `gestalt run` queues intent → orchestrator picks up → clones project
   repo fresh per cycle → runs generate loop against cloned harness files
+- **Gate ↔ generate feedback loop wired.** A `fail` verdict (auto-resolvable
+  signals, no GP_BREACH) dispatches a `generate:intent` task back to the
+  generate queue with `retryCount + 1` and the signals routed to the
+  responsible specialist agent (LINT_FAILURE / TEST_FAILURE / CONSTRAINT_VIOLATION
+  → code-agent; CONTEXT_GAP → context-agent). The intent transitions
+  `in-review → generating` for the retry. `code-prompt` includes a
+  "Quality-gate feedback from the previous attempt" section listing every
+  prior signal with file:line + rule. After `MAX_GATE_RETRIES = 3` cycles
+  the gate gives up and marks the intent `failed`. The retry leg's commit
+  uses `fix:` prefix and a `retry N/3` suffix so `git log` narrates the
+  cycle history. Verified live (`2a57b087`): 4 cycles fired, all
+  committed to Git, intent ended at `failed` after retry budget
+  exhausted
 - **Quality gate v1 wired end-to-end.** After the generate orchestrator
   pushes artifacts, the gate worker (registered as `startGateWorker(config.queue)`
   in `server.ts` step 7) clones the project repo fresh and runs:
@@ -514,11 +527,13 @@ Operator caveats:
   for `LLM_MODEL`. Worth adding a startup-time ping or clear error path
 - Non-interactive mode for `gestalt init-admin` (--email/--password flags)
   for scripted use — current implementation is TTY-only
-- **Feedback loop from gate back to generate.** Today a `fail` verdict
-  marks the intent `failed` and stops. The design (per `feedback-router.ts`
-  in `agents-generate`) routes auto-resolvable signals back to the
-  responsible specialist agents. Implement when iteration speed matters
-  more than human-in-the-loop oversight
+- **Retry cycle full re-runs all generate agents** even though only the
+  routed agents need fresh work (code-agent typically). Cheaper retries
+  would skip intent/design/context when their prior artifacts are
+  present in the Git tip. For now: ~50-60s per retry cycle. Tracked as
+  an optimisation, not a correctness gap
+- **Read `qualityGate.maxRetries` from the project's HARNESS.json** —
+  currently hardcoded to 3 in both the gate and generate orchestrators
 - **Real-tooling gate agents** (typecheck via `tsc`, lint via ESLint,
   tests via `vitest`). Each needs the project's deps installed in the
   cloned tree — likely a `pnpm install --frozen-lockfile` step before
@@ -758,3 +773,102 @@ Decisions made:
 Build status: All 12 packages compile clean. Both orchestrators
 registered at startup. First end-to-end intent → gate → escalate cycle
 working as designed.
+
+---
+
+### Session 2026-05-29 — Claude Code (gate ↔ generate feedback loop)
+
+The follow-up to the quality-gate-v1 session. Closes the loop so a `fail`
+verdict no longer terminates the intent — it dispatches a retry to the
+generate queue with the gate's signals threaded into the routed
+specialist agent's prompt.
+
+Changed:
+- `packages/agents/generate/src/types.ts`: `AgentTask` gained optional
+  `priorSignals: FeedbackSignal[]` and `retryCount: number`. Threaded
+  through the orchestrator into each step's task
+- `packages/agents/generate/src/prompts/code-prompt.ts`: when
+  `priorSignals.length > 0`, prepends a "Quality-gate feedback from the
+  previous attempt" section listing every prior signal with file:line +
+  rule and the platform's expectation ("Address each one in this
+  attempt; do not regress on items that were not flagged")
+- `packages/agents/generate/src/agents/code-agent.ts`: forwards
+  `task.priorSignals` to `buildCodePrompt`
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  - `IntentTaskPayload` extended with `retryCount` and `priorSignals`
+  - exports `MAX_GATE_RETRIES = 3`
+  - `drivePlan` accepts `priorSignals`; per-step, it routes only the
+    signal subset relevant to that agent role (per the
+    `feedback-router.ts` table — code-agent gets LINT_FAILURE /
+    TEST_FAILURE / CONSTRAINT_VIOLATION; context-agent gets CONTEXT_GAP)
+  - commit-message switches `feat:` → `fix:` and appends ` retry N/3`
+    on retry cycles so `git log` narrates the SDLC
+  - gate-handoff payload now forwards `retryCount` (so the gate enforces
+    the budget across re-entries) and `projectId` / `text` (so the gate
+    can reconstruct a `generate:intent` payload on retry dispatch)
+- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
+  - `GateTaskPayload` extended with `retryCount` / `projectId` / `text`
+  - new `MAX_GATE_RETRIES = 3` constant
+  - new `GenerateRetryPayload` local type — the shape of the message
+    posted back to the generate queue (mirrors generate's payload
+    without importing agents-generate at runtime)
+  - verdict handling rewritten as `pass → approved` / `escalate →
+    escalated` / `fail → maybeDispatchRetry(...) ? generating : failed`
+  - new `maybeDispatchRetry()` helper: checks budget, filters
+    auto-resolvable signals, reconstructs the project/text from the
+    intents table if needed, transitions the intent back to
+    `generating`, emits an `intent.status-changed` event with a
+    `note: gate-retry N/M — K signal(s) routed` field, then `dispatch()`s
+    a `generate:intent` task with `retryCount + 1` and the routed
+    signals
+- `packages/agents/quality-gate/src/agents/llm-review-agent.ts`: tuned
+  signal mapping so `golden-principle` category by itself no longer
+  escalates. GP_BREACH only fires for `critical` severity — actual
+  security threats (hardcoded secrets, unguarded SQL, RBAC bypass).
+  Common LLM findings like "missing input validation" now flow as
+  CONSTRAINT_VIOLATION and can be retried
+
+Verified live against `trackeros` (correlationId `2a57b087…`):
+- Intent: "Add a settings module ... PATCH /settings ... validate with Zod"
+- Cycle 1 (50s): generate produced 12 artifacts and pushed; gate fail
+  (2 signals); retry dispatched
+- Cycle 2 (45s): generate retried with prior signals in code-prompt;
+  pushed `fix: ... [retry 1/3]`; gate fail (3 signals)
+- Cycle 3 (54s): pushed `fix: ... [retry 2/3]`; gate fail (1 signal)
+- Cycle 4 (50s): pushed `fix: ... [retry 3/3]`; gate fail (4 signals);
+  retry budget exhausted → intent → `failed`
+- Each cycle's agent_executions, signals, and artifacts are persisted;
+  the Git log shows the four commits in chronological order
+- Total wall-clock for the failed-after-retries case: 214 seconds
+- Pure-utility intent (`66891cc2…`) in the same session: gate passed
+  on first try → intent → `approved`. First time the platform has
+  reached `approved` end-to-end
+
+Decisions made:
+- **Retry dispatches a fresh `generate:intent` task** rather than a new
+  task type. The orchestrator distinguishes retries by the presence of
+  `retryCount > 0` and `priorSignals`. Keeps the queue plumbing simple
+  and lets the existing handleIntentTask code path own the cycle
+- **Full plan re-runs on retry** — all 6 specialist agents run again,
+  even though only code-agent typically needs to act on the feedback.
+  Skipping intent/design/context when their prior artifacts exist in
+  the Git tip is an optimisation, not a correctness gap. Tracked under
+  Pending enhancements
+- **MAX_GATE_RETRIES hardcoded to 3** in both orchestrators — matches
+  the harness template's `qualityGate.maxRetries: 3`. Reading it per-
+  project from HARNESS.json is a small follow-up
+- **`golden-principle` category no longer auto-escalates.** The LLM's
+  default categorisation is too aggressive — almost every cycle on a
+  corporate-ops app produces at least one "missing input validation"
+  or "audit log could be improved" finding, and those are fixable, not
+  human-review-worthy. GP_BREACH is now gated on `critical` severity
+  only, which the prompt reserves for real security threats
+- **`retry N/3` suffix in commit subjects.** Lets operators see at a
+  glance which commits were generated, which were gate-driven retries,
+  and how many cycles the platform spent. `feat:` → `fix:` prefix swap
+  on retry follows conventional-commits
+
+Build status: All 12 packages compile clean. Both orchestrators
+register at startup. Feedback loop verified end-to-end with both a
+budget-exhaustion failure case (`2a57b087`, 4 cycles → `failed`) and a
+clean-first-try success case (`66891cc2`, 1 cycle → `approved`).

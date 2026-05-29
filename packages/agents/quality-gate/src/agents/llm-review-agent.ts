@@ -205,7 +205,13 @@ function mapItemsToSignals(
     // stay in the artifact only.
     if (item.severity === 'low' || item.severity === 'info') continue;
 
-    const isBreach = item.category === 'golden-principle' || item.severity === 'critical';
+    // GOLDEN_PRINCIPLE_BREACH triggers `escalate` (human review, never
+    // auto-resolved). Reserve it for `critical` severity only — that
+    // means actual security threats: hardcoded secrets, unguarded SQL,
+    // RBAC bypass. "Missing input validation" or "could improve audit
+    // logging" are fixable issues that should route back to the code-
+    // agent via CONSTRAINT_VIOLATION, not escalate to a human.
+    const isBreach = item.severity === 'critical';
 
     out.push({
       id: crypto.randomUUID(),

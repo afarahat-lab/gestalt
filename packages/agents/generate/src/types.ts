@@ -165,6 +165,19 @@ export interface AgentTask {
   agentRole: AgentRole;
   contextSnapshot: ContextSnapshot;
   maxRetries: number;
+  /**
+   * Signals carried over from a prior quality-gate `fail` verdict.
+   * Empty (or undefined) on the first attempt; populated when the
+   * gate orchestrator dispatches a retry. The prompt builder for the
+   * routed specialist agent includes them so the model knows what to
+   * fix.
+   */
+  priorSignals?: FeedbackSignal[];
+  /**
+   * Zero-based retry counter. 0 = first attempt, N = Nth retry cycle.
+   * Caps at the harness's `qualityGate.maxRetries`.
+   */
+  retryCount?: number;
 }
 
 // ─── Plan ─────────────────────────────────────────────────────────────────────

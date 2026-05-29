@@ -30,7 +30,7 @@ import { runContextAgent } from '../agents/context-agent';
 import { runLintConfigAgent } from '../agents/lint-config-agent';
 import { runCodeAgent } from '../agents/code-agent';
 import { runTestAgent } from '../agents/test-agent';
-import type { ExecutionPlan, AgentResult, GateFeedback } from '../types';
+import type { ExecutionPlan, AgentResult, GateFeedback, FeedbackSignal } from '../types';
 import type { AgentRole } from '@gestalt/core';
 
 /**
@@ -65,7 +65,19 @@ interface IntentTaskPayload {
   clarification?: string;
   ambiguityId?: string;
   resume?: boolean;
+  /**
+   * Quality-gate retry context. Populated only when the gate dispatched
+   * this task on a failed verdict (the feedback loop). The orchestrator
+   * threads `priorSignals` into the routed specialist agents' tasks; the
+   * `retryCount` is incremented by the gate before each dispatch and is
+   * forwarded to the gate again so loop termination (max retries) works
+   * across re-entries.
+   */
+  retryCount?: number;
+  priorSignals?: FeedbackSignal[];
 }
+
+export const MAX_GATE_RETRIES = 3;
 
 /**
  * Starts the orchestrator worker.
@@ -169,8 +181,25 @@ async function handleIntentTask(
 
     await transitionIntent(payload.intentId, correlationId, 'generating');
 
+    const retryCount = payload.retryCount ?? 0;
+    const priorSignals = payload.priorSignals ?? [];
+
+    if (retryCount > 0) {
+      childLog.info(
+        { retryCount, priorSignalCount: priorSignals.length },
+        'Quality-gate retry cycle — prior signals will be threaded into routed agents',
+      );
+    }
+
     // Drive the plan to completion
-    await drivePlan(plan, projectRoot, payload.intentId, payload.text ?? '', childLog);
+    await drivePlan(
+      plan,
+      projectRoot,
+      payload.intentId,
+      payload.text ?? '',
+      priorSignals,
+      childLog,
+    );
 
     if (hasPlanFailed(plan)) {
       await transitionIntent(payload.intentId, correlationId, 'failed');
@@ -191,12 +220,15 @@ async function handleIntentTask(
 
     if (allArtifacts.length > 0 && project) {
       const intentText = (payload.text ?? '').trim().split('\n')[0]?.slice(0, 72) ?? '';
+      const retrySuffix = retryCount > 0 ? ` retry ${retryCount}/${MAX_GATE_RETRIES}` : '';
+      const verb = retryCount > 0 ? 'fix' : 'feat';
+      const subject = intentText
+        ? `${verb}: ${intentText} [gestalt ${correlationId.slice(0, 8)}${retrySuffix}]`
+        : `${verb}: generated artifacts [gestalt ${correlationId.slice(0, 8)}${retrySuffix}]`;
       await commitAndPushArtifacts({
         workDir: projectRoot,
         defaultBranch: project.defaultBranch,
-        commitMessage: intentText
-          ? `feat: ${intentText} [gestalt ${correlationId.slice(0, 8)}]`
-          : `feat: generated artifacts [gestalt ${correlationId.slice(0, 8)}]`,
+        commitMessage: subject,
         artifacts: allArtifacts,
         childLog,
       });
@@ -214,7 +246,16 @@ async function handleIntentTask(
       sourceAgent: 'orchestrator',
       targetAgent: 'review-agent',
       priority: message.priority,
-      payload: { intentId: payload.intentId, artifacts: allArtifacts },
+      payload: {
+        intentId: payload.intentId,
+        artifacts: allArtifacts,
+        // Forward retry state so the gate can enforce maxRetries across
+        // re-entries. The gate increments retryCount before dispatching
+        // its own follow-up.
+        retryCount,
+        projectId: payload.projectId,
+        text: payload.text,
+      },
       createdAt: new Date(),
       expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),
     }, queueConfigFromEnv());
@@ -253,8 +294,21 @@ async function drivePlan(
   projectRoot: string,
   intentId: string,
   intentText: string,
+  priorSignals: FeedbackSignal[],
   childLog: ReturnType<typeof createContextLogger>,
 ): Promise<void> {
+  // Per the gate's feedback-router contract, only certain signal types route
+  // back to generate. We attach those subset to the specialist agent the
+  // router targets — passing every signal to every agent dilutes context.
+  const signalsForAgent = (role: AgentRole): FeedbackSignal[] => {
+    const routes: Partial<Record<string, AgentRole>> = {
+      LINT_FAILURE: 'code-agent',
+      TEST_FAILURE: 'code-agent',
+      CONSTRAINT_VIOLATION: 'code-agent',
+      CONTEXT_GAP: 'context-agent',
+    };
+    return priorSignals.filter((s) => routes[s.type] === role);
+  };
   const MAX_ITERATIONS = 20;  // safety limit
   let iterations = 0;
 
@@ -301,12 +355,14 @@ async function drivePlan(
 
         try {
           const context = await assembleContext(projectRoot, plan, agentRole, intentText);
+          const routedSignals = signalsForAgent(agentRole);
           const task = {
             taskId: crypto.randomUUID(),
             correlationId: plan.correlationId,
             agentRole,
             contextSnapshot: context,
             maxRetries: 2,
+            priorSignals: routedSignals.length ? routedSignals : undefined,
           };
 
           const llmClient = getLLMClient();

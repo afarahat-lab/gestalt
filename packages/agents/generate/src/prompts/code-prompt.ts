@@ -4,11 +4,30 @@
  * Golden principles are injected as hard constraints.
  */
 
-import type { ContextSnapshot } from '../types';
+import type { ContextSnapshot, FeedbackSignal } from '../types';
 
-export function buildCodePrompt(ctx: ContextSnapshot, attempt: number): string {
+export function buildCodePrompt(
+  ctx: ContextSnapshot,
+  attempt: number,
+  priorSignals: FeedbackSignal[] = [],
+): string {
   const retry = attempt > 0
     ? `\n\nIMPORTANT: Retry attempt ${attempt}. Return pure JSON only.\n`
+    : '';
+
+  // Gate feedback — appears only on a quality-gate-triggered retry cycle.
+  const gateFeedback = priorSignals.length > 0
+    ? `\n\n## Quality-gate feedback from the previous attempt\n\nYour previous attempt was rejected by the quality gate with these signals. Address each one in this attempt; do not regress on items that were not flagged.\n\n${priorSignals.map((s, i) => {
+        const loc = s.location?.file
+          ? s.location.line
+            ? `${s.location.file}:${s.location.line}`
+            : s.location.file
+          : '(file-wide)';
+        const rule = s.location?.file && (s.location as { rule?: string }).rule
+          ? ` rule=${(s.location as { rule?: string }).rule}`
+          : '';
+        return `${i + 1}. [${s.type}/${s.severity}] ${loc}${rule}\n   ${s.message}`;
+      }).join('\n')}\n`
     : '';
 
   const designArtifact = ctx.priorArtifacts.find((a) => a.path === '.gestalt/design-spec.json');
@@ -25,6 +44,7 @@ export function buildCodePrompt(ctx: ContextSnapshot, attempt: number): string {
   return `You are the code agent in the Gestalt platform.
 Generate TypeScript application code based on the design specification.
 ${retry}
+${gateFeedback}
 
 ## Project context
 
