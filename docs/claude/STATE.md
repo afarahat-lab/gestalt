@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-30 (Claude Code — split CLAUDE.md into docs/claude/; platform capabilities unchanged)
+**Last updated:** 2026-05-30 (Claude Code — configurable server URL across the CLI)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -28,6 +28,26 @@ the historical record of how the state evolved._
 - Auth middleware active — protected routes return 401
 - First-boot bootstrap verified end-to-end: `gestalt init-admin` creates
   admin + JWT; `gestalt login` authenticates; `GET /auth/me` returns user
+- **CLI server URL is fully configurable.** `gestalt config show` /
+  `gestalt config set-server <url>` / `gestalt config reset` let
+  operators inspect and change `~/.gestalt/config.json` without going
+  through the auth flow. Every CLI command that contacts the server
+  (`login`, `init`, `init-admin`, `run`, `status`, `logs`,
+  `dashboard`, `projects list|use|set-adapter`) accepts an optional
+  `--server <url>` flag — one-shot override on all of them; only
+  `login` and `init-admin` persist the URL to config on success
+  (those are the bootstrap commands). All commands route URL
+  selection through one helper (`resolveServerUrl`); no remaining
+  direct `config.serverUrl` reads in command files. `gestalt status`
+  prints the active server URL in its header
+  (`Gestalt — http://localhost:3000`). Every connectivity failure
+  surfaces the attempted URL through a shared formatter and, when
+  the URL is still the local-dev default
+  (`http://localhost:3000`), adds a first-run hint nudging the user
+  to `gestalt config set-server` + `gestalt login`. URL validation
+  (`http://` or `https://` only, trailing slash stripped) lives in
+  `normaliseServerUrl`. `gestalt config show` never prints the token
+  itself — only `set` / `not set`
 - `gestalt init` fully implemented — Git-backed four-phase wizard:
   registers project on server, server clones repo, commits harness files,
   pushes; developer runs `git pull` to receive harness locally

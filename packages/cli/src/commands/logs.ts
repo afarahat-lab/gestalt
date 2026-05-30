@@ -4,19 +4,25 @@
  */
 
 import { GestaltApiClient } from '../api/client';
-import { loadCliConfig } from '../ui/config';
+import { loadCliConfig, resolveServerUrl } from '../ui/config';
+import { printConnectionError, isConnectivityError } from '../ui/server-errors';
 import { c, blank, createSpinner } from '../ui/prompts';
 import type { LogsOptions } from '../types';
 
-export async function logsCommand(options: LogsOptions): Promise<void> {
+interface LogsCommandOptions extends LogsOptions {
+  server?: string;
+}
+
+export async function logsCommand(options: LogsCommandOptions): Promise<void> {
   const config = await loadCliConfig();
+  const serverUrl = resolveServerUrl(options, config);
 
   if (!config.token) {
     console.log(c.error('Not authenticated. Run: gestalt login'));
     process.exit(1);
   }
 
-  const client = new GestaltApiClient({ serverUrl: config.serverUrl, token: config.token });
+  const client = new GestaltApiClient({ serverUrl, token: config.token });
 
   blank();
   console.log(c.dim('Streaming platform events (Ctrl+C to stop)...'));
@@ -45,8 +51,12 @@ export async function logsCommand(options: LogsOptions): Promise<void> {
         );
       }
     }
-  } catch {
+  } catch (err) {
     blank();
+    if (isConnectivityError(err)) {
+      printConnectionError(serverUrl);
+      process.exit(1);
+    }
     console.log(c.warn('Connection lost.'));
     process.exit(0);
   }
@@ -68,9 +78,9 @@ function formatEventType(type: string): string {
   return fn(type.padEnd(32));
 }
 
-export async function dashboardCommand(): Promise<void> {
+export async function dashboardCommand(options: { server?: string } = {}): Promise<void> {
   const config = await loadCliConfig();
-  const url = config.serverUrl;
+  const url = resolveServerUrl(options, config);
 
   const spinner = createSpinner('Opening dashboard...');
   spinner.start();

@@ -6,7 +6,8 @@
  */
 
 import { GestaltApiClient } from '../api/client';
-import { loadCliConfig } from '../ui/config';
+import { loadCliConfig, resolveServerUrl } from '../ui/config';
+import { printConnectionError, isConnectivityError } from '../ui/server-errors';
 import {
   c, blank, divider, createSpinner,
   statusBadge,
@@ -21,6 +22,7 @@ export async function runCommand(intentText: string, options: RunOptions): Promi
   }
 
   const config = await loadCliConfig();
+  const serverUrl = resolveServerUrl(options, config);
 
   if (!config.token) {
     console.log(c.error('Not authenticated. Run: gestalt login'));
@@ -33,7 +35,7 @@ export async function runCommand(intentText: string, options: RunOptions): Promi
     process.exit(1);
   }
 
-  const client = new GestaltApiClient({ serverUrl: config.serverUrl, token: config.token });
+  const client = new GestaltApiClient({ serverUrl, token: config.token });
 
   // ─── Submit ────────────────────────────────────────────────────────────────
 
@@ -54,7 +56,12 @@ export async function runCommand(intentText: string, options: RunOptions): Promi
     correlationId = response.data.correlationId;
     submitSpinner.succeed(c.success('Intent submitted'));
   } catch (err) {
-    submitSpinner.fail(c.error(`Failed: ${err instanceof Error ? err.message : String(err)}`));
+    submitSpinner.stop();
+    if (isConnectivityError(err)) {
+      printConnectionError(serverUrl);
+    } else {
+      console.log(c.error(`Failed: ${err instanceof Error ? err.message : String(err)}`));
+    }
     process.exit(1);
   }
 
@@ -146,7 +153,7 @@ export async function runCommand(intentText: string, options: RunOptions): Promi
         }
       }
     }
-  } catch (err) {
+  } catch {
     blank();
     console.log(c.warn('Connection to server lost. Run `gestalt status` to check progress.'));
     process.exit(0);

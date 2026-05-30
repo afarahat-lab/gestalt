@@ -1357,3 +1357,169 @@ Decisions made:
   top-level path but co-locating with the inputs makes the
   regeneration step obvious from the directory layout
 
+---
+
+### Session 2026-05-30 — Claude Code (configurable server URL across the CLI)
+
+Closes the most common production misconfiguration: the CLI defaults to
+`http://localhost:3000` but the server lives on a remote host
+(`https://gestalt.company.com`). Every CLI command now reads the URL
+through one helper, accepts a `--server` one-shot override, and shows
+the attempted URL on connectivity failure. A new `gestalt config`
+parent command lets operators inspect and change the persisted URL
+without going through the auth flow.
+
+Changed:
+- `packages/cli/src/ui/config.ts`:
+  - New `resolveServerUrl(options, config)` helper — single source of
+    truth for "which URL does this invocation talk to". `options.server`
+    (the `--server` flag) wins; otherwise falls back to
+    `config.serverUrl`. Every command imports this; no `config.serverUrl`
+    direct reads remain in command bodies after the change
+  - New `normaliseServerUrl(input)` — trims trailing slashes, validates
+    `http://` / `https://` prefix, throws a clear `Error` on bad input.
+    Used by `config set-server`
+  - New `isDefaultServerUrl(url)` — flags whether the active URL is
+    still `DEFAULT_CLI_CONFIG.serverUrl`. Drives the first-run hint
+- `packages/cli/src/ui/server-errors.ts` (new): shared
+  `printConnectionError(url)` formatter. Always echoes the attempted
+  URL; when the URL is the local-dev default, appends the first-run
+  hint nudging the operator to `gestalt config set-server` then
+  `gestalt login`. Also exports `isConnectivityError(err)` — heuristic
+  that distinguishes a reachable server returning an HTTP error
+  (`ApiClientError`, presented verbatim) from an unreachable server
+  (`ECONNREFUSED`, `ENOTFOUND`, etc., routed through the formatter)
+- `packages/cli/src/commands/config.ts` (new): three subcommands —
+  - `gestalt config show` — prints `serverUrl`, `currentProjectId`,
+    and `token: set | not set`. The token value itself is NEVER
+    printed; only its presence
+  - `gestalt config set-server <url>` — validates via
+    `normaliseServerUrl`, persists via `updateCliConfig`. Auth-free
+  - `gestalt config reset` — prompts `y/N`, then writes
+    `DEFAULT_CLI_CONFIG` via `saveCliConfig` so previously persisted
+    fields are dropped, not just nulled. Aborts cleanly on `N`
+- `packages/cli/src/commands/{login,init-admin,init,run,status,logs,
+  projects}.ts`: every command threaded through `resolveServerUrl(...)`.
+  Every API client constructor now reads from the resolved URL instead
+  of `config.serverUrl`. Connectivity errors route through
+  `printConnectionError(serverUrl)` for a consistent presentation
+- `packages/cli/src/commands/status.ts`: the platform-status path now
+  starts with a header line `Gestalt — <serverUrl>`, so operators can
+  see at a glance which server they're talking to. Same idea as
+  psql's connection prompt
+- `packages/cli/src/commands/logs.ts`: `dashboardCommand()` also
+  accepts a `--server` override (it opens the dashboard URL in a
+  browser; a remote operator wants the remote URL, not localhost)
+- `packages/cli/src/commands/login.ts` + `init-admin.ts`: persist
+  `serverUrl` on success (these are the bootstrap commands). Every
+  other command treats `--server` as one-shot only — no write-through.
+  Both fail through the new connection-error formatter
+- `packages/cli/src/index.ts`: new `gestalt config` parent +
+  three subcommands. `--server <url>` flag added to every command
+  that talks to the server. Updated top-of-file command list and
+  added a paragraph documenting the persist-on-bootstrap-only rule.
+  Defaults removed from `--server` declarations so commander forwards
+  `undefined` to the command, letting `resolveServerUrl` distinguish
+  "no flag" from "flag with the default value"
+- `packages/cli/src/types.ts`: `RunOptions` gained `server?: string`
+  so `--server` propagates through the same shape every other command
+  uses
+- `docs/guides/quick-start.md` Step 6 rewritten to show all three sign-in
+  flows (local-only / `config set-server` + login / `login --server …`)
+  with a note that the URL persists to `~/.gestalt/config.json`. The
+  Summary table gained `gestalt config show` / `set-server` / `reset`
+- `docs/runbooks/common-issues.md`: new entry **"CLI connects to wrong
+  server / localhost instead of remote"** under CLI issues —
+  symptom, cause, resolution (`config show` then `config set-server`),
+  plus the `gestalt status` header trick for spot-checking the active
+  server URL
+
+Verified live:
+- `pnpm --filter @gestalt/cli build` clean; `pnpm -r build` clean
+  across all 12 packages
+- `gestalt config show` against a fresh HOME prints the default
+  config with `token: not set`
+- `gestalt config set-server https://gestalt.company.com` → `✓
+  Server URL set to https://gestalt.company.com`. Trailing slash is
+  stripped (`https://gestalt.company.com/` normalises to the same
+  result). `ftp://nope` rejected with `Server URL must start with
+  http:// or https://`
+- `gestalt config show` after the set call confirms the new
+  `serverUrl`. Token still `not set`
+- `gestalt login --server http://127.0.0.1:65530` (deliberate
+  unreachable port) prints the new formatter output exactly:
+  ```
+  ✗ Cannot reach server at http://127.0.0.1:65530
+    Check the server is running and the URL is correct.
+    Current server: http://127.0.0.1:65530
+    To change: gestalt config set-server <url>
+  ```
+  No persisted config change after the failure
+- Direct call to `printConnectionError('http://localhost:3000')`
+  appends the first-run hint:
+  ```
+    If your Gestalt server is running on a different machine, set the URL first:
+      gestalt config set-server https://gestalt.company.com
+      gestalt login
+  ```
+  Direct call against `https://gestalt.company.com` does NOT append
+  the hint (correct: the URL is no longer the default)
+- `gestalt status` against the running local platform prints the
+  header `Gestalt — http://localhost:3000` followed by the existing
+  active-agents and recent-intents output
+- `gestalt status --server http://127.0.0.1:3000` prints
+  `Gestalt — http://127.0.0.1:3000` for the single invocation; the
+  persisted `serverUrl` in `~/.gestalt/config.json` stays at
+  `http://localhost:3000` (one-shot non-persistence confirmed)
+
+Decisions made:
+- **`login` and `init-admin` persist `--server`; everything else
+  doesn't.** The brief's exception was only `login`, but
+  `init-admin` is the same kind of bootstrap command — it
+  presupposes you have NO config yet and want it pinned to this
+  server. Persisting on both keeps the bootstrap UX consistent. Every
+  non-auth command stays one-shot per the brief
+- **Connectivity heuristic by `Error.name === 'ApiClientError'` and
+  errno code, not URL-class introspection.** `ApiClientError` is
+  thrown for any non-2xx HTTP response — that's a reachable server
+  with an error, not a connectivity problem. Anything raised by
+  `fetch` itself (DNS, refused connection, TLS, timeout) sets a
+  recognisable errno code on `err.code` or `err.cause.code`. We
+  fall back to a regex on the message text to cover environments
+  where the codes aren't exposed
+- **`config show` prints `token: set | not set`, never the value.**
+  The brief required this; reinforced by GP-004 (no sensitive data
+  in logs). The constant is the field name only — the actual JWT
+  never crosses the terminal even on a verbose user dump
+- **`config reset` confirms with `y/N`, defaults to NO.** The
+  operation is destructive (signs the user out, clears their
+  current project, restores the local-dev default URL). A bare
+  Enter cancels — same shape as `rm -i` and `git reset --hard`
+  guards
+- **`init` got `--server` as a one-shot too**, even though it
+  requires an existing token. The use case: an operator with a
+  saved token for `https://gestalt.company.com` wants to register
+  a project against a *staging* instance at
+  `https://gestalt-staging.company.com` — `--server` lets them do
+  that for one invocation. The existing token still goes into the
+  Authorization header; if the staging server rejects it that's a
+  surfaced 401, not a connectivity error
+- **Status header lives in `showPlatformStatus`, not
+  `showIntentDetail`.** Intent detail is invoked with a specific
+  correlationId — the operator already knows which server holds
+  that intent because they got the id from somewhere. The
+  platform-status flow is the one operators reach for when
+  something feels off, so that's the right place to spotlight
+  which server we're hitting
+- **`isConnectivityError` lives in `server-errors.ts`, not
+  `api/client.ts`.** Originally it was inline in `run.ts`. Moved
+  to the shared module so every command checks the same heuristic
+  and updates land in one place if the fetch error shapes change
+
+Build status: `pnpm -r build` clean across all 12 packages. CLI
+manually exercised against a real running platform (admin login,
+status, config show / set-server / reset, `--server` one-shot
+override against the platform on `127.0.0.1`). The platform-side
+endpoints are unchanged — this is entirely a CLI concern as the
+brief stated.
+

@@ -41,6 +41,7 @@ export interface InitState {
 // ─── Command options ──────────────────────────────────────────────────────────
 
 export interface RunOptions {
+  server?: string;             // one-shot --server override (not persisted)
   projectId?: string;
   priority?: 'critical' | 'high' | 'normal' | 'low';
 }

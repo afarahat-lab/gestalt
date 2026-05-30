@@ -1,10 +1,15 @@
 /**
  * gestalt login — authenticates against the Gestalt server.
  * Stores the JWT token in ~/.gestalt/config.json.
+ *
+ * `--server <url>` persists the URL on success (login is the one command
+ * where the server URL gets written through to config — every other command
+ * treats `--server` as a one-shot override).
  */
 
 import { GestaltApiClient } from '../api/client';
-import { loadCliConfig, updateCliConfig } from '../ui/config';
+import { loadCliConfig, resolveServerUrl, updateCliConfig } from '../ui/config';
+import { printConnectionError } from '../ui/server-errors';
 import {
   c, blank, divider, createSpinner,
   prompt, promptSecret, printLocalAuthWarning,
@@ -12,7 +17,10 @@ import {
 
 export async function loginCommand(serverUrl?: string): Promise<void> {
   const config = await loadCliConfig();
-  const url = serverUrl ?? config.serverUrl;
+  // login is the only command that persists --server. Everywhere else it is
+  // a one-shot override. Treat an absent flag the same as everywhere else:
+  // fall back to the persisted serverUrl.
+  const url = resolveServerUrl({ server: serverUrl }, config);
 
   blank();
   console.log(c.bold('Sign in to Gestalt'));
@@ -28,9 +36,9 @@ export async function loginCommand(serverUrl?: string): Promise<void> {
   try {
     await client.health();
     healthSpinner.succeed(c.success('Server reachable'));
-  } catch (err) {
-    healthSpinner.fail(c.error(`Cannot reach server at ${url}`));
-    console.log(c.dim('Check that the Gestalt server is running: docker-compose ps'));
+  } catch {
+    healthSpinner.stop();
+    printConnectionError(url);
     process.exit(1);
   }
 

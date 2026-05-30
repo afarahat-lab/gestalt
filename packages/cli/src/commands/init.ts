@@ -12,26 +12,28 @@
  */
 
 import { GestaltApiClient, ApiClientError } from '../api/client';
-import { loadCliConfig, updateCliConfig } from '../ui/config';
+import { loadCliConfig, resolveServerUrl, updateCliConfig } from '../ui/config';
+import { printConnectionError, isConnectivityError } from '../ui/server-errors';
 import {
   c, blank, divider, createSpinner,
   prompt, promptSecret,
 } from '../ui/prompts';
 
-export async function initCommand(): Promise<void> {
+export async function initCommand(options: { server?: string } = {}): Promise<void> {
   blank();
   console.log(c.title('Welcome to Gestalt.'));
   console.log(c.dim('We will register your project and seed its harness in Git.'));
   blank();
 
   const config = await loadCliConfig();
+  const serverUrl = resolveServerUrl(options, config);
 
   if (!config.token) {
     console.log(c.error('Not signed in. Run `gestalt login` (or `gestalt init-admin` on a fresh platform) first.'));
     process.exit(1);
   }
 
-  const client = new GestaltApiClient({ serverUrl: config.serverUrl, token: config.token });
+  const client = new GestaltApiClient({ serverUrl, token: config.token });
 
   // ─── Phase 0 — Server health ───────────────────────────────────────────────
 
@@ -42,10 +44,10 @@ export async function initCommand(): Promise<void> {
   healthSpinner.start();
   try {
     await client.health();
-    healthSpinner.succeed(c.success(`Server reachable (${config.serverUrl})`));
+    healthSpinner.succeed(c.success(`Server reachable (${serverUrl})`));
   } catch {
-    healthSpinner.fail(c.error(`Cannot reach server at ${config.serverUrl}`));
-    console.log(c.dim('Check that the Gestalt server is running: docker-compose ps'));
+    healthSpinner.stop();
+    printConnectionError(serverUrl);
     process.exit(1);
   }
   blank();
@@ -94,6 +96,8 @@ export async function initCommand(): Promise<void> {
     registerSpinner.stop();
     if (err instanceof ApiClientError && err.status === 409) {
       console.log(c.error(`A project named '${name}' already exists. Pick a different name or run \`gestalt projects use ${name}\`.`));
+    } else if (isConnectivityError(err)) {
+      printConnectionError(serverUrl);
     } else {
       console.log(c.error(`Registration failed: ${err instanceof Error ? err.message : String(err)}`));
     }
@@ -130,7 +134,12 @@ export async function initCommand(): Promise<void> {
     commitSha = data.commitSha;
     genSpinner.succeed(c.success(`Harness committed to ${gitUrl}`));
   } catch (err) {
-    genSpinner.fail(c.error(`Harness init failed: ${err instanceof Error ? err.message : String(err)}`));
+    genSpinner.stop();
+    if (isConnectivityError(err)) {
+      printConnectionError(serverUrl);
+    } else {
+      console.log(c.error(`Harness init failed: ${err instanceof Error ? err.message : String(err)}`));
+    }
     process.exit(1);
   }
 
@@ -155,7 +164,12 @@ export async function initCommand(): Promise<void> {
     await client.getProject(projectId);
     validateSpinner.stop();
   } catch (err) {
-    validateSpinner.fail(c.error(`Validation failed: ${err instanceof Error ? err.message : String(err)}`));
+    validateSpinner.stop();
+    if (isConnectivityError(err)) {
+      printConnectionError(serverUrl);
+    } else {
+      console.log(c.error(`Validation failed: ${err instanceof Error ? err.message : String(err)}`));
+    }
     process.exit(1);
   }
 

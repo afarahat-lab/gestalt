@@ -6,7 +6,8 @@
  */
 
 import { GestaltApiClient } from '../api/client';
-import { loadCliConfig } from '../ui/config';
+import { loadCliConfig, resolveServerUrl } from '../ui/config';
+import { printConnectionError, isConnectivityError } from '../ui/server-errors';
 import {
   c, blank, divider, createSpinner,
   statusBadge, printTable,
@@ -15,29 +16,39 @@ import type { StatusOptions } from '../types';
 
 interface StatusCommandOptions extends StatusOptions {
   id?: string;
+  server?: string;
 }
 
 export async function statusCommand(options: StatusCommandOptions): Promise<void> {
   const config = await loadCliConfig();
+  const serverUrl = resolveServerUrl(options, config);
 
   if (!config.token) {
     console.log(c.error('Not authenticated. Run: gestalt login'));
     process.exit(1);
   }
 
-  const client = new GestaltApiClient({ serverUrl: config.serverUrl, token: config.token });
+  const client = new GestaltApiClient({ serverUrl, token: config.token });
 
   if (options.id) {
-    await showIntentDetail(client, options.id);
+    await showIntentDetail(client, options.id, serverUrl);
   } else {
-    await showPlatformStatus(client, config.currentProjectId);
+    await showPlatformStatus(client, config.currentProjectId, serverUrl);
   }
 }
 
 async function showPlatformStatus(
   client: GestaltApiClient,
   projectId: string | null,
+  serverUrl: string,
 ): Promise<void> {
+  // Header — surfaces the server URL the operator is talking to so they
+  // can spot a wrong-server config at a glance. Same idea as the prompt
+  // in psql showing the current connection.
+  blank();
+  console.log(`${c.bold('Gestalt')} ${c.dim('—')} ${c.info(serverUrl)}`);
+  divider();
+
   const spinner = createSpinner('Fetching status...');
   spinner.start();
 
@@ -95,12 +106,17 @@ async function showPlatformStatus(
     blank();
 
   } catch (err) {
-    spinner.fail(c.error(`Failed: ${err instanceof Error ? err.message : String(err)}`));
+    spinner.stop();
+    if (isConnectivityError(err)) {
+      printConnectionError(serverUrl);
+    } else {
+      console.log(c.error(`Failed: ${err instanceof Error ? err.message : String(err)}`));
+    }
     process.exit(1);
   }
 }
 
-async function showIntentDetail(client: GestaltApiClient, id: string): Promise<void> {
+async function showIntentDetail(client: GestaltApiClient, id: string, serverUrl: string): Promise<void> {
   const spinner = createSpinner('Fetching intent...');
   spinner.start();
 
@@ -157,7 +173,12 @@ async function showIntentDetail(client: GestaltApiClient, id: string): Promise<v
     blank();
 
   } catch (err) {
-    spinner.fail(c.error(`Failed: ${err instanceof Error ? err.message : String(err)}`));
+    spinner.stop();
+    if (isConnectivityError(err)) {
+      printConnectionError(serverUrl);
+    } else {
+      console.log(c.error(`Failed: ${err instanceof Error ? err.message : String(err)}`));
+    }
     process.exit(1);
   }
 }

@@ -97,6 +97,37 @@ pnpm --filter @gestalt/cli build
 
 ---
 
+### CLI connects to wrong server / localhost instead of remote
+
+**Symptom:** every command fails with `✗ Cannot reach server at
+http://localhost:3000` even though the Gestalt server is running on a
+remote host (e.g. `https://gestalt.company.com`).
+
+**Cause:** the CLI persists its server URL in `~/.gestalt/config.json`. The
+default is `http://localhost:3000`; if you have not run `gestalt login
+--server <url>` or `gestalt config set-server <url>`, every command points
+at localhost.
+
+**Resolution:**
+
+```bash
+# Check your current config (token value never printed)
+gestalt config show
+
+# Set the correct server URL
+gestalt config set-server https://gestalt.company.com
+gestalt login
+```
+
+`--server <url>` works as a one-shot override on every command for the
+single invocation; use `gestalt config set-server` to persist.
+
+The status command always prints the server URL in its header
+(`Gestalt — https://gestalt.company.com`) — a quick way to confirm which
+server you are talking to.
+
+---
+
 ## Authentication issues
 
 ### Admin setup fails with "admin already exists"

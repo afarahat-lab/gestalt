@@ -144,10 +144,25 @@ gestalt --help
 ### Step 6 — Sign in
 
 ```bash
+# If server is on this machine (local testing)
 gestalt login
-# Server: http://localhost:3000
-# Enter your admin email and password
+
+# If server is on a remote machine (production / team setup)
+gestalt config set-server https://gestalt.company.com
+gestalt login
+
+# Or in one step
+gestalt login --server https://gestalt.company.com
 ```
+
+The server URL is saved to `~/.gestalt/config.json` after login and reused by
+all subsequent commands. You can inspect the current config (without revealing
+your token) any time with `gestalt config show`.
+
+`--server <url>` works as a one-shot override on every command (`gestalt
+status --server …`, `gestalt run … --server …`, etc.) — it is NOT persisted
+on those commands; use `gestalt config set-server <url>` to change the
+default.
 
 ---
 
@@ -261,6 +276,9 @@ gestalt dashboard
 | Command | When | Purpose |
 |---|---|---|
 | `docker-compose up -d` | Once (server) | Start the platform |
+| `gestalt config show` | As needed | View current CLI config (URL, project, token presence) |
+| `gestalt config set-server <url>` | First time / remote swap | Persist a server URL without logging in |
+| `gestalt config reset` | Rarely | Sign out, clear project, restore default URL |
 | `gestalt init-admin` | Once (server) | Create first admin user |
 | `gestalt login` | Each machine | Authenticate the CLI |
 | `gestalt init` | Once per project | Register project + seed harness in Git |

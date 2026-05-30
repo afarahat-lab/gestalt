@@ -4,10 +4,15 @@
  * The corresponding server endpoint (POST /auth/admin/setup) only works when
  * the platform has zero users. After the first admin is created, the endpoint
  * returns 403 and operators must use `gestalt login` instead.
+ *
+ * Like `gestalt login`, this command persists the server URL on success —
+ * it is part of the bootstrap flow that wires the CLI to a specific server
+ * for all subsequent commands.
  */
 
 import { GestaltApiClient, ApiClientError } from '../api/client';
-import { loadCliConfig, updateCliConfig } from '../ui/config';
+import { loadCliConfig, resolveServerUrl, updateCliConfig } from '../ui/config';
+import { printConnectionError } from '../ui/server-errors';
 import {
   c, blank, divider, createSpinner,
   prompt, promptSecret, printLocalAuthWarning,
@@ -17,7 +22,7 @@ const MIN_PASSWORD_LENGTH = 8;
 
 export async function initAdminCommand(serverUrl?: string): Promise<void> {
   const config = await loadCliConfig();
-  const url = serverUrl ?? config.serverUrl;
+  const url = resolveServerUrl({ server: serverUrl }, config);
 
   blank();
   console.log(c.bold('Create the first Gestalt admin'));
@@ -33,8 +38,8 @@ export async function initAdminCommand(serverUrl?: string): Promise<void> {
     await client.health();
     healthSpinner.succeed(c.success('Server reachable'));
   } catch {
-    healthSpinner.fail(c.error(`Cannot reach server at ${url}`));
-    console.log(c.dim('Check that the Gestalt server is running: docker-compose ps'));
+    healthSpinner.stop();
+    printConnectionError(url);
     process.exit(1);
   }
 
