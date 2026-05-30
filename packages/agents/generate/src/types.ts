@@ -13,7 +13,20 @@ export type Complexity = 'small' | 'medium' | 'large';
 
 export type AmbiguityImpact = 'low' | 'medium' | 'high';
 
-export type AgentStatus = 'pending' | 'running' | 'completed' | 'skipped' | 'failed';
+export type AgentStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'skipped'
+  | 'failed'
+  /**
+   * Distinct from `failed`. The agent ran successfully but discovered the
+   * input is too vague to proceed (no success criteria, or a high-impact
+   * ambiguity). The orchestrator translates this into an Alert + a
+   * `waiting-for-clarification` intent status. The operator can resume
+   * the cycle by POSTing to `/intents/:id/clarify`.
+   */
+  | 'clarification-needed';
 
 export type OrchestratorState =
   | 'received'
@@ -149,10 +162,21 @@ export interface FeedbackSignal {
   createdAt: Date;
 }
 
+export interface ClarificationNeeded {
+  reason: string;
+  suggestions: string[];
+}
+
 export interface AgentResult {
   agentRole: AgentRole;
   status: AgentStatus;
   skipReason?: string;
+  /**
+   * Populated only when `status === 'clarification-needed'`. The
+   * orchestrator copies these fields into the Alert row so the operator
+   * sees the same explanation in the dashboard.
+   */
+  clarificationNeeded?: ClarificationNeeded;
   artifacts: GeneratedArtifact[];
   signals: FeedbackSignal[];
   tokensUsed: number;
@@ -178,6 +202,21 @@ export interface AgentTask {
    * Caps at the harness's `qualityGate.maxRetries`.
    */
   retryCount?: number;
+  /**
+   * Source of the originating intent — human-submitted vs. queued by a
+   * maintenance agent. Threaded so the intent-agent can skip the
+   * clarification gate for `maintenance-agent` intents: those are typed
+   * `MaintenanceIntent` objects with a structured prefix and never
+   * vague enough to need operator input (ADR-035).
+   */
+  intentSource?: 'human' | 'maintenance-agent';
+  /**
+   * Optional operator-supplied clarification text. Populated only when
+   * the orchestrator is resuming an intent that was previously paused
+   * with `waiting-for-clarification`. The intent-agent prompt appends
+   * this verbatim under an "Operator clarification" heading.
+   */
+  clarification?: string;
 }
 
 // ─── Plan ─────────────────────────────────────────────────────────────────────

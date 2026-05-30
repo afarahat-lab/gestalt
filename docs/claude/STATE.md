@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-30 (Claude Code — SPA mounted under /app/* for shareable deep links)
+**Last updated:** 2026-05-31 (Claude Code — clarification flow + IntentFeed projectId bug fix)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -81,6 +81,56 @@ the historical record of how the state evolved._
   truth (ADR-032). Audit-logged as `project.config-updated`
 - `gestalt run` queues intent → orchestrator picks up → clones project
   repo fresh per cycle → runs generate loop against cloned harness files
+- **Intent clarification flow wired end-to-end.** A vague intent
+  (e.g. "make it better") no longer fails silently at the test-agent —
+  the intent-agent runs, sees `successCriteria.length === 0` (or a
+  high-impact ambiguity), and returns a new typed
+  `AgentStatus = 'clarification-needed'` with a `{ reason, suggestions }`
+  payload. The orchestrator:
+  - creates an `alerts` row (`type: 'clarification-needed'`,
+    `severity: high`, `requiredAction: 'provide-clarification'`,
+    `context.intentId` + `context.suggestions[]` JSONB-stashed)
+  - emits an `alert.created` SSE event so the dashboard updates
+    without a refresh
+  - transitions the intent to `waiting-for-clarification`
+  - flips `plan.state = 'waiting_for_clarification'` so the outer
+    while-loop bails before any downstream agent runs
+  The maintenance-sourced intent guard (ADR-035 prefix
+  `[gestalt-maintenance/<type>]`) short-circuits the clarification
+  check — those are typed `MaintenanceIntent` objects and never
+  need operator clarification. Dashboard Alerts view renders the
+  card with the `?` badge, suggestions list, textarea, and a
+  "resume intent" button. Resume flow:
+  - `POST /intents/:id/clarify { clarification }` acknowledges every
+    unacknowledged `clarification-needed` alert for the
+    correlationId, audit-logs the operator's clarification text
+    (GP-002), and re-dispatches a `generate:intent` task with
+    `clarification` threaded through
+  - orchestrator hydrates the missing `projectId` + `text` from
+    the persisted intent row, calls `runIntentAgent` with the
+    clarification text appended to the prompt under an "Operator
+    clarification" heading; downstream agents proceed normally
+  - the `intent-agent` clarification gate runs AFTER the LLM call
+    (we trust the LLM to drive the decision, not a pre-flight
+    regex)
+  - Verified live (`61fd59a6`): submitted "make it better" against
+    `trackeros`; intent paused in ~2 s, alert visible in dashboard
+    with three suggestions, textarea, and resume button; submitted
+    "Add a slugify utility under src/shared/utils/slugify with
+    slugify(s: string): string"; alert disappeared, cycle resumed,
+    all six generate agents ran in ~22 s; intent reached
+    `in-review`. Browser screenshots captured of alert card + post-
+    submit empty state
+- **Dashboard Intent Feed now shows ALL intents, including failed
+  and waiting-for-clarification.** Pre-existing bug: the feed read
+  `projectId` from `localStorage.getItem('gestalt_project')` with
+  fallback `'default'` — that string never matched a real
+  `project_id` and `listIntents` always returned zero rows (so
+  failed intents had no trace in the dashboard). Fixed by fetching
+  `/projects` on mount, persisting the selected id under
+  `gestalt_project_id`, and rendering a project selector dropdown
+  in the page header. No status filter is applied to `listIntents`
+  — the feed shows the full intent timeline for the project
 - **Maintenance layer wired end-to-end (ADR-018, ADR-019, ADR-020,
   ADR-035).** Four scheduled agents run in-process via `node-cron`,
   registered as `startMaintenanceScheduler(config)` at server.ts step 9:
@@ -284,6 +334,12 @@ the historical record of how the state evolved._
   text→jsonb cast wraps the whole array as a JSON string scalar) and
   `parseFindings` normalises the read path against postgres.js
   returning either a parsed array or a raw JSON string
+- `alerts` — create, findById, findUnacknowledged, findByCorrelationId,
+  acknowledge. `intent_id` lives in `context` JSONB (schema 001
+  predates the FK); `parseContext` normalises postgres.js's
+  parsed-object vs raw-JSON-string return shapes the same way
+  `parseFindings` does for maintenanceRuns. `intentId` lifted out of
+  context into the read-side record for ergonomics
 
 **CLI install:**
 - `@gestalt/cli` is private — not on npm
@@ -300,6 +356,24 @@ the historical record of how the state evolved._
 8. `gestalt run "<intent>"` — submit work to agents
 
 **Pending enhancements (design in chat first):**
+- **Clarification text is lost on a gate retry.** After a successful
+  resume, the gate may dispatch a `generate:intent` retry (verdict
+  `fail`, auto-resolvable signals) — and that retry payload doesn't
+  carry the original `clarification` text. intent-agent re-runs
+  without it, sees no success criteria again, and creates a SECOND
+  clarification alert. Observed live (`61fd59a6` cycle in the
+  2026-05-31 session). Fix shape: persist the most recent
+  clarification on the `intents` row (or as a fixed-name artifact
+  the intent-agent reads from the working tree) so it survives
+  retries; alternatively skip the intent-agent on retry when a
+  prior `.gestalt/intent-spec.json` exists in the Git tip (this
+  also closes the related "retry cycle full re-runs all generate
+  agents" entry below)
+- **POST /interventions still a 501 stub.** The clarification flow
+  bypasses it (uses `POST /intents/:id/clarify` directly because
+  that endpoint owns the resume side effect). When breach
+  acknowledgement / promotion approval get UIs they'll need a
+  real implementation here
 - **Return-URL preservation across login.** Pasting `/app/intents/<id>`
   in a fresh tab today bounces to `/app/login` and after sign-in
   lands on `/app/` (the intent ID is dropped). Small SPA-only change —

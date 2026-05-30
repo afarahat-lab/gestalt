@@ -8,7 +8,7 @@
 import type {
   IntentSummary, IntentDetail, Alert, InterventionRequest,
   InterventionRecord, MaintenanceRunSummary, LiveEvent, DashboardUser,
-  AgentExecutionSummary,
+  AgentExecutionSummary, ProjectSummary,
 } from '../types';
 
 export class DashboardApiClient {
@@ -48,8 +48,23 @@ export class DashboardApiClient {
     return this.get(`/intents/${id}`);
   }
 
-  async clarifyIntent(id: string, body: { clarification: string; ambiguityId: string }): Promise<{ data: { resumed: true } }> {
+  async clarifyIntent(
+    id: string,
+    body: { clarification: string; ambiguityId?: string },
+  ): Promise<{ data: { resumed: true; acknowledgedAlerts: number } }> {
     return this.post(`/intents/${id}/clarify`, body);
+  }
+
+  // ─── Projects ──────────────────────────────────────────────────────────────
+
+  async listProjects(): Promise<{ data: ProjectSummary[] }> {
+    return this.get('/projects');
+  }
+
+  // ─── Alerts (additional) ───────────────────────────────────────────────────
+
+  async acknowledgeAlert(id: string): Promise<{ data: Alert }> {
+    return this.post(`/alerts/${id}/acknowledge`, {});
   }
 
   // ─── Active agents ─────────────────────────────────────────────────────────

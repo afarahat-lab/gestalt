@@ -8,14 +8,34 @@ import type { ContextSnapshot } from '../types';
 /**
  * Builds the intent extraction prompt.
  * On retry attempts, adds explicit guidance about what failed previously.
+ * When `clarification` is supplied, the prompt includes the operator's
+ * follow-up text verbatim so the LLM can incorporate the missing detail
+ * (this is the resume path after a `waiting-for-clarification` pause).
  */
 export function buildIntentPrompt(
   ctx: ContextSnapshot,
   attempt: number,
+  clarification?: string,
 ): string {
   const retryGuidance =
     attempt > 0
       ? `\n\nIMPORTANT: This is retry attempt ${attempt}. Your previous response could not be parsed as valid JSON or was missing required fields. Ensure your response is pure JSON with no markdown fences, no preamble, and no trailing text.\n`
+      : '';
+
+  const clarificationBlock = clarification?.trim()
+    ? `
+
+## Operator clarification
+
+The original intent was too vague to extract success criteria on the
+first attempt. The operator has supplied the following clarification —
+treat it as the authoritative refinement of the intent:
+
+${clarification.trim()}
+
+When extracting successCriteria, base them on the clarification, not on
+the original intent text alone.
+`
       : '';
 
   return `You are the intent agent in the Gestalt platform.
@@ -37,7 +57,7 @@ ${ctx.goldenPrinciples.map((p) => `- ${p.title}: ${p.description}`).join('\n')}
 ## Intent to parse
 
 "${ctx.intentSpec.rawIntent}"
-
+${clarificationBlock}
 ## Instructions
 
 Produce a JSON object with this exact structure. Do not include any text outside the JSON.

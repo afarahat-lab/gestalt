@@ -35,7 +35,14 @@ interface ListIntentsQuery {
 
 interface ClarifyBody {
   clarification: string;
-  ambiguityId: string;
+  /**
+   * Optional — only meaningful when the original pause was caused by a
+   * specific ambiguity. Today the clarification flow doesn't depend on
+   * it (the operator's text is appended to the next intent-agent
+   * prompt regardless), but it's recorded in the audit metadata so
+   * downstream analytics can correlate.
+   */
+  ambiguityId?: string;
 }
 
 export async function registerIntentRoutes(app: FastifyInstance): Promise<void> {
@@ -151,12 +158,25 @@ export async function registerIntentRoutes(app: FastifyInstance): Promise<void> 
     },
   );
 
-  // POST /intents/:id/clarify — resolve a CONTEXT_GAP
+  // POST /intents/:id/clarify — resolve a clarification-needed pause
+  //
+  // Side effects (all required for the resume to look right in the UI):
+  //   1. Acknowledge every unacknowledged alert on this correlationId
+  //      so the Alerts tab clears immediately
+  //   2. Dispatch a fresh `generate:intent` task with `clarification`
+  //      threaded through. The orchestrator hydrates the missing
+  //      `projectId` + `text` from the persisted intent record, so the
+  //      resume payload stays minimal
+  //   3. Transition the intent back to `generating`
+  //   4. Emit `intent.status-changed` so live dashboards update
+  //   5. Audit-log the clarification text (GP-002) so we can answer
+  //      "what did the operator say?" later
   app.post<{ Params: { id: string }; Body: ClarifyBody }>(
     '/intents/:id/clarify',
     { preHandler: requireRole('operator') },
     async (request, reply) => {
-      const { intents } = getRepositories();
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+      const { intents, alerts, audit } = getRepositories();
       const intent = await intents.findById(request.params.id);
 
       if (!intent) {
@@ -169,8 +189,20 @@ export async function registerIntentRoutes(app: FastifyInstance): Promise<void> 
       }
 
       const { clarification, ambiguityId } = request.body;
+      if (!clarification?.trim()) {
+        return reply.code(400).send({ error: 'clarification text is required' });
+      }
 
-      // Resume the generate loop with clarification
+      // 1. Acknowledge in-flight clarification alerts for this cycle.
+      const existing = await alerts.findByCorrelationId(intent.correlationId);
+      const toAck = existing.filter(
+        (a) => a.acknowledgedAt === null && a.type === 'clarification-needed',
+      );
+      for (const alert of toAck) {
+        await alerts.acknowledge(alert.id, request.user.id);
+      }
+
+      // 2. Resume the generate loop with clarification text appended.
       const { loadConfig } = await import('@gestalt/core');
       const config = loadConfig();
       const message: TaskMessage = {
@@ -180,20 +212,50 @@ export async function registerIntentRoutes(app: FastifyInstance): Promise<void> 
         sourceAgent: 'orchestrator',
         targetAgent: 'orchestrator',
         priority: toTaskPriority(intent.priority),
-        payload: { intentId: intent.id, clarification, ambiguityId, resume: true },
+        payload: {
+          intentId: intent.id,
+          // projectId + text omitted on purpose — the orchestrator
+          // hydrates them from `intents.findById` to keep this payload
+          // small and consistent with the persisted record.
+          clarification: clarification.trim(),
+          ambiguityId,
+          resume: true,
+        },
         createdAt: new Date(),
         expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
       };
 
       await dispatch(message, config.queue);
-      await intents.updateStatus(intent.id, 'generating');
 
+      // 3 + 4. Status transition + SSE.
+      await intents.updateStatus(intent.id, 'generating');
       emitLiveEvent('intent.status-changed', intent.correlationId, {
         intentId: intent.id,
         status: 'generating',
       });
 
-      return reply.send({ data: { resumed: true } });
+      // 5. Audit the clarification (GP-002). Capture the text so the
+      // history is reconstructable; truncate to keep the row sane.
+      await audit.append({
+        actor: request.user.id,
+        action: 'intent.clarified',
+        entityType: 'intents',
+        entityId: intent.id,
+        correlationId: intent.correlationId,
+        metadata: {
+          clarification: clarification.trim().slice(0, 4000),
+          ambiguityId: ambiguityId ?? null,
+          acknowledgedAlertIds: toAck.map((a) => a.id),
+          ip: request.ip,
+        },
+      });
+
+      return reply.send({
+        data: {
+          resumed: true,
+          acknowledgedAlerts: toAck.length,
+        },
+      });
     },
   );
 }

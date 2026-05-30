@@ -3,6 +3,17 @@
  * All types for the oversight dashboard.
  */
 
+// ─── Projects ─────────────────────────────────────────────────────────────────
+
+export interface ProjectSummary {
+  id: string;
+  name: string;
+  gitUrl: string;
+  defaultBranch: string;
+  createdBy: string;
+  createdAt: string;
+}
+
 // ─── Intent feed ──────────────────────────────────────────────────────────────
 
 export type IntentStatus =

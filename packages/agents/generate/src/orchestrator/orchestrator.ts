@@ -53,8 +53,8 @@ const log = createContextLogger({ module: 'orchestrator' });
 
 interface IntentTaskPayload {
   intentId: string;
-  text: string;
-  projectId: string;
+  text?: string;       // optional on the resume leg — orchestrator hydrates from DB
+  projectId?: string;  // optional on the resume leg — orchestrator hydrates from DB
   /**
    * Pre-set projectRoot. Reserved for resume / clarification flows that
    * already cloned a working tree. Normal first-time dispatch leaves this
@@ -62,9 +62,16 @@ interface IntentTaskPayload {
    * directory (ADR-032).
    */
   projectRoot?: string;
+  /**
+   * Operator-supplied clarification text. Populated when the cycle is
+   * resuming after a `waiting-for-clarification` pause. The orchestrator
+   * forwards this verbatim to the intent-agent's task, where the prompt
+   * builder appends it under an "Operator clarification" heading.
+   */
   clarification?: string;
   ambiguityId?: string;
   resume?: boolean;
+  source?: 'human' | 'maintenance-agent';
   /**
    * Quality-gate retry context. Populated only when the gate dispatched
    * this task on a failed verdict (the feedback loop). The orchestrator
@@ -144,10 +151,23 @@ async function handleIntentTask(
   let project: Awaited<ReturnType<typeof projects.findById>> | null = null;
 
   try {
-    project = await projects.findById(payload.projectId);
+    // On the resume leg (POST /intents/:id/clarify) the caller only
+    // sends `intentId` + `clarification`. Hydrate the missing payload
+    // fields from the persisted intent record so the rest of the
+    // handler sees a uniform payload regardless of entry point.
+    const intentRecord = await intents.findById(payload.intentId);
+    if (!intentRecord) {
+      throw new Error(`Intent ${payload.intentId} not found`);
+    }
+    const projectId = payload.projectId ?? intentRecord.projectId;
+    const intentText = payload.text ?? intentRecord.text;
+    const intentSource: 'human' | 'maintenance-agent' =
+      payload.source ?? intentRecord.source;
+
+    project = await projects.findById(projectId);
     if (!project) {
       throw new Error(
-        `Project ${payload.projectId} not found — register it first via POST /projects`,
+        `Project ${projectId} not found — register it first via POST /projects`,
       );
     }
 
@@ -196,9 +216,13 @@ async function handleIntentTask(
       plan,
       projectRoot,
       payload.intentId,
-      payload.text ?? '',
+      intentText,
       priorSignals,
       childLog,
+      {
+        intentSource,
+        clarification: payload.clarification,
+      },
     );
 
     if (hasPlanFailed(plan)) {
@@ -240,8 +264,8 @@ async function handleIntentTask(
         // re-entries. The gate increments retryCount before dispatching
         // its own follow-up.
         retryCount,
-        projectId: payload.projectId,
-        text: payload.text,
+        projectId,
+        text: intentText,
       },
       createdAt: new Date(),
       expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),
@@ -276,6 +300,11 @@ async function handleIntentTask(
  * — no downstream steps run (handleIntentTask is responsible for noticing
  * the flag and skipping the gate dispatch).
  */
+interface DrivePlanOptions {
+  intentSource: 'human' | 'maintenance-agent';
+  clarification?: string;
+}
+
 async function drivePlan(
   plan: ExecutionPlan,
   projectRoot: string,
@@ -283,6 +312,7 @@ async function drivePlan(
   intentText: string,
   priorSignals: FeedbackSignal[],
   childLog: ReturnType<typeof createContextLogger>,
+  opts: DrivePlanOptions,
 ): Promise<void> {
   // Per the gate's feedback-router contract, only certain signal types route
   // back to generate. We attach those subset to the specialist agent the
@@ -350,6 +380,13 @@ async function drivePlan(
             contextSnapshot: context,
             maxRetries: 2,
             priorSignals: routedSignals.length ? routedSignals : undefined,
+            // intent-agent uses these to decide whether to apply the
+            // clarification gate, and to fold the operator's
+            // clarification text into the prompt on resume. Other
+            // agents ignore them.
+            intentSource: opts.intentSource,
+            clarification:
+              agentRole === 'intent-agent' ? opts.clarification : undefined,
           };
 
           const llmClient = getLLMClient();
@@ -406,12 +443,47 @@ async function drivePlan(
             signalCount: result.signals?.length ?? 0,
           });
 
-          // Check for high-impact ambiguity (CONTEXT_GAP from intent-agent)
-          const hasContextGap = result.signals.some(
-            (s) => s.type === 'CONTEXT_GAP' && agentRole === 'intent-agent',
-          );
-          if (hasContextGap) {
-            childLog.warn('High-impact ambiguity detected — waiting for clarification');
+          // Clarification gate. The intent-agent reports a typed
+          // `clarification-needed` status when the cycle can't proceed
+          // without operator input. We translate that into:
+          //   - intent row transitions to `waiting-for-clarification`
+          //   - an Alert row is created (the dashboard's Alerts view
+          //     surfaces it; the operator submits the answer through
+          //     POST /intents/:id/clarify)
+          //   - `alert.created` SSE event so the UI updates without a
+          //     refresh
+          //   - the plan state flips to `waiting_for_clarification`,
+          //     which the outer while-loop checks each iteration to
+          //     bail out before any downstream agent runs
+          if (
+            result.status === 'clarification-needed' &&
+            result.clarificationNeeded &&
+            agentRole === 'intent-agent'
+          ) {
+            const { alerts } = getRepositories();
+            const created = await alerts.create({
+              correlationId: plan.correlationId,
+              intentId,
+              type: 'clarification-needed',
+              severity: 'high',
+              title: 'Intent needs clarification',
+              description: result.clarificationNeeded.reason,
+              requiredAction: 'provide-clarification',
+              context: {
+                suggestions: result.clarificationNeeded.suggestions,
+              },
+            });
+            emitLiveEvent('alert.created', plan.correlationId, {
+              alertId: created.id,
+              type: created.type,
+              intentId,
+              title: created.title,
+              severity: created.severity,
+            });
+            childLog.warn(
+              { alertId: created.id, reason: result.clarificationNeeded.reason },
+              'Clarification needed — pausing cycle',
+            );
             plan.state = 'waiting_for_clarification';
             await transitionIntent(intentId, plan.correlationId, 'waiting-for-clarification');
           }

@@ -14,7 +14,7 @@ content is derived._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-30 (Claude Code — SPA mounted under /app/* for shareable deep links)
+**Last updated:** 2026-05-31 (Claude Code — clarification flow + IntentFeed projectId bug fix)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -87,6 +87,56 @@ content is derived._
   truth (ADR-032). Audit-logged as `project.config-updated`
 - `gestalt run` queues intent → orchestrator picks up → clones project
   repo fresh per cycle → runs generate loop against cloned harness files
+- **Intent clarification flow wired end-to-end.** A vague intent
+  (e.g. "make it better") no longer fails silently at the test-agent —
+  the intent-agent runs, sees `successCriteria.length === 0` (or a
+  high-impact ambiguity), and returns a new typed
+  `AgentStatus = 'clarification-needed'` with a `{ reason, suggestions }`
+  payload. The orchestrator:
+  - creates an `alerts` row (`type: 'clarification-needed'`,
+    `severity: high`, `requiredAction: 'provide-clarification'`,
+    `context.intentId` + `context.suggestions[]` JSONB-stashed)
+  - emits an `alert.created` SSE event so the dashboard updates
+    without a refresh
+  - transitions the intent to `waiting-for-clarification`
+  - flips `plan.state = 'waiting_for_clarification'` so the outer
+    while-loop bails before any downstream agent runs
+  The maintenance-sourced intent guard (ADR-035 prefix
+  `[gestalt-maintenance/<type>]`) short-circuits the clarification
+  check — those are typed `MaintenanceIntent` objects and never
+  need operator clarification. Dashboard Alerts view renders the
+  card with the `?` badge, suggestions list, textarea, and a
+  "resume intent" button. Resume flow:
+  - `POST /intents/:id/clarify { clarification }` acknowledges every
+    unacknowledged `clarification-needed` alert for the
+    correlationId, audit-logs the operator's clarification text
+    (GP-002), and re-dispatches a `generate:intent` task with
+    `clarification` threaded through
+  - orchestrator hydrates the missing `projectId` + `text` from
+    the persisted intent row, calls `runIntentAgent` with the
+    clarification text appended to the prompt under an "Operator
+    clarification" heading; downstream agents proceed normally
+  - the `intent-agent` clarification gate runs AFTER the LLM call
+    (we trust the LLM to drive the decision, not a pre-flight
+    regex)
+  - Verified live (`61fd59a6`): submitted "make it better" against
+    `trackeros`; intent paused in ~2 s, alert visible in dashboard
+    with three suggestions, textarea, and resume button; submitted
+    "Add a slugify utility under src/shared/utils/slugify with
+    slugify(s: string): string"; alert disappeared, cycle resumed,
+    all six generate agents ran in ~22 s; intent reached
+    `in-review`. Browser screenshots captured of alert card + post-
+    submit empty state
+- **Dashboard Intent Feed now shows ALL intents, including failed
+  and waiting-for-clarification.** Pre-existing bug: the feed read
+  `projectId` from `localStorage.getItem('gestalt_project')` with
+  fallback `'default'` — that string never matched a real
+  `project_id` and `listIntents` always returned zero rows (so
+  failed intents had no trace in the dashboard). Fixed by fetching
+  `/projects` on mount, persisting the selected id under
+  `gestalt_project_id`, and rendering a project selector dropdown
+  in the page header. No status filter is applied to `listIntents`
+  — the feed shows the full intent timeline for the project
 - **Maintenance layer wired end-to-end (ADR-018, ADR-019, ADR-020,
   ADR-035).** Four scheduled agents run in-process via `node-cron`,
   registered as `startMaintenanceScheduler(config)` at server.ts step 9:
@@ -290,6 +340,12 @@ content is derived._
   text→jsonb cast wraps the whole array as a JSON string scalar) and
   `parseFindings` normalises the read path against postgres.js
   returning either a parsed array or a raw JSON string
+- `alerts` — create, findById, findUnacknowledged, findByCorrelationId,
+  acknowledge. `intent_id` lives in `context` JSONB (schema 001
+  predates the FK); `parseContext` normalises postgres.js's
+  parsed-object vs raw-JSON-string return shapes the same way
+  `parseFindings` does for maintenanceRuns. `intentId` lifted out of
+  context into the read-side record for ergonomics
 
 **CLI install:**
 - `@gestalt/cli` is private — not on npm
@@ -306,6 +362,24 @@ content is derived._
 8. `gestalt run "<intent>"` — submit work to agents
 
 **Pending enhancements (design in chat first):**
+- **Clarification text is lost on a gate retry.** After a successful
+  resume, the gate may dispatch a `generate:intent` retry (verdict
+  `fail`, auto-resolvable signals) — and that retry payload doesn't
+  carry the original `clarification` text. intent-agent re-runs
+  without it, sees no success criteria again, and creates a SECOND
+  clarification alert. Observed live (`61fd59a6` cycle in the
+  2026-05-31 session). Fix shape: persist the most recent
+  clarification on the `intents` row (or as a fixed-name artifact
+  the intent-agent reads from the working tree) so it survives
+  retries; alternatively skip the intent-agent on retry when a
+  prior `.gestalt/intent-spec.json` exists in the Git tip (this
+  also closes the related "retry cycle full re-runs all generate
+  agents" entry below)
+- **POST /interventions still a 501 stub.** The clarification flow
+  bypasses it (uses `POST /intents/:id/clarify` directly because
+  that endpoint owns the resume side effect). When breach
+  acknowledgement / promotion approval get UIs they'll need a
+  real implementation here
 - **Return-URL preservation across login.** Pasting `/app/intents/<id>`
   in a fresh tab today bounces to `/app/login` and after sign-in
   lands on `/app/` (the intent ID is dropped). Small SPA-only change —
@@ -378,172 +452,6 @@ content is derived._
 ---
 
 ## Recent session log entries (last 3 from SESSION_LOG.md)
-
-### Session 2026-05-30 — Claude Code (configurable server URL across the CLI)
-
-Closes the most common production misconfiguration: the CLI defaults to
-`http://localhost:3000` but the server lives on a remote host
-(`https://gestalt.company.com`). Every CLI command now reads the URL
-through one helper, accepts a `--server` one-shot override, and shows
-the attempted URL on connectivity failure. A new `gestalt config`
-parent command lets operators inspect and change the persisted URL
-without going through the auth flow.
-
-Changed:
-- `packages/cli/src/ui/config.ts`:
-  - New `resolveServerUrl(options, config)` helper — single source of
-    truth for "which URL does this invocation talk to". `options.server`
-    (the `--server` flag) wins; otherwise falls back to
-    `config.serverUrl`. Every command imports this; no `config.serverUrl`
-    direct reads remain in command bodies after the change
-  - New `normaliseServerUrl(input)` — trims trailing slashes, validates
-    `http://` / `https://` prefix, throws a clear `Error` on bad input.
-    Used by `config set-server`
-  - New `isDefaultServerUrl(url)` — flags whether the active URL is
-    still `DEFAULT_CLI_CONFIG.serverUrl`. Drives the first-run hint
-- `packages/cli/src/ui/server-errors.ts` (new): shared
-  `printConnectionError(url)` formatter. Always echoes the attempted
-  URL; when the URL is the local-dev default, appends the first-run
-  hint nudging the operator to `gestalt config set-server` then
-  `gestalt login`. Also exports `isConnectivityError(err)` — heuristic
-  that distinguishes a reachable server returning an HTTP error
-  (`ApiClientError`, presented verbatim) from an unreachable server
-  (`ECONNREFUSED`, `ENOTFOUND`, etc., routed through the formatter)
-- `packages/cli/src/commands/config.ts` (new): three subcommands —
-  - `gestalt config show` — prints `serverUrl`, `currentProjectId`,
-    and `token: set | not set`. The token value itself is NEVER
-    printed; only its presence
-  - `gestalt config set-server <url>` — validates via
-    `normaliseServerUrl`, persists via `updateCliConfig`. Auth-free
-  - `gestalt config reset` — prompts `y/N`, then writes
-    `DEFAULT_CLI_CONFIG` via `saveCliConfig` so previously persisted
-    fields are dropped, not just nulled. Aborts cleanly on `N`
-- `packages/cli/src/commands/{login,init-admin,init,run,status,logs,
-  projects}.ts`: every command threaded through `resolveServerUrl(...)`.
-  Every API client constructor now reads from the resolved URL instead
-  of `config.serverUrl`. Connectivity errors route through
-  `printConnectionError(serverUrl)` for a consistent presentation
-- `packages/cli/src/commands/status.ts`: the platform-status path now
-  starts with a header line `Gestalt — <serverUrl>`, so operators can
-  see at a glance which server they're talking to. Same idea as
-  psql's connection prompt
-- `packages/cli/src/commands/logs.ts`: `dashboardCommand()` also
-  accepts a `--server` override (it opens the dashboard URL in a
-  browser; a remote operator wants the remote URL, not localhost)
-- `packages/cli/src/commands/login.ts` + `init-admin.ts`: persist
-  `serverUrl` on success (these are the bootstrap commands). Every
-  other command treats `--server` as one-shot only — no write-through.
-  Both fail through the new connection-error formatter
-- `packages/cli/src/index.ts`: new `gestalt config` parent +
-  three subcommands. `--server <url>` flag added to every command
-  that talks to the server. Updated top-of-file command list and
-  added a paragraph documenting the persist-on-bootstrap-only rule.
-  Defaults removed from `--server` declarations so commander forwards
-  `undefined` to the command, letting `resolveServerUrl` distinguish
-  "no flag" from "flag with the default value"
-- `packages/cli/src/types.ts`: `RunOptions` gained `server?: string`
-  so `--server` propagates through the same shape every other command
-  uses
-- `docs/guides/quick-start.md` Step 6 rewritten to show all three sign-in
-  flows (local-only / `config set-server` + login / `login --server …`)
-  with a note that the URL persists to `~/.gestalt/config.json`. The
-  Summary table gained `gestalt config show` / `set-server` / `reset`
-- `docs/runbooks/common-issues.md`: new entry **"CLI connects to wrong
-  server / localhost instead of remote"** under CLI issues —
-  symptom, cause, resolution (`config show` then `config set-server`),
-  plus the `gestalt status` header trick for spot-checking the active
-  server URL
-
-Verified live:
-- `pnpm --filter @gestalt/cli build` clean; `pnpm -r build` clean
-  across all 12 packages
-- `gestalt config show` against a fresh HOME prints the default
-  config with `token: not set`
-- `gestalt config set-server https://gestalt.company.com` → `✓
-  Server URL set to https://gestalt.company.com`. Trailing slash is
-  stripped (`https://gestalt.company.com/` normalises to the same
-  result). `ftp://nope` rejected with `Server URL must start with
-  http:// or https://`
-- `gestalt config show` after the set call confirms the new
-  `serverUrl`. Token still `not set`
-- `gestalt login --server http://127.0.0.1:65530` (deliberate
-  unreachable port) prints the new formatter output exactly:
-  ```
-  ✗ Cannot reach server at http://127.0.0.1:65530
-    Check the server is running and the URL is correct.
-    Current server: http://127.0.0.1:65530
-    To change: gestalt config set-server <url>
-  ```
-  No persisted config change after the failure
-- Direct call to `printConnectionError('http://localhost:3000')`
-  appends the first-run hint:
-  ```
-    If your Gestalt server is running on a different machine, set the URL first:
-      gestalt config set-server https://gestalt.company.com
-      gestalt login
-  ```
-  Direct call against `https://gestalt.company.com` does NOT append
-  the hint (correct: the URL is no longer the default)
-- `gestalt status` against the running local platform prints the
-  header `Gestalt — http://localhost:3000` followed by the existing
-  active-agents and recent-intents output
-- `gestalt status --server http://127.0.0.1:3000` prints
-  `Gestalt — http://127.0.0.1:3000` for the single invocation; the
-  persisted `serverUrl` in `~/.gestalt/config.json` stays at
-  `http://localhost:3000` (one-shot non-persistence confirmed)
-
-Decisions made:
-- **`login` and `init-admin` persist `--server`; everything else
-  doesn't.** The brief's exception was only `login`, but
-  `init-admin` is the same kind of bootstrap command — it
-  presupposes you have NO config yet and want it pinned to this
-  server. Persisting on both keeps the bootstrap UX consistent. Every
-  non-auth command stays one-shot per the brief
-- **Connectivity heuristic by `Error.name === 'ApiClientError'` and
-  errno code, not URL-class introspection.** `ApiClientError` is
-  thrown for any non-2xx HTTP response — that's a reachable server
-  with an error, not a connectivity problem. Anything raised by
-  `fetch` itself (DNS, refused connection, TLS, timeout) sets a
-  recognisable errno code on `err.code` or `err.cause.code`. We
-  fall back to a regex on the message text to cover environments
-  where the codes aren't exposed
-- **`config show` prints `token: set | not set`, never the value.**
-  The brief required this; reinforced by GP-004 (no sensitive data
-  in logs). The constant is the field name only — the actual JWT
-  never crosses the terminal even on a verbose user dump
-- **`config reset` confirms with `y/N`, defaults to NO.** The
-  operation is destructive (signs the user out, clears their
-  current project, restores the local-dev default URL). A bare
-  Enter cancels — same shape as `rm -i` and `git reset --hard`
-  guards
-- **`init` got `--server` as a one-shot too**, even though it
-  requires an existing token. The use case: an operator with a
-  saved token for `https://gestalt.company.com` wants to register
-  a project against a *staging* instance at
-  `https://gestalt-staging.company.com` — `--server` lets them do
-  that for one invocation. The existing token still goes into the
-  Authorization header; if the staging server rejects it that's a
-  surfaced 401, not a connectivity error
-- **Status header lives in `showPlatformStatus`, not
-  `showIntentDetail`.** Intent detail is invoked with a specific
-  correlationId — the operator already knows which server holds
-  that intent because they got the id from somewhere. The
-  platform-status flow is the one operators reach for when
-  something feels off, so that's the right place to spotlight
-  which server we're hitting
-- **`isConnectivityError` lives in `server-errors.ts`, not
-  `api/client.ts`.** Originally it was inline in `run.ts`. Moved
-  to the shared module so every command checks the same heuristic
-  and updates land in one place if the fetch error shapes change
-
-Build status: `pnpm -r build` clean across all 12 packages. CLI
-manually exercised against a real running platform (admin login,
-status, config show / set-server / reset, `--server` one-shot
-override against the platform on `127.0.0.1`). The platform-side
-endpoints are unchanged — this is entirely a CLI concern as the
-brief stated.
-
----
 
 ### Session 2026-05-30 — Claude Code (dashboard login page reachable + SPA fallback fix)
 
@@ -807,4 +715,263 @@ Follow-ups added to Pending enhancements:
   but the server has no routes under `/api` (every API route is at
   the root level). Pre-existing dead config noticed during the
   audit for this session; cleanup, not a behavior change
+
+---
+
+### Session 2026-05-31 — Claude Code (intent clarification flow + dashboard IntentFeed bug fix)
+
+Closes a long-standing bad UX: vague intents (e.g. "make it better")
+used to grind through three generate agents and then fail at the
+test-agent with `CONTEXT_GAP No success criteria`, with no actionable
+operator surface. Now they pause at the intent-agent itself, create an
+operator-facing alert with three suggested clarifications + a
+textarea, and resume cleanly once the operator submits a refinement.
+Also fixes the pre-existing IntentFeed bug (`projectId` always
+`'default'` → failed intents invisible in the dashboard).
+
+Changed:
+- `packages/agents/generate/src/types.ts`:
+  - `AgentStatus` gained `'clarification-needed'` — distinct from
+    `failed`. The agent ran successfully but discovered the input
+    is too vague to proceed; semantically the cycle "paused", not
+    "failed"
+  - New `ClarificationNeeded` shape `{ reason, suggestions: string[] }`
+    + optional `clarificationNeeded?: ClarificationNeeded` on
+    `AgentResult`. Orchestrator copies these into the alert row
+  - `AgentTask` gained `intentSource?: 'human' | 'maintenance-agent'`
+    and `clarification?: string` — threaded into the intent-agent's
+    task so it can (a) skip the clarification gate for
+    maintenance-sourced intents and (b) fold the operator's
+    clarification into the prompt on resume
+- `packages/agents/generate/src/agents/intent-agent.ts`:
+  - New `needsClarification(spec, rawIntentText, intentSource)`
+    helper. Exempts maintenance-sourced intents (the
+    `[gestalt-maintenance/<type>]` prefix is the canonical
+    detection per ADR-035, and `intentSource === 'maintenance-agent'`
+    is a belt-and-braces second check). Returns a typed
+    `ClarificationNeeded` when `spec.successCriteria.length === 0`
+    or when any ambiguity has `impactIfWrong === 'high'`
+  - The clarification gate runs AFTER the LLM call — we trust the
+    LLM's structured output to drive the decision, not a
+    pre-flight regex on the raw intent string
+  - Emits a single CONTEXT_GAP signal with `autoResolvable: false`
+    (the gate's retry router must never auto-resolve these — only
+    a human clarification can make progress) and an `.gestalt/intent-spec.json`
+    artifact carrying whatever the LLM did extract (the operator
+    may want to see the half-built spec when deciding how to
+    refine)
+- `packages/agents/generate/src/prompts/intent-prompt.ts`: new
+  optional `clarification?: string` parameter. When supplied, the
+  prompt gains an "## Operator clarification" section that includes
+  the text verbatim and instructs the LLM to base
+  `successCriteria` on the clarification rather than the original
+  intent alone
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  - `IntentTaskPayload`: `text` and `projectId` are now optional so
+    the resume leg can omit them (the orchestrator hydrates both
+    from `intents.findById(payload.intentId)`)
+  - New `intentSource` payload field — defaults to the persisted
+    `IntentRecord.source` if absent, so the gate's retry leg sees
+    the right value too
+  - `drivePlan` takes a `DrivePlanOptions { intentSource,
+    clarification }` argument and threads both into every
+    intent-agent task it creates
+  - Replaced the previous CONTEXT_GAP detection block with a
+    structural check `result.status === 'clarification-needed'`.
+    On match: `alerts.create({ type: 'clarification-needed',
+    severity: 'high', title, description, requiredAction:
+    'provide-clarification', context: { suggestions, intentId } })`,
+    emit `alert.created` SSE, transition intent to
+    `waiting-for-clarification`, flip
+    `plan.state = 'waiting_for_clarification'`
+- `packages/core/src/repository/index.ts`:
+  - New `AlertRecord`, `AlertType`
+    (`'clarification-needed' | 'GOLDEN_PRINCIPLE_BREACH' |
+    'promotion-pending'`), `AlertRequiredAction`
+    (`'provide-clarification' | 'acknowledge-breach' |
+    'approve-promotion' | 'reject-promotion'`), and
+    `AlertRepository` interface (`create / findById /
+    findUnacknowledged / findByCorrelationId / acknowledge`)
+  - `RepositoryRegistry` gained `alerts`. Re-exported from
+    `@gestalt/core` so consumers see the new symbols
+- `packages/adapters/postgres/src/repositories/alerts.ts` (new):
+  `PostgresAlertRepository`. The schema-001 `alerts` table has no
+  `intent_id` column, so the repo stashes `intentId` (and
+  type-specific payload such as `suggestions`) inside the
+  `context` JSONB column. Insert uses an explicit `::jsonb` cast
+  (without it postgres' implicit text→jsonb is a quote-wrap, not a
+  parse — same trap as `maintenance_runs.findings`). New
+  `parseContext` helper handles postgres.js's two possible read
+  shapes (parsed object vs raw JSON string) the same way
+  `parseFindings` does. Lifts `intentId` out of context onto the
+  read-side record for ergonomics
+- `packages/adapters/{oracle,mssql}/src/repositories/alerts.ts`
+  (new): throw-stub `*AlertRepository` classes so interface drift
+  in core forces a build break here
+- `packages/adapters/postgres/src/index.ts`,
+  `packages/adapters/{oracle,mssql}/src/index.ts`: wire the new
+  `PostgresAlertRepository` / re-export the stubs
+- `packages/server/src/oversight/routes.ts`:
+  - Replaced the `GET /alerts` and `GET /alerts/:id` throw-stubs
+    with real handlers backed by `AlertRepository`. The list
+    endpoint defaults to `acknowledged=false` (matches the
+    dashboard's request shape) with optional `severity` filter
+  - New `POST /alerts/:id/acknowledge` for explicit dashboard
+    use (the clarification flow auto-acknowledges via
+    `POST /intents/:id/clarify`, so this is mostly belt-and-braces)
+  - `POST /interventions` reduced to a 501 stub with a clear
+    message pointing operators at `POST /intents/:id/clarify` —
+    breach / promotion UIs aren't shipping yet
+- `packages/server/src/routes/intents.ts`: `POST /intents/:id/clarify`
+  rewritten with the full side-effect chain. Acknowledges every
+  in-flight `clarification-needed` alert for the correlationId
+  before dispatching the resume, omits `projectId` + `text` from
+  the resume payload (orchestrator hydrates them from
+  `intents.findById`), audit-logs the operator's clarification
+  text via `audit.append` (GP-002 — truncated to 4 KB), and
+  returns `{ resumed: true, acknowledgedAlerts: N }`. Empty
+  `clarification` body → 400 with a clear message
+- `packages/dashboard/src/types.ts`: new `ProjectSummary` type
+- `packages/dashboard/src/api/client.ts`:
+  - `clarifyIntent` body shape adjusted (`ambiguityId` now optional)
+    and return shape includes `acknowledgedAlerts: number`
+  - New `listProjects()` → `{ data: ProjectSummary[] }`
+  - New `acknowledgeAlert(id)` → `{ data: Alert }`
+- `packages/dashboard/src/views/Alerts.tsx`: clarification card
+  branch added. Renders the `?` badge in addition to the existing
+  severity badge, the suggestions list (defensive
+  `Array.isArray` check on the JSONB context), the textarea
+  with a useful placeholder, and a "resume intent" button. Submit
+  flow extracts `intentId` from `alert.context.intentId`, posts
+  to `/intents/:id/clarify`, shows
+  "✓ Clarification submitted — resuming..." for 1.2 s, then
+  removes the card. Also subscribes to `intent.status-changed`
+  SSE so the list refreshes when other tabs clear an alert
+- `packages/dashboard/src/views/IntentFeed.tsx`: pre-existing
+  bug fixed. Was reading `projectId` from
+  `localStorage.getItem('gestalt_project')` with fallback
+  `'default'` — the literal string `'default'` never matched a
+  real `project_id` and `listIntents` always returned zero rows
+  (so failed intents had no trace in the dashboard). Now fetches
+  `/projects` on mount, persists the selected id under
+  `gestalt_project_id`, and renders a `<select>` dropdown in the
+  page header listing every project the user can see. No status
+  filter is applied — the feed shows the full intent timeline
+  including `failed` and `waiting-for-clarification`. Empty
+  states distinguish between "no project registered" and
+  "no intents yet"
+
+Verified live against `trackeros`:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt, `Up (healthy)`. Login as `a@b.c`
+  (existing operator, password supplied for this verification
+  session and redacted from output)
+- **Submitted intent "make it better"** (correlationId
+  `61fd59a6-3b78-40af-9f82-d9be6364934e`). 2 s wall-clock to the
+  paused state
+- `agent_executions`: one row (`intent-agent / completed / 1967 ms`).
+  No downstream agents ran
+- `signals`: one CONTEXT_GAP row,
+  `Intent requires clarification: Intent is too vague — no
+  success criteria could be extracted.`, severity `high`,
+  `autoResolvable: false`
+- `alerts`: one row, `type: clarification-needed`, severity
+  `high`, `requiredAction: provide-clarification`, context JSONB
+  carries `suggestions: [...3 items]` + `intentId`
+- `intents.status`: `waiting-for-clarification`
+- **GET /alerts** returned the alert with `intentId` populated and
+  `context` as a real object (after the `parseContext` fix —
+  before it, postgres.js was returning context as a raw JSON
+  string and the dashboard's
+  `alert.context['suggestions']` was `undefined`)
+- **Dashboard verified in a real headless Chrome:**
+  - Login → Alerts tab shows "1 requiring attention"
+  - Clarification card renders with `?` badge, "clarification-needed"
+    tag, title, description, all three suggestion bullets, the
+    textarea with placeholder, and the "resume intent" button.
+    Screenshot `02-alert-expanded.png` matches the brief exactly
+  - Typed clarification + clicked "resume intent" → card
+    vanished, page transitioned to the empty-state
+    "No alerts — platform running autonomously" within 1.2 s.
+    Screenshot `03-after-submit.png`
+- **Resume cycle:** intent transitioned `waiting-for-clarification
+  → generating → in-review` within ~22 s. All six generate
+  agents ran (intent-agent re-ran with the operator's
+  clarification text in the prompt; design / context skipped;
+  code-agent 12.5 s; test-agent 2.4 s); the gate then dispatched
+  its own constraint-agent + review-agent and decided on a
+  retry — which surfaced the gate-retry edge case noted under
+  Pending enhancements
+- **IntentFeed bug fix verified:** dashboard now shows "2 total ·
+  trackeros" with both `make it better` (`? needs input`) and
+  the older `start implementation` intent (`✗ failed` — the one
+  the operator had reported as invisible). Project selector
+  dropdown in the page header. Screenshot `04-intent-feed.png`
+
+Decisions made:
+- **Clarification gate runs AFTER the LLM call, not as a
+  pre-flight regex.** A pre-flight word-count check would
+  short-circuit useful work (an LLM may extract perfect
+  successCriteria from a 4-word intent and a long-prose intent
+  may still leave fields empty). Trust the structured output;
+  classify based on what came back
+- **`autoResolvable: false` on the CONTEXT_GAP from this gate.**
+  Hard-coded in the intent-agent. The gate ↔ generate feedback
+  router doesn't have a path that can satisfy a vague intent
+  without a human — only `POST /intents/:id/clarify` can. If
+  we ever ship an auto-clarification agent (LLM expands the
+  intent itself), it should produce a NEW signal type, not flip
+  this flag
+- **Alert `context` JSONB stores `intentId` + `suggestions`,
+  not a new schema migration.** The `alerts` table predates the
+  intent FK; adding a column means a migration + back-compat
+  reads for older rows. The JSONB-stash pattern matches the
+  brief, keeps the migration history clean, and only adds one
+  defensive `parseContext` helper on the read side
+- **`POST /intents/:id/clarify` acknowledges in-flight alerts as
+  part of the same call.** Alternative: have the dashboard call
+  `POST /alerts/:id/acknowledge` separately. Bundling the
+  acknowledgement keeps the resume atomic from the operator's
+  perspective and prevents the case where the resume succeeds
+  but the alert lingers because the second call dropped
+- **Maintenance-sourced intents check uses BOTH `intentSource`
+  and the `[gestalt-maintenance/<type>]` text prefix.** The
+  prefix is the canonical ADR-035 marker; the explicit
+  `intentSource` field is belt-and-braces in case a future
+  caller forgets the prefix. Either is sufficient on its own
+- **Did NOT persist the clarification text on the `intents` row.**
+  Means the gate-retry leg (which doesn't carry clarification
+  in its payload) loses it and the intent-agent re-asks. This
+  edge case is logged under Pending enhancements rather than
+  fixed here — the right fix is either to persist a
+  per-intent `clarification` column OR to skip the
+  intent-agent on retry when `.gestalt/intent-spec.json`
+  already exists in the cloned tip (the existing "retry cycle
+  full re-runs all generate agents" optimisation
+  conveniently subsumes this)
+- **Dashboard `gestalt_project` localStorage key renamed to
+  `gestalt_project_id`.** The old key contained the literal
+  string `'default'` which never matched a real project. The
+  new key makes the contents-are-a-UUID contract obvious and
+  guarantees no overlap with stale storage on existing
+  operators' machines
+- **POST /interventions is now an explicit 501 with a message.**
+  Replaces the previous `throw new Error('not yet implemented')`
+  which crashed Fastify with an Unhandled-error 500. The new
+  response tells operators where the working endpoint is
+  (`POST /intents/:id/clarify`)
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Dashboard image rebuilt; full SDLC slice (vague intent → pause →
+clarification card in dashboard → resume → cycle re-runs through
+all six generate agents → gate fires) verified end-to-end. The
+gate-retry-loses-clarification edge case is a real but bounded
+follow-up; the operator's primary complaint (vague intents fail
+silently at test-agent with no alert) is resolved.
+
+Follow-ups added to Pending enhancements:
+- Clarification text is lost on a gate retry (described in detail
+  in STATE.md under Pending enhancements)
+- `POST /interventions` still a 501 stub — only matters when
+  breach / promotion UIs ship
 

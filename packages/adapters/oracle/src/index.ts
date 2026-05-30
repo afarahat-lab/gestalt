@@ -5,3 +5,4 @@
 export { OracleProjectRepository } from './repositories/projects';
 export { OracleDeploymentEventRepository } from './repositories/deployment-events';
 export { OracleMaintenanceRunRepository } from './repositories/maintenance-runs';
+export { OracleAlertRepository } from './repositories/alerts';

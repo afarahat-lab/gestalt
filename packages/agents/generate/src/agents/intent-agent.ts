@@ -10,10 +10,20 @@
  * This agent never skips. If intent is received, this agent runs.
  */
 
-import type { AgentTask, AgentResult, IntentSpec, Ambiguity } from '../types';
+import type { AgentTask, AgentResult, ClarificationNeeded, IntentSpec, Ambiguity } from '../types';
 import { buildIntentPrompt } from '../prompts/intent-prompt';
 
 const MAX_INTERNAL_RETRIES = 2;
+
+/**
+ * Intents queued by a maintenance agent carry this exact prefix on their
+ * text (see ADR-035). The clarification gate must NOT fire for them —
+ * `MaintenanceIntent` payloads are typed and self-contained; an empty
+ * `successCriteria` array on a maintenance-sourced intent is the
+ * maintenance-agent telling the generate layer "I will not synthesise
+ * tests; just apply the structural change."
+ */
+const MAINTENANCE_PREFIX = '[gestalt-maintenance/';
 
 /**
  * Runs the intent agent for the given task.
@@ -34,10 +44,57 @@ export async function runIntentAgent(
 
   for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
     try {
-      const prompt = buildIntentPrompt(task.contextSnapshot, attempt);
+      const prompt = buildIntentPrompt(task.contextSnapshot, attempt, task.clarification);
       const raw = await llmCall(prompt);
       const spec = parseIntentSpec(raw, task.correlationId, rawIntentText);
       validateIntentSpec(spec);
+
+      // Clarification gate. Runs AFTER the LLM call (we trust the LLM's
+      // structured output to drive the decision, not a pre-flight regex).
+      // Skipped for maintenance-sourced intents — those are typed
+      // `MaintenanceIntent` objects, not free-form vague text, so even
+      // an empty successCriteria array is a legitimate signal that the
+      // maintenance agent didn't synthesise tests.
+      const clarificationNeeded = needsClarification(spec, rawIntentText, task.intentSource);
+      if (clarificationNeeded) {
+        return {
+          agentRole: 'intent-agent',
+          status: 'clarification-needed',
+          clarificationNeeded,
+          artifacts: [
+            // Still persist the intent-spec — the resume cycle will
+            // overwrite it with a better one, and the operator may want
+            // to see what the LLM extracted even when it isn't enough.
+            {
+              id: crypto.randomUUID(),
+              correlationId: task.correlationId,
+              type: 'design',
+              path: '.gestalt/intent-spec.json',
+              content: JSON.stringify(spec, null, 2),
+              producedBy: 'intent-agent',
+              createdAt: new Date(),
+            },
+          ],
+          signals: [
+            {
+              id: crypto.randomUUID(),
+              correlationId: task.correlationId,
+              type: 'CONTEXT_GAP',
+              severity: 'high',
+              sourceAgent: 'intent-agent',
+              message: `Intent requires clarification: ${clarificationNeeded.reason}`,
+              // Cannot be auto-resolved by the gate's retry loop —
+              // only a human-supplied clarification (POST /clarify) can
+              // make progress. Routes through the alerts surface, not
+              // through the gate ↔ generate feedback router.
+              autoResolvable: false,
+              createdAt: new Date(),
+            },
+          ],
+          tokensUsed: 0,
+          durationMs: Date.now() - startedAt,
+        };
+      }
 
       return {
         agentRole: 'intent-agent',
@@ -133,8 +190,55 @@ function validateIntentSpec(spec: IntentSpec): void {
 }
 
 /**
+ * Returns a `ClarificationNeeded` describing why the cycle must pause,
+ * or `null` if the spec is good enough to proceed. Maintenance-sourced
+ * intents are exempted up front: their text always carries the
+ * `[gestalt-maintenance/<type>]` prefix the maintenance runner adds,
+ * and their structure is governed by ADR-035, not by operator prose.
+ */
+function needsClarification(
+  spec: IntentSpec,
+  rawIntentText: string,
+  intentSource: 'human' | 'maintenance-agent' | undefined,
+): ClarificationNeeded | null {
+  if (intentSource === 'maintenance-agent') return null;
+  if (rawIntentText.startsWith(MAINTENANCE_PREFIX)) return null;
+
+  const suggestions = [
+    'Describe the specific feature you want to build',
+    'Include what the feature should do and what inputs/outputs it has',
+    'Describe what "done" looks like — what can a user do after this is built?',
+  ];
+
+  if (spec.successCriteria.length === 0) {
+    return {
+      reason: 'Intent is too vague — no success criteria could be extracted.',
+      suggestions,
+    };
+  }
+
+  const highImpact = spec.ambiguities.find((a) => a.impactIfWrong === 'high');
+  if (highImpact) {
+    return {
+      reason: `High-impact ambiguity: ${highImpact.description}`,
+      suggestions: [
+        `Choose between: ${highImpact.options.join(' / ')}`,
+        ...suggestions,
+      ],
+    };
+  }
+
+  return null;
+}
+
+/**
  * Converts high-impact ambiguities into CONTEXT_GAP signals.
  * Low and medium impact ambiguities are documented but do not signal.
+ *
+ * Note: when `needsClarification` returns non-null the clarification
+ * gate fires first and we never reach this function — so the
+ * "low/medium ambiguities only" framing still holds for the
+ * completed-status path.
  */
 function buildAmbiguitySignals(
   ambiguities: Ambiguity[],

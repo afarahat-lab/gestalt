@@ -199,6 +199,58 @@ export interface RepositoryRegistry {
   projects: ProjectRepository;
   deploymentEvents: DeploymentEventRepository;
   maintenanceRuns: MaintenanceRunRepository;
+  alerts: AlertRepository;
+}
+
+// ─── Alert repository ─────────────────────────────────────────────────────────
+
+/**
+ * Operator-facing notification of something the platform cannot decide
+ * on its own. Today's producers:
+ *   - clarification-needed: intent-agent paused the cycle (free-form
+ *     intent too vague — see ADR-007 + the 2026-05-30 clarification
+ *     session)
+ *   - GOLDEN_PRINCIPLE_BREACH: gate / promotion-agent escalated
+ *
+ * Persisted in the `alerts` table (migration 001). The `intent_id` and
+ * action-specific payload (e.g. `suggestions` for clarification alerts)
+ * live in the `context` JSONB column so adding a new alert type does
+ * not require a schema migration.
+ */
+export type AlertType =
+  | 'clarification-needed'
+  | 'GOLDEN_PRINCIPLE_BREACH'
+  | 'promotion-pending';
+
+export type AlertRequiredAction =
+  | 'provide-clarification'
+  | 'acknowledge-breach'
+  | 'approve-promotion'
+  | 'reject-promotion';
+
+export interface AlertRecord {
+  id: string;
+  correlationId: string;
+  intentId: string | null;
+  type: AlertType;
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  title: string;
+  description: string;
+  requiredAction: AlertRequiredAction;
+  context: Record<string, unknown>;
+  createdAt: Date;
+  acknowledgedAt: Date | null;
+  acknowledgedBy: string | null;
+}
+
+export interface AlertRepository extends BaseRepository {
+  create(
+    alert: Omit<AlertRecord, 'id' | 'createdAt' | 'acknowledgedAt' | 'acknowledgedBy'>,
+  ): Promise<AlertRecord>;
+  findById(id: string): Promise<AlertRecord | null>;
+  findUnacknowledged(): Promise<AlertRecord[]>;
+  findByCorrelationId(correlationId: string): Promise<AlertRecord[]>;
+  acknowledge(id: string, userId: string): Promise<AlertRecord>;
 }
 
 // ─── Maintenance run repository (ADR-018, ADR-019, ADR-035) ───────────────────

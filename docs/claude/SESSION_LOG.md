@@ -1788,3 +1788,262 @@ Follow-ups added to Pending enhancements:
   the root level). Pre-existing dead config noticed during the
   audit for this session; cleanup, not a behavior change
 
+---
+
+### Session 2026-05-31 — Claude Code (intent clarification flow + dashboard IntentFeed bug fix)
+
+Closes a long-standing bad UX: vague intents (e.g. "make it better")
+used to grind through three generate agents and then fail at the
+test-agent with `CONTEXT_GAP No success criteria`, with no actionable
+operator surface. Now they pause at the intent-agent itself, create an
+operator-facing alert with three suggested clarifications + a
+textarea, and resume cleanly once the operator submits a refinement.
+Also fixes the pre-existing IntentFeed bug (`projectId` always
+`'default'` → failed intents invisible in the dashboard).
+
+Changed:
+- `packages/agents/generate/src/types.ts`:
+  - `AgentStatus` gained `'clarification-needed'` — distinct from
+    `failed`. The agent ran successfully but discovered the input
+    is too vague to proceed; semantically the cycle "paused", not
+    "failed"
+  - New `ClarificationNeeded` shape `{ reason, suggestions: string[] }`
+    + optional `clarificationNeeded?: ClarificationNeeded` on
+    `AgentResult`. Orchestrator copies these into the alert row
+  - `AgentTask` gained `intentSource?: 'human' | 'maintenance-agent'`
+    and `clarification?: string` — threaded into the intent-agent's
+    task so it can (a) skip the clarification gate for
+    maintenance-sourced intents and (b) fold the operator's
+    clarification into the prompt on resume
+- `packages/agents/generate/src/agents/intent-agent.ts`:
+  - New `needsClarification(spec, rawIntentText, intentSource)`
+    helper. Exempts maintenance-sourced intents (the
+    `[gestalt-maintenance/<type>]` prefix is the canonical
+    detection per ADR-035, and `intentSource === 'maintenance-agent'`
+    is a belt-and-braces second check). Returns a typed
+    `ClarificationNeeded` when `spec.successCriteria.length === 0`
+    or when any ambiguity has `impactIfWrong === 'high'`
+  - The clarification gate runs AFTER the LLM call — we trust the
+    LLM's structured output to drive the decision, not a
+    pre-flight regex on the raw intent string
+  - Emits a single CONTEXT_GAP signal with `autoResolvable: false`
+    (the gate's retry router must never auto-resolve these — only
+    a human clarification can make progress) and an `.gestalt/intent-spec.json`
+    artifact carrying whatever the LLM did extract (the operator
+    may want to see the half-built spec when deciding how to
+    refine)
+- `packages/agents/generate/src/prompts/intent-prompt.ts`: new
+  optional `clarification?: string` parameter. When supplied, the
+  prompt gains an "## Operator clarification" section that includes
+  the text verbatim and instructs the LLM to base
+  `successCriteria` on the clarification rather than the original
+  intent alone
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  - `IntentTaskPayload`: `text` and `projectId` are now optional so
+    the resume leg can omit them (the orchestrator hydrates both
+    from `intents.findById(payload.intentId)`)
+  - New `intentSource` payload field — defaults to the persisted
+    `IntentRecord.source` if absent, so the gate's retry leg sees
+    the right value too
+  - `drivePlan` takes a `DrivePlanOptions { intentSource,
+    clarification }` argument and threads both into every
+    intent-agent task it creates
+  - Replaced the previous CONTEXT_GAP detection block with a
+    structural check `result.status === 'clarification-needed'`.
+    On match: `alerts.create({ type: 'clarification-needed',
+    severity: 'high', title, description, requiredAction:
+    'provide-clarification', context: { suggestions, intentId } })`,
+    emit `alert.created` SSE, transition intent to
+    `waiting-for-clarification`, flip
+    `plan.state = 'waiting_for_clarification'`
+- `packages/core/src/repository/index.ts`:
+  - New `AlertRecord`, `AlertType`
+    (`'clarification-needed' | 'GOLDEN_PRINCIPLE_BREACH' |
+    'promotion-pending'`), `AlertRequiredAction`
+    (`'provide-clarification' | 'acknowledge-breach' |
+    'approve-promotion' | 'reject-promotion'`), and
+    `AlertRepository` interface (`create / findById /
+    findUnacknowledged / findByCorrelationId / acknowledge`)
+  - `RepositoryRegistry` gained `alerts`. Re-exported from
+    `@gestalt/core` so consumers see the new symbols
+- `packages/adapters/postgres/src/repositories/alerts.ts` (new):
+  `PostgresAlertRepository`. The schema-001 `alerts` table has no
+  `intent_id` column, so the repo stashes `intentId` (and
+  type-specific payload such as `suggestions`) inside the
+  `context` JSONB column. Insert uses an explicit `::jsonb` cast
+  (without it postgres' implicit text→jsonb is a quote-wrap, not a
+  parse — same trap as `maintenance_runs.findings`). New
+  `parseContext` helper handles postgres.js's two possible read
+  shapes (parsed object vs raw JSON string) the same way
+  `parseFindings` does. Lifts `intentId` out of context onto the
+  read-side record for ergonomics
+- `packages/adapters/{oracle,mssql}/src/repositories/alerts.ts`
+  (new): throw-stub `*AlertRepository` classes so interface drift
+  in core forces a build break here
+- `packages/adapters/postgres/src/index.ts`,
+  `packages/adapters/{oracle,mssql}/src/index.ts`: wire the new
+  `PostgresAlertRepository` / re-export the stubs
+- `packages/server/src/oversight/routes.ts`:
+  - Replaced the `GET /alerts` and `GET /alerts/:id` throw-stubs
+    with real handlers backed by `AlertRepository`. The list
+    endpoint defaults to `acknowledged=false` (matches the
+    dashboard's request shape) with optional `severity` filter
+  - New `POST /alerts/:id/acknowledge` for explicit dashboard
+    use (the clarification flow auto-acknowledges via
+    `POST /intents/:id/clarify`, so this is mostly belt-and-braces)
+  - `POST /interventions` reduced to a 501 stub with a clear
+    message pointing operators at `POST /intents/:id/clarify` —
+    breach / promotion UIs aren't shipping yet
+- `packages/server/src/routes/intents.ts`: `POST /intents/:id/clarify`
+  rewritten with the full side-effect chain. Acknowledges every
+  in-flight `clarification-needed` alert for the correlationId
+  before dispatching the resume, omits `projectId` + `text` from
+  the resume payload (orchestrator hydrates them from
+  `intents.findById`), audit-logs the operator's clarification
+  text via `audit.append` (GP-002 — truncated to 4 KB), and
+  returns `{ resumed: true, acknowledgedAlerts: N }`. Empty
+  `clarification` body → 400 with a clear message
+- `packages/dashboard/src/types.ts`: new `ProjectSummary` type
+- `packages/dashboard/src/api/client.ts`:
+  - `clarifyIntent` body shape adjusted (`ambiguityId` now optional)
+    and return shape includes `acknowledgedAlerts: number`
+  - New `listProjects()` → `{ data: ProjectSummary[] }`
+  - New `acknowledgeAlert(id)` → `{ data: Alert }`
+- `packages/dashboard/src/views/Alerts.tsx`: clarification card
+  branch added. Renders the `?` badge in addition to the existing
+  severity badge, the suggestions list (defensive
+  `Array.isArray` check on the JSONB context), the textarea
+  with a useful placeholder, and a "resume intent" button. Submit
+  flow extracts `intentId` from `alert.context.intentId`, posts
+  to `/intents/:id/clarify`, shows
+  "✓ Clarification submitted — resuming..." for 1.2 s, then
+  removes the card. Also subscribes to `intent.status-changed`
+  SSE so the list refreshes when other tabs clear an alert
+- `packages/dashboard/src/views/IntentFeed.tsx`: pre-existing
+  bug fixed. Was reading `projectId` from
+  `localStorage.getItem('gestalt_project')` with fallback
+  `'default'` — the literal string `'default'` never matched a
+  real `project_id` and `listIntents` always returned zero rows
+  (so failed intents had no trace in the dashboard). Now fetches
+  `/projects` on mount, persists the selected id under
+  `gestalt_project_id`, and renders a `<select>` dropdown in the
+  page header listing every project the user can see. No status
+  filter is applied — the feed shows the full intent timeline
+  including `failed` and `waiting-for-clarification`. Empty
+  states distinguish between "no project registered" and
+  "no intents yet"
+
+Verified live against `trackeros`:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt, `Up (healthy)`. Login as `a@b.c`
+  (existing operator, password supplied for this verification
+  session and redacted from output)
+- **Submitted intent "make it better"** (correlationId
+  `61fd59a6-3b78-40af-9f82-d9be6364934e`). 2 s wall-clock to the
+  paused state
+- `agent_executions`: one row (`intent-agent / completed / 1967 ms`).
+  No downstream agents ran
+- `signals`: one CONTEXT_GAP row,
+  `Intent requires clarification: Intent is too vague — no
+  success criteria could be extracted.`, severity `high`,
+  `autoResolvable: false`
+- `alerts`: one row, `type: clarification-needed`, severity
+  `high`, `requiredAction: provide-clarification`, context JSONB
+  carries `suggestions: [...3 items]` + `intentId`
+- `intents.status`: `waiting-for-clarification`
+- **GET /alerts** returned the alert with `intentId` populated and
+  `context` as a real object (after the `parseContext` fix —
+  before it, postgres.js was returning context as a raw JSON
+  string and the dashboard's
+  `alert.context['suggestions']` was `undefined`)
+- **Dashboard verified in a real headless Chrome:**
+  - Login → Alerts tab shows "1 requiring attention"
+  - Clarification card renders with `?` badge, "clarification-needed"
+    tag, title, description, all three suggestion bullets, the
+    textarea with placeholder, and the "resume intent" button.
+    Screenshot `02-alert-expanded.png` matches the brief exactly
+  - Typed clarification + clicked "resume intent" → card
+    vanished, page transitioned to the empty-state
+    "No alerts — platform running autonomously" within 1.2 s.
+    Screenshot `03-after-submit.png`
+- **Resume cycle:** intent transitioned `waiting-for-clarification
+  → generating → in-review` within ~22 s. All six generate
+  agents ran (intent-agent re-ran with the operator's
+  clarification text in the prompt; design / context skipped;
+  code-agent 12.5 s; test-agent 2.4 s); the gate then dispatched
+  its own constraint-agent + review-agent and decided on a
+  retry — which surfaced the gate-retry edge case noted under
+  Pending enhancements
+- **IntentFeed bug fix verified:** dashboard now shows "2 total ·
+  trackeros" with both `make it better` (`? needs input`) and
+  the older `start implementation` intent (`✗ failed` — the one
+  the operator had reported as invisible). Project selector
+  dropdown in the page header. Screenshot `04-intent-feed.png`
+
+Decisions made:
+- **Clarification gate runs AFTER the LLM call, not as a
+  pre-flight regex.** A pre-flight word-count check would
+  short-circuit useful work (an LLM may extract perfect
+  successCriteria from a 4-word intent and a long-prose intent
+  may still leave fields empty). Trust the structured output;
+  classify based on what came back
+- **`autoResolvable: false` on the CONTEXT_GAP from this gate.**
+  Hard-coded in the intent-agent. The gate ↔ generate feedback
+  router doesn't have a path that can satisfy a vague intent
+  without a human — only `POST /intents/:id/clarify` can. If
+  we ever ship an auto-clarification agent (LLM expands the
+  intent itself), it should produce a NEW signal type, not flip
+  this flag
+- **Alert `context` JSONB stores `intentId` + `suggestions`,
+  not a new schema migration.** The `alerts` table predates the
+  intent FK; adding a column means a migration + back-compat
+  reads for older rows. The JSONB-stash pattern matches the
+  brief, keeps the migration history clean, and only adds one
+  defensive `parseContext` helper on the read side
+- **`POST /intents/:id/clarify` acknowledges in-flight alerts as
+  part of the same call.** Alternative: have the dashboard call
+  `POST /alerts/:id/acknowledge` separately. Bundling the
+  acknowledgement keeps the resume atomic from the operator's
+  perspective and prevents the case where the resume succeeds
+  but the alert lingers because the second call dropped
+- **Maintenance-sourced intents check uses BOTH `intentSource`
+  and the `[gestalt-maintenance/<type>]` text prefix.** The
+  prefix is the canonical ADR-035 marker; the explicit
+  `intentSource` field is belt-and-braces in case a future
+  caller forgets the prefix. Either is sufficient on its own
+- **Did NOT persist the clarification text on the `intents` row.**
+  Means the gate-retry leg (which doesn't carry clarification
+  in its payload) loses it and the intent-agent re-asks. This
+  edge case is logged under Pending enhancements rather than
+  fixed here — the right fix is either to persist a
+  per-intent `clarification` column OR to skip the
+  intent-agent on retry when `.gestalt/intent-spec.json`
+  already exists in the cloned tip (the existing "retry cycle
+  full re-runs all generate agents" optimisation
+  conveniently subsumes this)
+- **Dashboard `gestalt_project` localStorage key renamed to
+  `gestalt_project_id`.** The old key contained the literal
+  string `'default'` which never matched a real project. The
+  new key makes the contents-are-a-UUID contract obvious and
+  guarantees no overlap with stale storage on existing
+  operators' machines
+- **POST /interventions is now an explicit 501 with a message.**
+  Replaces the previous `throw new Error('not yet implemented')`
+  which crashed Fastify with an Unhandled-error 500. The new
+  response tells operators where the working endpoint is
+  (`POST /intents/:id/clarify`)
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Dashboard image rebuilt; full SDLC slice (vague intent → pause →
+clarification card in dashboard → resume → cycle re-runs through
+all six generate agents → gate fires) verified end-to-end. The
+gate-retry-loses-clarification edge case is a real but bounded
+follow-up; the operator's primary complaint (vague intents fail
+silently at test-agent with no alert) is resolved.
+
+Follow-ups added to Pending enhancements:
+- Clarification text is lost on a gate retry (described in detail
+  in STATE.md under Pending enhancements)
+- `POST /interventions` still a 501 stub — only matters when
+  breach / promotion UIs ship
+

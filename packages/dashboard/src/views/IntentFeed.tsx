@@ -4,7 +4,7 @@ import { useDashboardApi } from '../hooks/useApi';
 import { useLiveEvent } from '../hooks/useLiveEvents';
 import { StatusBadge } from '../components/shared/StatusBadge';
 import { PageHeader, Card, EmptyState, LoadingSpinner } from '../components/shared/PageHeader';
-import type { IntentSummary } from '../types';
+import type { IntentSummary, ProjectSummary } from '../types';
 
 const PRIORITY_COLORS: Record<string, string> = {
   critical: 'var(--red)',
@@ -13,18 +13,56 @@ const PRIORITY_COLORS: Record<string, string> = {
   low:      'var(--text-dim)',
 };
 
+const PROJECT_STORAGE_KEY = 'gestalt_project_id';
+
 export function IntentFeed() {
   const api = useDashboardApi();
   const navigate = useNavigate();
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  // Persisted UUID of the currently-selected project. The previous
+  // implementation read `gestalt_project` and defaulted to the string
+  // `'default'`, which never matched a real project_id and caused
+  // listIntents to return zero rows (the "failed intents had no trace
+  // in the dashboard" bug). We now hydrate the project list from
+  // /projects and pick either the persisted ID (if still valid) or the
+  // first one.
+  const [projectId, setProjectId] = useState<string | null>(() =>
+    localStorage.getItem(PROJECT_STORAGE_KEY),
+  );
   const [intents, setIntents] = useState<IntentSummary[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('');
 
-  const projectId = localStorage.getItem('gestalt_project') ?? 'default';
+  // Hydrate projects on mount. Pick the persisted id if it still
+  // resolves; otherwise fall back to the first project the API returns.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await api.listProjects();
+        if (cancelled) return;
+        setProjects(res.data);
+        const stillValid = projectId && res.data.some((p) => p.id === projectId);
+        if (!stillValid && res.data[0]) {
+          localStorage.setItem(PROJECT_STORAGE_KEY, res.data[0].id);
+          setProjectId(res.data[0].id);
+        }
+      } catch { /* handled — load() will surface */ }
+    })();
+    return () => { cancelled = true; };
+    // intentionally only on mount; project switches go through onChange
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const load = useCallback(async () => {
+    if (!projectId) { setLoading(false); return; }
     try {
+      // No status filter — the Intent Feed shows ALL intents for the
+      // project, including failed and waiting-for-clarification.
+      // Status visibility is the operator's primary signal that
+      // something needs attention; filtering them out hid the failed
+      // intents the operator reported missing.
       const res = await api.listIntents({ projectId, limit: 50 });
       setIntents(res.data ?? []);
       setTotal(res.total ?? 0);
@@ -38,6 +76,11 @@ export function IntentFeed() {
   useLiveEvent('intent.created', () => { void load(); });
   useLiveEvent('intent.status-changed', () => { void load(); });
 
+  const handleProjectChange = (id: string) => {
+    localStorage.setItem(PROJECT_STORAGE_KEY, id);
+    setProjectId(id);
+  };
+
   const filtered = filter
     ? intents.filter(i =>
         i.status === filter ||
@@ -49,20 +92,40 @@ export function IntentFeed() {
     <div>
       <PageHeader
         title="Intents"
-        subtitle={`${total} total`}
+        subtitle={projectId
+          ? `${total} total · ${projects.find((p) => p.id === projectId)?.name ?? projectId.slice(0, 8)}`
+          : projects.length === 0 ? 'no project registered' : 'choose a project'}
         actions={
-          <input
-            placeholder="filter..."
-            value={filter}
-            onChange={e => setFilter(e.target.value)}
-            style={filterInputStyle}
-          />
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+            {projects.length > 0 && (
+              <select
+                value={projectId ?? ''}
+                onChange={(e) => handleProjectChange(e.target.value)}
+                style={filterInputStyle}
+              >
+                {projects.map((p) => (
+                  <option key={p.id} value={p.id}>{p.name}</option>
+                ))}
+              </select>
+            )}
+            <input
+              placeholder="filter..."
+              value={filter}
+              onChange={e => setFilter(e.target.value)}
+              style={filterInputStyle}
+            />
+          </div>
         }
       />
 
       <div style={{ padding: '20px 28px' }}>
         {loading ? (
           <LoadingSpinner />
+        ) : !projectId ? (
+          <EmptyState
+            message="No projects registered"
+            hint="Run `gestalt init` on the CLI to register your first project."
+          />
         ) : filtered.length === 0 ? (
           <EmptyState
             message="No intents yet"
