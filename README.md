@@ -70,7 +70,7 @@ git pull        # AGENTS.md, HARNESS.json, docs/* arrive locally
 ```bash
 gestalt run "Set up the initial project scaffold"
 gestalt status
-gestalt dashboard   # opens http://localhost:3000
+gestalt dashboard   # opens http://localhost:3000/app/
 ```
 
 Agent-generated changes are committed and pushed back to the same Git repo —

@@ -28,7 +28,11 @@ export default function App() {
 
   return (
     <ApiProvider value={client}>
-      <BrowserRouter>
+      {/* basename mirrors Vite's `base: '/app/'`. Every `navigate(...)`
+          and `<Link to=...>` is now interpreted relative to /app, so
+          `/intents/:id` inside the SPA resolves to /app/intents/:id in
+          the URL bar — distinct from the API's /intents/:id. */}
+      <BrowserRouter basename="/app">
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route

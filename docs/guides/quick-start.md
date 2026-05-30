@@ -266,8 +266,13 @@ gestalt status
 Open the dashboard:
 ```bash
 gestalt dashboard
-# Opens http://localhost:3000 in your browser
+# Opens http://localhost:3000/app/ in your browser
 ```
+
+The dashboard SPA is served at `/app/*`. The bare server URL
+(`http://localhost:3000/`) 302-redirects to `/app/`, so any URL you
+copy from the address bar is shareable — paste it into a new tab or
+send it to a teammate and the dashboard loads that exact view.
 
 ---
 

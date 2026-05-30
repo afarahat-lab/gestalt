@@ -80,7 +80,10 @@ function formatEventType(type: string): string {
 
 export async function dashboardCommand(options: { server?: string } = {}): Promise<void> {
   const config = await loadCliConfig();
-  const url = resolveServerUrl(options, config);
+  // The SPA is served at /app/*. The bare server URL 302-redirects there,
+  // but opening the canonical URL directly avoids a redirect hop and
+  // shows operators the path their copied URLs will carry.
+  const dashboardUrl = `${resolveServerUrl(options, config)}/app/`;
 
   const spinner = createSpinner('Opening dashboard...');
   spinner.start();
@@ -88,15 +91,15 @@ export async function dashboardCommand(options: { server?: string } = {}): Promi
   try {
     const { exec } = await import('child_process');
     const command = process.platform === 'darwin'
-      ? `open "${url}"`
+      ? `open "${dashboardUrl}"`
       : process.platform === 'win32'
-        ? `start "${url}"`
-        : `xdg-open "${url}"`;
+        ? `start "${dashboardUrl}"`
+        : `xdg-open "${dashboardUrl}"`;
 
     exec(command);
-    spinner.succeed(`Dashboard opened at ${c.info(url)}`);
+    spinner.succeed(`Dashboard opened at ${c.info(dashboardUrl)}`);
   } catch {
     spinner.stop();
-    console.log(`Open your browser and navigate to: ${c.info(url)}`);
+    console.log(`Open your browser and navigate to: ${c.info(dashboardUrl)}`);
   }
 }

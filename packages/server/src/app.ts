@@ -79,29 +79,58 @@ export async function createApp(
 
   // ─── Dashboard static files ────────────────────────────────────────────────
   //
-  // fastify-static handles the asset bytes (`/`, `/index.html`,
-  // `/assets/...`). The SPA fallback below serves `index.html` for any
-  // unknown GET path so client-side routing (`/login`, `/agents`, etc.)
-  // can take over inside the SPA. `decorateReply` MUST be true — the
-  // fallback handler calls `reply.sendFile('index.html')`, which is the
-  // helper the plugin attaches when decorateReply is on.
+  // The SPA lives at /app/* so its routes never collide with API paths
+  // (the previous /intents/:id and /alerts collisions made deep-linking
+  // from the dashboard impossible — pasting a copied URL into a new tab
+  // hit the API and returned JSON). Now:
+  //
+  //   /app/                    → dashboard index.html (Vite-built bundle)
+  //   /app/assets/<hash>.{js,css} → fastify-static serves the bundle
+  //   /app/intents/:id, /app/login, /app/agents, … → SPA fallback serves
+  //                              index.html; React Router takes over
+  //   /                        → 302 redirect to /app/ (so `gestalt
+  //                              dashboard` users can still type the
+  //                              bare URL and land in the right place)
+  //   anything else            → either a registered API route, or 404
+  //
+  // fastify-static is mounted with `prefix: '/app'`. The not-found
+  // handler is the SPA fallback ONLY for `/app/*` GETs; everything else
+  // falls through to the API's 404. `decorateReply` must stay at the
+  // default (true) so `reply.sendFile()` is available to the fallback.
 
   const dashboardDist = join(__dirname, '..', '..', 'dashboard', 'dist');
   try {
     await app.register(staticPlugin, {
       root: dashboardDist,
-      prefix: '/',
+      prefix: '/app/',
     });
 
-    // SPA fallback — any GET path that isn't a known API route or a
-    // static asset serves `index.html`. The client-side router renders
-    // the appropriate view; the SPA's `RequireAuth` guard handles
-    // unauthenticated state by routing to `/login`.
+    // Convenience redirect — `gestalt dashboard` opens `<serverUrl>/app/`
+    // directly, but a human typing the bare URL into the address bar
+    // shouldn't get an opaque 401 from the API. 302 takes them to the
+    // SPA root.
+    app.get('/', async (_request, reply) => {
+      return reply.redirect(302, '/app/');
+    });
+
+    // SPA fallback. Three branches:
+    //  - GET under /app/* that didn't match a real file → serve
+    //    index.html so React Router can render the right view
+    //    (`/app/login`, `/app/intents/:id`, etc.)
+    //  - Non-GET to anywhere unknown → 404 JSON (a stray write should
+    //    never silently land in the SPA bucket)
+    //  - GET to anywhere outside /app/* that isn't an API route → 404
+    //    JSON (a typo at `/intnts` should fail loudly, not serve an
+    //    `index.html` whose asset refs point at /app/assets and so
+    //    silently break in the browser)
     app.setNotFoundHandler((request, reply) => {
       if (request.method !== 'GET') {
         return reply.code(404).send({ error: 'Not found' });
       }
-      return reply.sendFile('index.html');
+      if (request.url.startsWith('/app/') || request.url === '/app') {
+        return reply.sendFile('index.html');
+      }
+      return reply.code(404).send({ error: 'Not found' });
     });
   } catch {
     log.warn('Dashboard dist not found — serving API only. Run `pnpm build` in dashboard package.');

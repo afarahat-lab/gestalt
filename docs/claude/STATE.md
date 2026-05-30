@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-30 (Claude Code — dashboard login page reachable + SPA fallback fix)
+**Last updated:** 2026-05-30 (Claude Code — SPA mounted under /app/* for shareable deep links)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -26,21 +26,27 @@ the historical record of how the state evolved._
   `003_projects`, `004_deployments`, `005_maintenance`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
-- **Dashboard SPA reachable in the browser.** `gestalt dashboard`
-  opens the server URL; the server serves the React SPA from
-  `packages/dashboard/dist/` via `fastify-static` mounted at `/`. The
-  auth preHandler skips itself for GET requests whose path does not
-  start with one of the known API prefixes (`/auth`, `/admin`,
-  `/health`, `/status`, `/intents`, `/projects`, `/maintenance`,
-  `/events`, `/alerts`, `/interventions`) — so `/`, `/login`,
-  `/assets/*`, `/agents`, `/gate`, `/deployments`, etc. all load
-  unauthenticated. The SPA boots, reads the JWT from `localStorage`,
-  and bounces to its own `/login` view if absent. Non-GET methods to
-  non-API paths still require auth. The SPA fallback in
-  `setNotFoundHandler` serves `index.html` for any unknown GET path
-  so client-side routing works (`decorateReply` on the static plugin
-  must be left at its default of `true` — the fallback calls
-  `reply.sendFile('index.html')`)
+- **Dashboard SPA reachable in the browser, deep-linkable, no path
+  collisions with the API.** `gestalt dashboard` opens
+  `<serverUrl>/app/`; the server serves the React SPA from
+  `packages/dashboard/dist/` via `fastify-static` mounted at the
+  `/app/` prefix. Vite is built with `base: '/app/'` so asset URLs in
+  the built `index.html` reference `/app/assets/<hash>.{js,css}`.
+  React Router uses `<BrowserRouter basename="/app">`, so every
+  `navigate('/intents/${id}')` inside the SPA resolves to
+  `/app/intents/${id}` in the URL bar. The API still owns the root
+  and bare paths (`/intents/:id`, `/alerts`, etc.) — the URL spaces
+  are now fully disjoint, which means **dashboard URLs are
+  shareable**: copy from the address bar, paste in a new tab, and
+  the dashboard loads that exact view (RequireAuth bounces to
+  `/app/login` if no token, otherwise renders the deep-linked
+  component). The auth preHandler bypasses GET requests under
+  `/app/*` only; non-GET methods always require auth. The bare
+  server URL (`/`) issues a 302 redirect to `/app/` for convenience.
+  The not-found handler is the SPA fallback only for `/app/*` GETs;
+  any other unknown GET (e.g. a typo at `/intnts`) returns 404 JSON
+  instead of silently serving the SPA shell (whose asset refs would
+  break)
 - First-boot bootstrap verified end-to-end: `gestalt init-admin` creates
   admin + JWT; `gestalt login` authenticates; `GET /auth/me` returns user
 - **CLI server URL is fully configurable.** `gestalt config show` /
@@ -294,14 +300,15 @@ the historical record of how the state evolved._
 8. `gestalt run "<intent>"` — submit work to agents
 
 **Pending enhancements (design in chat first):**
-- **SPA deep-link collisions with API paths.** The dashboard's
-  `/intents/:id` and `/alerts` SPA routes collide with the registered
-  API routes at the same paths. Today, typing those URLs directly into
-  the browser hits the API handler and returns JSON (401 if
-  unauthenticated). Resolving requires moving the SPA under a prefix
-  (`/dashboard/*`) or the API under one (`/api/*`); both are bigger
-  refactors. Workaround for now: navigate within the SPA, do not
-  type API URLs into the address bar
+- **Return-URL preservation across login.** Pasting `/app/intents/<id>`
+  in a fresh tab today bounces to `/app/login` and after sign-in
+  lands on `/app/` (the intent ID is dropped). Small SPA-only change —
+  `useLocation()` + `?from=` query param in the `RequireAuth` Navigate
+  and the Login view's post-success `navigate(...)`. ~10 minutes
+- **Vite dev-server proxy `/api` entry is dead.** The proxy in
+  `packages/dashboard/vite.config.ts` forwards `/api → localhost:3000`
+  but the server has no routes under `/api`. Pre-existing dead
+  config; remove on the next dashboard-config touch
 - **Encrypt Git PATs at rest.** `project_git_credentials.token` is plain
   text. Documented TODO in `repositories/projects.ts`. Pick a key-management
   approach before any shared/production use

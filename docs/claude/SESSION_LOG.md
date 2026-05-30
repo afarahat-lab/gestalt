@@ -1624,3 +1624,167 @@ report is resolved end-to-end: dashboard reachable, login page
 renders, SPA client-side routing works, API auth unchanged for
 unauthenticated requests.
 
+---
+
+### Session 2026-05-30 — Claude Code (SPA mounted under /app/* for shareable deep links)
+
+Closes the Pending enhancement from the previous session: dashboard
+URLs were not shareable because the SPA's `/intents/:id` and `/alerts`
+routes collided with API routes at the same paths. Pasting a URL
+copied from the dashboard into a new tab hit the API handler and
+returned JSON 401 instead of the dashboard view. Operator-flagged as
+a real UX issue; resolved by moving the entire SPA under a `/app/*`
+prefix so the URL spaces are disjoint.
+
+Changed:
+- `packages/dashboard/vite.config.ts`: added `base: '/app/'`. The
+  built `index.html` now references `/app/assets/<hash>.{js,css}`
+  instead of `/assets/<hash>.{js,css}`. Vite handles every absolute
+  asset URL in the bundle automatically — no per-file edits needed
+- `packages/dashboard/src/App.tsx`:
+  `<BrowserRouter>` → `<BrowserRouter basename="/app">`. Every
+  `navigate(...)`, `<Link to=...>`, `<NavLink to=...>`, and
+  `<Navigate to=...>` in the SPA is now interpreted relative to
+  `/app`; e.g. the Login view's post-success `navigate('/')`
+  resolves to `/app/` in the URL bar, the Layout's `navigate('/login')`
+  becomes `/app/login`, IntentFeed's
+  `navigate(\`/intents/${id}\`)` becomes `/app/intents/${id}`. The
+  audit upfront (grep across the SPA) confirmed no string-
+  concatenated absolute URLs would need separate edits
+- `packages/server/src/app.ts`:
+  - `staticPlugin` prefix changed from `/` to `/app/`
+  - New `app.get('/', ...)` handler 302-redirects to `/app/`. The
+    bare URL is what operators type by hand and what older sessions
+    of `gestalt dashboard` left in their history; the redirect lands
+    them in the SPA without an opaque 401
+  - `setNotFoundHandler` rewritten as a three-branch dispatch:
+    non-GET → 404 JSON; GET under `/app/` (or exact `/app`) → serve
+    `index.html` (SPA fallback for client-side routes like
+    `/app/login`, `/app/intents/:id`); anything else → 404 JSON.
+    Without that last branch, a typo at `/intnts` would silently
+    serve the SPA shell whose asset refs now point at
+    `/app/assets/...` and so the browser would render a blank page
+- `packages/server/src/auth/middleware.ts`:
+  - Dropped the `API_PATH_PREFIXES` list and `isApiPath` helper —
+    no longer needed because the SPA bucket is now a single prefix
+  - New `isSpaPath(url)` matches `/app` or `/app/*`
+  - Auth preHandler bypass simplified to
+    `if (request.method === 'GET' && isSpaPath(request.url)) return;`
+  - Added `'GET /'` to `PUBLIC_ROUTES` so the new redirect handler
+    can fire without auth (it's a registered route, so the preHandler
+    runs before the handler)
+- `packages/cli/src/commands/logs.ts`: `dashboardCommand` now opens
+  `${resolveServerUrl(...)}/app/` instead of the bare URL. The 302
+  on `/` would still get operators there if they type the bare URL,
+  but the CLI shows the canonical path so users learn the URL shape
+  their copied URLs will carry
+- `docs/guides/quick-start.md`: Step 9 dashboard snippet updated —
+  the comment now reads "Opens http://localhost:3000/app/" and a
+  short paragraph explains the shareable-URL property
+
+Verified live end-to-end. Dashboard image rebuilt
+(`pnpm --filter @gestalt/dashboard build` regenerates the asset
+hashes), server image rebuilt
+(`docker-compose up -d --build server`). Server running healthy.
+
+Server-side smoke (curl, every routing branch):
+- `GET /` → `302  Location=http://localhost:3000/app/` ✅
+- `GET /app/` → `200 text/html; 701 bytes` ✅
+- `GET /app/login` → `200 text/html; 701 bytes` (SPA fallback) ✅
+- `GET /app/intents/abc-123` → `200 text/html; 701 bytes`
+  (deep-link via SPA fallback) ✅
+- `GET /app/assets/index-BpHu9QYW.js` → `200 application/javascript;
+  198,701 bytes` ✅
+- `GET /intents` → `401 application/json` (API unchanged) ✅
+- `GET /alerts` → `401 application/json` (was the SPA collision;
+  now unambiguously API) ✅
+- `GET /intnts` (typo, unauthenticated) → `401 application/json`
+  (auth fires before the not-found handler) ✅
+- `GET /intnts` (typo, WITH auth) → `404 application/json`
+  (proves the not-found handler returns proper 404 instead of
+  silently serving the SPA shell) ✅
+- `POST /` → `401` ✅
+- `POST /app/something` (with auth) → `404 application/json` ✅
+
+Browser flow (headless Chrome via CDP):
+- A. Bare `http://localhost:3000/` → 302 → `/app/login`; Login
+     view renders with email + password fields
+- B. Submit `admin@test.local` + `localadmin123` → `POST /auth/login`
+     returns 200, URL transitions to `/app/` after 400 ms, IntentFeed
+     view renders with "0 total" and "connected" SSE pill
+- C. Deep link probe in same session — navigated to `/app/agents` →
+     ActiveAgents view renders ("Active agents — idle — No agents
+     running — platform is idle") at URL `/app/agents`
+- D. **Share-URL probe** (the actual bug):
+  opened `/app/intents/share-test-id` in a fresh tab (new
+  `Target.createTarget`, no inherited localStorage) → server
+  served the SPA HTML → SPA boots, `RequireAuth` sees no token →
+  `<Navigate to="/login" replace>` runs through basename, URL
+  becomes `/app/login`, login form renders. Operator can sign in
+  exactly as if they'd opened the dashboard normally. **Before
+  this session, the same paste hit the API at `/intents/:id` and
+  returned `{"error":"Authentication required"}` JSON with no way
+  to recover in-browser.**
+- E. Inverse check — `fetch('/intents/share-test-id')` from the
+     SPA (i.e. the bare API path) still returns `401 application/json
+     {"error":"Authentication required"}`. API contract unchanged
+
+Decisions made:
+- **SPA path is `/app/*`, not `/dashboard/*` or `/ui/*`.** Three
+  characters, one syllable. The exact prefix isn't load-bearing for
+  the implementation — the operator's previous note suggested
+  `/app/*` so kept it
+- **Bare `/` gets a 302 redirect, not the SPA at `/`.** Two reasons:
+  (1) it lets operators type the bare hostname and land somewhere
+  useful; (2) it surfaces the canonical URL shape in the address
+  bar after the redirect, so the first thing they copy is already
+  `/app/...`. Considered serving the SPA at both `/` and `/app/*`
+  but that would resurrect the collision risk for any future
+  bare-path SPA route
+- **The not-found handler refuses to serve the SPA for non-`/app/*`
+  GETs**, even though that means a typo at `/intnts` shows JSON
+  404 rather than the SPA. The alternative (serve `index.html`
+  for everything) means the SPA's `<link>` + `<script>` tags
+  reference `/app/assets/...` while the URL bar shows `/intnts` —
+  if React Router can't match, the user gets a blank dashboard.
+  A clear 404 is better than that silent breakage
+- **Auth middleware: `GET /` is in `PUBLIC_ROUTES`, not bypassed
+  via `isSpaPath`.** They're semantically different — `GET /` is
+  a registered route that exists to redirect; `isSpaPath` bypasses
+  the auth check entirely for fastify-static's static-asset reads.
+  Keeping them separate documents the intent
+- **CLI opens `<url>/app/` explicitly** rather than relying on the
+  302. The redirect would still get operators there, but the CLI's
+  output (`Dashboard opened at http://localhost:3000/app/`) is what
+  most users will copy to share with teammates, so it should show
+  the canonical URL
+- **Did NOT add return-URL preservation across the post-login
+  redirect.** The SPA's Login view does `navigate('/')` on success
+  (which resolves to `/app/`). A share-URL flow currently: paste
+  `/app/intents/foo` → bounce to `/app/login` → after login, land
+  on `/app/` (Intents list), NOT back on the original intent.
+  This is a pre-existing UX gap (the basename move didn't change
+  it) — flagged as a smaller follow-up if it matters
+
+Pending-enhancement entry **"SPA deep-link collisions with API
+paths"** removed from `STATE.md` — resolved.
+
+Build status: `pnpm -r build` clean across all 12 packages. Docker
+server image rebuilt; container `Up (healthy)`. All four CLI
+layers (generate / gate / deploy / maintenance) unchanged and
+running. Dashboard SPA reachable at `/app/*` with shareable
+deep-link URLs; API contract at bare paths unchanged.
+
+Follow-ups added to Pending enhancements:
+- **Return-URL preservation through the post-login redirect.** Today
+  pasting `/app/intents/<id>` in a fresh tab bounces to `/app/login`
+  then lands on `/app/` after sign-in (the intent ID is dropped).
+  React Router's `useLocation()` + a `?from=` query param in the
+  Navigate call would preserve it. ~10 min change in `App.tsx` +
+  `Login.tsx`
+- **Vite dev-server proxy has a dead `/api` entry.** The proxy in
+  `packages/dashboard/vite.config.ts` lists `/api → localhost:3000`
+  but the server has no routes under `/api` (every API route is at
+  the root level). Pre-existing dead config noticed during the
+  audit for this session; cleanup, not a behavior change
+
