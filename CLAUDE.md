@@ -146,8 +146,8 @@ the **Current state** section below for the authoritative snapshot and the
 | `@gestalt/adapter-oracle` | ✅ compiles (stub) |
 | `@gestalt/adapter-mssql` | ✅ compiles (stub) |
 | `@gestalt/agents-generate` | ✅ compiles |
-| `@gestalt/agents-quality-gate` | ✅ compiles (stub) |
-| `@gestalt/agents-deploy` | ✅ compiles (stub) |
+| `@gestalt/agents-quality-gate` | ✅ compiles |
+| `@gestalt/agents-deploy` | ✅ compiles |
 | `@gestalt/agents-maintenance` | ✅ compiles |
 | `@gestalt/registry` | ✅ compiles |
 | `@gestalt/server` | ✅ compiles |
@@ -400,12 +400,18 @@ Operator caveats:
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-30 (Claude Code — maintenance layer v1)
+**Last updated:** 2026-05-30 (Claude Code — docs refresh after maintenance layer)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
 **What is built and working:**
 - All 8 architecture layers fully designed and documented
+- **All four SDLC layers fully implemented end-to-end:** generate,
+  quality-gate, deploy, maintenance. The closed loop runs:
+  `human intent → generate → gate → deploy → deployed`, plus
+  `maintenance scheduler → queues typed MaintenanceIntent → back into
+  generate`. See per-layer detail bullets below; per-agent run lifecycles
+  are summarised in the "Session log" entries dated 2026-05-29 / 30
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
 - All five migrations apply on startup: `001_initial`, `002_local_auth`,
@@ -561,21 +567,28 @@ Operator caveats:
 - `GET /status`, `GET /status/agents`, `GET /intents`, `GET /intents/:id`
   all return 200
 
-**What is not yet built:**
+**Implemented with caveats (worth knowing):**
 - `@gestalt/agents-quality-gate` — constraint-agent + llm-review-agent +
-  gate orchestrator implemented (above). lint-agent / security-agent /
-  test-runner-agent still stubs (need pnpm-install-in-clone pipeline)
+  gate orchestrator implemented and exercised live. lint-agent /
+  security-agent / test-runner-agent remain stubs (need a
+  pnpm-install-in-clone pipeline to run real tooling); the package
+  works end-to-end without them via the two implemented agents
 - `@gestalt/agents-deploy` — pr-agent + pipeline-agent + promotion-agent
-  + deploy orchestrator + PipelineAdapter (`GitHubActions` + `NoOp`)
-  implemented (above). Azure DevOps / GitLab CI / Jenkins adapters not
-  implemented — the brief's scope was one concrete adapter
-- `@gestalt/agents-maintenance` — drift-agent + alignment-agent +
-  gc-agent + evaluation-agent + node-cron scheduler + MonitoringAdapter
-  (`Prometheus` + `Datadog` + `NoOp`) implemented (above). All four
-  agents exercised live via `POST /maintenance/trigger`
-- `@gestalt/adapter-oracle` — stub (builds, ProjectRepository throws)
-- `@gestalt/adapter-mssql` — stub (builds, ProjectRepository throws)
-- `@gestalt/registry` — types and client only
+  + deploy orchestrator implemented. Two `PipelineAdapter` impls live
+  (`GitHubActions`, `NoOp`); Azure DevOps / GitLab CI / Jenkins
+  adapters intentionally not implemented (one concrete adapter was the
+  ADR-033 scope)
+- `@gestalt/agents-maintenance` — all four agents (drift, alignment,
+  gc, evaluation) + node-cron scheduler + three `MonitoringAdapter`
+  impls (`Prometheus`, `Datadog`, `NoOp`) implemented and exercised
+  live via `POST /maintenance/trigger`. Prometheus / Datadog
+  implementations not yet verified against a real monitoring instance
+
+**What is not yet built:**
+- `@gestalt/adapter-oracle` — stub (every repository method throws;
+  exists only to surface interface drift at build time)
+- `@gestalt/adapter-mssql` — same shape as oracle
+- `@gestalt/registry` — types and client only (no server, no UI)
 
 **Postgres adapter repository coverage (all real, no remaining stubs):**
 - `intents`     — full CRUD + list with paging
@@ -617,13 +630,6 @@ Operator caveats:
 8. `gestalt run "<intent>"` — submit work to agents
 
 **Pending enhancements (design in chat first):**
-- **Move the artifact push from generate-orchestrator to pr-agent.**
-  Per the original design, the orchestrator hands an in-memory artifact
-  set to the deploy-layer pr-agent, which opens a PR rather than pushing
-  to `defaultBranch`. The orchestrator currently pushes straight to
-  `defaultBranch` because pr-agent does not exist yet. When pr-agent
-  lands, move the commit/push logic there and have the orchestrator
-  pass artifacts via the gate handoff
 - **Encrypt Git PATs at rest.** `project_git_credentials.token` is plain
   text. Documented TODO in `repositories/projects.ts`. Pick a key-management
   approach before any shared/production use
@@ -1463,3 +1469,67 @@ layers (generate orchestrator, gate, deploy, maintenance scheduler)
 register on startup; migrations 001-005 apply on first run. Maintenance
 agents exercised live; queued intents flow through the generate
 orchestrator on the same code path as human-submitted intents.
+
+---
+
+### Session 2026-05-30 — Claude Code (docs refresh after maintenance layer)
+
+Documentation-only pass. No code changes. Brings the **Current build
+status** table and the **Current state** section in line with what is
+actually shipped after the maintenance-layer commit (`62faa06`).
+
+Changed:
+- `CLAUDE.md` — **Current build status** table: dropped the `(stub)`
+  qualifier from `@gestalt/agents-quality-gate` and `@gestalt/agents-deploy`.
+  Both have been fully implemented end-to-end with live verification
+  (constraint + LLM review for the gate, pr-agent + pipeline-agent +
+  promotion-agent + 2 PipelineAdapter impls for deploy). The remaining
+  `(stub)` markers on `@gestalt/adapter-oracle` and
+  `@gestalt/adapter-mssql` are correct — those are genuine throw-stubs
+- `CLAUDE.md` — **Current state → What is built and working**: added a
+  one-line summary at the top of the bullet list explicitly stating
+  all four SDLC layers (generate / gate / deploy / maintenance) are
+  fully implemented end-to-end, with a pointer to the per-layer detail
+  bullets that follow. Migrations bullet already covered all five
+  (`001`-`005`); repo coverage already listed `deploymentEvents` and
+  `maintenanceRuns`. No edits needed there
+- `CLAUDE.md` — **What is not yet built** rewritten. The previous
+  framing put `agents-quality-gate` / `agents-deploy` / `agents-maintenance`
+  under this heading with a long "implemented (above) BUT…" caveat
+  that made them read as not-built. Split into two sections:
+  **Implemented with caveats** (the three layer packages — captures
+  what's in and what's intentionally out per their respective briefs)
+  and **What is not yet built** (just the genuine non-starts:
+  `adapter-oracle`, `adapter-mssql`, `registry`)
+- `CLAUDE.md` — **Pending enhancements**: removed the "Move the
+  artifact push from generate-orchestrator to pr-agent" entry. That
+  was resolved in commit `8f8757c` (2026-05-30 single-push deploy +
+  workflow seed session); the generate orchestrator no longer mutates
+  Git at all. The corresponding `What is built and working` bullet
+  already documents this — pr-agent is now the sole writer
+
+Decisions made:
+- **Split "What is not yet built" into two headings** rather than
+  trying to keep agent packages in one section with long caveats. The
+  three layer packages are implemented and exercised; their caveats
+  (stub sub-agents, missing alternate adapters) are scoped feature
+  limits, not "not built". Operators reading the section want to know
+  what they can't do today — `adapter-oracle` / `adapter-mssql` /
+  `registry` are the honest answers
+- **Kept the per-layer detail bullets unchanged** even though they
+  duplicate the new top-line summary. Readers who scan only the
+  summary get the high-level answer; readers who need to know which
+  agent does what for debugging or onboarding still have the detail
+  paragraphs in the same section
+- **Did not edit the per-layer detail bullets to remove their now-
+  redundant verification anecdotes** (e.g. the `8f53b75d` cycle
+  description in the deploy bullet). They serve as the "is this still
+  live?" reality check for future agents and shouldn't bit-rot into a
+  marketing summary
+- **Did not touch the session log entries above this one.** Past
+  sessions are the audit trail of how the project arrived at the
+  current state and remain accurate as historical records — there is
+  no value in retro-editing them. New sessions append
+
+Build status: no code changes; build state from the previous
+`62faa06` commit is unchanged. `pnpm -r build` would still pass.
