@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-31 (Claude Code — global dashboard project selector + per-view localStorage cleanup)
+**Last updated:** 2026-05-31 (Claude Code — `/projects` returns all projects, not owner-only; defensive 401 → /login)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -147,6 +147,27 @@ the historical record of how the state evolved._
   failed intents had no trace in the dashboard). No status filter
   is applied to `listIntents` — the feed shows the full intent
   timeline for the project
+- **`GET /projects` returns ALL registered projects** to any
+  authenticated user. The previous owner-only filter
+  (`projects.list(request.user.id)` → only rows where
+  `created_by = userId`) meant that if operator A registered
+  `trackeros` and operator B logged into the dashboard, B would
+  see "No projects — run gestalt init" even though
+  `gestalt projects list` worked for A. Self-hosted small teams
+  expect every operator to see every project; the filter has been
+  switched to `projects.listAll()`. If per-project access control
+  is required later, add a `project_members` table and intersect
+  there — do NOT re-introduce the owner-only filter at this
+  endpoint
+- **ProjectContext defensively redirects to `/app/login` on 401.**
+  RequireAuth at the top of the dashboard route tree only checks
+  for the presence of a token, not its validity. A stale or
+  expired JWT used to bounce every API call to 401, which
+  ProjectContext silently caught and rendered as "No projects —
+  run gestalt init". The catch block now distinguishes
+  `ApiError.status === 401` (delete the token, hard-navigate to
+  `/app/login`) from other failures (network down, 500 — keep
+  showing the layout, set `projects: []`)
 - **Project selection is global across the entire dashboard.**
   `packages/dashboard/src/context/ProjectContext.tsx` fetches
   `/projects` once on mount, hydrates from

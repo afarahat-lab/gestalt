@@ -141,13 +141,25 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
     },
   );
 
-  // GET /projects — list projects owned by the requester
+  // GET /projects — list every registered project.
+  //
+  // Returns ALL projects, not just those owned by `request.user.id`.
+  // Gestalt is a small-team self-hosted platform: collaborators expect
+  // every operator to be able to see and submit intents against every
+  // project. The previous owner-only filter meant a project registered
+  // by operator A was invisible to operator B (the dashboard then
+  // rendered "No projects — run gestalt init" even though `gestalt
+  // projects list` worked because the CLI's JWT belonged to A).
+  //
+  // If per-project access control becomes a requirement, add a
+  // `project_members` table and intersect there; do NOT re-introduce
+  // the owner-only filter at this endpoint.
   app.get(
     '/projects',
     async (request, reply) => {
       if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
       const { projects } = getRepositories();
-      const rows = await projects.list(request.user.id);
+      const rows = await projects.listAll();
       return reply.send({ data: rows.map(toPublic) });
     },
   );

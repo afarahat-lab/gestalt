@@ -25,6 +25,7 @@ import React, {
   createContext, useContext, useCallback, useEffect, useMemo, useState,
 } from 'react';
 import { useDashboardApi } from '../hooks/useApi';
+import { ApiError } from '../api/client';
 import type { ProjectSummary } from '../types';
 
 const STORAGE_KEY = 'gestalt_project_id';
@@ -67,8 +68,23 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
         if (chosen) localStorage.setItem(STORAGE_KEY, chosen);
         return chosen;
       });
-    } catch {
-      // Surface as "no projects" rather than crashing the layout.
+    } catch (err) {
+      // A 401 here means the JWT in localStorage is expired or invalid.
+      // RequireAuth at the top of the tree only checks presence, not
+      // validity, so a stale token gets you onto the dashboard and
+      // then silently fails every API call. Without this branch the
+      // sidebar would show "No projects — run gestalt init" even
+      // though the operator has projects but is just signed out.
+      if (err instanceof ApiError && err.status === 401) {
+        localStorage.removeItem('gestalt_token');
+        // Hard navigate so React Router picks up the no-token state
+        // and RequireAuth bounces to /app/login.
+        window.location.href = '/app/login';
+        return;
+      }
+      // Other errors (network down, server 500) surface as "no
+      // projects" rather than crashing the layout — operator can
+      // refresh the tab.
       setProjects([]);
       setCurrentProjectIdState(null);
     } finally {

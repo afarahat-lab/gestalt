@@ -2340,3 +2340,109 @@ Follow-up added to Pending enhancements:
   dashboard skip the client-side join and let the sidebar
   badge match the filtered list in the Alerts view
 
+---
+
+### Session 2026-05-31 — Claude Code (`/projects` returns all projects + 401 → /login)
+
+Operator reported the previous session's dashboard saying
+"No projects — run gestalt init" while `gestalt projects list`
+on the same machine showed `trackeros`. Two root causes:
+
+1. **Server-side, primary:** `GET /projects` was filtering by
+   `created_by = request.user.id`. The CLI was signed in as
+   `a@b.c` (who owns the project); the dashboard session was
+   either a different user or simply the same user but the
+   previous session's brief had assumed the endpoint returned
+   "all projects for the authenticated user". The owner-only
+   filter never made sense for a small-team self-hosted
+   platform where collaborators expect every operator to see
+   every registered project.
+2. **Dashboard-side, defensive:** if the JWT in localStorage
+   was stale (expired or signed under a wiped user), every
+   API call returned 401. `RequireAuth` only checks for token
+   presence, so the dashboard rendered with a useless token
+   and silently failed every fetch. `ProjectContext`'s catch
+   block then converted the 401 into "No projects". The user
+   was stuck.
+
+Changed:
+- `packages/server/src/routes/projects.ts`:
+  `GET /projects` now calls `projects.listAll()` instead of
+  `projects.list(request.user.id)`. Comment on the route
+  explicitly documents the model ("self-hosted small team —
+  every authenticated operator can see every project") and the
+  intended migration path if access control becomes a
+  requirement (add a `project_members` table; intersect there;
+  do NOT re-introduce the owner-only filter on this endpoint)
+- `packages/dashboard/src/context/ProjectContext.tsx`: imports
+  `ApiError` from the dashboard's API client. The catch block
+  is now two-branched:
+  - `ApiError.status === 401` → `localStorage.removeItem('gestalt_token')`
+    + `window.location.href = '/app/login'`. Hard navigation so
+    React Router restarts and `RequireAuth` sends the user to the
+    login view
+  - anything else → quiet "no projects" state (lets the operator
+    refresh the tab; doesn't blow up the layout for transient
+    network blips)
+
+Verified live against the running platform:
+- `pnpm -r build` clean. Server image + dashboard bundle
+  (`index-DipB4z-Z.js`, 204 KB) rebuilt
+- **Baseline:** logged in as `a@b.c` (project owner) → 1 project
+  via `GET /projects` (trackeros). Unchanged
+- **Bug reproduction + fix:**
+  - Inserted a second user `second@test.local` directly into
+    the DB (admin/setup is one-shot — guarded for first-boot
+    only). bcrypt-hashed `opsop123` using the server image's
+    bundled `bcrypt@5.1.1`
+  - Confirmed via `gen_random_uuid()` UUID that the user is
+    distinct from the project's creator
+  - Logged in as `second@test.local` via `POST /auth/login`
+    (JWT length 259, role `operator`)
+  - `GET /projects` returns trackeros with
+    `createdBy: 9e9c4051-…` (the OTHER user's id). Pre-fix this
+    would have returned an empty array
+- **Browser drive (headless Chrome):** logged in as
+  `second@test.local`, sidebar shows the `trackeros` selector,
+  IntentFeed header reads "3 total · trackeros" and renders all
+  three existing intents (`make it better` ×2 + the older
+  `start implementation` failed). Screenshot saved. Pre-fix
+  this exact session would have shown "No projects — run
+  gestalt init" in the sidebar
+- Test user deleted afterwards; DB back to a clean
+  one-user one-project state
+
+Decisions made:
+- **Server fix at the route level**, not at the repo. The
+  `projects.list(userId)` method still exists in the
+  `ProjectRepository` interface (could be useful for an
+  "owned by me" view later) — we just don't call it from
+  `GET /projects` anymore. Cheap to keep around and avoids
+  an interface change that would ripple through
+  oracle/mssql stubs
+- **No new `?scope=mine` query parameter** to support
+  "show only my projects" today. YAGNI — the operator-facing
+  use case is "show me what's here so I can pick one"; the
+  audit trail of who created a project lives on the row
+  itself (`createdBy`). Add a query param if and when the UX
+  ever differentiates
+- **Dashboard 401 is a hard navigate, not a React Router
+  `<Navigate>`.** A redirect from inside `ProjectContext`
+  would race against the rest of the app's mounting; a
+  `window.location.href` restart guarantees the RequireAuth
+  guard runs from a clean state with the token removed.
+  Slightly heavier than a router redirect but predictable
+- **Other transient errors stay as "no projects".** The
+  dashboard should be resilient to a flaky network or a
+  brief server hiccup. Bouncing the operator to /login for
+  a single failed fetch would be infuriating. Only 401 —
+  the actual "you don't have a valid session" signal —
+  triggers the bounce
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; dashboard SPA serves the new bundle
+under `/app/*`. Both fixes verified live: the previously-
+filtered owner-only view is gone, and an expired-token
+session now bounces to login instead of showing a
+misleading empty state.
+
