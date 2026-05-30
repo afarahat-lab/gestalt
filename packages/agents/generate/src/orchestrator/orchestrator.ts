@@ -211,6 +211,15 @@ async function handleIntentTask(
       );
     }
 
+    // The DB is the source of truth for clarification text. /clarify
+    // calls `intents.saveClarification` before dispatching, so the
+    // persisted column is populated on the very first resume AND on
+    // every subsequent gate-retry dispatch (where the BullMQ payload
+    // does not carry it). Fall back to `payload.clarification` only
+    // if the DB read somehow missed it (e.g. a worker pulled the
+    // message before the UPDATE committed — very rare).
+    const clarificationText = intentRecord.clarification ?? payload.clarification ?? undefined;
+
     // Drive the plan to completion
     await drivePlan(
       plan,
@@ -221,7 +230,7 @@ async function handleIntentTask(
       childLog,
       {
         intentSource,
-        clarification: payload.clarification,
+        clarification: clarificationText,
       },
     );
 

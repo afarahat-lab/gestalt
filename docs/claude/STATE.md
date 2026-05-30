@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-31 (Claude Code — clarification flow + IntentFeed projectId bug fix)
+**Last updated:** 2026-05-31 (Claude Code — clarification text persisted on the intents row; survives gate retries)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -22,8 +22,9 @@ the historical record of how the state evolved._
   are summarised in the "Session log" entries dated 2026-05-29 / 30
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
-- All five migrations apply on startup: `001_initial`, `002_local_auth`,
-  `003_projects`, `004_deployments`, `005_maintenance`
+- All six migrations apply on startup: `001_initial`, `002_local_auth`,
+  `003_projects`, `004_deployments`, `005_maintenance`,
+  `006_intent_clarification`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
 - **Dashboard SPA reachable in the browser, deep-linkable, no path
@@ -121,6 +122,23 @@ the historical record of how the state evolved._
     all six generate agents ran in ~22 s; intent reached
     `in-review`. Browser screenshots captured of alert card + post-
     submit empty state
+  - **Clarification text persists across gate retries
+    (migration 006).** `intents.clarification TEXT NULL`;
+    `POST /intents/:id/clarify` writes the column via
+    `intents.saveClarification(id, text)` BEFORE dispatching the
+    resume task. The orchestrator reads `intentRecord.clarification`
+    on every dispatch (including the gate-retry leg, whose BullMQ
+    payload does not carry the text) and threads it into the
+    intent-agent's task. Audit-log records only
+    `{ clarificationLength: N, acknowledgedAlertIds, ip }` — the
+    text itself never leaves the DB (GP-006). Verified live
+    (`63bc2a3b`): intent-agent ran 3 times across the cycle
+    (initial pause, post-clarify resume, gate retry); each run
+    saw the persisted 156-char clarification; only ONE
+    clarification alert was ever created (the original — the
+    pre-fix bug would have created a second one on the retry
+    leg); intent reached `escalated` for an unrelated review-agent
+    GP_BREACH after the second gate review
 - **Dashboard Intent Feed now shows ALL intents, including failed
   and waiting-for-clarification.** Pre-existing bug: the feed read
   `projectId` from `localStorage.getItem('gestalt_project')` with
@@ -311,7 +329,10 @@ the historical record of how the state evolved._
 - `@gestalt/registry` — types and client only (no server, no UI)
 
 **Postgres adapter repository coverage (all real, no remaining stubs):**
-- `intents`     — full CRUD + list with paging
+- `intents`     — full CRUD + list with paging + `saveClarification`
+  (writes operator clarification text to the nullable column added
+  in migration 006; orchestrator reads it on every dispatch so it
+  survives gate-retry legs)
 - `executions`  — create, updateStatus, findByCorrelationId, findActive
 - `artifacts`   — save, findByCorrelationId (typed filter), findById
 - `signals`     — save, findByCorrelationId, findUnresolved, markResolved
@@ -356,19 +377,6 @@ the historical record of how the state evolved._
 8. `gestalt run "<intent>"` — submit work to agents
 
 **Pending enhancements (design in chat first):**
-- **Clarification text is lost on a gate retry.** After a successful
-  resume, the gate may dispatch a `generate:intent` retry (verdict
-  `fail`, auto-resolvable signals) — and that retry payload doesn't
-  carry the original `clarification` text. intent-agent re-runs
-  without it, sees no success criteria again, and creates a SECOND
-  clarification alert. Observed live (`61fd59a6` cycle in the
-  2026-05-31 session). Fix shape: persist the most recent
-  clarification on the `intents` row (or as a fixed-name artifact
-  the intent-agent reads from the working tree) so it survives
-  retries; alternatively skip the intent-agent on retry when a
-  prior `.gestalt/intent-spec.json` exists in the Git tip (this
-  also closes the related "retry cycle full re-runs all generate
-  agents" entry below)
 - **POST /interventions still a 501 stub.** The clarification flow
   bypasses it (uses `POST /intents/:id/clarify` directly because
   that endpoint owns the resume side effect). When breach

@@ -70,6 +70,24 @@ export class PostgresIntentRepository implements IntentRepository {
     return row;
   }
 
+  /**
+   * Persists the operator's clarification text. The text is intentionally
+   * NOT echoed back into any audit metadata — only its length, per
+   * GP-006 (no sensitive data in logs). Auditability is preserved via
+   * direct DB query against this column.
+   */
+  async saveClarification(id: string, clarification: string): Promise<IntentRecord> {
+    const db = getDb();
+    const [row] = await db<IntentRecord[]>`
+      UPDATE intents
+      SET clarification = ${clarification}, updated_at = NOW()
+      WHERE id = ${id}
+      RETURNING *
+    `;
+    if (!row) throw new Error(`Intent ${id} not found`);
+    return row;
+  }
+
   async list(params: {
     projectId: string;
     status?: IntentStatus;

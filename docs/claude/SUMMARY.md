@@ -14,7 +14,7 @@ content is derived._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-31 (Claude Code — clarification flow + IntentFeed projectId bug fix)
+**Last updated:** 2026-05-31 (Claude Code — clarification text persisted on the intents row; survives gate retries)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -28,8 +28,9 @@ content is derived._
   are summarised in the "Session log" entries dated 2026-05-29 / 30
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
-- All five migrations apply on startup: `001_initial`, `002_local_auth`,
-  `003_projects`, `004_deployments`, `005_maintenance`
+- All six migrations apply on startup: `001_initial`, `002_local_auth`,
+  `003_projects`, `004_deployments`, `005_maintenance`,
+  `006_intent_clarification`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
 - **Dashboard SPA reachable in the browser, deep-linkable, no path
@@ -127,6 +128,23 @@ content is derived._
     all six generate agents ran in ~22 s; intent reached
     `in-review`. Browser screenshots captured of alert card + post-
     submit empty state
+  - **Clarification text persists across gate retries
+    (migration 006).** `intents.clarification TEXT NULL`;
+    `POST /intents/:id/clarify` writes the column via
+    `intents.saveClarification(id, text)` BEFORE dispatching the
+    resume task. The orchestrator reads `intentRecord.clarification`
+    on every dispatch (including the gate-retry leg, whose BullMQ
+    payload does not carry the text) and threads it into the
+    intent-agent's task. Audit-log records only
+    `{ clarificationLength: N, acknowledgedAlertIds, ip }` — the
+    text itself never leaves the DB (GP-006). Verified live
+    (`63bc2a3b`): intent-agent ran 3 times across the cycle
+    (initial pause, post-clarify resume, gate retry); each run
+    saw the persisted 156-char clarification; only ONE
+    clarification alert was ever created (the original — the
+    pre-fix bug would have created a second one on the retry
+    leg); intent reached `escalated` for an unrelated review-agent
+    GP_BREACH after the second gate review
 - **Dashboard Intent Feed now shows ALL intents, including failed
   and waiting-for-clarification.** Pre-existing bug: the feed read
   `projectId` from `localStorage.getItem('gestalt_project')` with
@@ -317,7 +335,10 @@ content is derived._
 - `@gestalt/registry` — types and client only (no server, no UI)
 
 **Postgres adapter repository coverage (all real, no remaining stubs):**
-- `intents`     — full CRUD + list with paging
+- `intents`     — full CRUD + list with paging + `saveClarification`
+  (writes operator clarification text to the nullable column added
+  in migration 006; orchestrator reads it on every dispatch so it
+  survives gate-retry legs)
 - `executions`  — create, updateStatus, findByCorrelationId, findActive
 - `artifacts`   — save, findByCorrelationId (typed filter), findById
 - `signals`     — save, findByCorrelationId, findUnresolved, markResolved
@@ -362,19 +383,6 @@ content is derived._
 8. `gestalt run "<intent>"` — submit work to agents
 
 **Pending enhancements (design in chat first):**
-- **Clarification text is lost on a gate retry.** After a successful
-  resume, the gate may dispatch a `generate:intent` retry (verdict
-  `fail`, auto-resolvable signals) — and that retry payload doesn't
-  carry the original `clarification` text. intent-agent re-runs
-  without it, sees no success criteria again, and creates a SECOND
-  clarification alert. Observed live (`61fd59a6` cycle in the
-  2026-05-31 session). Fix shape: persist the most recent
-  clarification on the `intents` row (or as a fixed-name artifact
-  the intent-agent reads from the working tree) so it survives
-  retries; alternatively skip the intent-agent on retry when a
-  prior `.gestalt/intent-spec.json` exists in the Git tip (this
-  also closes the related "retry cycle full re-runs all generate
-  agents" entry below)
 - **POST /interventions still a 501 stub.** The clarification flow
   bypasses it (uses `POST /intents/:id/clarify` directly because
   that endpoint owns the resume side effect). When breach
@@ -452,107 +460,6 @@ content is derived._
 ---
 
 ## Recent session log entries (last 3 from SESSION_LOG.md)
-
-### Session 2026-05-30 — Claude Code (dashboard login page reachable + SPA fallback fix)
-
-Bug report from the operator: running `gestalt dashboard` opened a
-browser tab to `http://localhost:3000` which returned
-`{"error":"Authentication required"}` as JSON. No login page.
-
-Root cause was two separate bugs in the server stack:
-
-1. **Auth `preHandler` blocked every URL, including dashboard assets.**
-   The middleware compared the requested route key against a hard
-   `PUBLIC_ROUTES` set; everything else returned 401. `/`,
-   `/login`, `/assets/index-*.js`, `/agents`, `/gate` — all 401. The
-   browser never received `index.html`, so the React SPA never booted
-   to render its own `Login` view
-2. **`setNotFoundHandler` called `reply.sendFile('index.html')` while
-   the static plugin was registered with `decorateReply: false`.** That
-   option disables the `sendFile` helper, so the SPA fallback handler
-   threw `TypeError: reply.sendFile is not a function` for every path
-   that fell through to the fallback (including legitimate dashboard
-   client-side routes like `/login`)
-
-Changed:
-- `packages/server/src/auth/middleware.ts`:
-  - New `API_PATH_PREFIXES` list — `/auth`, `/admin`, `/health`,
-    `/status`, `/intents`, `/projects`, `/maintenance`, `/events`,
-    `/alerts`, `/interventions`. Mirrors the actual API surface
-    registered by the route plugins
-  - New `isApiPath(url)` helper — strips the query string, then
-    matches against the prefix list
-  - `preHandler` rewritten to bypass auth when
-    `request.method === 'GET' && !isApiPath(request.url)`. SPA paths
-    and static assets reach `fastify-static` / the SPA fallback
-    without auth; non-GET methods to non-API paths still get
-    rejected (a stray write should never land in the SPA bucket)
-- `packages/server/src/app.ts`:
-  - Removed `decorateReply: false` from the `fastify-static`
-    registration so `reply.sendFile()` is available to the fallback
-  - SPA fallback in `setNotFoundHandler` now guards on method —
-    `GET` falls through to `index.html`, everything else returns
-    a 404 JSON
-
-Verified live:
-- `pnpm --filter @gestalt/server build` clean
-- `docker-compose up -d --build server` healthy
-- `curl http://localhost:3000/` → `200 text/html` (the SPA HTML;
-  693 bytes — only the empty shell, the asset URLs are filled in
-  client-side by Vite)
-- `curl http://localhost:3000/login` → `200 text/html` (SPA fallback
-  serving `index.html`)
-- `curl http://localhost:3000/agents` → `200 text/html`
-- `curl http://localhost:3000/assets/index-<hash>.js` →
-  `200 application/javascript; 198,685 bytes` (static plugin serves
-  the real bundle)
-- `curl http://localhost:3000/assets/index-<hash>.css` →
-  `200 text/css; 1,770 bytes`
-- `curl http://localhost:3000/intents` → `401 application/json`
-  (API auth still enforced)
-- `curl -X POST http://localhost:3000/intents` → `401`
-  (write-side auth still enforced)
-- `curl -X POST http://localhost:3000/` → `401` (correct — non-GET
-  to a non-API path still falls under auth, not the SPA fallback)
-- `gestalt dashboard` opens `http://localhost:3000`; the SPA boots,
-  `RequireAuth` sees no token in localStorage and redirects to
-  `/login` where the existing `Login` view renders. Operators can
-  now sign in via the dashboard
-
-Decisions made:
-- **Path-prefix split, not Accept-header sniffing.** Considered
-  `Accept: text/html`-based routing (browser vs API), but Fastify
-  routes the registered API handler before the static plugin no
-  matter what `Accept` is — the Accept check would only matter for
-  unmatched paths, which is exactly where prefix matching already
-  works. Prefix matching is also explicit and grep-able
-- **Bypass applies to GET only.** A POST to `/` could otherwise
-  silently succeed via the SPA fallback (returning `index.html` as
-  the response body); guarded that in the fallback handler too,
-  belt-and-braces. The `isApiPath` check in middleware blocks the
-  preHandler from skipping for non-GET methods regardless
-- **Did NOT move the dashboard under a `/dashboard/*` prefix.** The
-  obvious "real" fix to the SPA-vs-API collision at `/intents/:id`
-  and `/alerts` is a path-prefix move, but that requires changing
-  Vite's `base`, the SPA's `<base href>`, every `<Link to=...>` in
-  the codebase, and the CLI's dashboard URL. Out of scope for a
-  bug-fix session. Captured as a Pending enhancement so the next
-  refactor session picks it up. Today's compromise: typing
-  `/intents/123` into the browser address bar hits the API handler
-  and returns JSON 401; navigate via the SPA's own links instead
-- **Static plugin's `decorateReply: false` was a latent bug.** The
-  previous setup never actually served the SPA fallback in
-  production because no unauthenticated request ever made it past
-  the auth middleware to call `sendFile`. Removing the flag fixes
-  both the asset path and the fallback path
-
-Build status: `pnpm -r build` would compile clean across all 12
-packages (only `@gestalt/server` changed). The platform's bug
-report is resolved end-to-end: dashboard reachable, login page
-renders, SPA client-side routing works, API auth unchanged for
-unauthenticated requests.
-
----
 
 ### Session 2026-05-30 — Claude Code (SPA mounted under /app/* for shareable deep links)
 
@@ -974,4 +881,141 @@ Follow-ups added to Pending enhancements:
   in STATE.md under Pending enhancements)
 - `POST /interventions` still a 501 stub — only matters when
   breach / promotion UIs ship
+
+---
+
+### Session 2026-05-31 — Claude Code (persist clarification text on the intents row)
+
+Closes the gate-retry follow-up from the previous session: the
+operator's clarification was previously threaded only through the
+BullMQ payload, and on the gate's retry leg the orchestrator
+re-dispatched `generate:intent` without it. The intent-agent then
+re-ran on the original vague text and produced a second
+clarification alert. Making the DB the source of truth fixes the
+issue at every retry hop with no special-casing.
+
+Changed:
+- `packages/adapters/postgres/src/migrations/006_intent_clarification.sql`
+  (new): `ALTER TABLE intents ADD COLUMN clarification TEXT;`
+  Pure schema. Nullable — existing rows keep NULL forever and
+  intents that never paused for clarification also stay NULL
+- `packages/core/src/repository/index.ts`:
+  - `IntentRecord` gained `clarification: string | null`
+  - `IntentRepository.create()` Omit type now also excludes
+    `clarification` (column defaults to NULL on insert)
+  - New `IntentRepository.saveClarification(id, text)` →
+    `IntentRecord`
+- `packages/adapters/postgres/src/repositories/intents.ts`:
+  - `saveClarification` impl — `UPDATE intents SET clarification,
+    updated_at = NOW() RETURNING *`. Throws if id not found
+  - `SELECT *` continues to work (postgres.js maps the new column
+    automatically — no per-row mapper)
+- `packages/adapters/oracle/src/repositories/intents.ts` (new) +
+  `packages/adapters/mssql/src/repositories/intents.ts` (new): full
+  `IntentRepository` throw-stubs so future interface drift surfaces
+  here. Matches the established alerts / deployment-events /
+  maintenance-runs / projects stub pattern. Re-exported from each
+  adapter's `index.ts`
+- `packages/server/src/routes/intents.ts` POST /clarify:
+  - Calls `intents.saveClarification` immediately after the
+    waiting-for-clarification status guard, BEFORE the BullMQ
+    dispatch. If the dispatch races ahead of the UPDATE the
+    orchestrator still finds the row populated by the time it
+    actually reads it (postgres MVCC + the orchestrator's
+    `findById` is a fresh transaction). If the UPDATE failed the
+    dispatch never fires
+  - Audit metadata reshaped: `clarificationLength: N` (number, not
+    the text), `ambiguityId`, `acknowledgedAlertIds`, `ip`. Action
+    name changed to `intent.clarification-provided` per the
+    brief. The clarification text itself is NOT written to the
+    audit row — GP-006 (no sensitive data in logs). Forensics
+    that need the text query `intents.clarification` directly
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  Replaced `clarification: payload.clarification` in the
+  drivePlan options with
+  `clarification: intentRecord.clarification ?? payload.clarification ?? undefined`.
+  Comment explains the DB is the source of truth; the payload
+  fallback only matters for a fractional-millisecond race where
+  the worker pulled the message before the UPDATE committed (very
+  rare; harmless if it loses)
+
+Verified live against `trackeros`, correlationId
+`63bc2a3b-d6a4-4e34-b165-3b55d0fd1a3d`:
+- `pnpm -r build` clean across all 12 packages
+- Docker server image rebuilt; migration 006 applied on first
+  boot (`schema_migrations` now lists six versions through
+  `006_intent_clarification`)
+- `intents.clarification` column exists, `text`, nullable
+- Submitted "make it better" → intent → `waiting-for-clarification`
+  in 2 s; `clarification` column still NULL
+- `POST /intents/<id>/clarify` with a 156-character clarification
+  returned `{ resumed: true, acknowledgedAlerts: 1 }`. DB row
+  immediately shows `length(clarification) = 156`
+- **Audit row contents** (GP-006 verification):
+  `{"clarificationLength":156, "ambiguityId":null,
+  "acknowledgedAlertIds":["be7c6bb6-…"], "ip":"192.168.65.1"}`.
+  No clarification text anywhere in the audit_log
+- **Full cycle: intent-agent ran THREE times.** First on the
+  pause (vague text → clarification-needed). Second on the
+  post-`/clarify` resume (clarification populated via direct
+  payload). **Third on the gate retry** (the previous
+  session's bug case). All three runs read
+  `intentRecord.clarification` from the DB — the gate-retry
+  intent-agent run returned `status: completed` (NOT
+  `clarification-needed`), proving the persistence chain
+  works
+- **Only ONE alert in `alerts` for the full cycle.** The
+  pre-fix bug would have created a second clarification alert on
+  the gate-retry leg. The DB shows exactly one row, acknowledged
+- Intent reached `escalated` for an unrelated review-agent
+  GP_BREACH on the generated slugify implementation. The
+  clarification persistence carried clean through all retries;
+  the terminal escalation was a separate, code-quality issue out
+  of scope for this fix
+
+Decisions made:
+- **DB column, not Git-tracked artifact.** Considered persisting
+  the clarification text alongside `.gestalt/intent-spec.json` in
+  the project repo. The DB is simpler (no Git race with the
+  orchestrator's per-cycle clone), and clarification text is
+  metadata about the cycle rather than something the next git
+  pull should surface to developers. A column on `intents` keeps
+  it discoverable via the same SQL operators already use
+- **Payload still carries `clarification` even though the DB is
+  the source of truth.** The dispatch fires in the same handler
+  that just called `saveClarification`, so the UPDATE is in
+  flight when the worker picks up the task. In the common case
+  the DB read still wins. The payload fallback only matters for
+  a worker that pulls the task between BEGIN and COMMIT — vanishingly
+  unlikely with one server + one DB, but the cost is zero and the
+  belt-and-braces guarantee is real
+- **Audit metadata only carries length, not text** (GP-006). The
+  audit row records the *event* — operator X clarified intent Y
+  at time Z with N characters. The *content* of the clarification
+  lives on the intent row and can be queried by a forensics
+  operator. Splitting these surfaces aligns with the existing
+  pattern (audit_log never contains the artifact content, only the
+  reference)
+- **Orchestrator uses `??` chain, not `||` chain.** Empty string
+  is a valid clarification (theoretically), so falsy-coalesce
+  via `||` would drop it; `??` only swallows null/undefined
+- **Did NOT change the gate-retry payload shape.** It already
+  carries `intentId`, which is all the orchestrator needs to
+  hydrate via `intents.findById`. Adding clarification text to
+  the retry payload would duplicate state and re-introduce the
+  drift the DB fixes
+- **Oracle and MSSQL got new full `IntentRepository` throw-stubs.**
+  The brief asked for "saveClarification throw-stub for parity";
+  there were no existing intent stubs in those adapters (only
+  the four later additions had stubs). Adding full stubs follows
+  the established convention and means the next interface change
+  to IntentRepository also surfaces at oracle/mssql build time
+- **Removed the resolved follow-up** ("clarification text lost on
+  a gate retry") from `STATE.md`. Logged under the previous
+  session's "Follow-ups added to Pending enhancements" list
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Migration 006 applied. Full vague-intent → clarify → resume →
+gate-retry cycle verified end-to-end; the clarification text
+persists on the intents row through every dispatch leg.
 

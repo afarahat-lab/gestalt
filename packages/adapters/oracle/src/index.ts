@@ -2,6 +2,7 @@
 // Repository stubs live under ./repositories so that interface drift in
 // @gestalt/core surfaces as a build error here, not at runtime.
 
+export { OracleIntentRepository } from './repositories/intents';
 export { OracleProjectRepository } from './repositories/projects';
 export { OracleDeploymentEventRepository } from './repositories/deployment-events';
 export { OracleMaintenanceRunRepository } from './repositories/maintenance-runs';

@@ -37,6 +37,14 @@ export interface IntentRecord {
   correlationId: string;
   projectId: string;
   text: string;
+  /**
+   * Operator-supplied refinement, populated by `POST /intents/:id/clarify`
+   * when the cycle paused with `waiting-for-clarification`. The
+   * orchestrator reads this column on every dispatch (including gate
+   * retries) so the intent-agent's prompt picks the clarification up
+   * even when the BullMQ payload no longer carries it.
+   */
+  clarification: string | null;
   status: IntentStatus;
   source: 'human' | 'maintenance-agent';
   priority: 'critical' | 'high' | 'normal' | 'low';
@@ -46,10 +54,17 @@ export interface IntentRecord {
 }
 
 export interface IntentRepository extends BaseRepository {
-  create(intent: Omit<IntentRecord, 'createdAt' | 'updatedAt' | 'resolvedAt'>): Promise<IntentRecord>;
+  create(intent: Omit<IntentRecord, 'createdAt' | 'updatedAt' | 'resolvedAt' | 'clarification'>): Promise<IntentRecord>;
   findById(id: string): Promise<IntentRecord | null>;
   findByCorrelationId(correlationId: string): Promise<IntentRecord | null>;
   updateStatus(id: string, status: IntentStatus): Promise<IntentRecord>;
+  /**
+   * Persists the operator's clarification text on the intent row.
+   * Called from `POST /intents/:id/clarify` before re-dispatching the
+   * generate task so subsequent reads (including gate retries) see the
+   * same text.
+   */
+  saveClarification(id: string, clarification: string): Promise<IntentRecord>;
   list(params: { projectId: string; status?: IntentStatus; limit: number; offset: number }): Promise<{ records: IntentRecord[]; total: number }>;
 }
 

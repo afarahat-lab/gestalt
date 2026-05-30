@@ -2,6 +2,7 @@
 // Repository stubs live under ./repositories so that interface drift in
 // @gestalt/core surfaces as a build error here, not at runtime.
 
+export { MssqlIntentRepository } from './repositories/intents';
 export { MssqlProjectRepository } from './repositories/projects';
 export { MssqlDeploymentEventRepository } from './repositories/deployment-events';
 export { MssqlMaintenanceRunRepository } from './repositories/maintenance-runs';

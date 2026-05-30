@@ -2047,3 +2047,140 @@ Follow-ups added to Pending enhancements:
 - `POST /interventions` still a 501 stub — only matters when
   breach / promotion UIs ship
 
+---
+
+### Session 2026-05-31 — Claude Code (persist clarification text on the intents row)
+
+Closes the gate-retry follow-up from the previous session: the
+operator's clarification was previously threaded only through the
+BullMQ payload, and on the gate's retry leg the orchestrator
+re-dispatched `generate:intent` without it. The intent-agent then
+re-ran on the original vague text and produced a second
+clarification alert. Making the DB the source of truth fixes the
+issue at every retry hop with no special-casing.
+
+Changed:
+- `packages/adapters/postgres/src/migrations/006_intent_clarification.sql`
+  (new): `ALTER TABLE intents ADD COLUMN clarification TEXT;`
+  Pure schema. Nullable — existing rows keep NULL forever and
+  intents that never paused for clarification also stay NULL
+- `packages/core/src/repository/index.ts`:
+  - `IntentRecord` gained `clarification: string | null`
+  - `IntentRepository.create()` Omit type now also excludes
+    `clarification` (column defaults to NULL on insert)
+  - New `IntentRepository.saveClarification(id, text)` →
+    `IntentRecord`
+- `packages/adapters/postgres/src/repositories/intents.ts`:
+  - `saveClarification` impl — `UPDATE intents SET clarification,
+    updated_at = NOW() RETURNING *`. Throws if id not found
+  - `SELECT *` continues to work (postgres.js maps the new column
+    automatically — no per-row mapper)
+- `packages/adapters/oracle/src/repositories/intents.ts` (new) +
+  `packages/adapters/mssql/src/repositories/intents.ts` (new): full
+  `IntentRepository` throw-stubs so future interface drift surfaces
+  here. Matches the established alerts / deployment-events /
+  maintenance-runs / projects stub pattern. Re-exported from each
+  adapter's `index.ts`
+- `packages/server/src/routes/intents.ts` POST /clarify:
+  - Calls `intents.saveClarification` immediately after the
+    waiting-for-clarification status guard, BEFORE the BullMQ
+    dispatch. If the dispatch races ahead of the UPDATE the
+    orchestrator still finds the row populated by the time it
+    actually reads it (postgres MVCC + the orchestrator's
+    `findById` is a fresh transaction). If the UPDATE failed the
+    dispatch never fires
+  - Audit metadata reshaped: `clarificationLength: N` (number, not
+    the text), `ambiguityId`, `acknowledgedAlertIds`, `ip`. Action
+    name changed to `intent.clarification-provided` per the
+    brief. The clarification text itself is NOT written to the
+    audit row — GP-006 (no sensitive data in logs). Forensics
+    that need the text query `intents.clarification` directly
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  Replaced `clarification: payload.clarification` in the
+  drivePlan options with
+  `clarification: intentRecord.clarification ?? payload.clarification ?? undefined`.
+  Comment explains the DB is the source of truth; the payload
+  fallback only matters for a fractional-millisecond race where
+  the worker pulled the message before the UPDATE committed (very
+  rare; harmless if it loses)
+
+Verified live against `trackeros`, correlationId
+`63bc2a3b-d6a4-4e34-b165-3b55d0fd1a3d`:
+- `pnpm -r build` clean across all 12 packages
+- Docker server image rebuilt; migration 006 applied on first
+  boot (`schema_migrations` now lists six versions through
+  `006_intent_clarification`)
+- `intents.clarification` column exists, `text`, nullable
+- Submitted "make it better" → intent → `waiting-for-clarification`
+  in 2 s; `clarification` column still NULL
+- `POST /intents/<id>/clarify` with a 156-character clarification
+  returned `{ resumed: true, acknowledgedAlerts: 1 }`. DB row
+  immediately shows `length(clarification) = 156`
+- **Audit row contents** (GP-006 verification):
+  `{"clarificationLength":156, "ambiguityId":null,
+  "acknowledgedAlertIds":["be7c6bb6-…"], "ip":"192.168.65.1"}`.
+  No clarification text anywhere in the audit_log
+- **Full cycle: intent-agent ran THREE times.** First on the
+  pause (vague text → clarification-needed). Second on the
+  post-`/clarify` resume (clarification populated via direct
+  payload). **Third on the gate retry** (the previous
+  session's bug case). All three runs read
+  `intentRecord.clarification` from the DB — the gate-retry
+  intent-agent run returned `status: completed` (NOT
+  `clarification-needed`), proving the persistence chain
+  works
+- **Only ONE alert in `alerts` for the full cycle.** The
+  pre-fix bug would have created a second clarification alert on
+  the gate-retry leg. The DB shows exactly one row, acknowledged
+- Intent reached `escalated` for an unrelated review-agent
+  GP_BREACH on the generated slugify implementation. The
+  clarification persistence carried clean through all retries;
+  the terminal escalation was a separate, code-quality issue out
+  of scope for this fix
+
+Decisions made:
+- **DB column, not Git-tracked artifact.** Considered persisting
+  the clarification text alongside `.gestalt/intent-spec.json` in
+  the project repo. The DB is simpler (no Git race with the
+  orchestrator's per-cycle clone), and clarification text is
+  metadata about the cycle rather than something the next git
+  pull should surface to developers. A column on `intents` keeps
+  it discoverable via the same SQL operators already use
+- **Payload still carries `clarification` even though the DB is
+  the source of truth.** The dispatch fires in the same handler
+  that just called `saveClarification`, so the UPDATE is in
+  flight when the worker picks up the task. In the common case
+  the DB read still wins. The payload fallback only matters for
+  a worker that pulls the task between BEGIN and COMMIT — vanishingly
+  unlikely with one server + one DB, but the cost is zero and the
+  belt-and-braces guarantee is real
+- **Audit metadata only carries length, not text** (GP-006). The
+  audit row records the *event* — operator X clarified intent Y
+  at time Z with N characters. The *content* of the clarification
+  lives on the intent row and can be queried by a forensics
+  operator. Splitting these surfaces aligns with the existing
+  pattern (audit_log never contains the artifact content, only the
+  reference)
+- **Orchestrator uses `??` chain, not `||` chain.** Empty string
+  is a valid clarification (theoretically), so falsy-coalesce
+  via `||` would drop it; `??` only swallows null/undefined
+- **Did NOT change the gate-retry payload shape.** It already
+  carries `intentId`, which is all the orchestrator needs to
+  hydrate via `intents.findById`. Adding clarification text to
+  the retry payload would duplicate state and re-introduce the
+  drift the DB fixes
+- **Oracle and MSSQL got new full `IntentRepository` throw-stubs.**
+  The brief asked for "saveClarification throw-stub for parity";
+  there were no existing intent stubs in those adapters (only
+  the four later additions had stubs). Adding full stubs follows
+  the established convention and means the next interface change
+  to IntentRepository also surfaces at oracle/mssql build time
+- **Removed the resolved follow-up** ("clarification text lost on
+  a gate retry") from `STATE.md`. Logged under the previous
+  session's "Follow-ups added to Pending enhancements" list
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Migration 006 applied. Full vague-intent → clarify → resume →
+gate-retry cycle verified end-to-end; the clarification text
+persists on the intents row through every dispatch leg.
+
