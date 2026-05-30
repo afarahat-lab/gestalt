@@ -57,6 +57,53 @@ export async function projectsListCommand(): Promise<void> {
   }
 }
 
+const VALID_PIPELINE_ADAPTERS = ['noop', 'github-actions'] as const;
+
+export async function setAdapterCommand(name: string, adapter: string): Promise<void> {
+  if (!VALID_PIPELINE_ADAPTERS.includes(adapter as typeof VALID_PIPELINE_ADAPTERS[number])) {
+    console.log(c.error(
+      `Unsupported pipeline adapter '${adapter}'. Valid values: ${VALID_PIPELINE_ADAPTERS.join(', ')}`,
+    ));
+    process.exit(1);
+  }
+
+  const config = await loadCliConfig();
+  if (!config.token) {
+    console.log(c.error('Not authenticated. Run: gestalt login'));
+    process.exit(1);
+  }
+
+  const client = new GestaltApiClient({ serverUrl: config.serverUrl, token: config.token });
+
+  try {
+    const { data: projects } = await client.listProjects();
+    const match = projects.find((p) => p.name === name);
+    if (!match) {
+      console.log(c.error(`No project named '${name}'. Run \`gestalt projects list\` to see what is registered.`));
+      process.exit(1);
+    }
+
+    blank();
+    console.log(c.dim(`Updating ${match.name} pipeline.adapter → ${adapter} ...`));
+    const result = await client.updateProjectConfig(match.id, { pipeline: { adapter } });
+    blank();
+    if (result.data.updated) {
+      console.log(c.success(`✓ Pipeline adapter set to ${result.data.adapter}`));
+      if (result.data.commitSha) {
+        console.log(c.dim(`  commit: ${result.data.commitSha.slice(0, 8)}`));
+      }
+      console.log(c.dim('  Next intent cycle will use the new adapter.'));
+      console.log(c.dim('  Run `git pull` in your local project to receive the HARNESS.json update.'));
+    } else {
+      console.log(c.dim(`No change — adapter already set to ${adapter}.`));
+    }
+    blank();
+  } catch (err) {
+    console.log(c.error(`Failed to update adapter: ${err instanceof Error ? err.message : String(err)}`));
+    process.exit(1);
+  }
+}
+
 export async function projectsUseCommand(name: string): Promise<void> {
   const config = await loadCliConfig();
   if (!config.token) {

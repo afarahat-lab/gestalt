@@ -67,3 +67,25 @@ export type PipelineAdapterType =
   | 'noop';
 
 export type PipelineStatus = 'running' | 'passed' | 'failed' | 'cancelled';
+
+/**
+ * Thrown by a PipelineAdapter when the configured credential is missing
+ * a required scope (e.g. GitHub PAT without `workflow` scope). This is a
+ * configuration error that requires human intervention — retries will
+ * never succeed. The deploy-orchestrator catches this specifically,
+ * emits a GOLDEN_PRINCIPLE_BREACH signal, and escalates the intent
+ * (never marks it `failed`, which would imply a transient problem).
+ */
+export class PipelineAdapterAuthError extends Error {
+  readonly kind: 'auth-error' = 'auth-error';
+  constructor(
+    message: string,
+    /** The adapter type that surfaced the error — for the signal message. */
+    public readonly adapter: PipelineAdapterType,
+    /** Which operation hit the auth wall (`dispatch` / `createPR` / `promote`). */
+    public readonly operation: string,
+  ) {
+    super(message);
+    this.name = 'PipelineAdapterAuthError';
+  }
+}

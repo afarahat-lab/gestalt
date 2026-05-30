@@ -255,7 +255,22 @@ gestalt admin create-user --email admin@company.com --role admin
 
 ---
 
-## Step 10 — Verify installation
+## Step 10 — Connect to your CI/CD system (optional)
+
+By default, every project registered through this server uses the NoOp
+pipeline adapter — the deploy chain runs end-to-end but never touches a
+real CI/CD system. Switch each project's adapter when the project repo
+is ready for real CI:
+
+- [GitHub Actions](./ci-cd/github-actions.md) — `gestalt projects set-adapter <name> github-actions`
+
+Other adapter implementations (Azure DevOps, GitLab CI, Jenkins) are
+planned but not yet built; the `PipelineAdapter` interface is in place
+so they can be added without touching the deploy-orchestrator.
+
+---
+
+## Step 11 — Verify installation
 
 ```bash
 # Health check

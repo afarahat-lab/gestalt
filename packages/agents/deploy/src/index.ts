@@ -28,3 +28,4 @@ export type { GitHubActionsAdapterOptions } from './adapters/github-actions-adap
 export { NoOpPipelineAdapter } from './adapters/noop-pipeline-adapter';
 export { resolvePipelineAdapter } from './adapters/resolver';
 export type { PipelineAdapter, PipelineAdapterType, PipelineStatus } from './adapters/pipeline-adapter';
+export { PipelineAdapterAuthError } from './adapters/pipeline-adapter';

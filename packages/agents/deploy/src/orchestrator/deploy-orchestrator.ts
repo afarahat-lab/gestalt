@@ -37,6 +37,7 @@ import type {
 import { runPRAgent } from '../agents/pr-agent';
 import { runPipelineAgent } from '../agents/pipeline-agent';
 import { runPromotionAgent } from '../agents/promotion-agent';
+import { PipelineAdapterAuthError } from '../adapters/pipeline-adapter';
 
 const log = createContextLogger({ module: 'deploy-orchestrator' });
 
@@ -218,11 +219,51 @@ async function handleDeployTask(
   } catch (err) {
     childLog.error({ err, taskType: type }, 'Deploy orchestrator error');
     const payload = message.payload as { intentId?: string };
+    if (err instanceof PipelineAdapterAuthError && payload.intentId) {
+      // PAT scope error — configuration problem, never retry. Save a
+      // GOLDEN_PRINCIPLE_BREACH signal so the operator sees exactly what
+      // needs to change, then escalate.
+      await escalateAuthError(err, correlationId, payload.intentId, type).catch(() => undefined);
+      return buildTaskResult(message, 'failed', startedAt);
+    }
     if (payload.intentId) {
       await transitionIntent(payload.intentId, correlationId, 'failed').catch(() => undefined);
     }
     throw err;
   }
+}
+
+async function escalateAuthError(
+  err: PipelineAdapterAuthError,
+  correlationId: string,
+  intentId: string,
+  taskType: string,
+): Promise<void> {
+  const { signals } = getRepositories();
+  const sourceAgent: DeployAgentRole =
+    taskType === 'deploy:pr'
+      ? 'pr-agent'
+      : taskType === 'deploy:pipeline'
+        ? 'pipeline-agent'
+        : 'promotion-agent';
+  const signal: PlatformSignal = {
+    id: crypto.randomUUID(),
+    correlationId,
+    type: 'GOLDEN_PRINCIPLE_BREACH',
+    severity: 'critical',
+    sourceAgent,
+    message: err.message,
+    autoResolvable: false,
+    createdAt: new Date(),
+  };
+  await signals.save(signal);
+  emitLiveEvent('signal.emitted', correlationId, {
+    type: signal.type,
+    severity: signal.severity,
+    sourceAgent: signal.sourceAgent,
+    message: signal.message,
+  });
+  await transitionIntent(intentId, correlationId, 'escalated');
 }
 
 // ─── Observability wrapper ───────────────────────────────────────────────────

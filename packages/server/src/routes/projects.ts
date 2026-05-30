@@ -17,7 +17,7 @@
  *   - Audit records (GP-002) are written for create + init-harness
  */
 
-import { mkdtemp, rm, writeFile, mkdir } from 'fs/promises';
+import { mkdtemp, readFile, rm, writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { simpleGit, type SimpleGit } from 'simple-git';
@@ -40,6 +40,15 @@ interface CreateProjectBody {
 interface InitHarnessBody {
   projectDescription: string;
 }
+
+interface UpdateConfigBody {
+  pipeline?: {
+    adapter?: string;
+  };
+}
+
+const VALID_PIPELINE_ADAPTERS = ['noop', 'github-actions'] as const;
+type ValidPipelineAdapter = typeof VALID_PIPELINE_ADAPTERS[number];
 
 /**
  * Returns a public view of a project record — strips anything that should
@@ -251,6 +260,136 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
       }
     },
   );
+
+  // POST /projects/:id/config — clone, edit HARNESS.json, commit, push
+  //
+  // The HARNESS.json file in the project repo is the source of truth for
+  // adapter configuration (ADR-032 — Git is the project filesystem).
+  // This route does not store any config in the DB; it only mutates the
+  // committed HARNESS.json so the next deploy cycle's resolver picks it
+  // up.
+  //
+  // Today only `pipeline.adapter` is settable; the body shape is generic
+  // so other fields (monitoring, qualityGate) can be added without
+  // changing the API surface.
+  app.post<{ Params: { id: string }; Body: UpdateConfigBody }>(
+    '/projects/:id/config',
+    { preHandler: requireRole('operator') },
+    async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+
+      const body = request.body ?? ({} as UpdateConfigBody);
+      const requestedAdapter = body.pipeline?.adapter;
+      if (!requestedAdapter) {
+        return reply.code(400).send({
+          error: 'No supported config field provided. Currently `pipeline.adapter` is the only field supported.',
+        });
+      }
+      if (!VALID_PIPELINE_ADAPTERS.includes(requestedAdapter as ValidPipelineAdapter)) {
+        return reply.code(400).send({
+          error: `Unsupported pipeline adapter '${requestedAdapter}'. Valid values: ${VALID_PIPELINE_ADAPTERS.join(', ')}`,
+          code: 'INVALID_PIPELINE_ADAPTER',
+        });
+      }
+      const newAdapter = requestedAdapter as ValidPipelineAdapter;
+
+      const { projects, audit } = getRepositories();
+      const project = await projects.findById(request.params.id);
+      if (!project) return reply.code(404).send({ error: 'Project not found' });
+
+      const token = await projects.getCredential(project.id);
+      if (!token) {
+        return reply.code(400).send({
+          error: 'Project has no Git credential on file; re-register the project',
+          code: 'NO_CREDENTIAL',
+        });
+      }
+
+      const workDir = await mkdtemp(join(tmpdir(), `gestalt-config-${crypto.randomUUID()}-`));
+      try {
+        const cloneUrl = authenticatedGitUrl(project.gitUrl, token);
+        await simpleGit().clone(cloneUrl, workDir);
+        const repo: SimpleGit = simpleGit(workDir);
+
+        try {
+          await repo.checkout(project.defaultBranch);
+        } catch {
+          await repo.checkoutLocalBranch(project.defaultBranch);
+        }
+
+        const harnessPath = join(workDir, 'HARNESS.json');
+        let parsed: Record<string, unknown>;
+        try {
+          const raw = await readFile(harnessPath, 'utf8');
+          parsed = JSON.parse(raw) as Record<string, unknown>;
+        } catch (err) {
+          return reply.code(409).send({
+            error: 'HARNESS.json missing or invalid in repo — run `gestalt init` first',
+            details: err instanceof Error ? err.message : String(err),
+          });
+        }
+
+        const currentPipeline = (parsed['pipeline'] as Record<string, unknown> | undefined) ?? {};
+        const previousAdapter = currentPipeline['adapter'];
+        if (previousAdapter === newAdapter) {
+          return reply.send({
+            data: { updated: false, reason: 'no-change', adapter: newAdapter },
+          });
+        }
+        parsed['pipeline'] = { ...currentPipeline, adapter: newAdapter };
+
+        await writeFile(harnessPath, JSON.stringify(parsed, null, 2) + '\n', 'utf8');
+
+        await repo.addConfig('user.name', 'Gestalt Platform');
+        await repo.addConfig('user.email', 'platform@gestalt.local');
+        await repo.add('HARNESS.json');
+
+        const status = await repo.status();
+        if (status.files.length === 0) {
+          // File-on-disk identical to working tree even after the
+          // mutation — defensive guard, should be unreachable.
+          return reply.send({
+            data: { updated: false, reason: 'no-diff', adapter: newAdapter },
+          });
+        }
+
+        const commit = await repo.commit(`chore: update pipeline adapter to ${newAdapter} [gestalt]`);
+        await repo.push('origin', project.defaultBranch);
+
+        await audit.append({
+          actor: request.user.id,
+          action: 'project.config-updated',
+          entityType: 'projects',
+          entityId: project.id,
+          correlationId: request.correlationId,
+          metadata: {
+            field: 'pipeline.adapter',
+            previousValue: previousAdapter ?? null,
+            newValue: newAdapter,
+            commitSha: commit.commit,
+            ip: request.ip,
+          },
+        });
+
+        log.info(
+          { projectId: project.id, adapter: newAdapter, commitSha: commit.commit },
+          'Project config updated',
+        );
+
+        return reply.send({
+          data: { updated: true, adapter: newAdapter, commitSha: commit.commit },
+        });
+      } catch (err) {
+        log.error({ err, projectId: project.id }, 'Project config update failed');
+        return reply.code(500).send({
+          error: 'Failed to update project config',
+          details: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+      }
+    },
+  );
 }
 
 // ─── Harness file content ─────────────────────────────────────────────────────
@@ -296,6 +435,23 @@ ${projectDescription}
 ## When context is missing
 
 Emit a \`CONTEXT_GAP\` signal with the specific missing information identified.
+
+## Operator notes — Git credential scopes
+
+The personal access token registered with this project drives BOTH the
+platform's clone/push and the deploy layer's CI/CD calls. Required scopes:
+
+- **GitHub PAT (classic)** — \`repo\` (clone, push, create PRs) +
+  \`workflow\` (dispatch GitHub Actions workflows). Fine-grained PATs need
+  Contents: read+write, Pull requests: read+write, Actions: read+write,
+  Workflows: read+write.
+- **GitLab Project Access Token** — \`api\` + \`write_repository\`.
+- **Azure DevOps PAT** — \`Code (Read & Write)\` + \`Build (Read & Execute)\`.
+
+Without the workflow scope the deploy layer's pipeline-agent will fail with
+a \`GOLDEN_PRINCIPLE_BREACH\` signal and the intent will be escalated for
+human review. Re-issue the PAT with the missing scope and re-register the
+project to recover.
 `;
 }
 

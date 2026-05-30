@@ -8,6 +8,7 @@
  *   gestalt init-admin [--server <url>]
  *   gestalt projects list
  *   gestalt projects use <name>
+ *   gestalt projects set-adapter <name> <adapter>
  *   gestalt run "<intent>" [--priority critical|high|normal|low]
  *   gestalt status [--id <correlationId>]
  *   gestalt logs [--follow] [--id <correlationId>]
@@ -18,7 +19,7 @@ import { program } from 'commander';
 import { loginCommand } from './commands/login';
 import { initCommand } from './commands/init';
 import { initAdminCommand } from './commands/init-admin';
-import { projectsListCommand, projectsUseCommand } from './commands/projects';
+import { projectsListCommand, projectsUseCommand, setAdapterCommand } from './commands/projects';
 import { runCommand } from './commands/run';
 import { statusCommand } from './commands/status';
 import { logsCommand, dashboardCommand } from './commands/logs';
@@ -74,6 +75,13 @@ projects
   .description('Set the current project (by name)')
   .action(async (name: string) => {
     await projectsUseCommand(name).catch(fatalError);
+  });
+
+projects
+  .command('set-adapter <name> <adapter>')
+  .description('Switch a project\'s pipeline adapter (noop | github-actions). Commits HARNESS.json.')
+  .action(async (name: string, adapter: string) => {
+    await setAdapterCommand(name, adapter).catch(fatalError);
   });
 
 // gestalt run

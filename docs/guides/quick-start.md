@@ -165,8 +165,35 @@ git init
 git remote add origin https://github.com/yourorg/my-project.git
 ```
 
-You also need a personal access token (PAT) with read+write permission on the
-repo — the server uses it to clone and to push the initial harness commit.
+You also need a personal access token (PAT). The same token is used by the
+platform to clone the repo, push the initial harness commit, AND drive any
+CI/CD calls the deploy layer makes (PR creation, workflow dispatches,
+environment promotions). Required scopes:
+
+```
+GitHub PAT (classic):
+  - repo       (read/write repository, create PRs)
+  - workflow   (trigger GitHub Actions workflows)
+
+GitHub fine-grained PAT (per-repository):
+  - Contents: read+write
+  - Pull requests: read+write
+  - Actions: read+write
+  - Workflows: read+write
+
+GitLab Project Access Token:
+  - api
+  - write_repository
+
+Azure DevOps PAT:
+  - Code (Read & Write)
+  - Build (Read & Execute)
+```
+
+Without the workflow scope (or the equivalent for non-GitHub hosts), the
+deploy layer's pipeline-agent will fail and the intent will be escalated
+with a `GOLDEN_PRINCIPLE_BREACH` signal explaining the missing scope. Issue
+the PAT before continuing.
 
 ### Step 8 — Initialise the project
 
@@ -239,6 +266,7 @@ gestalt dashboard
 | `gestalt init` | Once per project | Register project + seed harness in Git |
 | `gestalt projects list` | As needed | List your registered projects |
 | `gestalt projects use <name>` | As needed | Switch the current project |
+| `gestalt projects set-adapter <name> <adapter>` | Once per CI swap | Switch pipeline adapter (`noop` ↔ `github-actions`) |
 | `gestalt run "<intent>"` | Daily | Submit work to agents |
 | `gestalt status` | Daily | Check platform and intent status |
 | `gestalt logs` | Daily | Stream live agent activity |

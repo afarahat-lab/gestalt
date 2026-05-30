@@ -400,7 +400,7 @@ Operator caveats:
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-30 (Claude Code — docs refresh after maintenance layer)
+**Last updated:** 2026-05-30 (Claude Code — real GitHub Actions integration verified end-to-end)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -423,7 +423,13 @@ Operator caveats:
 - `gestalt init` fully implemented — Git-backed four-phase wizard:
   registers project on server, server clones repo, commits harness files,
   pushes; developer runs `git pull` to receive harness locally
-- `gestalt projects list` and `gestalt projects use <name>` working
+- `gestalt projects list`, `gestalt projects use <name>`, and
+  `gestalt projects set-adapter <name> <noop|github-actions>` working.
+  `set-adapter` clones the project repo, mutates `pipeline.adapter` in
+  `HARNESS.json`, commits as
+  `chore: update pipeline adapter to <adapter> [gestalt]`, and pushes
+  to `defaultBranch` — HARNESS.json in the repo remains the source of
+  truth (ADR-032). Audit-logged as `project.config-updated`
 - `gestalt run` queues intent → orchestrator picks up → clones project
   repo fresh per cycle → runs generate loop against cloned harness files
 - **Maintenance layer wired end-to-end (ADR-018, ADR-019, ADR-020,
@@ -502,6 +508,21 @@ Operator caveats:
     pipeline 1.9s, staging promote 1.0s, production promote 0.9s);
     intent → `deployed`. Branch `origin/gestalt/8f53b75d-add-a-string-case-utility-module`
     pushed to GitHub; deployment_events has all 5 expected rows
+  - **First REAL GitHub Actions cycle (`67e5ee02`, kebab-case utility,
+    2026-05-30 session).** Adapter switched from `noop` to
+    `github-actions` via the new `gestalt projects set-adapter` CLI.
+    49 s wall-clock total — generate 12 s → gate 1 s → deploy 30 s
+    (pr-agent 4.6 s, pipeline-agent 21.0 s including the real GitHub
+    Actions run, staging promote 1.8 s, production promote 1.8 s).
+    PR #1 opened on `afarahat-lab/trackeros`, GitHub Actions run
+    `26689527360` completed with `conclusion: success`,
+    `event: workflow_dispatch`. All 5 `deployment_events` rows carry
+    the real numeric `run_id` and a real `pr_url`; the dashboard /
+    `gestalt status --id` are no longer faking. PAT-scope GP_BREACH
+    path was NOT exercised (the PAT used had `workflow` scope);
+    detection logic is unit-shaped and tested at the adapter level
+    only. ADR-034 production-without-staging path also stays
+    NoOp-validated since the cycle ran clean
 - **Gate ↔ generate feedback loop wired.** A `fail` verdict (auto-resolvable
   signals, no GP_BREACH) dispatches a `generate:intent` task back to the
   generate queue with `retryCount + 1` and the signals routed to the
@@ -644,17 +665,28 @@ Operator caveats:
   an optimisation, not a correctness gap
 - **Read `qualityGate.maxRetries` from the project's HARNESS.json** —
   currently hardcoded to 3 in both the gate and generate orchestrators
-- **Real CI in `pipeline-agent`** — today most cycles use
-  `NoOpPipelineAdapter` (default in the harness template). Projects
-  opt in by flipping `HARNESS.json` `pipeline.adapter` to
-  `github-actions`. `init-harness` already seeds the matching
-  `.github/workflows/gestalt.yml` (workflow_dispatch, ubuntu-latest,
-  checkout + Node 20 + pnpm install + pnpm test) so the adapter has
-  something to dispatch; projects customise the workflow body to add
-  lint / build / deploy commands
 - **Other PipelineAdapter implementations** (Azure DevOps, GitLab CI,
   Jenkins). The interface is in place; only `GitHubActions` + `NoOp`
-  are implemented today
+  are implemented today. `GitHubActions` is verified end-to-end (see
+  `67e5ee02` cycle in the session log); the others are typed stubs in
+  the `PipelineAdapterType` union but have no implementation
+- **`set-adapter` only switches `pipeline.adapter` today.** The
+  `POST /projects/:id/config` body shape is generic
+  (`{ pipeline?: ... }`) — adding monitoring (`maintenance.monitoring.adapter`)
+  and `qualityGate.maxRetries` follows the same whitelist + clone-edit-
+  commit pattern but is not implemented yet
+- **Promotion workflow dispatches against a hardcoded `'main'` ref.**
+  `GitHubActionsAdapter.promoteToEnvironment` always sends
+  `{"ref":"main",...}` instead of the project's `defaultBranch`.
+  Projects on `master`/`trunk`/etc. will see the promotion workflow
+  fail to dispatch. Thread `project.defaultBranch` through the
+  promotion-agent → adapter call to fix
+- **No proactive PAT-scope validation at registration / set-adapter
+  time.** A PAT missing `workflow` scope only surfaces on the first
+  pipeline dispatch (`GOLDEN_PRINCIPLE_BREACH` signal + intent
+  `escalated`). A startup-time `GET /user` + `GET /repos/:o/:r` ping
+  in `init-harness` / `set-adapter` would catch the misconfiguration
+  before any intent cycle
 - **Promotion strategy beyond auto.** Today both staging → production
   fires unconditionally on a passed pipeline. The `EnvironmentStrategy`
   type already supports `trigger: 'manual'` + `approvals: N`; wire that
@@ -1533,3 +1565,232 @@ Decisions made:
 
 Build status: no code changes; build state from the previous
 `62faa06` commit is unchanged. `pnpm -r build` would still pass.
+
+---
+
+### Session 2026-05-30 — Claude Code (GitHub Actions adapter hardening + live verification)
+
+Audited the `GitHubActionsAdapter` for the bugs flagged in the brief —
+race condition in `triggerPipeline`, single-shot run discovery, and the
+missing PAT-scope error path — then verified the full deploy chain
+against a real GitHub repo with a real PAT.
+
+Changed:
+- `packages/agents/deploy/src/adapters/pipeline-adapter.ts`: new
+  `PipelineAdapterAuthError` class. Typed marker for "PAT lacks
+  required scope" so the deploy-orchestrator can distinguish a
+  configuration error (escalate, never retry) from a transient adapter
+  failure (mark `failed`). Carries `adapter` + `operation` for the
+  signal message
+- `packages/agents/deploy/src/adapters/github-actions-adapter.ts`:
+  - **`triggerPipeline` rewritten.** Captures `dispatchedAt` BEFORE the
+    `workflow_dispatch` call. After dispatch, waits 3 s then retries up
+    to 10 times with 2 s intervals (~23 s total) for the run to appear.
+    Each attempt calls a new `findDispatchedRun(branch, dispatchedAt)`
+    helper that queries
+    `GET /actions/runs?branch=<branch>&event=workflow_dispatch&per_page=10`,
+    filters to runs created at-or-after `dispatchedAt - 2s` (clock skew
+    tolerance), sorts by `created_at` desc, and returns the most recent
+    match. Stops `runs[0]`-style false positives from concurrent runs
+    on the same branch
+  - **`createPullRequest` / `getPipelineStatus` / `promoteToEnvironment`
+    all detect missing-scope 403s.** New `throwIfAuthError(status,
+    body, operation, requiredScope)` helper checks for HTTP 403 + body
+    containing `"Resource not accessible"` (GitHub's marker for both
+    "by personal access token" and "by integration" variants) and
+    throws `PipelineAdapterAuthError` instead of a generic error
+  - **Status mapping verified — unchanged.** `status !== 'completed'` →
+    `'running'`; `'success'` → `'passed'`; `'cancelled'` → `'cancelled'`;
+    everything else → `'failed'`. Matches the brief and GitHub's
+    documented `status`/`conclusion` shapes
+  - **`promoteToEnvironment` cleaned up.** Stopped sending the
+    synthesised `gestalt/promote-<corr8>` branch input (the branch
+    didn't exist anywhere); now sends `environment` +
+    `correlationId` only. `ref` stays `main` because the platform
+    only promotes after a merged PR, by which point the artifact set
+    is on the default branch
+- `packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`:
+  - Imports the new error class
+  - Catch block now does `instanceof PipelineAdapterAuthError` first —
+    if matched, saves a `GOLDEN_PRINCIPLE_BREACH` signal (severity
+    `critical`, message from the adapter), emits `signal.emitted` SSE,
+    and transitions the intent to `escalated`. Returns a `failed` task
+    result so BullMQ does not retry. Generic errors retain the previous
+    `failed` transition + rethrow
+  - New `escalateAuthError()` helper maps `taskType` →
+    `DeployAgentRole` (`deploy:pr` → `pr-agent`, etc.) for the
+    `sourceAgent` field, satisfying the `AgentRole` union
+- `packages/agents/deploy/src/index.ts`: re-exports
+  `PipelineAdapterAuthError`
+- `packages/server/src/routes/projects.ts`:
+  - New `POST /projects/:id/config` route (`requireRole('operator')`).
+    Accepts `{ pipeline?: { adapter?: string } }`. Validates against
+    a `VALID_PIPELINE_ADAPTERS` whitelist (`noop`, `github-actions`).
+    Clones the project repo, reads + parses `HARNESS.json`, mutates
+    `pipeline.adapter`, writes the file back, commits as
+    `chore: update pipeline adapter to <adapter> [gestalt]`, pushes
+    to the default branch. Returns `{ updated: true, adapter,
+    commitSha }`. Short-circuit `{ updated: false, reason: 'no-change' }`
+    when the file already has the requested adapter. Temp dir cleaned
+    in `finally`. Audit-logs `project.config-updated` with previous +
+    new values
+  - `buildAgentsMd()` extended with an **"Operator notes — Git
+    credential scopes"** section documenting the PAT scope requirements
+    for GitHub (classic + fine-grained) / GitLab / Azure DevOps and
+    explaining that missing the `workflow` scope produces a
+    `GOLDEN_PRINCIPLE_BREACH` + escalation
+- `packages/cli/src/api/client.ts`: new `updateProjectConfig(projectId,
+  config)` typed wrapper for the new route
+- `packages/cli/src/commands/projects.ts`: new `setAdapterCommand(name,
+  adapter)`. Client-side adapter whitelist (mirrors the server's) so
+  typos fail fast before the network round-trip. Resolves project ID
+  by name (consistent with `projects use`), prints commit SHA on
+  success, reminds the operator to `git pull` to receive the
+  HARNESS.json update locally
+- `packages/cli/src/index.ts`: registered
+  `gestalt projects set-adapter <name> <adapter>`. Updated the
+  command list at the top of the file
+- `docs/guides/quick-start.md`: Step 7 rewritten — the PAT-scope
+  requirements (repo + workflow for GitHub, fine-grained equivalents,
+  GitLab, Azure DevOps) now appear inline. Added the new
+  `set-adapter` command to the Summary table
+- `docs/guides/deployment.md`: new **Step 10 — Connect to your CI/CD
+  system (optional)** that links to the GitHub Actions guide and notes
+  the planned-but-not-built status of the other adapters
+- `docs/guides/ci-cd/github-actions.md` (new): the standalone GitHub
+  Actions integration guide. Covers PAT scope creation (classic +
+  fine-grained), the project-repo prerequisites (lockfile + test
+  script + workflow file), the `gestalt projects set-adapter`
+  command, how to verify the integration end-to-end against
+  `deployment_events` + the GitHub Actions tab, and a troubleshooting
+  section for the auth-error signal, missing workflow file, lingering
+  NoOp adapter, and 10-minute polling timeout
+
+Verified live against `trackeros`:
+- Fresh `docker-compose up -d --build` (volumes recreated, no prior
+  data). Migrations 001–005 applied on first start; server reaches
+  `Up (healthy)`; `/health` returns 200
+- Admin created via `POST /auth/admin/setup`; login token persisted
+  to `~/.gestalt/config.json`
+- Registered `trackeros` via `POST /projects` with a real GitHub PAT
+  (`ghp_…145klzw`). The token never appears in logs or responses —
+  `/projects` and `/projects/:id` strip credentials by design via
+  `toPublic()`
+- `POST /projects/<id>/init-harness` cloned, wrote the harness
+  (including `.github/workflows/gestalt.yml`), pushed
+  `a77b0517` to `main`
+- Manually committed a minimal `package.json` (with
+  `"test": "echo \"no tests yet\" && exit 0"`) + `pnpm-lock.yaml` so
+  the workflow's `pnpm install --frozen-lockfile && pnpm test` step
+  has something to run. Commit `e614760`
+- `gestalt projects set-adapter trackeros github-actions` — the new
+  CLI command. The route cloned the repo, flipped
+  `pipeline.adapter` from `noop` to `github-actions` in
+  `HARNESS.json`, committed `37e91f31` (commit subject:
+  `chore: update pipeline adapter to github-actions [gestalt]`),
+  pushed to `main`. `git pull` locally confirmed the file content
+- Submitted intent "Add a kebab-case utility under
+  src/shared/utils/kebab-case with kebabCase(s: string): string"
+- Correlation id `67e5ee02-a325-4a6d-b554-92d03856690a`
+- Full cycle: generate 12 s → gate 1 s → deploy 30 s. Intent →
+  `deployed` in 49 s wall-clock
+- `agent_executions`: 12 rows, all green or skipped as expected:
+  intent (4.0 s) / design (1.6 s) / context (0.7 s) / lint-config
+  (skipped) / code (1.3 s) / test (4.4 s) / constraint (3 ms) / review
+  (0.9 s) / pr-agent (4.6 s) / pipeline-agent (21.0 s) / promotion
+  staging (1.8 s) / promotion production (1.8 s)
+- `deployment_events`: 5 rows in order — `pr-opened` (PR #1),
+  `pipeline-triggered` (runId `26689527360`), `pipeline-passed`
+  (same runId, 16 s after trigger), `promoted-staging`,
+  `promoted-production`
+- **GitHub side confirmed via REST API.** PR
+  `https://github.com/afarahat-lab/trackeros/pull/1` is open against
+  `main`, head branch
+  `gestalt/67e5ee02-add-a-kebab-case-utility-under`, title
+  `Add a kebab-case utility under src/shared/utils/kebab-case with kebab...`.
+  Workflow run `26689527360` shows `status: completed`,
+  `conclusion: success`, `event: workflow_dispatch`, html_url
+  `https://github.com/afarahat-lab/trackeros/actions/runs/26689527360`.
+  This is the first time a Gestalt cycle has driven a real CI run
+  end-to-end
+
+Decisions made:
+- **PAT-scope error becomes a typed `PipelineAdapterAuthError`, not a
+  return value.** Auth errors can happen at any adapter call; making
+  the agent return signatures wear an `auth-error` kind would force
+  three different shape changes (pr-agent returns plain on success,
+  pipeline-agent returns a result with outcome union, promotion-agent
+  same as pipeline). A typed throw at the adapter + a single
+  `instanceof` catch in the orchestrator concentrates the handling and
+  leaves the agent contracts alone
+- **PAT-scope error is GOLDEN_PRINCIPLE_BREACH, not CONSTRAINT_VIOLATION
+  / CONTEXT_GAP.** The signal explicitly tells the operator the system
+  cannot proceed and what change to make. No retry will fix it — same
+  shape as ADR-034's "production without staging" enforcement. Mapping
+  to GP_BREACH plus `escalated` status ensures the human-only
+  resolution path
+- **Detection signature is the `'Resource not accessible'` substring.**
+  GitHub returns two near-identical 403 bodies for missing scopes
+  (`"Resource not accessible by personal access token"` for classic
+  PATs and `"Resource not accessible by integration"` for fine-grained
+  /  apps). Substring match covers both without parsing the JSON or
+  caring about apostrophes / casing changes
+- **`triggerPipeline` retry budget is 3 s + 10×2 s.** Picked to cover
+  the GitHub run-creation latency we observe in practice (1–4 s) with
+  generous headroom while staying inside the 60 s BullMQ worker
+  default. If the run never appears within ~23 s, the dispatch
+  probably failed silently (rare but possible if the workflow file is
+  malformed) — we throw with a clear message and let the orchestrator
+  fail the intent
+- **`set-adapter` validation lives both client-side and server-side.**
+  The CLI rejects bad adapter names before the network call (fast
+  failure for operator typos) and the server re-validates in case the
+  route is called from somewhere other than the CLI. Both lists are
+  the same hardcoded `['noop', 'github-actions']` for now — when a new
+  adapter ships, both edits will be needed
+- **`set-adapter` commits HARNESS.json straight to the default
+  branch.** Same model as `init-harness`. This is configuration of the
+  platform-controlled file; opening a PR for the operator to review
+  would defeat the purpose of a CLI command. The audit-log entry
+  captures who-when-what for accountability
+- **Set the `branch` input on the trigger dispatch.** The harness
+  template's `gestalt.yml` declares a `branch` input; previously the
+  adapter only sent `correlationId` + `environment` and the workflow
+  saw an empty `branch`. Sending the PR branch makes the workflow's
+  branch input usable for projects that customise the workflow (e.g.,
+  to comment on the PR with build status)
+- **Did NOT extend the existing `/projects/:id/config` route to
+  monitoring / qualityGate fields.** Out of scope for this session;
+  the body shape is generic (`{ pipeline?: ... }`) so monitoring +
+  qualityGate fields can be added without changing the API surface.
+  When they're added, the adapter whitelist pattern carries over
+
+Build status: `pnpm -r build` clean across all 12 packages. Full
+SDLC slice — generate → gate → deploy → real GitHub Actions run →
+staging promote → production promote → `deployed` — verified live
+in 49 s wall-clock. PR open and visible; CI run visible in the
+Actions tab. The GitHub PAT used for verification
+(`ghp_…145klzw`) was scoped `repo` + `workflow` and is now stored in
+`project_git_credentials` for project `a5ed81a5-…`. **Operator
+action:** rotate or revoke this PAT after the session per standard
+hygiene; the next `gestalt init` or a re-run of `POST /projects` (the
+PAT is captured per-project, not at the user level) will pick up the
+replacement.
+
+Follow-ups added to Pending enhancements:
+- **`set-adapter` for monitoring + qualityGate fields.** The route
+  body is generic, but only `pipeline.adapter` is validated +
+  applied today. Same pattern (whitelist + clone-edit-commit) will
+  cover the maintenance monitoring adapter and the
+  `qualityGate.maxRetries` field once they need to be operator-
+  settable
+- **Promotion workflow `ref` is hardcoded to `'main'`.** Projects
+  whose default branch is not `main` (e.g., `master`, `trunk`) will
+  see promotion dispatches against a non-existent ref. Read
+  `project.defaultBranch` through to the promotion-agent and forward
+  it via the adapter call
+- **Adapter resolver does not yet validate the PAT proactively.** A
+  PAT missing `workflow` scope only fails on the first dispatch. A
+  startup-time `GET /user` or `GET /repos/:o/:r` check could surface
+  the misconfiguration to the operator at `gestalt init` /
+  `set-adapter` time, before any cycle starts

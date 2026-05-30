@@ -121,6 +121,15 @@ export class GestaltApiClient {
     return this.post(`/projects/${projectId}/init-harness`, { projectDescription });
   }
 
+  async updateProjectConfig(
+    projectId: string,
+    config: { pipeline?: { adapter?: string } },
+  ): Promise<{
+    data: { updated: boolean; adapter?: string; commitSha?: string; reason?: string };
+  }> {
+    return this.post(`/projects/${projectId}/config`, config);
+  }
+
   // ─── Health ────────────────────────────────────────────────────────────────
 
   async health(): Promise<{ status: string; version: string }> {
