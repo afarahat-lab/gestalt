@@ -41,6 +41,9 @@ import {
 import {
   maintenanceTriggerCommand, maintenanceResetFindingsCommand,
 } from './commands/maintenance';
+import {
+  alertsListCommand, alertsShowCommand, alertsFixCommand, alertsDismissCommand,
+} from './commands/alerts';
 
 const pkg = { version: '0.1.0' };  // replaced by package.json at build time
 
@@ -151,6 +154,45 @@ maintenance
   .option('--server <url>', 'Server URL (one-shot override for this invocation)')
   .action(async (projectName: string, opts: { server?: string }) => {
     await maintenanceResetFindingsCommand(projectName, { server: opts.server }).catch(fatalError);
+  });
+
+// gestalt alerts
+const alerts = program
+  .command('alerts')
+  .description('Read + act on the oversight alert feed');
+
+alerts
+  .command('list')
+  .description('Show unacknowledged alerts for the current project')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (opts: { server?: string }) => {
+    await alertsListCommand({ server: opts.server }).catch(fatalError);
+  });
+
+alerts
+  .command('show <alertId>')
+  .description('Full detail for a single alert (id or 8-char prefix)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (alertId: string, opts: { server?: string }) => {
+    await alertsShowCommand(alertId, { server: opts.server }).catch(fatalError);
+  });
+
+alerts
+  .command('fix <alertId>')
+  .description('Submit a fix intent built from the alert context. Acknowledges the alert.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--context <text>', 'Additional context to append to the auto-built intent text')
+  .action(async (alertId: string, opts: { server?: string; context?: string }) => {
+    await alertsFixCommand(alertId, { server: opts.server, context: opts.context }).catch(fatalError);
+  });
+
+alerts
+  .command('dismiss <alertId>')
+  .description('Acknowledge an alert without action. Optional notes are recorded in the audit trail.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--notes <text>', 'Free-form notes')
+  .action(async (alertId: string, opts: { server?: string; notes?: string }) => {
+    await alertsDismissCommand(alertId, { server: opts.server, notes: opts.notes }).catch(fatalError);
   });
 
 // gestalt run

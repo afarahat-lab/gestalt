@@ -90,8 +90,27 @@ export class DashboardApiClient {
 
   // ─── Alerts (additional) ───────────────────────────────────────────────────
 
-  async acknowledgeAlert(id: string): Promise<{ data: Alert }> {
-    return this.post(`/alerts/${id}/acknowledge`, {});
+  async acknowledgeAlert(id: string, notes?: string): Promise<{ data: Alert }> {
+    return this.post(`/alerts/${id}/acknowledge`, { notes: notes ?? '' });
+  }
+
+  /**
+   * Submit a fix intent built server-side from the alert's enriched
+   * context. The alert is acknowledged as part of the same call, so the
+   * card disappears from the unacknowledged list on the next refresh.
+   * `additionalContext` is appended to the intent text (never replaces it).
+   */
+  async submitAlertFixIntent(
+    alertId: string,
+    additionalContext?: string,
+  ): Promise<{ data: { intentId: string; correlationId: string; intentText: string } }> {
+    return this.post(`/alerts/${alertId}/fix-intent`, {
+      additionalContext: additionalContext ?? '',
+    });
+  }
+
+  async dismissAlert(id: string, notes?: string): Promise<{ data: Alert }> {
+    return this.post(`/alerts/${id}/acknowledge`, { notes: notes ?? '' });
   }
 
   // ─── Active agents ─────────────────────────────────────────────────────────
@@ -111,14 +130,19 @@ export class DashboardApiClient {
 
   // ─── Alerts ────────────────────────────────────────────────────────────────
 
+  /**
+   * Server returns `{ data: EnrichedAlert[] }` (same envelope as every
+   * other list endpoint). Each row carries the per-type enrichment
+   * fields lifted from JSONB so the dashboard doesn't re-parse.
+   */
   async listAlerts(params?: {
     acknowledged?: boolean;
     severity?: string;
-  }): Promise<{ alerts: Alert[]; total: number }> {
+  }): Promise<{ data: Alert[]; total: number }> {
     return this.get('/alerts', params);
   }
 
-  async getAlert(id: string): Promise<Alert> {
+  async getAlert(id: string): Promise<{ data: Alert }> {
     return this.get(`/alerts/${id}`);
   }
 

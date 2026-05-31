@@ -2,39 +2,54 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { useDashboardApi } from '../hooks/useApi';
 import { useLiveEvent } from '../hooks/useLiveEvents';
 import { useProject } from '../context/ProjectContext';
-import { SignalBadge } from '../components/shared/StatusBadge';
 import { PageHeader, Card, EmptyState, LoadingSpinner, Button } from '../components/shared/PageHeader';
 import type { Alert } from '../types';
 
 /**
  * Operator-facing alert feed.
  *
- * Surfaces three flavours today:
- *   - clarification-needed: paused intent — operator types a refinement
- *     into the textarea and clicks "Resume intent". The submit calls
- *     POST /intents/:id/clarify; the server acknowledges the alert as
- *     part of the same call, so the card vanishes on the next refresh
- *   - GOLDEN_PRINCIPLE_BREACH: gate / promotion-agent escalations that
- *     require a typed acknowledgement and a resume-or-abort decision
- *   - approve-promotion: human-gated production promotions
+ * Each alert type renders a distinct card layout — the operator should
+ * not have to guess what the alert is about or what they can do. Three
+ * type-specific layouts today:
+ *
+ *   ? clarification-needed     — intent text + suggestions + textarea
+ *     Two actions: "Resume intent" (existing /clarify flow) or
+ *     "Submit fix intent" (queues a fresh intent with the alert's
+ *     description as context).
+ *
+ *   ⚙ maintenance-stuck        — finding type + attempt count +
+ *     affected files + suggestedAction + evidence. Single action:
+ *     "Submit fix intent". `[Dismiss]` to acknowledge without action.
+ *
+ *   ⛔ GOLDEN_PRINCIPLE_BREACH — breachMessage + file:line + agent.
+ *     Three actions: "Submit fix intent", "Resume without fix"
+ *     (legacy intervention path), "Abort intent".
+ *
+ * Every alert also exposes "Dismiss" — acknowledge with optional notes
+ * but no fix action.
  */
+
+const FIX_TYPES: ReadonlyArray<string> = [
+  'clarification-needed', 'maintenance-stuck', 'GOLDEN_PRINCIPLE_BREACH', 'gate-failed-max-retries',
+];
 
 export function Alerts() {
   const api = useDashboardApi();
   const { currentProjectId } = useProject();
   const [alerts, setAlerts] = useState<Alert[]>([]);
-  // Set of intentIds that belong to the currently selected project.
-  // The alerts API itself has no `projectId` filter (Pending enhancement
-  // — would need a new query parameter on /alerts that joins on intents).
-  // For now we fetch the project's intents and filter alerts client-side
-  // by checking each alert's `context.intentId` against the set.
+  // Alerts API has no projectId filter today — we filter client-side by
+  // joining each alert's context.intentId against the project's intent
+  // list. Pending enhancement: server-side projectId query param.
   const [projectIntentIds, setProjectIntentIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [expanded, setExpanded] = useState<string | null>(null);
-  const [notes, setNotes] = useState('');
-  const [clarification, setClarification] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const [confirmation, setConfirmation] = useState<string | null>(null);
+  // Per-alert UI state — textarea + submitting flag keyed by alert.id
+  // so opening two cards at once doesn't share input.
+  const [clarification, setClarification] = useState<Record<string, string>>({});
+  const [additionalContext, setAdditionalContext] = useState<Record<string, string>>({});
+  const [dismissNotes, setDismissNotes] = useState<Record<string, string>>({});
+  const [submitting, setSubmitting] = useState<Record<string, string | null>>({});
+  const [confirmation, setConfirmation] = useState<Record<string, string>>({});
 
   const load = useCallback(async () => {
     if (!currentProjectId) {
@@ -48,9 +63,9 @@ export function Alerts() {
         api.listAlerts({ acknowledged: false }),
         api.listIntents({ projectId: currentProjectId, limit: 200 }),
       ]);
-      setAlerts(alertsRes.alerts ?? []);
+      setAlerts(alertsRes.data ?? []);
       setProjectIntentIds(new Set((intentsRes.data ?? []).map((i) => i.id)));
-    } catch { /* */ } finally { setLoading(false); }
+    } catch { /* ignore — empty state covers it */ } finally { setLoading(false); }
   }, [api, currentProjectId]);
 
   useEffect(() => { void load(); }, [load]);
@@ -59,67 +74,77 @@ export function Alerts() {
   useLiveEvent('intent.status-changed', () => void load());
   useLiveEvent('intent.created', () => void load());
 
-  const alert_fn = window.alert;
+  const browserAlert = window.alert;
 
-  const handleAcknowledge = async (alert: Alert, decision: 'resume' | 'abort') => {
-    if (!notes.trim() && alert.requiredAction === 'acknowledge-breach') {
-      alert_fn('Notes are required for GOLDEN_PRINCIPLE_BREACH acknowledgements.');
+  // ─── Action handlers ──────────────────────────────────────────────────────
+
+  const handleResumeClarification = async (alert: Alert): Promise<void> => {
+    const text = (clarification[alert.id] ?? '').trim();
+    if (!text) {
+      browserAlert('Please describe the clarification before resuming.');
       return;
     }
-    setSubmitting(true);
-    try {
-      await api.submitIntervention({
-        alertId: alert.id,
-        correlationId: alert.correlationId,
-        type: alert.requiredAction,
-        payload: { type: alert.requiredAction, decision, notes } as never,
-      });
-      setExpanded(null);
-      setNotes('');
-      await load();
-    } finally { setSubmitting(false); }
-  };
-
-  const handleApprove = async (alert: Alert) => {
-    setSubmitting(true);
-    try {
-      await api.submitIntervention({
-        alertId: alert.id,
-        correlationId: alert.correlationId,
-        type: 'approve-promotion',
-        payload: { type: 'approve-promotion', environment: String((alert.context as Record<string, unknown>)['environment'] ?? 'production') } as never,
-      });
-      await load();
-    } finally { setSubmitting(false); }
-  };
-
-  const handleClarify = async (alert: Alert) => {
-    if (!clarification.trim()) {
-      alert_fn('Please describe the clarification before resuming.');
-      return;
-    }
-    const ctx = alert.context as Record<string, unknown>;
-    const intentId = typeof ctx['intentId'] === 'string' ? (ctx['intentId'] as string) : null;
+    const intentId = alert.intentId
+      ?? (typeof alert.context['intentId'] === 'string' ? (alert.context['intentId'] as string) : null);
     if (!intentId) {
-      alert_fn('This alert is missing the intent id — cannot resume from the dashboard.');
+      browserAlert('This alert is missing the intent id — cannot resume from the dashboard.');
       return;
     }
-    setSubmitting(true);
+    setSubmitting((s) => ({ ...s, [alert.id]: 'resume' }));
     try {
-      await api.clarifyIntent(intentId, {
-        clarification: clarification.trim(),
-        ambiguityId: typeof ctx['ambiguityId'] === 'string'
-          ? (ctx['ambiguityId'] as string)
-          : undefined,
-      });
-      setConfirmation(alert.id);
-      setClarification('');
-      // The server acknowledges the alert as part of POST /clarify, so
-      // a re-fetch will drop the card. Give the operator a moment to
-      // see the confirmation first.
-      setTimeout(() => { setConfirmation(null); setExpanded(null); void load(); }, 1200);
-    } finally { setSubmitting(false); }
+      await api.clarifyIntent(intentId, { clarification: text });
+      setConfirmation((c) => ({ ...c, [alert.id]: 'Clarification submitted — resuming intent' }));
+      setClarification((s) => ({ ...s, [alert.id]: '' }));
+      setTimeout(() => {
+        setConfirmation((c) => { const n = { ...c }; delete n[alert.id]; return n; });
+        setExpanded(null);
+        void load();
+      }, 1200);
+    } finally {
+      setSubmitting((s) => ({ ...s, [alert.id]: null }));
+    }
   };
+
+  const handleFixIntent = async (alert: Alert): Promise<void> => {
+    const ctx = (additionalContext[alert.id] ?? '').trim();
+    setSubmitting((s) => ({ ...s, [alert.id]: 'fix' }));
+    try {
+      const res = await api.submitAlertFixIntent(alert.id, ctx);
+      const shortText = res.data.intentText.length > 80
+        ? res.data.intentText.slice(0, 77) + '...'
+        : res.data.intentText;
+      setConfirmation((c) => ({ ...c, [alert.id]: `✓ Fix intent submitted — "${shortText}"` }));
+      setAdditionalContext((s) => ({ ...s, [alert.id]: '' }));
+      setTimeout(() => {
+        setConfirmation((c) => { const n = { ...c }; delete n[alert.id]; return n; });
+        setExpanded(null);
+        void load();
+      }, 1800);
+    } catch (err) {
+      browserAlert(`Failed to submit fix intent: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setSubmitting((s) => ({ ...s, [alert.id]: null }));
+    }
+  };
+
+  const handleDismiss = async (alert: Alert): Promise<void> => {
+    const notes = (dismissNotes[alert.id] ?? '').trim();
+    setSubmitting((s) => ({ ...s, [alert.id]: 'dismiss' }));
+    try {
+      await api.dismissAlert(alert.id, notes);
+      setConfirmation((c) => ({ ...c, [alert.id]: '✓ Alert dismissed' }));
+      setDismissNotes((s) => ({ ...s, [alert.id]: '' }));
+      setTimeout(() => {
+        setConfirmation((c) => { const n = { ...c }; delete n[alert.id]; return n; });
+        setExpanded(null);
+        void load();
+      }, 1000);
+    } finally {
+      setSubmitting((s) => ({ ...s, [alert.id]: null }));
+    }
+  };
+
+  // ─── Render ───────────────────────────────────────────────────────────────
 
   if (loading) return <LoadingSpinner />;
   if (!currentProjectId) {
@@ -137,13 +162,17 @@ export function Alerts() {
   }
 
   const SEVERITY_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
-  // Project filter — client-side: keep alerts whose intentId belongs to
-  // the current project's intent set. Alerts without an intentId
-  // (project-level / global) pass through; these are rare today
-  // (clarification alerts always carry intentId in context).
+  // Client-side project scoping — keep alerts whose context.intentId (or
+  // top-level intentId) belongs to this project; alerts without an
+  // intentId (project-level / global) pass through.
   const projectScoped = alerts.filter((a) => {
-    const ctx = (a.context ?? {}) as Record<string, unknown>;
-    const intentId = typeof ctx['intentId'] === 'string' ? (ctx['intentId'] as string) : null;
+    const intentId = a.intentId
+      ?? (typeof a.context?.['intentId'] === 'string' ? (a.context['intentId'] as string) : null);
+    // maintenance-stuck carries projectId directly in context, so we
+    // can filter on that without joining intents.
+    if (a.type === 'maintenance-stuck' && typeof a.context?.['projectId'] === 'string') {
+      return a.context['projectId'] === currentProjectId;
+    }
     if (!intentId) return true;
     return projectIntentIds.has(intentId);
   });
@@ -165,144 +194,64 @@ export function Alerts() {
           />
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            {sorted.map(alert => {
+            {sorted.map((alert) => {
               const isExpanded = expanded === alert.id;
-              const isBreach = alert.type === 'GOLDEN_PRINCIPLE_BREACH';
-              const isClarification = alert.requiredAction === 'provide-clarification';
-              const wasJustSubmitted = confirmation === alert.id;
-
+              const canFix = FIX_TYPES.includes(alert.type);
+              const confirmText = confirmation[alert.id];
+              const busy = submitting[alert.id] !== null && submitting[alert.id] !== undefined;
               return (
                 <Card
                   key={alert.id}
                   style={{
-                    borderColor: isBreach ? 'var(--red)'
-                      : isClarification ? 'var(--amber)'
-                      : alert.severity === 'high' ? 'var(--amber)' : undefined,
+                    borderColor:
+                      alert.type === 'GOLDEN_PRINCIPLE_BREACH' ? 'var(--red)' :
+                      alert.type === 'clarification-needed' ? 'var(--amber)' :
+                      alert.type === 'maintenance-stuck' ? 'var(--amber)' :
+                      undefined,
                   }}
                 >
-                  {/* Header */}
-                  <div
-                    style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '14px 16px', cursor: 'pointer' }}
-                    onClick={() => setExpanded(isExpanded ? null : alert.id)}
-                  >
-                    {isBreach && (
-                      <span style={{
-                        background: 'var(--red)',
-                        color: '#fff',
-                        fontSize: '10px',
-                        fontWeight: 700,
-                        padding: '2px 6px',
-                        borderRadius: '3px',
-                        fontFamily: 'var(--font-mono)',
-                        flexShrink: 0,
-                      }}>
-                        BREACH
-                      </span>
-                    )}
-                    {isClarification && (
-                      <span style={{
-                        background: 'var(--amber)',
-                        color: '#000',
-                        fontSize: '10px',
-                        fontWeight: 700,
-                        padding: '2px 6px',
-                        borderRadius: '3px',
-                        fontFamily: 'var(--font-mono)',
-                        flexShrink: 0,
-                      }}>
-                        ?
-                      </span>
-                    )}
-                    <SignalBadge type={alert.type} severity={alert.severity} />
-                    <p style={{ flex: 1, fontSize: '13px', color: 'var(--text-primary)' }}>{alert.title}</p>
-                    <span style={{ fontSize: '11px', color: 'var(--text-dim)', fontFamily: 'var(--font-mono)', flexShrink: 0 }}>
-                      {new Date(alert.createdAt).toLocaleTimeString()}
-                    </span>
-                    <span style={{ color: 'var(--text-dim)', fontSize: '12px' }}>{isExpanded ? '▲' : '▼'}</span>
-                  </div>
-
-                  {/* Expanded detail */}
+                  <AlertHeader
+                    alert={alert}
+                    expanded={isExpanded}
+                    onToggle={() => setExpanded(isExpanded ? null : alert.id)}
+                  />
                   {isExpanded && (
                     <div style={{ borderTop: '1px solid var(--border)', padding: '14px 16px', background: 'var(--bg-base)' }}>
-                      <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '14px' }}>
-                        {alert.description}
-                      </p>
-
-                      {/* Clarification flow */}
-                      {isClarification && (
-                        <div style={{ marginBottom: '12px' }}>
-                          {wasJustSubmitted ? (
-                            <p style={{ fontSize: '12px', color: 'var(--green)', fontFamily: 'var(--font-mono)' }}>
-                              ✓ Clarification submitted — resuming...
-                            </p>
-                          ) : (
-                            <>
-                              {Array.isArray((alert.context as Record<string, unknown>)['suggestions']) && (
-                                <div style={{ marginBottom: '10px' }}>
-                                  <p style={{ fontSize: '11px', color: 'var(--text-dim)', fontFamily: 'var(--font-mono)', marginBottom: '4px' }}>
-                                    suggestions
-                                  </p>
-                                  <ul style={{ margin: 0, paddingLeft: '18px', fontSize: '12px', color: 'var(--text-secondary)' }}>
-                                    {((alert.context as Record<string, unknown>)['suggestions'] as string[]).map((s, i) => (
-                                      <li key={i} style={{ marginBottom: '4px' }}>{s}</li>
-                                    ))}
-                                  </ul>
-                                </div>
-                              )}
-                              <textarea
-                                value={clarification}
-                                onChange={e => setClarification(e.target.value)}
-                                placeholder="Describe the missing detail (success criteria, inputs, outputs, what 'done' looks like)..."
-                                style={notesStyle}
-                              />
-                              <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
-                                <Button
-                                  variant="primary"
-                                  onClick={() => void handleClarify(alert)}
-                                  disabled={submitting || !clarification.trim()}
-                                >
-                                  resume intent
-                                </Button>
-                              </div>
-                            </>
-                          )}
-                        </div>
+                      {confirmText && (
+                        <div style={{
+                          fontSize: '12px', color: 'var(--green)', fontFamily: 'var(--font-mono)',
+                          marginBottom: '10px',
+                        }}>{confirmText}</div>
                       )}
-
-                      {/* Breach acknowledgement */}
-                      {alert.requiredAction === 'acknowledge-breach' && (
-                        <div style={{ marginBottom: '12px' }}>
-                          <p style={{ fontSize: '11px', color: 'var(--red)', fontFamily: 'var(--font-mono)', marginBottom: '8px' }}>
-                            Notes required (mandatory for breach acknowledgement)
-                          </p>
-                          <textarea
-                            value={notes}
-                            onChange={e => setNotes(e.target.value)}
-                            placeholder="Explain your decision..."
-                            style={notesStyle}
-                          />
-                          <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
-                            <Button variant="danger" onClick={() => handleAcknowledge(alert, 'abort')} disabled={submitting}>
-                              abort cycle
-                            </Button>
-                            <Button onClick={() => handleAcknowledge(alert, 'resume')} disabled={submitting || !notes.trim()}>
-                              resume cycle
-                            </Button>
-                          </div>
-                        </div>
+                      <AlertBody alert={alert} />
+                      {alert.type === 'clarification-needed' && (
+                        <ClarificationActions
+                          alert={alert}
+                          value={clarification[alert.id] ?? ''}
+                          onChange={(v) => setClarification((s) => ({ ...s, [alert.id]: v }))}
+                          onResume={() => void handleResumeClarification(alert)}
+                          submittingMode={submitting[alert.id] ?? null}
+                          busy={busy}
+                        />
                       )}
-
-                      {/* Promotion approval */}
-                      {alert.requiredAction === 'approve-promotion' && (
-                        <div style={{ display: 'flex', gap: '8px' }}>
-                          <Button variant="primary" onClick={() => handleApprove(alert)} disabled={submitting}>
-                            approve promotion
-                          </Button>
-                          <Button variant="danger" disabled={submitting}>
-                            reject
-                          </Button>
-                        </div>
+                      {canFix && (
+                        <FixIntentBlock
+                          alert={alert}
+                          value={additionalContext[alert.id] ?? ''}
+                          onChange={(v) => setAdditionalContext((s) => ({ ...s, [alert.id]: v }))}
+                          onSubmit={() => void handleFixIntent(alert)}
+                          submittingMode={submitting[alert.id] ?? null}
+                          busy={busy}
+                        />
                       )}
+                      <DismissBlock
+                        alert={alert}
+                        value={dismissNotes[alert.id] ?? ''}
+                        onChange={(v) => setDismissNotes((s) => ({ ...s, [alert.id]: v }))}
+                        onSubmit={() => void handleDismiss(alert)}
+                        submittingMode={submitting[alert.id] ?? null}
+                        busy={busy}
+                      />
                     </div>
                   )}
                 </Card>
@@ -315,7 +264,291 @@ export function Alerts() {
   );
 }
 
-const notesStyle: React.CSSProperties = {
+// ─── Header (always visible) ──────────────────────────────────────────────────
+
+function AlertHeader({ alert, expanded, onToggle }: {
+  alert: Alert;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div
+      style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '14px 16px', cursor: 'pointer' }}
+      onClick={onToggle}
+    >
+      <TypeGlyph alert={alert} />
+      <span style={{
+        fontFamily: 'var(--font-mono)', fontSize: '10px', textTransform: 'uppercase',
+        letterSpacing: '0.06em', color: 'var(--text-secondary)', flexShrink: 0,
+      }}>
+        {alert.type.replace(/_/g, ' ').replace(/-/g, ' ')}
+      </span>
+      <SeverityBadge severity={alert.severity} />
+      <p style={{ flex: 1, fontSize: '13px', color: 'var(--text-primary)' }}>{alert.title}</p>
+      <span style={{ fontSize: '11px', color: 'var(--text-dim)', fontFamily: 'var(--font-mono)', flexShrink: 0 }}>
+        {new Date(alert.createdAt).toLocaleTimeString()}
+      </span>
+      <span style={{ color: 'var(--text-dim)', fontSize: '12px' }}>{expanded ? '▲' : '▼'}</span>
+    </div>
+  );
+}
+
+function TypeGlyph({ alert }: { alert: Alert }) {
+  const { glyph, color } =
+    alert.type === 'clarification-needed'     ? { glyph: '?', color: 'var(--amber)' } :
+    alert.type === 'maintenance-stuck'        ? { glyph: '⚙', color: 'var(--amber)' } :
+    alert.type === 'GOLDEN_PRINCIPLE_BREACH'  ? { glyph: '⛔', color: 'var(--red)' } :
+    alert.type === 'gate-failed-max-retries'  ? { glyph: '✗', color: 'var(--red)' } :
+                                                { glyph: '!',  color: 'var(--text-dim)' };
+  return (
+    <span style={{
+      fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: '13px',
+      color, width: '16px', flexShrink: 0, textAlign: 'center',
+    }}>
+      {glyph}
+    </span>
+  );
+}
+
+function SeverityBadge({ severity }: { severity: string }) {
+  const bg =
+    severity === 'critical' ? 'var(--red)' :
+    severity === 'high'     ? 'var(--amber)' :
+    severity === 'medium'   ? 'var(--blue)' :
+                              'var(--text-dim)';
+  return (
+    <span style={{
+      fontFamily: 'var(--font-mono)', fontSize: '10px', fontWeight: 700,
+      padding: '2px 6px', borderRadius: '3px',
+      background: bg, color: severity === 'high' ? '#000' : '#fff',
+      flexShrink: 0,
+    }}>
+      [{severity}]
+    </span>
+  );
+}
+
+// ─── Body — per-type detail ──────────────────────────────────────────────────
+
+function AlertBody({ alert }: { alert: Alert }) {
+  if (alert.type === 'clarification-needed') return <ClarificationBody alert={alert} />;
+  if (alert.type === 'maintenance-stuck')    return <MaintenanceStuckBody alert={alert} />;
+  if (alert.type === 'GOLDEN_PRINCIPLE_BREACH') return <BreachBody alert={alert} />;
+  return (
+    <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '12px' }}>
+      {alert.description}
+    </p>
+  );
+}
+
+function ClarificationBody({ alert }: { alert: Alert }) {
+  const suggestions = Array.isArray(alert.context?.['suggestions'])
+    ? (alert.context['suggestions'] as string[])
+    : [];
+  return (
+    <div style={{ marginBottom: '12px' }}>
+      {alert.intentText && (
+        <KV label="Intent">
+          <span style={{ color: 'var(--text-primary)' }}>&quot;{alert.intentText}&quot;</span>
+        </KV>
+      )}
+      {alert.intentStatus && <KV label="Status">{alert.intentStatus}</KV>}
+      <p style={{ marginTop: '10px', fontSize: '12px', color: 'var(--text-secondary)' }}>
+        <strong style={{ color: 'var(--text-primary)' }}>Why paused:</strong> {alert.description}
+      </p>
+      {suggestions.length > 0 && (
+        <div style={{ marginTop: '8px' }}>
+          <p style={mutedLabel}>Suggestions</p>
+          <ul style={{ margin: '4px 0 0 18px', fontSize: '12px', color: 'var(--text-secondary)' }}>
+            {suggestions.map((s, i) => <li key={i} style={{ marginBottom: '3px' }}>{s}</li>)}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MaintenanceStuckBody({ alert }: { alert: Alert }) {
+  return (
+    <div style={{ marginBottom: '12px' }}>
+      <KV label="Agent">{alert.context?.['agentRole'] as string ?? '(unknown)'}</KV>
+      <KV label="Finding">{alert.findingType ?? '(unknown)'}</KV>
+      {alert.attemptCount !== null && alert.attemptCount !== undefined && (
+        <KV label="After">{alert.attemptCount} attempt{alert.attemptCount === 1 ? '' : 's'}</KV>
+      )}
+      {alert.suggestedAction && (
+        <div style={{ marginTop: '10px' }}>
+          <p style={mutedLabel}>What was tried</p>
+          <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '4px' }}>
+            {alert.suggestedAction}
+          </p>
+        </div>
+      )}
+      {alert.affectedFiles && alert.affectedFiles.length > 0 && (
+        <div style={{ marginTop: '10px' }}>
+          <p style={mutedLabel}>Affected files</p>
+          <ul style={{ margin: '4px 0 0 0', padding: 0, listStyle: 'none' }}>
+            {alert.affectedFiles.map((f, i) => (
+              <li key={i} style={{ fontFamily: 'var(--font-mono)', fontSize: '11px', color: 'var(--text-secondary)' }}>
+                {f}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {alert.evidence && (
+        <div style={{ marginTop: '10px' }}>
+          <p style={mutedLabel}>Evidence</p>
+          <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '4px' }}>
+            {alert.evidence}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BreachBody({ alert }: { alert: Alert }) {
+  return (
+    <div style={{ marginBottom: '12px' }}>
+      {alert.breachAgent && <KV label="Detected by">{alert.breachAgent}</KV>}
+      <p style={{ marginTop: '10px', fontSize: '12px', color: 'var(--text-secondary)' }}>
+        <strong style={{ color: 'var(--text-primary)' }}>What happened:</strong>{' '}
+        {alert.breachMessage ?? alert.description}
+      </p>
+      {alert.breachLocation && (
+        <div style={{ marginTop: '8px', display: 'flex', gap: '14px', flexWrap: 'wrap' }}>
+          <KV label="File">{alert.breachLocation.file}</KV>
+          {alert.breachLocation.line !== undefined && (
+            <KV label="Line">{alert.breachLocation.line}</KV>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Action blocks ────────────────────────────────────────────────────────────
+
+function ClarificationActions({ alert, value, onChange, onResume, submittingMode, busy }: {
+  alert: Alert; value: string;
+  onChange: (v: string) => void;
+  onResume: () => void;
+  submittingMode: string | null;
+  busy: boolean;
+}) {
+  return (
+    <ActionBlock title="Provide clarification (resumes the existing intent)" alert={alert}>
+      <textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="Describe the missing detail — success criteria, inputs, outputs, what 'done' looks like..."
+        style={textareaStyle}
+      />
+      <div style={{ marginTop: '8px' }}>
+        <Button
+          variant="primary"
+          onClick={onResume}
+          disabled={busy || !value.trim()}
+        >
+          {submittingMode === 'resume' ? 'resuming...' : 'resume intent ▶'}
+        </Button>
+      </div>
+    </ActionBlock>
+  );
+}
+
+function FixIntentBlock({ alert, value, onChange, onSubmit, submittingMode, busy }: {
+  alert: Alert; value: string;
+  onChange: (v: string) => void;
+  onSubmit: () => void;
+  submittingMode: string | null;
+  busy: boolean;
+}) {
+  const label =
+    alert.type === 'clarification-needed' ? 'Or submit as a new intent (does not resume the existing one)' :
+    'Submit a fix intent';
+  return (
+    <ActionBlock title={label} alert={alert}>
+      <textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="Add additional context (optional) — the alert's structural context is always included."
+        style={textareaStyle}
+      />
+      <div style={{ marginTop: '8px' }}>
+        <Button onClick={onSubmit} disabled={busy}>
+          {submittingMode === 'fix' ? 'submitting...' : 'submit fix intent ▶'}
+        </Button>
+      </div>
+    </ActionBlock>
+  );
+}
+
+function DismissBlock({ alert, value, onChange, onSubmit, submittingMode, busy }: {
+  alert: Alert; value: string;
+  onChange: (v: string) => void;
+  onSubmit: () => void;
+  submittingMode: string | null;
+  busy: boolean;
+}) {
+  return (
+    <ActionBlock title="Dismiss (acknowledge without action)" alert={alert} compact>
+      <textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="Optional notes — reason for dismissal..."
+        style={{ ...textareaStyle, minHeight: '50px' }}
+      />
+      <div style={{ marginTop: '8px' }}>
+        <Button variant="danger" onClick={onSubmit} disabled={busy}>
+          {submittingMode === 'dismiss' ? 'dismissing...' : 'dismiss'}
+        </Button>
+      </div>
+    </ActionBlock>
+  );
+}
+
+function ActionBlock({ title, children, compact }: {
+  title: string;
+  alert: Alert;
+  compact?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <div style={{
+      border: '1px solid var(--border)', borderRadius: '5px',
+      padding: compact ? '8px 10px' : '10px 12px', marginTop: '10px',
+      background: 'var(--bg-subtle)',
+    }}>
+      <p style={mutedLabel}>{title}</p>
+      <div style={{ marginTop: '6px' }}>{children}</div>
+    </div>
+  );
+}
+
+// ─── Helpers + styles ─────────────────────────────────────────────────────────
+
+function KV({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div style={{ display: 'flex', gap: '8px', alignItems: 'baseline', marginBottom: '3px' }}>
+      <span style={{
+        fontFamily: 'var(--font-mono)', fontSize: '11px', color: 'var(--text-dim)',
+        textTransform: 'uppercase', letterSpacing: '0.04em', minWidth: '90px',
+      }}>{label}:</span>
+      <span style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', color: 'var(--text-secondary)' }}>
+        {children}
+      </span>
+    </div>
+  );
+}
+
+const mutedLabel: React.CSSProperties = {
+  fontSize: '10px', fontFamily: 'var(--font-mono)', color: 'var(--text-dim)',
+  textTransform: 'uppercase', letterSpacing: '0.06em', margin: 0,
+};
+
+const textareaStyle: React.CSSProperties = {
   width: '100%',
   minHeight: '70px',
   background: 'var(--bg-raised)',
@@ -326,4 +559,5 @@ const notesStyle: React.CSSProperties = {
   color: 'var(--text-primary)',
   outline: 'none',
   resize: 'vertical',
+  fontFamily: 'var(--font-mono)',
 };

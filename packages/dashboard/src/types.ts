@@ -185,9 +185,30 @@ export type AlertAction =
   | 'provide-clarification'
   | 'acknowledge-breach';
 
+export interface CodeLocation {
+  file: string;
+  line?: number;
+  column?: number;
+  rule?: string;
+}
+
+/**
+ * Server enriches each alert with type-specific fields lifted out of
+ * the JSONB `context` column so the dashboard can render without
+ * re-parsing. Only the keys relevant to the alert's `type` are
+ * populated; the rest are absent (not present as `null`).
+ *
+ *   clarification-needed →
+ *     intentText, intentStatus
+ *   maintenance-stuck →
+ *     findingType, affectedFiles, evidence, attemptCount, suggestedAction
+ *   GOLDEN_PRINCIPLE_BREACH →
+ *     breachMessage, breachLocation, breachAgent
+ */
 export interface Alert {
   id: string;
   correlationId: string;
+  intentId: string | null;
   type: string;          // signal type that triggered this alert
   severity: AlertSeverity;
   title: string;
@@ -196,6 +217,17 @@ export interface Alert {
   context: Record<string, unknown>;   // action-specific context
   createdAt: string;
   acknowledgedAt: string | null;
+  // Enrichment — present per alert type (see JSDoc above).
+  intentText?: string | null;
+  intentStatus?: string | null;
+  findingType?: string | null;
+  affectedFiles?: string[] | null;
+  evidence?: string | null;
+  attemptCount?: number | null;
+  suggestedAction?: string | null;
+  breachMessage?: string | null;
+  breachLocation?: CodeLocation | null;
+  breachAgent?: string | null;
 }
 
 // ─── Interventions ────────────────────────────────────────────────────────────

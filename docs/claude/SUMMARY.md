@@ -14,7 +14,7 @@ content is derived._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — alignment-agent module tree-block extractor + CLI maintenance commands)
+**Last updated:** 2026-06-01 (Claude Code — richer alerts: enriched payload + fix-intent flow + CLI alerts commands)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -693,6 +693,111 @@ content is derived._
 7. `git pull` — receive harness files locally
 8. `gestalt run "<intent>"` — submit work to agents
 
+**Alert system — enriched payload + fix-intent flow + CLI:**
+- `GET /alerts` and `GET /alerts/:id` return `{ data: EnrichedAlert[] }`
+  (the standard envelope). Each row carries the base `AlertRecord`
+  shape plus per-type fields lifted out of the JSONB `context`
+  column so the dashboard / CLI can render without re-parsing:
+  - `clarification-needed` → `intentText`, `intentStatus` (looked
+    up via `intents.findById(context.intentId)`)
+  - `maintenance-stuck` → `findingType`, `affectedFiles`,
+    `evidence`, `attemptCount`, `suggestedAction` (lifted from
+    `context`)
+  - `GOLDEN_PRINCIPLE_BREACH` → `breachMessage`, `breachLocation`,
+    `breachAgent` (resolved via `signals.findByCorrelationId(alert.
+    correlationId)` → pick the `GOLDEN_PRINCIPLE_BREACH` row)
+- `POST /alerts/:id/fix-intent { additionalContext? }` — operator
+  says "I understand the problem, generate a fix". The server
+  builds the intent text from the alert's enriched context, queues
+  a `generate:intent` task on the BullMQ queue (same shape as
+  `POST /intents`), acknowledges the alert in the same call so the
+  card disappears atomically, writes an `alert.fix-intent-submitted`
+  audit row (metadata: `fixIntentId`, `additionalContextLength`,
+  `intentTextLength`, `ip` — **never the context text itself per
+  GP-006**), and returns `{ intentId, correlationId, intentText }`.
+  `additionalContext` is **appended** to the auto-built text, never
+  replaces it — the alert's structural context always leads.
+  Intent text templates:
+  - `clarification-needed` → `Fix the following issue with intent
+    "X": <description>. <additionalContext>`
+  - `maintenance-stuck` → `<suggestedAction>. Context: <evidence>.
+    <additionalContext>`
+  - `GOLDEN_PRINCIPLE_BREACH` → `Fix golden principle breach in
+    <file>: <breachMessage>. <additionalContext>`
+- `POST /alerts/:id/acknowledge { notes? }` extended to accept an
+  optional notes body. Audit metadata captures `notesLength` only
+  — the text stays on the alert / persisted record, not in the
+  audit row (GP-006)
+- **Dashboard `Alerts.tsx` rewritten with per-type cards**
+  (`packages/dashboard/src/views/Alerts.tsx`). Each card has a
+  distinct layout matching the alert's information needs:
+  - `clarification-needed` — intent quote + status + "Why paused"
+    prose + suggestions bullet list + two action blocks:
+    "Provide clarification (resumes the existing intent)" with
+    `resume intent ▶` (existing `POST /intents/:id/clarify` flow,
+    kept intact) AND "Or submit as a new intent" with
+    `submit fix intent ▶` (new `POST /alerts/:id/fix-intent`)
+  - `maintenance-stuck` — Agent + Finding + Attempts KV header,
+    "What was tried" (`suggestedAction`), Affected files list,
+    Evidence prose; single action block "Submit a fix intent" +
+    optional context textarea
+  - `GOLDEN_PRINCIPLE_BREACH` — Detected by + Location KV header,
+    "What happened" prose, File + Line KV; single action block
+    "Submit a fix intent"
+  - Every card also shows a "Dismiss (acknowledge without action)"
+    action block with optional notes textarea + red `dismiss`
+    button. Per-alert UI state (textarea content, submission mode,
+    confirmation banner) is keyed by `alert.id` so opening
+    multiple cards at once doesn't share input
+- **CLI surface — `gestalt alerts`.** Four subcommands so
+  operators can work without the dashboard:
+  - `gestalt alerts list` — prints a table of unacknowledged
+    alerts for the current project (resolved from
+    `~/.gestalt/config.json` `currentProjectId`, with the same
+    `[severity]` colour-coding the dashboard uses); empty list
+    prints `✓ No unacknowledged alerts`
+  - `gestalt alerts show <id>` — full per-type detail panel
+    (Title / Description / per-type extras / Available actions
+    footer). Accepts either the full UUID or the first 8 chars
+    (same 8-char prefix the list table shows). Ambiguous
+    prefix errors with the match count
+  - `gestalt alerts fix <id> [--context <text>]` — submits a fix
+    intent via `POST /alerts/:id/fix-intent`. Prompts for the
+    optional context via `prompt()` when `--context` is not
+    supplied (consistent with `gestalt init-admin`). Prints the
+    new `intentId` / `correlationId` / first 80 chars of the
+    `intentText` + a `gestalt status` hint
+  - `gestalt alerts dismiss <id> [--notes <text>]` — acknowledges
+    without action via `POST /alerts/:id/acknowledge`. Prompts
+    for notes when `--notes` is not supplied
+  - All four accept the standard `--server <url>` one-shot
+    override; project scoping matches the dashboard's
+    client-side join on `context.intentId` against the current
+    project's intents (plus the direct `context.projectId`
+    short-circuit for `maintenance-stuck`)
+- Live verified end-to-end against `trackeros`:
+  - Two `maintenance-stuck` alerts existed in the DB from the
+    prior session. `gestalt alerts list` showed the table with
+    `[medium]` badges, `maintenance-stuck` type column, and the
+    8-char id; `gestalt alerts show b2260ec2` printed Finding /
+    Attempts / Affected files / Suggested action / Evidence
+  - `gestalt alerts fix b2260ec2 --context "(operator note)"`
+    submitted a fresh `intents` row (`source: 'human'`, status
+    `generating`), acknowledged the alert atomically, audit row
+    captured `additionalContextLength: 48` + `intentTextLength:
+    291` + `fixIntentId` (no text leakage)
+  - `gestalt alerts dismiss bf44dc0a --notes "..."` acknowledged
+    the second alert; audit captured `notesLength: 51` only
+  - Submitted a fresh "make it better" intent to create a
+    `clarification-needed` alert; `gestalt alerts show` enriched
+    correctly with `intentText: "make it better"` /
+    `intentStatus: waiting-for-clarification` / 3 suggestions
+  - Drove the dashboard at `/app/alerts` with headless Chrome:
+    the new clarification card rendered exactly per the brief —
+    `?` glyph + `CLARIFICATION NEEDED` + `[high]` badge + intent
+    quote / status KV + Why paused prose + suggestions list + 3
+    stacked action blocks (Resume / Submit-as-new / Dismiss)
+
 **Pending enhancements (design in chat first):**
 - **`GET /alerts` has no `projectId` filter.** The dashboard's
   Alerts view filters client-side by joining each alert's
@@ -703,11 +808,13 @@ content is derived._
   `alerts`) would let the API return the filtered set in one
   call and let the Layout's badge count match the visible list
   without extra plumbing
-- **POST /interventions still a 501 stub.** The clarification flow
-  bypasses it (uses `POST /intents/:id/clarify` directly because
-  that endpoint owns the resume side effect). When breach
-  acknowledgement / promotion approval get UIs they'll need a
-  real implementation here
+- **POST /interventions still a 501 stub.** The
+  clarification flow uses `POST /intents/:id/clarify` (owns the
+  resume side effect) and the new "submit fix intent" path uses
+  `POST /alerts/:id/fix-intent`. Promotion approval (the
+  remaining `approve-promotion` action type) does not have a
+  shipped UI yet and will likely use this endpoint when it
+  does
 - **Return-URL preservation across login.** Pasting `/app/intents/<id>`
   in a fresh tab today bounces to `/app/login` and after sign-in
   lands on `/app/` (the intent ID is dropped). Small SPA-only change —
@@ -774,207 +881,6 @@ content is derived._
 ---
 
 ## Recent session log entries (last 3 from SESSION_LOG.md)
-
-### Session 2026-05-31 — Claude Code (context-file maintenance intents take the direct-fix path)
-
-Fixed a long-standing routing bug in the maintenance layer. Both
-`alignment-agent` and `drift-agent` queue `CONTEXT_ALIGNMENT` /
-`CONTEXT_UPDATE` intents whose suggested-action text is a *documentation
-instruction* ("Update AGENTS.md to reference GP-003 …"). Previously the
-runner unconditionally dispatched every queued intent into the generate
-queue. The generate loop is the wrong tool — design-agent has no
-architecture to design, code-agent produces nothing actionable, and
-test-agent has nothing to test. Cycles either failed silently or burned
-LLM budget producing no value. ADR-018 explicitly permits maintenance
-agents to apply direct fixes for additive context-file edits; this
-session wires that path through the runner.
-
-Changed:
-- `packages/agents/maintenance/src/types.ts`:
-  - New `MaintenanceIntentClass` union
-    (`'context-file-update' | 'code-change'`) + a pure switch
-    `classifyMaintenanceIntent(type)` that maps `CONTEXT_UPDATE` /
-    `CONTEXT_ALIGNMENT` → `'context-file-update'` and
-    `PERFORMANCE_DEGRADATION` / `SECURITY_FINDING` → `'code-change'`.
-    Both exported from the package's public surface
-- `packages/agents/maintenance/src/agents/context-fixer.ts` (new):
-  - `applyContextFileFix(intent, project)` — the direct-fix path.
-    Signature returns
-    `{ committed: boolean; commitSha?: string; reason?: 'no-change' |
-    'truncation-guard' | 'file-missing' | 'llm-error' }` so the
-    runner can branch on the outcome without catching the success
-    case as an error
-  - **Path guard runs BEFORE the clone OR the LLM call.** If
-    `intent.affectedFiles[0]` is not in `docs/*` and is not exactly
-    `AGENTS.md`, throws with a clear ADR-018 reference. Empty
-    `affectedFiles` also throws. ADR-018 forbids the direct-fix path
-    from touching `src/`; the guard makes that structural
-  - Clone via `simple-git` to a `mkdtemp` dir; checkout
-    `defaultBranch` (best-effort — a brand-new repo may have an
-    unborn branch); read the target file, return `file-missing`
-    cleanly if not present
-  - LLM prompt: system message instructs "preserve all existing
-    content … return the complete updated file content with no
-    commentary or fences"; user message includes the current
-    content wrapped in `<<<FILE` / `FILE>>>` markers + the
-    finding's `evidence` + the `suggestedAction` (maintenance
-    prefix stripped). `getLLMClient().complete()` with
-    `maxTokens: 8192`, `temperature: 0.2`,
-    `correlationId: 'ctxfix-<projectId>-<TYPE>'`. Defensive
-    `stripFences` on the response just in case
-  - **Truncation guard.** If the LLM-generated content is shorter
-    than 50% of the original, log a warning and return
-    `{ committed: false, reason: 'truncation-guard' }`. The most
-    common LLM failure mode for "return the full file" tasks is to
-    return only the delta or a summary; the guard catches that
-    before the wrong content reaches Git
-  - No-op short-circuits — `newContent === currentContent` and
-    `repo.status().files.length === 0` both return cleanly without
-    a commit
-  - Commit author is `Gestalt Maintenance Agent
-    <maintenance-agent@gestalt.local>`; subject is
-    `docs: <cleanSubject (72-char cap)>
-    [gestalt-maintenance/<TYPE>]` so
-    `git log --grep='[gestalt-maintenance]'` enumerates every
-    direct-fix commit. Push goes to `defaultBranch`. Temp dir
-    cleaned in `finally` on every path
-- `packages/agents/maintenance/src/runner/index.ts`:
-  - Imports `classifyMaintenanceIntent` and `applyContextFileFix`
-  - In the per-project loop, replaced the unconditional
-    `dispatchMaintenanceIntent(intent)` call with a switch on
-    `classifyMaintenanceIntent(intent.type)`:
-    - `'context-file-update'`: call `applyContextFileFix` in-process;
-      on success, increment `totalDirectFixes` and append a typed
-      `direct-fix-applied` finding (with commit-sha lifted out for
-      the operator). On thrown failure, append a typed
-      `direct-fix-failed` finding (`severity: 'high'`,
-      `suggestedAction: 'Check server logs for the full error and
-      apply the fix manually.'`) and continue — one fix failing
-      should not blow up an alignment-agent run with 6 candidates.
-      On non-thrown skip (`reason !== undefined`), log at info and
-      continue
-    - `'code-change'`: unchanged path through
-      `dispatchMaintenanceIntent` (writes an `intents` row + a
-      `generate:intent` BullMQ task)
-  - `dispatchMaintenanceIntent` is now only called for code-change
-    intents
-- `packages/agents/maintenance/src/index.ts`:
-  - Re-exports `applyContextFileFix` + types so tests / advanced
-    wiring can call it without going through the runner
-  - Re-exports `MaintenanceIntentClass` + `classifyMaintenanceIntent`
-- The alignment-agent and drift-agent themselves are unchanged —
-  they already accumulated `intentsQueued: MaintenanceIntent[]` and
-  returned it (they never called `dispatch()` directly). The brief's
-  "Change 4" (turn the agents into pure detectors) was already true
-  in the codebase
-
-Verified live against `trackeros`:
-- `pnpm -r build` clean across all 12 packages
-- Server image rebuilt; `Up (healthy)`. Pre-trigger `main` HEAD on
-  GitHub: `7feaf3d9`
-- **First manual trigger** of alignment-agent via
-  `POST /maintenance/trigger`. Response shape:
-  ```
-  status: completed
-  intentsQueued: 0          (was 6 before this session)
-  directFixes:   6          (was 0 before this session)
-  findings:     12          (6 alignment findings + 6 direct-fix-applied)
-  durationMs:    ~32 s
-  ```
-- Server logs show the expected sequence: `Applying direct context
-  fix` × 6 / `Direct context fix committed` × 6, all from the
-  `module: "context-fixer"` logger, with no errors or warnings.
-  Each fix took 5–7 s end-to-end (clone + LLM call + commit + push)
-- Post-trigger `main` HEAD: `46cace91`. Re-cloning the repo
-  anonymously shows 6 new commits on top of `7feaf3d9` in the
-  expected order, each authored by `Gestalt Maintenance Agent
-  <maintenance-agent@gestalt.local>`, each with a subject starting
-  `docs:` and a `[gestalt-maintenance/CONTEXT_ALIGNMENT]` trailer:
-  - 4 commits to `docs/DOMAIN.md` (1–2 line additive tweaks for
-    the four `entity-without-module` findings: `components`,
-    `type`, `description`, `props`)
-  - 2 commits to `AGENTS.md` (1-line additions adding `GP-003`
-    and `GP-004` references for the orphan-principle findings)
-- **Second manual trigger** to confirm the routing holds and that
-  prior fixes carried through: `intentsQueued: 0`,
-  `directFixes: 4` (the entity findings re-fire because the
-  regex extractor still finds them in DOMAIN.md after the LLM's
-  minimal edits — the LLM chose to refine descriptions rather
-  than remove the entities; the GP-003 / GP-004 findings did NOT
-  re-fire because the first run's AGENTS.md edits resolved them
-  permanently). Four additional commits on `main`, same shape.
-  The path guard, truncation guard, no-change short-circuit, and
-  Git author config all continued to work as designed
-- Final `main` HEAD: `af8d5747`. Ten total
-  `[gestalt-maintenance]` commits landed in the two runs
-- The Maintenance dashboard view already renders both stats
-  (`intents queued` + `fixes applied`); no UI change was needed.
-  The dashboard now shows `0 intents queued · 6 fixes applied
-  · 32.1 s` on the post-fix runs, which is exactly the correct
-  reading
-
-Decisions made:
-- **Path guard runs BEFORE the clone**, not before the LLM call only.
-  Cloning a multi-MB repo to attempt a fix to a file the path guard
-  would reject anyway is pointless. The guard's purpose — "this code
-  path will never touch src/" — is best expressed by failing as
-  early as possible. The LLM call is bypassed as a consequence
-- **`MaintenanceIntent.affectedFiles[0]` is the canonical target.**
-  Every existing call site for `CONTEXT_ALIGNMENT` / `CONTEXT_UPDATE`
-  puts the file to *update* in slot 0 and the file *to compare
-  against* in slot 1 (alignment-agent's three branches: DOMAIN.md
-  first / ARCHITECTURE.md first / AGENTS.md first, depending on
-  which side has the orphan). Documented in the agent's signal
-  generation code. The fixer treats slot 0 as the authority
-- **Truncation floor 50%** matches the brief. Empirically, even
-  the most minimal LLM additive edit to a typical context file
-  produces output > 95% of the original length (you have to copy
-  the whole file just to add one line). 50% is generous against
-  legitimate edits and decisive against "the LLM returned only
-  the new section" failures
-- **No-op short-circuits return reasons, not throws.** The runner
-  needs to log "fix-not-needed" cases as info, not as errors —
-  treating "the LLM happened to produce the same content" as a
-  failure would noise the alerts view. The `reason: 'no-change'`
-  / `'file-missing'` / `'truncation-guard'` / `'llm-error'` union
-  gives the runner enough to record cleanly without an exception
-  catch
-- **`direct-fix-applied` and `direct-fix-failed` are surfaced as
-  `MaintenanceFinding` rows on the run.** The dashboard's
-  per-run findings panel already renders them — they show up
-  alongside the original alignment findings so the operator can
-  see the full causal chain in one expanded panel. `severity:
-  'low'` on applied (informational) and `severity: 'high'` on
-  failed (operator needs to intervene)
-- **Commit author is `Gestalt Maintenance Agent`.** drift-agent's
-  pre-existing additive-note path uses `Gestalt Drift Agent`;
-  consistent naming pattern. Email is `*@gestalt.local`, same
-  as drift-agent — the platform doesn't talk to a real mail
-  server so the local TLD is fine
-- **Failures are per-intent, not per-run.** A single intent failing
-  (LLM error, push rejected, etc.) records a `direct-fix-failed`
-  finding and continues to the next intent. The brief's "alignment
-  agent produces 6 findings → 6 fixes" pattern only works if one
-  bad fix doesn't abort the other 5. A try/catch around each
-  applyContextFileFix call gives us that
-- **`PERFORMANCE_DEGRADATION` / `SECURITY_FINDING` continue to
-  flow through the generate orchestrator unchanged.** These need
-  real code changes, real tests, real review — the generate →
-  gate → deploy loop is correct for them. The classification
-  switch is the *only* control flow change in the runner; the
-  legacy `dispatchMaintenanceIntent` is still called for those
-  cases
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Server image rebuilt; manual triggers verified end-to-end.
-Pending alignment-agent regex tightening (already on the
-follow-ups list) would reduce repeat fixes per run, but the
-routing fix is correct independently.
-
-No new follow-ups added — feature is self-contained and lives
-behind the existing ADR-018 / classification surface.
-
----
 
 ### Session 2026-06-01 — Claude Code (alignment-agent extractor fix + idempotency budget)
 
@@ -1545,4 +1451,290 @@ module extractor assumes literal `src/modules/<name>`
 references in ARCHITECTURE.md". The dual-pattern extractor +
 sharpened suggestedAction + depth-check together resolve the
 underlying reconciliation gap. No new follow-ups added.
+
+---
+
+### Session 2026-06-01 — Claude Code (richer alerts: enriched payload + fix-intent flow + CLI alerts commands)
+
+Closes the operator workflow gap on the alert surface. Before this
+session every alert rendered roughly the same (a title + description
++ a couple of action buttons), and the only way to act on a stuck
+maintenance finding or a GP breach was through the dashboard. The
+brief asked for three things:
+- Each alert type should surface its own structural context (intent
+  text for clarification, suggestedAction + attempts + files for
+  maintenance-stuck, breach location + message for GP_BREACH)
+- Every alert type should let the operator submit a fix intent with
+  the alert's context pre-populated
+- A `gestalt alerts` CLI so operators can read + act on alerts
+  without opening the dashboard
+
+Changed:
+- `packages/server/src/oversight/routes.ts` — rewrote the oversight
+  routes:
+  - Response shape on `GET /alerts` and `GET /alerts/:id` is now
+    `{ data: EnrichedAlert[] }` / `{ data: EnrichedAlert }` (the
+    standard envelope). `EnrichedAlert` extends the base
+    `AlertRecord` with optional per-type enrichment fields:
+    `intentText` + `intentStatus` for clarification-needed (looked
+    up via `intents.findById(context.intentId)`);
+    `findingType` + `affectedFiles` + `evidence` + `attemptCount` +
+    `suggestedAction` lifted out of the `context` JSONB for
+    maintenance-stuck; `breachMessage` + `breachLocation` +
+    `breachAgent` for GP_BREACH (resolved via
+    `signals.findByCorrelationId(alert.correlationId)` → pick the
+    `GOLDEN_PRINCIPLE_BREACH` row). Helper functions `enrichAlert` +
+    `stringOrNull` keep the rendering branchless on the wire side
+  - New `POST /alerts/:id/fix-intent { additionalContext? }`
+    (`requireRole('operator')`). Builds an intent text from the
+    enriched alert via the `buildFixIntentText` helper (three
+    templates: clarification / maintenance-stuck / GP_BREACH plus
+    a fallback that uses the alert description). Resolves the
+    projectId via the new `resolveProjectIdForAlert` (direct
+    `context.projectId` for maintenance-stuck; intent walk for
+    clarification-needed; correlationId → intent for GP_BREACH).
+    Writes an `intents` row (`source: 'human'` — the operator
+    pressed the button), dispatches the BullMQ task, transitions
+    intent to `generating`, acknowledges the original alert
+    (same call — the card disappears atomically with submission),
+    writes `alert.fix-intent-submitted` audit row, returns
+    `{ intentId, correlationId, intentText }`.
+    **`additionalContext` is APPENDED to the auto-built intent
+    text, never replaces it** — the alert's structural context
+    always leads. **Audit metadata captures `fixIntentId` +
+    `additionalContextLength` + `intentTextLength` only — the
+    operator's free-form text stays out of the audit row per
+    GP-006**
+  - `POST /alerts/:id/acknowledge` accepts an optional `{ notes }`
+    body. Audit metadata records `notesLength` only (GP-006).
+    The dismiss path on the dashboard / CLI uses this endpoint
+- `packages/dashboard/src/types.ts`:
+  - Extended `Alert` with the per-type enrichment fields (all
+    optional). Added a `CodeLocation` interface for the breach
+    location shape
+- `packages/dashboard/src/api/client.ts`:
+  - `listAlerts()` typed as `{ data: Alert[]; total }` (was
+    `{ alerts, total }` — the server changed envelope, this
+    keeps the dashboard in sync)
+  - `getAlert()` now `{ data: Alert }`
+  - `acknowledgeAlert(id, notes?)` sends `{ notes }`
+  - New `submitAlertFixIntent(alertId, additionalContext?)`
+    returning `{ data: { intentId, correlationId, intentText } }`
+  - New `dismissAlert(id, notes?)` as a semantic alias for the
+    acknowledge call (the dashboard's "Dismiss" button is
+    semantically distinct from the auto-ack that happens during
+    a fix or clarification submission, so a separate method
+    name makes the UI code easier to read)
+- `packages/dashboard/src/views/Alerts.tsx` (rewritten):
+  - Per-type body components: `ClarificationBody`,
+    `MaintenanceStuckBody`, `BreachBody`. Each renders the
+    fields relevant to its alert type using a shared
+    `KV` helper + a `mutedLabel` style for the small uppercase
+    section headings. Unknown types fall through to plain
+    `description` rendering
+  - Per-type action blocks: `ClarificationActions` (textarea +
+    "resume intent ▶" button — wraps the existing
+    `POST /intents/:id/clarify` flow), `FixIntentBlock`
+    (textarea + "submit fix intent ▶" — the new
+    `POST /alerts/:id/fix-intent`), `DismissBlock` (textarea +
+    red `dismiss` button — wraps `POST /alerts/:id/acknowledge`).
+    `FIX_TYPES` const gates which alert types render the fix
+    block (currently all four documented alert types — the
+    fallback is to NOT show it for unrecognised types)
+  - Per-alert UI state is keyed by `alert.id` so opening
+    multiple cards at once doesn't share input. Confirmation
+    banners (`✓ Fix intent submitted — "..."`) appear inside
+    the expanded panel and auto-clear after 1–2 s
+  - Project scoping unchanged from the prior session: client-side
+    join on `context.intentId` against the current project's
+    intents, plus the direct `context.projectId` short-circuit
+    for `maintenance-stuck`. Pending enhancement to add a
+    server-side filter still applies
+  - Header bar redesigned to show a per-type glyph (`?` amber
+    for clarification, `⚙` amber for maintenance-stuck, `⛔` red
+    for GP_BREACH, `✗` red for `gate-failed-max-retries`), the
+    uppercase type label, a colour-coded `[severity]` badge,
+    the title, the timestamp, and a chevron
+- `packages/cli/src/api/client.ts`:
+  - New `AlertSummary` + `AlertDetail` types mirroring the
+    dashboard's enriched shape
+  - New `listAlerts`, `getAlert`, `submitAlertFixIntent`,
+    `acknowledgeAlert` methods
+- `packages/cli/src/commands/alerts.ts` (new): four subcommands
+  per the brief — `alertsListCommand`, `alertsShowCommand`,
+  `alertsFixCommand`, `alertsDismissCommand`. Project resolution
+  prefers the stored `currentProjectId` (set by
+  `gestalt projects use`) with a fallback to `projects[0]`.
+  Alert lookup accepts either the full UUID or an 8-char prefix
+  (same shape the list table prints); ambiguous prefixes error
+  with the match count. `--context` / `--notes` flags can be
+  omitted — the commands fall through to `prompt()` for the
+  optional input (consistent with `gestalt init-admin`'s pattern)
+- `packages/cli/src/index.ts`: registered the new
+  `gestalt alerts` parent + four subcommands. Each accepts the
+  standard `--server <url>` one-shot override
+
+Verified live against `trackeros`:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt; dashboard bundle is the new
+  `index-CymrQ0Rf.js` (225 KB, +6 KB for the alerts rewrite)
+- **`GET /alerts` enrichment via curl** — 2 pre-existing
+  maintenance-stuck alerts from the prior session each came back
+  with `findingType: 'CONTEXT_ALIGNMENT'`, `attemptCount: 3`,
+  `affectedFiles: ['docs/ARCHITECTURE.md', 'docs/DOMAIN.md']`,
+  `suggestedAction` (the literal-path nudge text), and
+  `evidence: "entity 'StartButton' in DOMAIN.md has no matching
+  architecture module"` — all five fields lifted from JSONB on
+  the wire side
+- **`gestalt alerts list`** — printed both rows with `[medium]`
+  badges, `maintenance-stuck` type column, 8-char ids
+  (`b2260ec2`, `bf44dc0a`), and `45m` ages
+- **`gestalt alerts show b2260ec2`** — full detail panel rendered:
+  Title, Description, Finding, Attempts (3), Affected files
+  comma-joined, Suggested action prose, Evidence prose, and the
+  "Available actions" footer with the `gestalt alerts fix` /
+  `dismiss` hints using the 8-char prefix
+- **`gestalt alerts fix b2260ec2 --context "(operator note: use
+  the new literal-path format)"`** — submitted a fix intent:
+  - Server built intent text from the alert's
+    `suggestedAction` + appended the operator's note
+  - Created `intents` row `fd0ac307` with `source: 'human'`,
+    status `generating`
+  - Acknowledged alert `b2260ec2` in the same call —
+    `acknowledged_at` populated
+  - Audit row written with `action:
+    'alert.fix-intent-submitted'`, metadata
+    `{type: 'maintenance-stuck', fixIntentId:
+    'fd0ac307...', additionalContextLength: 48,
+    intentTextLength: 291, ip}` — no `additionalContext` text
+    or `intentText` content in the audit metadata
+- **`gestalt alerts dismiss bf44dc0a --notes "Will be
+  addressed when we redo the module structure"`** —
+  acknowledged the second alert with notes;
+  `alert.acknowledged` audit row metadata records
+  `{type, notesLength: 51, ip}` only
+- **`gestalt alerts list` (post)** — `✓ No unacknowledged
+  alerts` printed
+- **Fresh `clarification-needed` alert** — submitted "make it
+  better" via `POST /intents` to drive a paused cycle;
+  intent-agent created the alert with `context.intentId` +
+  `context.suggestions` (3 entries). `gestalt alerts show`
+  enriched the display with `intentText: "make it better"`,
+  `intentStatus: waiting-for-clarification`, and the 3
+  bullet-listed suggestions
+- **Browser drive (headless Chrome via CDP) at `/app/alerts`**:
+  - Layout rendered with the 1-alert badge in the sidebar
+  - Card collapsed shows: `?` amber glyph,
+    `CLARIFICATION NEEDED` uppercase label, `[high]` amber
+    badge, title `Intent needs clarification`, timestamp,
+    chevron
+  - Card expanded shows: `Intent: "make it better"` and
+    `Status: waiting-for-clarification` KV header, "Why
+    paused" prose, "Suggestions" bullet list with 3 entries,
+    and **three** stacked action blocks:
+    1. "Provide clarification (resumes the existing intent)"
+       — textarea + green `resume intent ▶` button
+    2. "Or submit as a new intent (does not resume the
+       existing one)" — textarea + neutral `submit fix
+       intent ▶` button
+    3. "Dismiss (acknowledge without action)" — optional
+       notes textarea + red `dismiss` button
+  - Screenshot captured; layout matches the brief's ASCII
+    mockup including the relative button positioning and
+    block ordering
+
+Decisions made:
+- **Enrichment is server-side, eager, single round trip.** Could
+  have shipped per-type fetch endpoints (`GET
+  /alerts/:id/clarification-detail`) but that would have
+  required N+1 calls from the list view (`/alerts` returns N
+  rows, each needing one detail fetch). The enrichment per row
+  is cheap — `intents.findById` is a PK lookup;
+  `signals.findByCorrelationId` is a single indexed query.
+  Done eagerly in `enrichAlert(alert)` on each row in the list
+  handler, parallel via `Promise.all`
+- **`enrichAlert` returns `EnrichedAlert` not raw `AlertRecord`.**
+  The wire shape is `EnrichedAlert extends AlertRecord` with
+  optional fields — every existing client that read `id`, `type`,
+  `title`, `description`, `context`, etc. continues to read them
+  unchanged. The enrichment fields are additive
+- **`additionalContext` is APPENDED, never replaces.** Brief was
+  explicit: "the alert's structural context always comes first".
+  `buildFixIntentText` constructs the typed template
+  (`suggestedAction. Context: evidence`) THEN appends the
+  operator's free text with a leading space. If the operator
+  leaves the field empty (or the CLI's `prompt` defaults to
+  empty), the trailing space is trimmed by `.trim()`
+- **The fix-intent path acknowledges the alert in the SAME
+  call.** Atomic from the operator's perspective. Means the
+  card disappears the moment a fix is submitted, no
+  refresh-then-still-here state. If the dispatch fails after the
+  intent row is written, the alert is already acked and the
+  operator has to re-trigger via the new intent. Acceptable
+  trade-off — the alternative (write intent → ack alert → only
+  ack on success of the upstream dispatch) introduces a window
+  where two operators could both fix the same alert
+- **`source: 'human'` on fix-intent-created intents.** The
+  operator chose to press the button (or run `gestalt alerts
+  fix`); semantically this is human-driven work, not a
+  maintenance auto-run. Same source the regular
+  `POST /intents` uses. Easy to distinguish in the audit trail
+  via the `alert.fix-intent-submitted` action + the
+  `fixIntentId` field
+- **GP-006 compliance for both new audit paths.** Audit row
+  records lengths only — `additionalContextLength` /
+  `intentTextLength` / `notesLength`. The text content lives on
+  the alert / intent records and can be queried by an audit
+  forensics operator via direct DB. Same pattern the
+  clarification flow established
+- **Per-alert UI state in `Alerts.tsx` is keyed by `alert.id`.**
+  The previous implementation kept a single `clarification` /
+  `notes` string at the component level, so opening two alerts
+  would either share the textarea contents (confusing) or one
+  card's submit would wipe the other's input. The new
+  `Record<alertId, string>` state model lets the operator scroll
+  through multiple expanded cards without interaction
+- **Per-type glyphs use `?` / `⚙` / `⛔` / `✗`.** Distinguish at
+  a glance in the collapsed header without needing to read the
+  type label. `⚙` for maintenance-stuck (settings cog =
+  "maintenance"), `⛔` for GP_BREACH (no-entry =
+  "non-negotiable"), `?` for clarification (already used by the
+  prior implementation's badge), `✗` for retry-budget exhausted
+- **`FIX_TYPES` allowlist gates the fix block.** Defensive — if a
+  future alert type lands without an associated `buildFixIntentText`
+  template, the fix block won't render. The fallback template in
+  `buildFixIntentText` uses the alert description, so even a new
+  type renders something sensible if added to the list
+- **`gestalt alerts show <prefix>` accepts an 8-char id prefix.**
+  The list table prints 8 chars; making `show` accept the same
+  shape (with full UUID also supported) is the obvious UX. The
+  prefix lookup goes through `client.listAlerts({ acknowledged:
+  false })` and `startsWith` matches; ambiguous matches error
+  with the count instead of silently picking the first
+- **CLI prompts on missing `--context` / `--notes`.** Brief
+  specified consistency with `gestalt init-admin`. The `prompt`
+  helper in `ui/prompts.ts` already does the readline interaction;
+  empty Enter passes through as an empty string (so the operator
+  can skip without typing). Both flags + prompt entries can be
+  empty; that's a valid "no additional context / no notes"
+  submission
+- **No new migrations.** All enrichment is computed from existing
+  data (alerts.context JSONB + intents/signals lookups). No new
+  columns, no new tables
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; dashboard bundle live under `/app/`. Full
+operator workflow verified end-to-end:
+- Server side: 4 endpoints exercised (GET /alerts, GET
+  /alerts/:id, POST /alerts/:id/fix-intent, POST
+  /alerts/:id/acknowledge), audit captures all 3 actions with
+  GP-006-compliant metadata
+- CLI side: all 4 subcommands exercised against real alerts
+  (list, show, fix with --context, dismiss with --notes); empty
+  list state confirmed
+- Dashboard side: clarification-needed card rendered with the
+  brief-specified layout (intent quote, suggestions, 3 action
+  blocks)
+
+No new follow-ups added — feature is self-contained.
 

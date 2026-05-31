@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — alignment-agent module tree-block extractor + CLI maintenance commands)
+**Last updated:** 2026-06-01 (Claude Code — richer alerts: enriched payload + fix-intent flow + CLI alerts commands)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -687,6 +687,111 @@ the historical record of how the state evolved._
 7. `git pull` — receive harness files locally
 8. `gestalt run "<intent>"` — submit work to agents
 
+**Alert system — enriched payload + fix-intent flow + CLI:**
+- `GET /alerts` and `GET /alerts/:id` return `{ data: EnrichedAlert[] }`
+  (the standard envelope). Each row carries the base `AlertRecord`
+  shape plus per-type fields lifted out of the JSONB `context`
+  column so the dashboard / CLI can render without re-parsing:
+  - `clarification-needed` → `intentText`, `intentStatus` (looked
+    up via `intents.findById(context.intentId)`)
+  - `maintenance-stuck` → `findingType`, `affectedFiles`,
+    `evidence`, `attemptCount`, `suggestedAction` (lifted from
+    `context`)
+  - `GOLDEN_PRINCIPLE_BREACH` → `breachMessage`, `breachLocation`,
+    `breachAgent` (resolved via `signals.findByCorrelationId(alert.
+    correlationId)` → pick the `GOLDEN_PRINCIPLE_BREACH` row)
+- `POST /alerts/:id/fix-intent { additionalContext? }` — operator
+  says "I understand the problem, generate a fix". The server
+  builds the intent text from the alert's enriched context, queues
+  a `generate:intent` task on the BullMQ queue (same shape as
+  `POST /intents`), acknowledges the alert in the same call so the
+  card disappears atomically, writes an `alert.fix-intent-submitted`
+  audit row (metadata: `fixIntentId`, `additionalContextLength`,
+  `intentTextLength`, `ip` — **never the context text itself per
+  GP-006**), and returns `{ intentId, correlationId, intentText }`.
+  `additionalContext` is **appended** to the auto-built text, never
+  replaces it — the alert's structural context always leads.
+  Intent text templates:
+  - `clarification-needed` → `Fix the following issue with intent
+    "X": <description>. <additionalContext>`
+  - `maintenance-stuck` → `<suggestedAction>. Context: <evidence>.
+    <additionalContext>`
+  - `GOLDEN_PRINCIPLE_BREACH` → `Fix golden principle breach in
+    <file>: <breachMessage>. <additionalContext>`
+- `POST /alerts/:id/acknowledge { notes? }` extended to accept an
+  optional notes body. Audit metadata captures `notesLength` only
+  — the text stays on the alert / persisted record, not in the
+  audit row (GP-006)
+- **Dashboard `Alerts.tsx` rewritten with per-type cards**
+  (`packages/dashboard/src/views/Alerts.tsx`). Each card has a
+  distinct layout matching the alert's information needs:
+  - `clarification-needed` — intent quote + status + "Why paused"
+    prose + suggestions bullet list + two action blocks:
+    "Provide clarification (resumes the existing intent)" with
+    `resume intent ▶` (existing `POST /intents/:id/clarify` flow,
+    kept intact) AND "Or submit as a new intent" with
+    `submit fix intent ▶` (new `POST /alerts/:id/fix-intent`)
+  - `maintenance-stuck` — Agent + Finding + Attempts KV header,
+    "What was tried" (`suggestedAction`), Affected files list,
+    Evidence prose; single action block "Submit a fix intent" +
+    optional context textarea
+  - `GOLDEN_PRINCIPLE_BREACH` — Detected by + Location KV header,
+    "What happened" prose, File + Line KV; single action block
+    "Submit a fix intent"
+  - Every card also shows a "Dismiss (acknowledge without action)"
+    action block with optional notes textarea + red `dismiss`
+    button. Per-alert UI state (textarea content, submission mode,
+    confirmation banner) is keyed by `alert.id` so opening
+    multiple cards at once doesn't share input
+- **CLI surface — `gestalt alerts`.** Four subcommands so
+  operators can work without the dashboard:
+  - `gestalt alerts list` — prints a table of unacknowledged
+    alerts for the current project (resolved from
+    `~/.gestalt/config.json` `currentProjectId`, with the same
+    `[severity]` colour-coding the dashboard uses); empty list
+    prints `✓ No unacknowledged alerts`
+  - `gestalt alerts show <id>` — full per-type detail panel
+    (Title / Description / per-type extras / Available actions
+    footer). Accepts either the full UUID or the first 8 chars
+    (same 8-char prefix the list table shows). Ambiguous
+    prefix errors with the match count
+  - `gestalt alerts fix <id> [--context <text>]` — submits a fix
+    intent via `POST /alerts/:id/fix-intent`. Prompts for the
+    optional context via `prompt()` when `--context` is not
+    supplied (consistent with `gestalt init-admin`). Prints the
+    new `intentId` / `correlationId` / first 80 chars of the
+    `intentText` + a `gestalt status` hint
+  - `gestalt alerts dismiss <id> [--notes <text>]` — acknowledges
+    without action via `POST /alerts/:id/acknowledge`. Prompts
+    for notes when `--notes` is not supplied
+  - All four accept the standard `--server <url>` one-shot
+    override; project scoping matches the dashboard's
+    client-side join on `context.intentId` against the current
+    project's intents (plus the direct `context.projectId`
+    short-circuit for `maintenance-stuck`)
+- Live verified end-to-end against `trackeros`:
+  - Two `maintenance-stuck` alerts existed in the DB from the
+    prior session. `gestalt alerts list` showed the table with
+    `[medium]` badges, `maintenance-stuck` type column, and the
+    8-char id; `gestalt alerts show b2260ec2` printed Finding /
+    Attempts / Affected files / Suggested action / Evidence
+  - `gestalt alerts fix b2260ec2 --context "(operator note)"`
+    submitted a fresh `intents` row (`source: 'human'`, status
+    `generating`), acknowledged the alert atomically, audit row
+    captured `additionalContextLength: 48` + `intentTextLength:
+    291` + `fixIntentId` (no text leakage)
+  - `gestalt alerts dismiss bf44dc0a --notes "..."` acknowledged
+    the second alert; audit captured `notesLength: 51` only
+  - Submitted a fresh "make it better" intent to create a
+    `clarification-needed` alert; `gestalt alerts show` enriched
+    correctly with `intentText: "make it better"` /
+    `intentStatus: waiting-for-clarification` / 3 suggestions
+  - Drove the dashboard at `/app/alerts` with headless Chrome:
+    the new clarification card rendered exactly per the brief —
+    `?` glyph + `CLARIFICATION NEEDED` + `[high]` badge + intent
+    quote / status KV + Why paused prose + suggestions list + 3
+    stacked action blocks (Resume / Submit-as-new / Dismiss)
+
 **Pending enhancements (design in chat first):**
 - **`GET /alerts` has no `projectId` filter.** The dashboard's
   Alerts view filters client-side by joining each alert's
@@ -697,11 +802,13 @@ the historical record of how the state evolved._
   `alerts`) would let the API return the filtered set in one
   call and let the Layout's badge count match the visible list
   without extra plumbing
-- **POST /interventions still a 501 stub.** The clarification flow
-  bypasses it (uses `POST /intents/:id/clarify` directly because
-  that endpoint owns the resume side effect). When breach
-  acknowledgement / promotion approval get UIs they'll need a
-  real implementation here
+- **POST /interventions still a 501 stub.** The
+  clarification flow uses `POST /intents/:id/clarify` (owns the
+  resume side effect) and the new "submit fix intent" path uses
+  `POST /alerts/:id/fix-intent`. Promotion approval (the
+  remaining `approve-promotion` action type) does not have a
+  shipped UI yet and will likely use this endpoint when it
+  does
 - **Return-URL preservation across login.** Pasting `/app/intents/<id>`
   in a fresh tab today bounces to `/app/login` and after sign-in
   lands on `/app/` (the intent ID is dropped). Small SPA-only change —

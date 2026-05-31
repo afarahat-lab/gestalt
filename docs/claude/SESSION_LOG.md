@@ -4040,3 +4040,289 @@ references in ARCHITECTURE.md". The dual-pattern extractor +
 sharpened suggestedAction + depth-check together resolve the
 underlying reconciliation gap. No new follow-ups added.
 
+---
+
+### Session 2026-06-01 — Claude Code (richer alerts: enriched payload + fix-intent flow + CLI alerts commands)
+
+Closes the operator workflow gap on the alert surface. Before this
+session every alert rendered roughly the same (a title + description
++ a couple of action buttons), and the only way to act on a stuck
+maintenance finding or a GP breach was through the dashboard. The
+brief asked for three things:
+- Each alert type should surface its own structural context (intent
+  text for clarification, suggestedAction + attempts + files for
+  maintenance-stuck, breach location + message for GP_BREACH)
+- Every alert type should let the operator submit a fix intent with
+  the alert's context pre-populated
+- A `gestalt alerts` CLI so operators can read + act on alerts
+  without opening the dashboard
+
+Changed:
+- `packages/server/src/oversight/routes.ts` — rewrote the oversight
+  routes:
+  - Response shape on `GET /alerts` and `GET /alerts/:id` is now
+    `{ data: EnrichedAlert[] }` / `{ data: EnrichedAlert }` (the
+    standard envelope). `EnrichedAlert` extends the base
+    `AlertRecord` with optional per-type enrichment fields:
+    `intentText` + `intentStatus` for clarification-needed (looked
+    up via `intents.findById(context.intentId)`);
+    `findingType` + `affectedFiles` + `evidence` + `attemptCount` +
+    `suggestedAction` lifted out of the `context` JSONB for
+    maintenance-stuck; `breachMessage` + `breachLocation` +
+    `breachAgent` for GP_BREACH (resolved via
+    `signals.findByCorrelationId(alert.correlationId)` → pick the
+    `GOLDEN_PRINCIPLE_BREACH` row). Helper functions `enrichAlert` +
+    `stringOrNull` keep the rendering branchless on the wire side
+  - New `POST /alerts/:id/fix-intent { additionalContext? }`
+    (`requireRole('operator')`). Builds an intent text from the
+    enriched alert via the `buildFixIntentText` helper (three
+    templates: clarification / maintenance-stuck / GP_BREACH plus
+    a fallback that uses the alert description). Resolves the
+    projectId via the new `resolveProjectIdForAlert` (direct
+    `context.projectId` for maintenance-stuck; intent walk for
+    clarification-needed; correlationId → intent for GP_BREACH).
+    Writes an `intents` row (`source: 'human'` — the operator
+    pressed the button), dispatches the BullMQ task, transitions
+    intent to `generating`, acknowledges the original alert
+    (same call — the card disappears atomically with submission),
+    writes `alert.fix-intent-submitted` audit row, returns
+    `{ intentId, correlationId, intentText }`.
+    **`additionalContext` is APPENDED to the auto-built intent
+    text, never replaces it** — the alert's structural context
+    always leads. **Audit metadata captures `fixIntentId` +
+    `additionalContextLength` + `intentTextLength` only — the
+    operator's free-form text stays out of the audit row per
+    GP-006**
+  - `POST /alerts/:id/acknowledge` accepts an optional `{ notes }`
+    body. Audit metadata records `notesLength` only (GP-006).
+    The dismiss path on the dashboard / CLI uses this endpoint
+- `packages/dashboard/src/types.ts`:
+  - Extended `Alert` with the per-type enrichment fields (all
+    optional). Added a `CodeLocation` interface for the breach
+    location shape
+- `packages/dashboard/src/api/client.ts`:
+  - `listAlerts()` typed as `{ data: Alert[]; total }` (was
+    `{ alerts, total }` — the server changed envelope, this
+    keeps the dashboard in sync)
+  - `getAlert()` now `{ data: Alert }`
+  - `acknowledgeAlert(id, notes?)` sends `{ notes }`
+  - New `submitAlertFixIntent(alertId, additionalContext?)`
+    returning `{ data: { intentId, correlationId, intentText } }`
+  - New `dismissAlert(id, notes?)` as a semantic alias for the
+    acknowledge call (the dashboard's "Dismiss" button is
+    semantically distinct from the auto-ack that happens during
+    a fix or clarification submission, so a separate method
+    name makes the UI code easier to read)
+- `packages/dashboard/src/views/Alerts.tsx` (rewritten):
+  - Per-type body components: `ClarificationBody`,
+    `MaintenanceStuckBody`, `BreachBody`. Each renders the
+    fields relevant to its alert type using a shared
+    `KV` helper + a `mutedLabel` style for the small uppercase
+    section headings. Unknown types fall through to plain
+    `description` rendering
+  - Per-type action blocks: `ClarificationActions` (textarea +
+    "resume intent ▶" button — wraps the existing
+    `POST /intents/:id/clarify` flow), `FixIntentBlock`
+    (textarea + "submit fix intent ▶" — the new
+    `POST /alerts/:id/fix-intent`), `DismissBlock` (textarea +
+    red `dismiss` button — wraps `POST /alerts/:id/acknowledge`).
+    `FIX_TYPES` const gates which alert types render the fix
+    block (currently all four documented alert types — the
+    fallback is to NOT show it for unrecognised types)
+  - Per-alert UI state is keyed by `alert.id` so opening
+    multiple cards at once doesn't share input. Confirmation
+    banners (`✓ Fix intent submitted — "..."`) appear inside
+    the expanded panel and auto-clear after 1–2 s
+  - Project scoping unchanged from the prior session: client-side
+    join on `context.intentId` against the current project's
+    intents, plus the direct `context.projectId` short-circuit
+    for `maintenance-stuck`. Pending enhancement to add a
+    server-side filter still applies
+  - Header bar redesigned to show a per-type glyph (`?` amber
+    for clarification, `⚙` amber for maintenance-stuck, `⛔` red
+    for GP_BREACH, `✗` red for `gate-failed-max-retries`), the
+    uppercase type label, a colour-coded `[severity]` badge,
+    the title, the timestamp, and a chevron
+- `packages/cli/src/api/client.ts`:
+  - New `AlertSummary` + `AlertDetail` types mirroring the
+    dashboard's enriched shape
+  - New `listAlerts`, `getAlert`, `submitAlertFixIntent`,
+    `acknowledgeAlert` methods
+- `packages/cli/src/commands/alerts.ts` (new): four subcommands
+  per the brief — `alertsListCommand`, `alertsShowCommand`,
+  `alertsFixCommand`, `alertsDismissCommand`. Project resolution
+  prefers the stored `currentProjectId` (set by
+  `gestalt projects use`) with a fallback to `projects[0]`.
+  Alert lookup accepts either the full UUID or an 8-char prefix
+  (same shape the list table prints); ambiguous prefixes error
+  with the match count. `--context` / `--notes` flags can be
+  omitted — the commands fall through to `prompt()` for the
+  optional input (consistent with `gestalt init-admin`'s pattern)
+- `packages/cli/src/index.ts`: registered the new
+  `gestalt alerts` parent + four subcommands. Each accepts the
+  standard `--server <url>` one-shot override
+
+Verified live against `trackeros`:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt; dashboard bundle is the new
+  `index-CymrQ0Rf.js` (225 KB, +6 KB for the alerts rewrite)
+- **`GET /alerts` enrichment via curl** — 2 pre-existing
+  maintenance-stuck alerts from the prior session each came back
+  with `findingType: 'CONTEXT_ALIGNMENT'`, `attemptCount: 3`,
+  `affectedFiles: ['docs/ARCHITECTURE.md', 'docs/DOMAIN.md']`,
+  `suggestedAction` (the literal-path nudge text), and
+  `evidence: "entity 'StartButton' in DOMAIN.md has no matching
+  architecture module"` — all five fields lifted from JSONB on
+  the wire side
+- **`gestalt alerts list`** — printed both rows with `[medium]`
+  badges, `maintenance-stuck` type column, 8-char ids
+  (`b2260ec2`, `bf44dc0a`), and `45m` ages
+- **`gestalt alerts show b2260ec2`** — full detail panel rendered:
+  Title, Description, Finding, Attempts (3), Affected files
+  comma-joined, Suggested action prose, Evidence prose, and the
+  "Available actions" footer with the `gestalt alerts fix` /
+  `dismiss` hints using the 8-char prefix
+- **`gestalt alerts fix b2260ec2 --context "(operator note: use
+  the new literal-path format)"`** — submitted a fix intent:
+  - Server built intent text from the alert's
+    `suggestedAction` + appended the operator's note
+  - Created `intents` row `fd0ac307` with `source: 'human'`,
+    status `generating`
+  - Acknowledged alert `b2260ec2` in the same call —
+    `acknowledged_at` populated
+  - Audit row written with `action:
+    'alert.fix-intent-submitted'`, metadata
+    `{type: 'maintenance-stuck', fixIntentId:
+    'fd0ac307...', additionalContextLength: 48,
+    intentTextLength: 291, ip}` — no `additionalContext` text
+    or `intentText` content in the audit metadata
+- **`gestalt alerts dismiss bf44dc0a --notes "Will be
+  addressed when we redo the module structure"`** —
+  acknowledged the second alert with notes;
+  `alert.acknowledged` audit row metadata records
+  `{type, notesLength: 51, ip}` only
+- **`gestalt alerts list` (post)** — `✓ No unacknowledged
+  alerts` printed
+- **Fresh `clarification-needed` alert** — submitted "make it
+  better" via `POST /intents` to drive a paused cycle;
+  intent-agent created the alert with `context.intentId` +
+  `context.suggestions` (3 entries). `gestalt alerts show`
+  enriched the display with `intentText: "make it better"`,
+  `intentStatus: waiting-for-clarification`, and the 3
+  bullet-listed suggestions
+- **Browser drive (headless Chrome via CDP) at `/app/alerts`**:
+  - Layout rendered with the 1-alert badge in the sidebar
+  - Card collapsed shows: `?` amber glyph,
+    `CLARIFICATION NEEDED` uppercase label, `[high]` amber
+    badge, title `Intent needs clarification`, timestamp,
+    chevron
+  - Card expanded shows: `Intent: "make it better"` and
+    `Status: waiting-for-clarification` KV header, "Why
+    paused" prose, "Suggestions" bullet list with 3 entries,
+    and **three** stacked action blocks:
+    1. "Provide clarification (resumes the existing intent)"
+       — textarea + green `resume intent ▶` button
+    2. "Or submit as a new intent (does not resume the
+       existing one)" — textarea + neutral `submit fix
+       intent ▶` button
+    3. "Dismiss (acknowledge without action)" — optional
+       notes textarea + red `dismiss` button
+  - Screenshot captured; layout matches the brief's ASCII
+    mockup including the relative button positioning and
+    block ordering
+
+Decisions made:
+- **Enrichment is server-side, eager, single round trip.** Could
+  have shipped per-type fetch endpoints (`GET
+  /alerts/:id/clarification-detail`) but that would have
+  required N+1 calls from the list view (`/alerts` returns N
+  rows, each needing one detail fetch). The enrichment per row
+  is cheap — `intents.findById` is a PK lookup;
+  `signals.findByCorrelationId` is a single indexed query.
+  Done eagerly in `enrichAlert(alert)` on each row in the list
+  handler, parallel via `Promise.all`
+- **`enrichAlert` returns `EnrichedAlert` not raw `AlertRecord`.**
+  The wire shape is `EnrichedAlert extends AlertRecord` with
+  optional fields — every existing client that read `id`, `type`,
+  `title`, `description`, `context`, etc. continues to read them
+  unchanged. The enrichment fields are additive
+- **`additionalContext` is APPENDED, never replaces.** Brief was
+  explicit: "the alert's structural context always comes first".
+  `buildFixIntentText` constructs the typed template
+  (`suggestedAction. Context: evidence`) THEN appends the
+  operator's free text with a leading space. If the operator
+  leaves the field empty (or the CLI's `prompt` defaults to
+  empty), the trailing space is trimmed by `.trim()`
+- **The fix-intent path acknowledges the alert in the SAME
+  call.** Atomic from the operator's perspective. Means the
+  card disappears the moment a fix is submitted, no
+  refresh-then-still-here state. If the dispatch fails after the
+  intent row is written, the alert is already acked and the
+  operator has to re-trigger via the new intent. Acceptable
+  trade-off — the alternative (write intent → ack alert → only
+  ack on success of the upstream dispatch) introduces a window
+  where two operators could both fix the same alert
+- **`source: 'human'` on fix-intent-created intents.** The
+  operator chose to press the button (or run `gestalt alerts
+  fix`); semantically this is human-driven work, not a
+  maintenance auto-run. Same source the regular
+  `POST /intents` uses. Easy to distinguish in the audit trail
+  via the `alert.fix-intent-submitted` action + the
+  `fixIntentId` field
+- **GP-006 compliance for both new audit paths.** Audit row
+  records lengths only — `additionalContextLength` /
+  `intentTextLength` / `notesLength`. The text content lives on
+  the alert / intent records and can be queried by an audit
+  forensics operator via direct DB. Same pattern the
+  clarification flow established
+- **Per-alert UI state in `Alerts.tsx` is keyed by `alert.id`.**
+  The previous implementation kept a single `clarification` /
+  `notes` string at the component level, so opening two alerts
+  would either share the textarea contents (confusing) or one
+  card's submit would wipe the other's input. The new
+  `Record<alertId, string>` state model lets the operator scroll
+  through multiple expanded cards without interaction
+- **Per-type glyphs use `?` / `⚙` / `⛔` / `✗`.** Distinguish at
+  a glance in the collapsed header without needing to read the
+  type label. `⚙` for maintenance-stuck (settings cog =
+  "maintenance"), `⛔` for GP_BREACH (no-entry =
+  "non-negotiable"), `?` for clarification (already used by the
+  prior implementation's badge), `✗` for retry-budget exhausted
+- **`FIX_TYPES` allowlist gates the fix block.** Defensive — if a
+  future alert type lands without an associated `buildFixIntentText`
+  template, the fix block won't render. The fallback template in
+  `buildFixIntentText` uses the alert description, so even a new
+  type renders something sensible if added to the list
+- **`gestalt alerts show <prefix>` accepts an 8-char id prefix.**
+  The list table prints 8 chars; making `show` accept the same
+  shape (with full UUID also supported) is the obvious UX. The
+  prefix lookup goes through `client.listAlerts({ acknowledged:
+  false })` and `startsWith` matches; ambiguous matches error
+  with the count instead of silently picking the first
+- **CLI prompts on missing `--context` / `--notes`.** Brief
+  specified consistency with `gestalt init-admin`. The `prompt`
+  helper in `ui/prompts.ts` already does the readline interaction;
+  empty Enter passes through as an empty string (so the operator
+  can skip without typing). Both flags + prompt entries can be
+  empty; that's a valid "no additional context / no notes"
+  submission
+- **No new migrations.** All enrichment is computed from existing
+  data (alerts.context JSONB + intents/signals lookups). No new
+  columns, no new tables
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; dashboard bundle live under `/app/`. Full
+operator workflow verified end-to-end:
+- Server side: 4 endpoints exercised (GET /alerts, GET
+  /alerts/:id, POST /alerts/:id/fix-intent, POST
+  /alerts/:id/acknowledge), audit captures all 3 actions with
+  GP-006-compliant metadata
+- CLI side: all 4 subcommands exercised against real alerts
+  (list, show, fix with --context, dismiss with --notes); empty
+  list state confirmed
+- Dashboard side: clarification-needed card rendered with the
+  brief-specified layout (intent quote, suggestions, 3 action
+  blocks)
+
+No new follow-ups added — feature is self-contained.
+

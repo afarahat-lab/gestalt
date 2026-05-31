@@ -43,6 +43,33 @@ export interface SignalSummary {
   autoResolvable: boolean;
 }
 
+export interface AlertSummary {
+  id: string;
+  correlationId: string;
+  intentId: string | null;
+  type: string;
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  title: string;
+  description: string;
+  requiredAction: string;
+  context: Record<string, unknown>;
+  createdAt: string;
+  acknowledgedAt: string | null;
+  // Enrichment fields — present per alert type (see oversight/routes.ts)
+  intentText?: string | null;
+  intentStatus?: string | null;
+  findingType?: string | null;
+  affectedFiles?: string[] | null;
+  evidence?: string | null;
+  attemptCount?: number | null;
+  suggestedAction?: string | null;
+  breachMessage?: string | null;
+  breachLocation?: { file: string; line?: number; column?: number; rule?: string } | null;
+  breachAgent?: string | null;
+}
+
+export type AlertDetail = AlertSummary;
+
 export interface PlatformStatus {
   activeAgents: number;
   timestamp: string;
@@ -187,6 +214,33 @@ export class GestaltApiClient {
 
   async resetMaintenanceFindings(projectId: string): Promise<{ data: { deleted: number } }> {
     return this.delete(`/maintenance/findings/${projectId}`);
+  }
+
+  // ─── Alerts ────────────────────────────────────────────────────────────────
+
+  async listAlerts(params?: {
+    acknowledged?: boolean;
+    severity?: string;
+  }): Promise<{ data: AlertSummary[]; total: number }> {
+    return this.get('/alerts', params);
+  }
+
+  async getAlert(id: string): Promise<{ data: AlertDetail }> {
+    return this.get(`/alerts/${id}`);
+  }
+
+  async submitAlertFixIntent(
+    id: string,
+    additionalContext?: string,
+  ): Promise<{ data: { intentId: string; correlationId: string; intentText: string } }> {
+    return this.post(`/alerts/${id}/fix-intent`, { additionalContext: additionalContext ?? '' });
+  }
+
+  async acknowledgeAlert(
+    id: string,
+    notes?: string,
+  ): Promise<{ data: AlertDetail }> {
+    return this.post(`/alerts/${id}/acknowledge`, { notes: notes ?? '' });
   }
 
   // ─── SSE stream ────────────────────────────────────────────────────────────
