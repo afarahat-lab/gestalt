@@ -21,6 +21,7 @@ import { registerAuthRoutes } from './auth/routes';
 import { registerAdminRoutes } from './routes/admin';
 import { registerIntentRoutes } from './routes/intents';
 import { registerProjectRoutes } from './routes/projects';
+import { registerExecutionRoutes } from './routes/executions';
 import { registerMaintenanceRoutes } from './routes/maintenance';
 import { registerStatusRoutes } from './routes/status';
 import { registerEventsRoute } from './routes/events';
@@ -73,6 +74,7 @@ export async function createApp(
   await registerAdminRoutes(app, sessionConfig);
   await registerIntentRoutes(app);
   await registerProjectRoutes(app);
+  await registerExecutionRoutes(app);
   await registerMaintenanceRoutes(app);
   await registerEventsRoute(app, sessionConfig);
   await registerOversightRoutes(app);

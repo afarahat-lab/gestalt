@@ -355,7 +355,7 @@ async function drivePlan(
         const taskType = `generate:${agentRole}`;
         const executionId = crypto.randomUUID();
         const startedAt = new Date();
-        const { executions, signals, artifacts } = getRepositories();
+        const { executions, signals, artifacts, executionLogs } = getRepositories();
 
         step.status = 'running';
         childLog.info({ agentRole }, 'Running agent step');
@@ -442,6 +442,32 @@ async function drivePlan(
             startedAt,
             completedAt,
           });
+
+          // Persist the execution log row — one per agent_executions
+          // row. The IntentDetail accordion in the dashboard reads
+          // this back via GET /executions/:id/log. Captures the
+          // prompt + LLM response (null for skipped non-LLM agents
+          // like lint-config-agent), the result status, the
+          // artifacts and signal types produced, and the error
+          // message on failure. Don't ride a single bad row into the
+          // whole step failing — wrap in `catch` so a missing column
+          // or DB blip doesn't break the cycle.
+          await executionLogs.save({
+            executionId,
+            correlationId: plan.correlationId,
+            agentRole,
+            prompt: result.lastPrompt ?? null,
+            llmResponse: result.llmResponse ?? null,
+            resultStatus: result.status,
+            artifactPaths: (result.artifacts ?? []).map((a) => a.path),
+            signalTypes: (result.signals ?? []).map((s) => s.type),
+            errorMessage: result.status === 'failed'
+              ? (result.signals[0]?.message ?? 'Unknown error')
+              : null,
+          }).catch((err) => {
+            childLog.warn({ err, executionId, agentRole }, 'executionLogs.save failed');
+          });
+
           emitLiveEvent('agent.completed', plan.correlationId, {
             executionId,
             agentRole,
@@ -505,6 +531,20 @@ async function drivePlan(
             durationMs: completedAt.getTime() - startedAt.getTime(),
             startedAt,
             completedAt,
+          }).catch(() => undefined);
+          // Persist a log row for the throw case too — we may not have
+          // the prompt (the agent crashed before returning) but the
+          // error message is the operator's only signal.
+          await executionLogs.save({
+            executionId,
+            correlationId: plan.correlationId,
+            agentRole,
+            prompt: null,
+            llmResponse: null,
+            resultStatus: 'failed',
+            artifactPaths: [],
+            signalTypes: [],
+            errorMessage: err instanceof Error ? err.message : String(err),
           }).catch(() => undefined);
           emitLiveEvent('agent.completed', plan.correlationId, {
             executionId,

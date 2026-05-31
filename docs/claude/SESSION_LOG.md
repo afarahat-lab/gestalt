@@ -2446,3 +2446,235 @@ filtered owner-only view is gone, and an expired-token
 session now bounces to login instead of showing a
 misleading empty state.
 
+---
+
+### Session 2026-05-31 — Claude Code (agent execution logs + IntentDetail accordion)
+
+Closes the "what did this agent actually see and say?" gap. Before
+this session, the dashboard's IntentDetail listed each agent run by
+role + duration + status — no way to see the prompt that was sent
+to the LLM, the response that came back, the artifacts that were
+produced, or the error message on failure. Now every agent run
+persists a log row containing all four; clicking any row in the
+dashboard expands an inline accordion with copy + show-full
+controls.
+
+Changed:
+- `packages/adapters/postgres/src/migrations/007_execution_logs.sql`
+  (new): `agent_execution_logs` table — `execution_id` FK with
+  `ON DELETE CASCADE`, `correlation_id`, `agent_role`,
+  nullable `prompt` + `llm_response` (non-LLM agents leave
+  them null), `result_status` text, `artifact_paths TEXT[]`,
+  `signal_types TEXT[]`, nullable `error_message`,
+  `created_at`. Two indexes (`execution_id`, `correlation_id`).
+  No schema_migrations writes — runner owns that
+- `packages/core/src/repository/index.ts`: new
+  `AgentExecutionLogRecord` + `AgentExecutionLogRepository`
+  (`save / findByExecutionId / findByCorrelationId`). Added
+  `findById` to `AgentExecutionRepository` so the
+  `/executions/:id/log` endpoint can fetch the row directly.
+  `RepositoryRegistry` gained `executionLogs`. Re-exported from
+  `@gestalt/core`
+- `packages/adapters/postgres/src/repositories/execution-logs.ts`
+  (new): `PostgresAgentExecutionLogRepository`. Maps
+  postgres-style `TEXT[]` → JS array directly; defends against
+  `null` arrays by normalising to `[]` on read
+- `packages/adapters/postgres/src/repositories/executions.ts`:
+  added the new `findById(id)` query (`SELECT * ... LIMIT 1`)
+- `packages/adapters/oracle/src/repositories/execution-logs.ts`
+  + `packages/adapters/mssql/src/repositories/execution-logs.ts`
+  (new): full throw-stub `*AgentExecutionLogRepository` so
+  interface drift forces a build break here
+- Adapter `index.ts` files updated to wire / re-export the new
+  classes
+- `packages/agents/generate/src/types.ts`: `AgentResult` gained
+  optional `lastPrompt?: string` and `llmResponse?: string`
+- All six generate agents updated to capture the most-recent
+  prompt + LLM response into local vars and propagate them on
+  every return path (success, retry-failure, clarification-needed,
+  hard-failed):
+  - `intent-agent.ts` — captures lastPrompt + lastLlmResponse
+    before each `llmCall(prompt)`; threads them into all four
+    exits (completed, clarification-needed, retries-exhausted,
+    thrown failure)
+  - `design-agent.ts` — same pattern. `failedResult` helper
+    widened to accept the two new fields
+  - `context-agent.ts`, `code-agent.ts`, `test-agent.ts` — same
+    capture+propagate pattern
+  - `lint-config-agent.ts` — unchanged. Never calls the LLM; both
+    fields stay undefined → orchestrator persists them as null
+- `packages/agents/quality-gate/src/types.ts`: `GateAgentResult`
+  gained the same optional `lastPrompt` + `llmResponse`
+- `packages/agents/quality-gate/src/agents/llm-review-agent.ts`:
+  threads both fields onto every return path (passed, failed,
+  errored). `constraint-agent.ts` is unchanged — regex sweeper,
+  no LLM call, the orchestrator persists nulls
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  destructures `executionLogs` from `getRepositories()` inside
+  the step loop. After `executions.updateStatus(...)`,
+  `await executionLogs.save(...)` with the result's
+  prompt/response/status, mapped artifact paths, mapped signal
+  types, and error message (first signal's message on
+  `failed`). Wrapped in `.catch()` so a log-save failure logs a
+  warning and does not break the cycle. The thrown-agent catch
+  branch also persists a row with null prompt/response,
+  `resultStatus: 'failed'`, and the error message
+- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
+  same persistence pattern inside `runWithObservability`. Both
+  branches (thrown + completed) save a row. `artifactPaths`
+  always empty (gate agents don't produce generate-style
+  artifacts); `signalTypes` from `result.signals`
+- `packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`:
+  same. Deploy agents are non-LLM so prompt + response are
+  always null. `artifactPaths` always empty; `signalTypes`
+  reflects whatever the agent emitted
+- `packages/server/src/routes/executions.ts` (new):
+  `GET /executions/:id/log` (preHandler `requireRole('viewer')`).
+  Fetches the execution row, finds the matching log,
+  parallel-loads the artifacts + signals for the
+  correlation, filters them down to
+  `producedBy === agentRole` /
+  `sourceAgent === agentRole`. Returns 404 if the execution
+  doesn't exist; returns 200 with `log: null` for pre-007
+  executions so the UI can render a placeholder without
+  distinguishing "intent missing" from "feature didn't exist
+  yet"
+- `packages/server/src/app.ts`: registers the new routes
+- `packages/dashboard/src/api/client.ts`: new
+  `getExecutionLog(executionId)` typed method. Pulls
+  `SignalSummary` into the import block (it was missing
+  before this change)
+- `packages/dashboard/src/views/IntentDetail.tsx`: rewrote
+  the agent timeline as a clickable accordion. State holds
+  the expanded set, a `logs` cache keyed by execution id,
+  and per-execution show-full toggles for prompt and
+  response. Click handler lazy-loads the log on first open
+  (`'loading'` state shown inline), caches the result.
+  Subsequent toggles use cached data. Prompt + LLM response
+  are truncated to 400 chars by default with a "show
+  full" button and a "copy" button (writes to clipboard via
+  `navigator.clipboard.writeText`). Null prompts render as
+  "— Not applicable (non-LLM agent)". The error box pinned
+  at the top of the panel shows the agent's error message
+  in red when present. Panel uses existing CSS variables;
+  multiple executions can be expanded at once for
+  side-by-side comparison
+
+Verified live against `trackeros`:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt; migration 007 applied
+  (`schema_migrations` now lists seven versions). Table shape
+  confirmed via `\d agent_execution_logs`
+- **Submitted intent** "Add a titleCase utility under
+  src/shared/utils/title-case ..." (correlationId
+  `9c28d399-d160-4534-ab3e-64ee142ae5b8`). Intent reached
+  `deployed` in ~17 s
+- **12 agent_executions → 12 agent_execution_logs** (1:1)
+- Full join query confirms the column shapes:
+  - LLM agents have populated `prompt` + `llm_response`:
+    - intent-agent: prompt 2818 / response 822, 1 artifact
+    - design-agent: 1939 / 83, 1 artifact
+    - context-agent: 1300 / 31
+    - code-agent: 3243 / 426, 2 artifacts
+      (`src/shared/utils/title-case/titleCase.ts`,
+      `index.ts`)
+    - test-agent: 1300 / 1654, 1 artifact
+    - review-agent: 3469 / 266
+  - Non-LLM agents have NULL prompt + NULL response, with
+    the right resultStatus:
+    - lint-config-agent: skipped (correctly recorded — the
+      agent never called the LLM)
+    - constraint-agent: passed
+    - pr-agent / pipeline-agent / promotion-agent ×2: all
+      `completed`, all nulls
+  - No `error_message` populated anywhere — the cycle ran
+    clean
+- `GET /executions/<code-agent-id>/log` returned the full
+  payload (3.2 KB prompt, the JSON response with the two
+  generated files, the two artifacts with their content,
+  empty signals list). Same call for the constraint-agent
+  execution returned the expected `prompt: null,
+  llmResponse: null, resultStatus: 'passed'`
+- **Browser drive (headless Chrome via CDP):** logged in as
+  `a@b.c`, navigated to `/app/intents/<intentId>`. All 12
+  execution rows render in the timeline with statuses + role
+  names + durations + ▼ chevrons. Clicked the code-agent row
+  → accordion expanded inline, showed the Agent meta panel
+  (Role: code-agent, Status: ● done, Duration: 1163ms,
+  Started: 8:20:03 PM), the Prompt section with `copy` +
+  `show full` buttons and "(2843 more chars)" truncation
+  marker, the LLM Response section with the same controls,
+  and the Artifacts/Signals sections. Screenshot captured.
+  Clicked the constraint-agent row → expanded panel showed
+  "Not applicable" placeholders for prompt and response;
+  result status "passed" (13 "Not applicable" text matches
+  in the DOM confirms the placeholders are everywhere they
+  should be — Prompt + LLM Response × multiple expanded
+  panels)
+
+Decisions made:
+- **One log row per agent_executions row, not a log stream.**
+  Incremental progress already flows through the in-process
+  event bus + SSE. The table captures the post-completion
+  snapshot for the dashboard's drill-down view. A log-stream
+  surface would balloon row counts and complicate the
+  retention story without giving the dashboard anything new
+- **`ON DELETE CASCADE` on the FK.** Matches the existing
+  BullMQ removeOnComplete contract: if an execution row is
+  pruned, its log goes with it. The audit trail of "agent X
+  ran for intent Y" lives on `agent_executions`; the log
+  table is the rich-text companion, not the canonical
+  record
+- **404 vs `log: null` for missing rows.** Returning 200
+  with `log: null` lets the dashboard render a clean
+  placeholder for pre-migration-007 executions without
+  having to distinguish "the execution doesn't exist" from
+  "the execution exists but its log was never captured".
+  404 is reserved for "no execution by that id at all"
+- **`TEXT[]` for artifactPaths + signalTypes, not JSONB.**
+  Both are simple list-of-strings; the postgres array type
+  preserves the array semantics directly and indexes
+  naturally if a future query wants `WHERE 'CONSTRAINT_VIOLATION' = ANY(signal_types)`.
+  JSONB would have worked but is overkill
+- **Persist on log-save failures as warnings, not throws.**
+  A DB blip on `executionLogs.save` should not break the
+  cycle. The row's primary state (agent_executions,
+  signals, artifacts) is already persisted; the log row is
+  diagnostic. Caught + logged at `warn`
+- **Prompt + response stored as TEXT, not JSONB.** They are
+  free-form strings that the LLM produced; treating them
+  as text avoids the parse-on-write cost and matches the
+  diagnostic intent (operator wants to read them as-is)
+- **GP-006 compliance:** prompt + response are stored in
+  the DB but NOT echoed to the audit log. The audit row for
+  `intent.clarification-provided` (added in the previous
+  clarification session) already records only
+  `clarificationLength`; this session does not touch that
+  contract. The new `agent_execution_logs.prompt` /
+  `llm_response` are operator-visible via the dashboard's
+  IntentDetail accordion, which requires authentication +
+  `requireRole('viewer')`
+- **Per-execution log fetch is lazy + cached** in the
+  dashboard. Opening the IntentDetail with 12 executions
+  fires zero `/executions/:id/log` calls until the operator
+  clicks something; clicking the same row twice in a row
+  uses the cached payload
+- **Truncate at 400 chars.** Picked to keep the panel
+  scannable in a typical browser viewport. Both prompt and
+  response can be 3+ KB on a non-trivial agent, which would
+  push the rest of the page off-screen. The full text is
+  always one click away via "show full"
+- **Inline accordion, not a modal**, per the brief. Lets
+  the operator have multiple executions expanded at once
+  for cross-checking (e.g. comparing the design-agent
+  prompt against what the code-agent saw)
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Migration 007 applied. End-to-end verified: prompts +
+responses + artifact paths + signal types persist for every
+agent run; the dashboard reads them back and renders the
+accordion panel with copy + show-full controls.
+
+No follow-ups added — this feature is self-contained and
+GP-006-compliant by design.
+

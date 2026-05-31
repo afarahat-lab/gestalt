@@ -14,7 +14,7 @@ content is derived._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-31 (Claude Code — `/projects` returns all projects, not owner-only; defensive 401 → /login)
+**Last updated:** 2026-05-31 (Claude Code — agent execution logs + IntentDetail accordion)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -28,9 +28,9 @@ content is derived._
   are summarised in the "Session log" entries dated 2026-05-29 / 30
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
-- All six migrations apply on startup: `001_initial`, `002_local_auth`,
+- All seven migrations apply on startup: `001_initial`, `002_local_auth`,
   `003_projects`, `004_deployments`, `005_maintenance`,
-  `006_intent_clarification`
+  `006_intent_clarification`, `007_execution_logs`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
 - **Dashboard SPA reachable in the browser, deep-linkable, no path
@@ -153,6 +153,40 @@ content is derived._
   failed intents had no trace in the dashboard). No status filter
   is applied to `listIntents` — the feed shows the full intent
   timeline for the project
+- **Agent execution logs populated for every agent run, accordion
+  in IntentDetail.** Migration 007 added `agent_execution_logs`
+  (1:1 with `agent_executions`, FK cascades on delete). All three
+  orchestrators (generate / quality-gate / deploy) persist one log
+  row per execution capturing the prompt, the LLM response, the
+  result status, the artifact paths the agent produced, the signal
+  types it emitted, and the error message on failure. LLM-backed
+  agents (intent / design / context / code / test in generate,
+  review-agent in gate) fill the prompt + response columns;
+  non-LLM agents (lint-config when skipped, constraint-agent in
+  gate, pr-agent / pipeline-agent / promotion-agent in deploy)
+  leave both null. New `GET /executions/:id/log` returns the
+  execution + log + filtered artifacts + filtered signals
+  (filtered by `producedBy === agentRole` and
+  `sourceAgent === agentRole` respectively). Returns 200 with
+  `log: null` for pre-migration-007 executions so the dashboard
+  can render a placeholder without confusing "intent missing"
+  with "feature didn't exist yet". The dashboard's IntentDetail
+  rewrote the agent timeline as a clickable accordion — click a
+  row → first-time fetch shows a loading state → subsequent
+  clicks use cached state. Expanded panel renders Agent meta
+  (role / status / duration / started time), Prompt (with copy
+  button + truncate-to-400-chars-with-show-full toggle), LLM
+  response (same controls), Artifacts produced, Signals emitted,
+  and an error box at the top when present. Verified live
+  (`9c28d399` cycle, titleCase utility): full deploy cycle in
+  ~17 s, 12 executions / 12 log rows; LLM agents show
+  prompt-length 1300–3469 chars and response-length 31–1654
+  chars; non-LLM agents show `prompt = NULL`,
+  `llmResponse = NULL`, `resultStatus = passed/completed`;
+  endpoint returns the full prompt and response bytes;
+  dashboard renders the expanded panel with copy + show-full
+  buttons and the "Not applicable" placeholders on the
+  constraint-agent row
 - **`GET /projects` returns ALL registered projects** to any
   authenticated user. The previous owner-only filter
   (`projects.list(request.user.id)` → only rows where
@@ -416,6 +450,11 @@ content is derived._
   parsed-object vs raw-JSON-string return shapes the same way
   `parseFindings` does for maintenanceRuns. `intentId` lifted out of
   context into the read-side record for ergonomics
+- `executionLogs` — save (1:1 per agent_executions row), findByExecutionId,
+  findByCorrelationId. Migration 007. Foreign key cascades on delete
+  matches the BullMQ removeOnComplete contract. The
+  AgentExecutionRepository also gained `findById(id)` so the
+  `/executions/:id/log` endpoint can fetch the join row
 
 **CLI install:**
 - `@gestalt/cli` is private — not on npm
@@ -518,143 +557,6 @@ content is derived._
 ---
 
 ## Recent session log entries (last 3 from SESSION_LOG.md)
-
-### Session 2026-05-31 — Claude Code (persist clarification text on the intents row)
-
-Closes the gate-retry follow-up from the previous session: the
-operator's clarification was previously threaded only through the
-BullMQ payload, and on the gate's retry leg the orchestrator
-re-dispatched `generate:intent` without it. The intent-agent then
-re-ran on the original vague text and produced a second
-clarification alert. Making the DB the source of truth fixes the
-issue at every retry hop with no special-casing.
-
-Changed:
-- `packages/adapters/postgres/src/migrations/006_intent_clarification.sql`
-  (new): `ALTER TABLE intents ADD COLUMN clarification TEXT;`
-  Pure schema. Nullable — existing rows keep NULL forever and
-  intents that never paused for clarification also stay NULL
-- `packages/core/src/repository/index.ts`:
-  - `IntentRecord` gained `clarification: string | null`
-  - `IntentRepository.create()` Omit type now also excludes
-    `clarification` (column defaults to NULL on insert)
-  - New `IntentRepository.saveClarification(id, text)` →
-    `IntentRecord`
-- `packages/adapters/postgres/src/repositories/intents.ts`:
-  - `saveClarification` impl — `UPDATE intents SET clarification,
-    updated_at = NOW() RETURNING *`. Throws if id not found
-  - `SELECT *` continues to work (postgres.js maps the new column
-    automatically — no per-row mapper)
-- `packages/adapters/oracle/src/repositories/intents.ts` (new) +
-  `packages/adapters/mssql/src/repositories/intents.ts` (new): full
-  `IntentRepository` throw-stubs so future interface drift surfaces
-  here. Matches the established alerts / deployment-events /
-  maintenance-runs / projects stub pattern. Re-exported from each
-  adapter's `index.ts`
-- `packages/server/src/routes/intents.ts` POST /clarify:
-  - Calls `intents.saveClarification` immediately after the
-    waiting-for-clarification status guard, BEFORE the BullMQ
-    dispatch. If the dispatch races ahead of the UPDATE the
-    orchestrator still finds the row populated by the time it
-    actually reads it (postgres MVCC + the orchestrator's
-    `findById` is a fresh transaction). If the UPDATE failed the
-    dispatch never fires
-  - Audit metadata reshaped: `clarificationLength: N` (number, not
-    the text), `ambiguityId`, `acknowledgedAlertIds`, `ip`. Action
-    name changed to `intent.clarification-provided` per the
-    brief. The clarification text itself is NOT written to the
-    audit row — GP-006 (no sensitive data in logs). Forensics
-    that need the text query `intents.clarification` directly
-- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
-  Replaced `clarification: payload.clarification` in the
-  drivePlan options with
-  `clarification: intentRecord.clarification ?? payload.clarification ?? undefined`.
-  Comment explains the DB is the source of truth; the payload
-  fallback only matters for a fractional-millisecond race where
-  the worker pulled the message before the UPDATE committed (very
-  rare; harmless if it loses)
-
-Verified live against `trackeros`, correlationId
-`63bc2a3b-d6a4-4e34-b165-3b55d0fd1a3d`:
-- `pnpm -r build` clean across all 12 packages
-- Docker server image rebuilt; migration 006 applied on first
-  boot (`schema_migrations` now lists six versions through
-  `006_intent_clarification`)
-- `intents.clarification` column exists, `text`, nullable
-- Submitted "make it better" → intent → `waiting-for-clarification`
-  in 2 s; `clarification` column still NULL
-- `POST /intents/<id>/clarify` with a 156-character clarification
-  returned `{ resumed: true, acknowledgedAlerts: 1 }`. DB row
-  immediately shows `length(clarification) = 156`
-- **Audit row contents** (GP-006 verification):
-  `{"clarificationLength":156, "ambiguityId":null,
-  "acknowledgedAlertIds":["be7c6bb6-…"], "ip":"192.168.65.1"}`.
-  No clarification text anywhere in the audit_log
-- **Full cycle: intent-agent ran THREE times.** First on the
-  pause (vague text → clarification-needed). Second on the
-  post-`/clarify` resume (clarification populated via direct
-  payload). **Third on the gate retry** (the previous
-  session's bug case). All three runs read
-  `intentRecord.clarification` from the DB — the gate-retry
-  intent-agent run returned `status: completed` (NOT
-  `clarification-needed`), proving the persistence chain
-  works
-- **Only ONE alert in `alerts` for the full cycle.** The
-  pre-fix bug would have created a second clarification alert on
-  the gate-retry leg. The DB shows exactly one row, acknowledged
-- Intent reached `escalated` for an unrelated review-agent
-  GP_BREACH on the generated slugify implementation. The
-  clarification persistence carried clean through all retries;
-  the terminal escalation was a separate, code-quality issue out
-  of scope for this fix
-
-Decisions made:
-- **DB column, not Git-tracked artifact.** Considered persisting
-  the clarification text alongside `.gestalt/intent-spec.json` in
-  the project repo. The DB is simpler (no Git race with the
-  orchestrator's per-cycle clone), and clarification text is
-  metadata about the cycle rather than something the next git
-  pull should surface to developers. A column on `intents` keeps
-  it discoverable via the same SQL operators already use
-- **Payload still carries `clarification` even though the DB is
-  the source of truth.** The dispatch fires in the same handler
-  that just called `saveClarification`, so the UPDATE is in
-  flight when the worker picks up the task. In the common case
-  the DB read still wins. The payload fallback only matters for
-  a worker that pulls the task between BEGIN and COMMIT — vanishingly
-  unlikely with one server + one DB, but the cost is zero and the
-  belt-and-braces guarantee is real
-- **Audit metadata only carries length, not text** (GP-006). The
-  audit row records the *event* — operator X clarified intent Y
-  at time Z with N characters. The *content* of the clarification
-  lives on the intent row and can be queried by a forensics
-  operator. Splitting these surfaces aligns with the existing
-  pattern (audit_log never contains the artifact content, only the
-  reference)
-- **Orchestrator uses `??` chain, not `||` chain.** Empty string
-  is a valid clarification (theoretically), so falsy-coalesce
-  via `||` would drop it; `??` only swallows null/undefined
-- **Did NOT change the gate-retry payload shape.** It already
-  carries `intentId`, which is all the orchestrator needs to
-  hydrate via `intents.findById`. Adding clarification text to
-  the retry payload would duplicate state and re-introduce the
-  drift the DB fixes
-- **Oracle and MSSQL got new full `IntentRepository` throw-stubs.**
-  The brief asked for "saveClarification throw-stub for parity";
-  there were no existing intent stubs in those adapters (only
-  the four later additions had stubs). Adding full stubs follows
-  the established convention and means the next interface change
-  to IntentRepository also surfaces at oracle/mssql build time
-- **Removed the resolved follow-up** ("clarification text lost on
-  a gate retry") from `STATE.md`. Logged under the previous
-  session's "Follow-ups added to Pending enhancements" list
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Migration 006 applied. Full vague-intent → clarify → resume →
-gate-retry cycle verified end-to-end; the clarification text
-persists on the intents row through every dispatch leg.
-
----
 
 ### Session 2026-05-31 — Claude Code (global dashboard project selector + per-view localStorage cleanup)
 
@@ -915,4 +817,236 @@ under `/app/*`. Both fixes verified live: the previously-
 filtered owner-only view is gone, and an expired-token
 session now bounces to login instead of showing a
 misleading empty state.
+
+---
+
+### Session 2026-05-31 — Claude Code (agent execution logs + IntentDetail accordion)
+
+Closes the "what did this agent actually see and say?" gap. Before
+this session, the dashboard's IntentDetail listed each agent run by
+role + duration + status — no way to see the prompt that was sent
+to the LLM, the response that came back, the artifacts that were
+produced, or the error message on failure. Now every agent run
+persists a log row containing all four; clicking any row in the
+dashboard expands an inline accordion with copy + show-full
+controls.
+
+Changed:
+- `packages/adapters/postgres/src/migrations/007_execution_logs.sql`
+  (new): `agent_execution_logs` table — `execution_id` FK with
+  `ON DELETE CASCADE`, `correlation_id`, `agent_role`,
+  nullable `prompt` + `llm_response` (non-LLM agents leave
+  them null), `result_status` text, `artifact_paths TEXT[]`,
+  `signal_types TEXT[]`, nullable `error_message`,
+  `created_at`. Two indexes (`execution_id`, `correlation_id`).
+  No schema_migrations writes — runner owns that
+- `packages/core/src/repository/index.ts`: new
+  `AgentExecutionLogRecord` + `AgentExecutionLogRepository`
+  (`save / findByExecutionId / findByCorrelationId`). Added
+  `findById` to `AgentExecutionRepository` so the
+  `/executions/:id/log` endpoint can fetch the row directly.
+  `RepositoryRegistry` gained `executionLogs`. Re-exported from
+  `@gestalt/core`
+- `packages/adapters/postgres/src/repositories/execution-logs.ts`
+  (new): `PostgresAgentExecutionLogRepository`. Maps
+  postgres-style `TEXT[]` → JS array directly; defends against
+  `null` arrays by normalising to `[]` on read
+- `packages/adapters/postgres/src/repositories/executions.ts`:
+  added the new `findById(id)` query (`SELECT * ... LIMIT 1`)
+- `packages/adapters/oracle/src/repositories/execution-logs.ts`
+  + `packages/adapters/mssql/src/repositories/execution-logs.ts`
+  (new): full throw-stub `*AgentExecutionLogRepository` so
+  interface drift forces a build break here
+- Adapter `index.ts` files updated to wire / re-export the new
+  classes
+- `packages/agents/generate/src/types.ts`: `AgentResult` gained
+  optional `lastPrompt?: string` and `llmResponse?: string`
+- All six generate agents updated to capture the most-recent
+  prompt + LLM response into local vars and propagate them on
+  every return path (success, retry-failure, clarification-needed,
+  hard-failed):
+  - `intent-agent.ts` — captures lastPrompt + lastLlmResponse
+    before each `llmCall(prompt)`; threads them into all four
+    exits (completed, clarification-needed, retries-exhausted,
+    thrown failure)
+  - `design-agent.ts` — same pattern. `failedResult` helper
+    widened to accept the two new fields
+  - `context-agent.ts`, `code-agent.ts`, `test-agent.ts` — same
+    capture+propagate pattern
+  - `lint-config-agent.ts` — unchanged. Never calls the LLM; both
+    fields stay undefined → orchestrator persists them as null
+- `packages/agents/quality-gate/src/types.ts`: `GateAgentResult`
+  gained the same optional `lastPrompt` + `llmResponse`
+- `packages/agents/quality-gate/src/agents/llm-review-agent.ts`:
+  threads both fields onto every return path (passed, failed,
+  errored). `constraint-agent.ts` is unchanged — regex sweeper,
+  no LLM call, the orchestrator persists nulls
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  destructures `executionLogs` from `getRepositories()` inside
+  the step loop. After `executions.updateStatus(...)`,
+  `await executionLogs.save(...)` with the result's
+  prompt/response/status, mapped artifact paths, mapped signal
+  types, and error message (first signal's message on
+  `failed`). Wrapped in `.catch()` so a log-save failure logs a
+  warning and does not break the cycle. The thrown-agent catch
+  branch also persists a row with null prompt/response,
+  `resultStatus: 'failed'`, and the error message
+- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
+  same persistence pattern inside `runWithObservability`. Both
+  branches (thrown + completed) save a row. `artifactPaths`
+  always empty (gate agents don't produce generate-style
+  artifacts); `signalTypes` from `result.signals`
+- `packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`:
+  same. Deploy agents are non-LLM so prompt + response are
+  always null. `artifactPaths` always empty; `signalTypes`
+  reflects whatever the agent emitted
+- `packages/server/src/routes/executions.ts` (new):
+  `GET /executions/:id/log` (preHandler `requireRole('viewer')`).
+  Fetches the execution row, finds the matching log,
+  parallel-loads the artifacts + signals for the
+  correlation, filters them down to
+  `producedBy === agentRole` /
+  `sourceAgent === agentRole`. Returns 404 if the execution
+  doesn't exist; returns 200 with `log: null` for pre-007
+  executions so the UI can render a placeholder without
+  distinguishing "intent missing" from "feature didn't exist
+  yet"
+- `packages/server/src/app.ts`: registers the new routes
+- `packages/dashboard/src/api/client.ts`: new
+  `getExecutionLog(executionId)` typed method. Pulls
+  `SignalSummary` into the import block (it was missing
+  before this change)
+- `packages/dashboard/src/views/IntentDetail.tsx`: rewrote
+  the agent timeline as a clickable accordion. State holds
+  the expanded set, a `logs` cache keyed by execution id,
+  and per-execution show-full toggles for prompt and
+  response. Click handler lazy-loads the log on first open
+  (`'loading'` state shown inline), caches the result.
+  Subsequent toggles use cached data. Prompt + LLM response
+  are truncated to 400 chars by default with a "show
+  full" button and a "copy" button (writes to clipboard via
+  `navigator.clipboard.writeText`). Null prompts render as
+  "— Not applicable (non-LLM agent)". The error box pinned
+  at the top of the panel shows the agent's error message
+  in red when present. Panel uses existing CSS variables;
+  multiple executions can be expanded at once for
+  side-by-side comparison
+
+Verified live against `trackeros`:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt; migration 007 applied
+  (`schema_migrations` now lists seven versions). Table shape
+  confirmed via `\d agent_execution_logs`
+- **Submitted intent** "Add a titleCase utility under
+  src/shared/utils/title-case ..." (correlationId
+  `9c28d399-d160-4534-ab3e-64ee142ae5b8`). Intent reached
+  `deployed` in ~17 s
+- **12 agent_executions → 12 agent_execution_logs** (1:1)
+- Full join query confirms the column shapes:
+  - LLM agents have populated `prompt` + `llm_response`:
+    - intent-agent: prompt 2818 / response 822, 1 artifact
+    - design-agent: 1939 / 83, 1 artifact
+    - context-agent: 1300 / 31
+    - code-agent: 3243 / 426, 2 artifacts
+      (`src/shared/utils/title-case/titleCase.ts`,
+      `index.ts`)
+    - test-agent: 1300 / 1654, 1 artifact
+    - review-agent: 3469 / 266
+  - Non-LLM agents have NULL prompt + NULL response, with
+    the right resultStatus:
+    - lint-config-agent: skipped (correctly recorded — the
+      agent never called the LLM)
+    - constraint-agent: passed
+    - pr-agent / pipeline-agent / promotion-agent ×2: all
+      `completed`, all nulls
+  - No `error_message` populated anywhere — the cycle ran
+    clean
+- `GET /executions/<code-agent-id>/log` returned the full
+  payload (3.2 KB prompt, the JSON response with the two
+  generated files, the two artifacts with their content,
+  empty signals list). Same call for the constraint-agent
+  execution returned the expected `prompt: null,
+  llmResponse: null, resultStatus: 'passed'`
+- **Browser drive (headless Chrome via CDP):** logged in as
+  `a@b.c`, navigated to `/app/intents/<intentId>`. All 12
+  execution rows render in the timeline with statuses + role
+  names + durations + ▼ chevrons. Clicked the code-agent row
+  → accordion expanded inline, showed the Agent meta panel
+  (Role: code-agent, Status: ● done, Duration: 1163ms,
+  Started: 8:20:03 PM), the Prompt section with `copy` +
+  `show full` buttons and "(2843 more chars)" truncation
+  marker, the LLM Response section with the same controls,
+  and the Artifacts/Signals sections. Screenshot captured.
+  Clicked the constraint-agent row → expanded panel showed
+  "Not applicable" placeholders for prompt and response;
+  result status "passed" (13 "Not applicable" text matches
+  in the DOM confirms the placeholders are everywhere they
+  should be — Prompt + LLM Response × multiple expanded
+  panels)
+
+Decisions made:
+- **One log row per agent_executions row, not a log stream.**
+  Incremental progress already flows through the in-process
+  event bus + SSE. The table captures the post-completion
+  snapshot for the dashboard's drill-down view. A log-stream
+  surface would balloon row counts and complicate the
+  retention story without giving the dashboard anything new
+- **`ON DELETE CASCADE` on the FK.** Matches the existing
+  BullMQ removeOnComplete contract: if an execution row is
+  pruned, its log goes with it. The audit trail of "agent X
+  ran for intent Y" lives on `agent_executions`; the log
+  table is the rich-text companion, not the canonical
+  record
+- **404 vs `log: null` for missing rows.** Returning 200
+  with `log: null` lets the dashboard render a clean
+  placeholder for pre-migration-007 executions without
+  having to distinguish "the execution doesn't exist" from
+  "the execution exists but its log was never captured".
+  404 is reserved for "no execution by that id at all"
+- **`TEXT[]` for artifactPaths + signalTypes, not JSONB.**
+  Both are simple list-of-strings; the postgres array type
+  preserves the array semantics directly and indexes
+  naturally if a future query wants `WHERE 'CONSTRAINT_VIOLATION' = ANY(signal_types)`.
+  JSONB would have worked but is overkill
+- **Persist on log-save failures as warnings, not throws.**
+  A DB blip on `executionLogs.save` should not break the
+  cycle. The row's primary state (agent_executions,
+  signals, artifacts) is already persisted; the log row is
+  diagnostic. Caught + logged at `warn`
+- **Prompt + response stored as TEXT, not JSONB.** They are
+  free-form strings that the LLM produced; treating them
+  as text avoids the parse-on-write cost and matches the
+  diagnostic intent (operator wants to read them as-is)
+- **GP-006 compliance:** prompt + response are stored in
+  the DB but NOT echoed to the audit log. The audit row for
+  `intent.clarification-provided` (added in the previous
+  clarification session) already records only
+  `clarificationLength`; this session does not touch that
+  contract. The new `agent_execution_logs.prompt` /
+  `llm_response` are operator-visible via the dashboard's
+  IntentDetail accordion, which requires authentication +
+  `requireRole('viewer')`
+- **Per-execution log fetch is lazy + cached** in the
+  dashboard. Opening the IntentDetail with 12 executions
+  fires zero `/executions/:id/log` calls until the operator
+  clicks something; clicking the same row twice in a row
+  uses the cached payload
+- **Truncate at 400 chars.** Picked to keep the panel
+  scannable in a typical browser viewport. Both prompt and
+  response can be 3+ KB on a non-trivial agent, which would
+  push the rest of the page off-screen. The full text is
+  always one click away via "show full"
+- **Inline accordion, not a modal**, per the brief. Lets
+  the operator have multiple executions expanded at once
+  for cross-checking (e.g. comparing the design-agent
+  prompt against what the code-agent saw)
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Migration 007 applied. End-to-end verified: prompts +
+responses + artifact paths + signal types persist for every
+agent run; the dashboard reads them back and renders the
+accordion panel with copy + show-full controls.
+
+No follow-ups added — this feature is self-contained and
+GP-006-compliant by design.
 

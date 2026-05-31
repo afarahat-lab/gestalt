@@ -347,7 +347,7 @@ async function runWithObservability<T extends GateAgentResult>(
   invoke: () => Promise<T>,
   childLog: ReturnType<typeof createContextLogger>,
 ): Promise<T> {
-  const { executions, signals } = getRepositories();
+  const { executions, signals, executionLogs } = getRepositories();
   const executionId = crypto.randomUUID();
   const startedAt = new Date();
 
@@ -380,6 +380,17 @@ async function runWithObservability<T extends GateAgentResult>(
       durationMs: completedAt.getTime() - startedAt.getTime(),
       startedAt,
       completedAt,
+    }).catch(() => undefined);
+    await executionLogs.save({
+      executionId,
+      correlationId,
+      agentRole,
+      prompt: null,
+      llmResponse: null,
+      resultStatus: 'failed',
+      artifactPaths: [],
+      signalTypes: [],
+      errorMessage: err instanceof Error ? err.message : String(err),
     }).catch(() => undefined);
     emitLiveEvent('agent.completed', correlationId, {
       executionId,
@@ -417,6 +428,31 @@ async function runWithObservability<T extends GateAgentResult>(
     startedAt,
     completedAt,
   });
+
+  // Persist the execution log row. The result type widens to allow the
+  // optional `lastPrompt` + `llmResponse` (added to `GateAgentResult`
+  // for LLM-backed gate agents like review-agent; non-LLM agents like
+  // constraint-agent leave them undefined and the column goes null).
+  const resultWithPrompt = result as unknown as GateAgentResult & {
+    lastPrompt?: string;
+    llmResponse?: string;
+  };
+  await executionLogs.save({
+    executionId,
+    correlationId,
+    agentRole,
+    prompt: resultWithPrompt.lastPrompt ?? null,
+    llmResponse: resultWithPrompt.llmResponse ?? null,
+    resultStatus: result.status,
+    artifactPaths: [],   // gate agents do not produce artifacts
+    signalTypes: result.signals.map((s) => s.type),
+    errorMessage: result.status === 'errored'
+      ? 'Gate agent threw before producing a structured response'
+      : null,
+  }).catch((err) => {
+    childLog.warn({ err, executionId, agentRole }, 'executionLogs.save failed');
+  });
+
   emitLiveEvent('agent.completed', correlationId, {
     executionId,
     agentRole,

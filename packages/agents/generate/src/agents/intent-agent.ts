@@ -42,10 +42,19 @@ export async function runIntentAgent(
   // already placed it on the snapshot's intentSpec.rawIntent.
   const rawIntentText = task.contextSnapshot.intentSpec.rawIntent;
 
+  // Capture the most recent attempt's prompt + response so the
+  // orchestrator can persist them into `agent_execution_logs` even when
+  // every attempt fails. Reset each iteration; the values surviving the
+  // loop belong to the last attempt the agent made.
+  let lastPrompt: string | undefined;
+  let lastLlmResponse: string | undefined;
+
   for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
     try {
       const prompt = buildIntentPrompt(task.contextSnapshot, attempt, task.clarification);
+      lastPrompt = prompt;
       const raw = await llmCall(prompt);
+      lastLlmResponse = raw;
       const spec = parseIntentSpec(raw, task.correlationId, rawIntentText);
       validateIntentSpec(spec);
 
@@ -61,6 +70,8 @@ export async function runIntentAgent(
           agentRole: 'intent-agent',
           status: 'clarification-needed',
           clarificationNeeded,
+          lastPrompt,
+          llmResponse: lastLlmResponse,
           artifacts: [
             // Still persist the intent-spec — the resume cycle will
             // overwrite it with a better one, and the operator may want
@@ -99,6 +110,8 @@ export async function runIntentAgent(
       return {
         agentRole: 'intent-agent',
         status: 'completed',
+        lastPrompt,
+        llmResponse: lastLlmResponse,
         artifacts: [
           {
             id: crypto.randomUUID(),
@@ -123,6 +136,8 @@ export async function runIntentAgent(
   return {
     agentRole: 'intent-agent',
     status: 'failed',
+    lastPrompt,
+    llmResponse: lastLlmResponse,
     artifacts: [],
     signals: [
       {

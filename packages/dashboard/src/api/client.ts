@@ -8,7 +8,7 @@
 import type {
   IntentSummary, IntentDetail, Alert, InterventionRequest,
   InterventionRecord, MaintenanceRunSummary, LiveEvent, DashboardUser,
-  AgentExecutionSummary, ProjectSummary,
+  AgentExecutionSummary, ProjectSummary, SignalSummary,
 } from '../types';
 
 export class DashboardApiClient {
@@ -53,6 +53,32 @@ export class DashboardApiClient {
     body: { clarification: string; ambiguityId?: string },
   ): Promise<{ data: { resumed: true; acknowledgedAlerts: number } }> {
     return this.post(`/intents/${id}/clarify`, body);
+  }
+
+  // ─── Execution detail ──────────────────────────────────────────────────────
+
+  /**
+   * Per-execution snapshot used by the IntentDetail accordion when an
+   * operator clicks a single agent run open. Returns null `log` for
+   * pre-migration-007 executions; the UI renders a "log not available"
+   * placeholder in that case.
+   */
+  async getExecutionLog(executionId: string): Promise<{
+    data: {
+      execution: AgentExecutionSummary;
+      log: {
+        prompt: string | null;
+        llmResponse: string | null;
+        resultStatus: string;
+        artifactPaths: string[];
+        signalTypes: string[];
+        errorMessage: string | null;
+      } | null;
+      artifacts: Array<{ id: string; type: string; path: string; content: string }>;
+      signals: SignalSummary[];
+    };
+  }> {
+    return this.get(`/executions/${executionId}/log`);
   }
 
   // ─── Projects ──────────────────────────────────────────────────────────────

@@ -73,10 +73,11 @@ export async function runLlmReviewAgent(
   const prompt = buildReviewPrompt(codeArtifacts, task.harnessConfig.goldenPrinciples);
 
   let review: LLMReview;
+  let raw: string | undefined;
   try {
-    const raw = await llmCall(prompt);
+    raw = await llmCall(prompt);
     review = parseReview(raw);
-  } catch (err) {
+  } catch {
     // The LLM call or JSON parse failed. Treat as an `errored` agent run —
     // gate verdict treats it as an absence of signals (pass through),
     // operator sees the error in the agent_executions row.
@@ -86,6 +87,8 @@ export async function runLlmReviewAgent(
       signals: [],
       durationMs: Date.now() - startedAt,
       reviewArtifact: null,
+      lastPrompt: prompt,
+      llmResponse: raw,
     };
   }
 
@@ -107,6 +110,8 @@ export async function runLlmReviewAgent(
     signals,
     durationMs: Date.now() - startedAt,
     reviewArtifact,
+    lastPrompt: prompt,
+    llmResponse: raw,
   };
 }
 

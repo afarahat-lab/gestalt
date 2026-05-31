@@ -14,16 +14,22 @@ export async function runDesignAgent(
 ): Promise<AgentResult> {
   const startedAt = Date.now();
   let lastError: Error | undefined;
+  let lastPrompt: string | undefined;
+  let lastLlmResponse: string | undefined;
 
   for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
     try {
       const prompt = buildDesignPrompt(task.contextSnapshot, attempt);
+      lastPrompt = prompt;
       const raw = await llmCall(prompt);
+      lastLlmResponse = raw;
       const design = parseDesignArtifact(raw, task.correlationId);
 
       return {
         agentRole: 'design-agent',
         status: 'completed',
+        lastPrompt,
+        llmResponse: lastLlmResponse,
         artifacts: [
           {
             id: crypto.randomUUID(),
@@ -44,7 +50,7 @@ export async function runDesignAgent(
     }
   }
 
-  return failedResult('design-agent', task.correlationId, startedAt, lastError);
+  return failedResult('design-agent', task.correlationId, startedAt, lastError, lastPrompt, lastLlmResponse);
 }
 
 function parseDesignArtifact(raw: string, correlationId: string): DesignArtifact {
@@ -63,10 +69,14 @@ function failedResult(
   correlationId: string,
   startedAt: number,
   error?: Error,
+  lastPrompt?: string,
+  llmResponse?: string,
 ): AgentResult {
   return {
     agentRole,
     status: 'failed',
+    lastPrompt,
+    llmResponse,
     artifacts: [],
     signals: [{
       id: crypto.randomUUID(),

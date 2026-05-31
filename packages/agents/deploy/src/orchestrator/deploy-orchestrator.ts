@@ -277,7 +277,7 @@ async function runWithObservability<T>(
   extractSignals: PlatformSignal[] | ((result: T) => PlatformSignal[]),
   childLog: ReturnType<typeof createContextLogger>,
 ): Promise<T> {
-  const { executions, signals } = getRepositories();
+  const { executions, signals, executionLogs } = getRepositories();
   const executionId = crypto.randomUUID();
   const startedAt = new Date();
 
@@ -309,6 +309,19 @@ async function runWithObservability<T>(
       durationMs: completedAt.getTime() - startedAt.getTime(),
       startedAt,
       completedAt,
+    }).catch(() => undefined);
+    // Deploy agents don't call LLMs — prompt/response are always null.
+    // The error message is the operator's only signal.
+    await executionLogs.save({
+      executionId,
+      correlationId,
+      agentRole,
+      prompt: null,
+      llmResponse: null,
+      resultStatus: 'failed',
+      artifactPaths: [],
+      signalTypes: [],
+      errorMessage: err instanceof Error ? err.message : String(err),
     }).catch(() => undefined);
     emitLiveEvent('agent.completed', correlationId, {
       executionId,
@@ -342,6 +355,21 @@ async function runWithObservability<T>(
     durationMs: completedAt.getTime() - startedAt.getTime(),
     startedAt,
     completedAt,
+  });
+  await executionLogs.save({
+    executionId,
+    correlationId,
+    agentRole,
+    prompt: null,           // deploy agents are non-LLM
+    llmResponse: null,
+    resultStatus: stepStatus,
+    artifactPaths: [],      // deploy agents do not produce generate-style artifacts
+    signalTypes: producedSignals.map((s) => s.type),
+    errorMessage: producedSignals.length > 0
+      ? (producedSignals[0]?.message ?? null)
+      : null,
+  }).catch((err) => {
+    childLog.warn({ err, executionId, agentRole }, 'executionLogs.save failed');
   });
   emitLiveEvent('agent.completed', correlationId, {
     executionId,

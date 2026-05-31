@@ -91,6 +91,43 @@ export interface AgentExecutionRepository extends BaseRepository {
   updateStatus(id: string, status: ExecutionStatus, fields?: Partial<AgentExecutionRecord>): Promise<AgentExecutionRecord>;
   findByCorrelationId(correlationId: string): Promise<AgentExecutionRecord[]>;
   findActive(): Promise<AgentExecutionRecord[]>;
+  findById(id: string): Promise<AgentExecutionRecord | null>;
+}
+
+// ─── Agent execution log repository ───────────────────────────────────────────
+
+/**
+ * Per-execution snapshot of the prompt + LLM response + result. One row
+ * per `agent_executions` row (1:1). Populated by the layer
+ * orchestrators (generate / quality-gate / deploy) right before they
+ * update the execution status to a terminal state. Consumed by the
+ * dashboard's IntentDetail view when an operator clicks an execution
+ * row open.
+ *
+ * The prompt and response can be large (multi-KB); the dashboard
+ * truncates them in the UI but always stores the full text in the DB.
+ * Non-LLM agents (gate constraint-agent / deploy pr-agent /
+ * pipeline-agent / promotion-agent) store `prompt = null` and
+ * `llmResponse = null`.
+ */
+export interface AgentExecutionLogRecord {
+  id: string;
+  executionId: string;
+  correlationId: string;
+  agentRole: string;
+  prompt: string | null;
+  llmResponse: string | null;
+  resultStatus: string;
+  artifactPaths: string[];
+  signalTypes: string[];
+  errorMessage: string | null;
+  createdAt: Date;
+}
+
+export interface AgentExecutionLogRepository extends BaseRepository {
+  save(log: Omit<AgentExecutionLogRecord, 'id' | 'createdAt'>): Promise<AgentExecutionLogRecord>;
+  findByExecutionId(executionId: string): Promise<AgentExecutionLogRecord | null>;
+  findByCorrelationId(correlationId: string): Promise<AgentExecutionLogRecord[]>;
 }
 
 // ─── Artifact repository ──────────────────────────────────────────────────────
@@ -215,6 +252,7 @@ export interface RepositoryRegistry {
   deploymentEvents: DeploymentEventRepository;
   maintenanceRuns: MaintenanceRunRepository;
   alerts: AlertRepository;
+  executionLogs: AgentExecutionLogRepository;
 }
 
 // ─── Alert repository ─────────────────────────────────────────────────────────

@@ -35,17 +35,23 @@ export async function runTestAgent(
   }
 
   let lastError: Error | undefined;
+  let lastPrompt: string | undefined;
+  let lastLlmResponse: string | undefined;
 
   for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
     try {
       const prompt = buildTestPrompt(task.contextSnapshot, attempt);
+      lastPrompt = prompt;
       const raw = await llmCall(prompt);
+      lastLlmResponse = raw;
       const testFiles = parseTestFiles(raw, task.correlationId);
       if (testFiles.length === 0) throw new Error('LLM returned no test files');
 
       return {
         agentRole: 'test-agent',
         status: 'completed',
+        lastPrompt,
+        llmResponse: lastLlmResponse,
         artifacts: testFiles,
         signals: [],
         tokensUsed: 0,
@@ -59,6 +65,8 @@ export async function runTestAgent(
   return {
     agentRole: 'test-agent',
     status: 'failed',
+    lastPrompt,
+    llmResponse: lastLlmResponse,
     artifacts: [],
     signals: [{
       id: crypto.randomUUID(),

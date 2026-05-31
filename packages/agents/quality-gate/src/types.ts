@@ -46,6 +46,15 @@ export interface GateAgentResult {
   status: 'passed' | 'failed' | 'errored';
   signals: GateSignal[];
   durationMs: number;
+  /**
+   * Populated by LLM-backed gate agents (review-agent today).
+   * Non-LLM agents (constraint-agent regex sweeper, future
+   * lint-agent / security-agent / test-runner-agent that shell out to
+   * project tooling) leave these undefined. Persisted into
+   * `agent_execution_logs` by the gate orchestrator.
+   */
+  lastPrompt?: string;
+  llmResponse?: string;
 }
 
 // Retry recommendation returned to generate layer

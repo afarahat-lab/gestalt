@@ -7,3 +7,4 @@ export { MssqlProjectRepository } from './repositories/projects';
 export { MssqlDeploymentEventRepository } from './repositories/deployment-events';
 export { MssqlMaintenanceRunRepository } from './repositories/maintenance-runs';
 export { MssqlAlertRepository } from './repositories/alerts';
+export { MssqlAgentExecutionLogRepository } from './repositories/execution-logs';

@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-31 (Claude Code — `/projects` returns all projects, not owner-only; defensive 401 → /login)
+**Last updated:** 2026-05-31 (Claude Code — agent execution logs + IntentDetail accordion)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -22,9 +22,9 @@ the historical record of how the state evolved._
   are summarised in the "Session log" entries dated 2026-05-29 / 30
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
-- All six migrations apply on startup: `001_initial`, `002_local_auth`,
+- All seven migrations apply on startup: `001_initial`, `002_local_auth`,
   `003_projects`, `004_deployments`, `005_maintenance`,
-  `006_intent_clarification`
+  `006_intent_clarification`, `007_execution_logs`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
 - **Dashboard SPA reachable in the browser, deep-linkable, no path
@@ -147,6 +147,40 @@ the historical record of how the state evolved._
   failed intents had no trace in the dashboard). No status filter
   is applied to `listIntents` — the feed shows the full intent
   timeline for the project
+- **Agent execution logs populated for every agent run, accordion
+  in IntentDetail.** Migration 007 added `agent_execution_logs`
+  (1:1 with `agent_executions`, FK cascades on delete). All three
+  orchestrators (generate / quality-gate / deploy) persist one log
+  row per execution capturing the prompt, the LLM response, the
+  result status, the artifact paths the agent produced, the signal
+  types it emitted, and the error message on failure. LLM-backed
+  agents (intent / design / context / code / test in generate,
+  review-agent in gate) fill the prompt + response columns;
+  non-LLM agents (lint-config when skipped, constraint-agent in
+  gate, pr-agent / pipeline-agent / promotion-agent in deploy)
+  leave both null. New `GET /executions/:id/log` returns the
+  execution + log + filtered artifacts + filtered signals
+  (filtered by `producedBy === agentRole` and
+  `sourceAgent === agentRole` respectively). Returns 200 with
+  `log: null` for pre-migration-007 executions so the dashboard
+  can render a placeholder without confusing "intent missing"
+  with "feature didn't exist yet". The dashboard's IntentDetail
+  rewrote the agent timeline as a clickable accordion — click a
+  row → first-time fetch shows a loading state → subsequent
+  clicks use cached state. Expanded panel renders Agent meta
+  (role / status / duration / started time), Prompt (with copy
+  button + truncate-to-400-chars-with-show-full toggle), LLM
+  response (same controls), Artifacts produced, Signals emitted,
+  and an error box at the top when present. Verified live
+  (`9c28d399` cycle, titleCase utility): full deploy cycle in
+  ~17 s, 12 executions / 12 log rows; LLM agents show
+  prompt-length 1300–3469 chars and response-length 31–1654
+  chars; non-LLM agents show `prompt = NULL`,
+  `llmResponse = NULL`, `resultStatus = passed/completed`;
+  endpoint returns the full prompt and response bytes;
+  dashboard renders the expanded panel with copy + show-full
+  buttons and the "Not applicable" placeholders on the
+  constraint-agent row
 - **`GET /projects` returns ALL registered projects** to any
   authenticated user. The previous owner-only filter
   (`projects.list(request.user.id)` → only rows where
@@ -410,6 +444,11 @@ the historical record of how the state evolved._
   parsed-object vs raw-JSON-string return shapes the same way
   `parseFindings` does for maintenanceRuns. `intentId` lifted out of
   context into the read-side record for ergonomics
+- `executionLogs` — save (1:1 per agent_executions row), findByExecutionId,
+  findByCorrelationId. Migration 007. Foreign key cascades on delete
+  matches the BullMQ removeOnComplete contract. The
+  AgentExecutionRepository also gained `findById(id)` so the
+  `/executions/:id/log` endpoint can fetch the join row
 
 **CLI install:**
 - `@gestalt/cli` is private — not on npm

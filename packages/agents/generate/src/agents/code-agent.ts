@@ -14,17 +14,23 @@ export async function runCodeAgent(
 ): Promise<AgentResult> {
   const startedAt = Date.now();
   let lastError: Error | undefined;
+  let lastPrompt: string | undefined;
+  let lastLlmResponse: string | undefined;
 
   for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
     try {
       const prompt = buildCodePrompt(task.contextSnapshot, attempt, task.priorSignals);
+      lastPrompt = prompt;
       const raw = await llmCall(prompt);
+      lastLlmResponse = raw;
       const codeFiles = parseCodeFiles(raw, task.correlationId);
       if (codeFiles.length === 0) throw new Error('LLM returned no code files');
 
       return {
         agentRole: 'code-agent',
         status: 'completed',
+        lastPrompt,
+        llmResponse: lastLlmResponse,
         artifacts: codeFiles,
         signals: [],
         tokensUsed: 0,
@@ -38,6 +44,8 @@ export async function runCodeAgent(
   return {
     agentRole: 'code-agent',
     status: 'failed',
+    lastPrompt,
+    llmResponse: lastLlmResponse,
     artifacts: [],
     signals: [{
       id: crypto.randomUUID(),

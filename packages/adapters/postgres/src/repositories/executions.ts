@@ -81,4 +81,12 @@ export class PostgresAgentExecutionRepository implements AgentExecutionRepositor
       ORDER BY created_at ASC
     `;
   }
+
+  async findById(id: string): Promise<AgentExecutionRecord | null> {
+    const db = getDb();
+    const rows = await db<AgentExecutionRecord[]>`
+      SELECT * FROM agent_executions WHERE id = ${id} LIMIT 1
+    `;
+    return rows[0] ?? null;
+  }
 }

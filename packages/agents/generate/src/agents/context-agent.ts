@@ -35,11 +35,15 @@ export async function runContextAgent(
   }
 
   let lastError: Error | undefined;
+  let lastPrompt: string | undefined;
+  let lastLlmResponse: string | undefined;
 
   for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
     try {
       const prompt = buildContextPrompt(task.contextSnapshot, attempt);
+      lastPrompt = prompt;
       const raw = await llmCall(prompt);
+      lastLlmResponse = raw;
       const updates = parseContextUpdates(raw);
 
       const artifacts: AgentResult['artifacts'] = [];
@@ -61,6 +65,8 @@ export async function runContextAgent(
       return {
         agentRole: 'context-agent',
         status: 'completed',
+        lastPrompt,
+        llmResponse: lastLlmResponse,
         artifacts,
         signals: [],
         tokensUsed: 0,
@@ -74,6 +80,8 @@ export async function runContextAgent(
   return {
     agentRole: 'context-agent',
     status: 'failed',
+    lastPrompt,
+    llmResponse: lastLlmResponse,
     artifacts: [],
     signals: [{
       id: crypto.randomUUID(),
