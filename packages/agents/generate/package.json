@@ -14,7 +14,8 @@
   },
   "dependencies": {
     "@gestalt/core": "workspace:*",
-    "simple-git": "^3.23.0"
+    "simple-git": "^3.23.0",
+    "yaml": "^2.4.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

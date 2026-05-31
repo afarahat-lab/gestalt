@@ -4,6 +4,7 @@
  */
 
 import type { ContextSnapshot } from '../types';
+import { applyAgentConfig } from './agent-config-helpers';
 
 export function buildTestPrompt(ctx: ContextSnapshot, attempt: number): string {
   const retry = attempt > 0
@@ -19,8 +20,7 @@ export function buildTestPrompt(ctx: ContextSnapshot, attempt: number): string {
     .map((a) => `// ${a.path}\n${a.content.slice(0, 500)}`)
     .join('\n\n---\n\n');
 
-  return `You are the test agent in the Gestalt platform.
-Generate Vitest tests that verify each success criterion.
+  const body = `Generate Vitest tests that verify each success criterion.
 ${retry}
 
 ## Success criteria to test
@@ -54,4 +54,5 @@ Test rules:
 - Assertions must be specific — no toBeTruthy() without good reason
 - Mock external dependencies (DB, LLM) — never real calls in tests
 `;
+  return applyAgentConfig(body, ctx.agentConfig);
 }

@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — richer alerts: enriched payload + fix-intent flow + CLI alerts commands)
+**Last updated:** 2026-06-01 (Claude Code — Step 1: externalise agent prompts to agents.yaml)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -686,6 +686,105 @@ the historical record of how the state evolved._
 6. `gestalt init` — register project + server pushes harness to Git
 7. `git pull` — receive harness files locally
 8. `gestalt run "<intent>"` — submit work to agents
+
+**Step 1: externalise agent prompts to agents.yaml — implemented.**
+- Every LLM-reasoning agent reads its persona (`role`, `goal`), LLM
+  tuning (`temperature`, `max_tokens`, optional `model`), and a flat
+  list of `prompt_extensions` from `agents.yaml` in the project repo
+  root (alongside `HARNESS.json`). Infrastructure agents
+  (`constraint-agent`, `test-runner-agent`, `pipeline-agent`,
+  `promotion-agent`, `gc-agent`) ignore the file — they do
+  deterministic work
+- **Schema** (snake_case YAML keys normalised to camelCase by the
+  loader; both shapes are accepted):
+  ```yaml
+  agents:
+    code-agent:
+      role: "Senior TypeScript engineer"
+      goal: "Generate production-quality TypeScript code..."
+      llm:
+        temperature: 0.2
+        max_tokens: 8000
+      prompt_extensions:
+        - "Always add a JSDoc comment to every exported function"
+        - "Use Result<T,E> pattern for error handling"
+  ```
+- **Loader** (`@gestalt/agents-generate/loadAgentConfig(projectRoot,
+  agentRole)`) is fully non-fatal:
+  - Missing file → per-role baseline (one of `intent-agent`,
+    `design-agent`, `context-agent`, `code-agent`, `test-agent`,
+    `review-agent`, `drift-agent`, `alignment-agent`,
+    `context-fixer` — matches the seeded YAML exactly)
+  - Malformed YAML → baseline + debug log
+  - Agent absent from YAML → baseline
+  - Partial entry (only `role`, no `llm.temperature`) → merged with
+    baseline gap-fill
+  - Backward compat: existing projects without an `agents.yaml`
+    committed get identical behaviour to before this change
+- **ContextSnapshot.agentConfig** added. The context-assembler calls
+  `loadAgentConfig(projectRoot, forAgent)` once per agent dispatch
+  and attaches the result. The `agents.yaml` is read from the
+  per-cycle clone, so an operator can edit + push and the next
+  intent cycle picks it up without a server restart (ADR-032)
+- **Prompt wrapping** via the `applyAgentConfig(body, agentConfig)`
+  helper. Every prompt builder
+  (`buildIntentPrompt` / `buildDesignPrompt` / `buildContextPrompt` /
+  `buildCodePrompt` / `buildTestPrompt` /
+  `buildLintConfigPrompt`) now prepends a single persona line
+  (`You are <role> working on the Gestalt platform. Your goal:
+  <goal>`) and appends `## Project-specific instructions\n- ext1\n
+  - ext2 ...` near the end (when the operator's
+  `promptExtensions` array is non-empty). The existing prompt
+  body — file paths, JSON output shapes, retry guidance — stays
+  intact. `llm-review-agent.ts` and `context-fixer.ts` follow the
+  same pattern inline (different surrounding architecture; same
+  effect)
+- **LLM tuning** flows through a shared `LlmCallFn` type:
+  `(prompt, overrides?: { temperature?, maxTokens?, model? }) =>
+  Promise<string>`. The orchestrator's `llmCall` wrapper forwards
+  the overrides to `LLMClient.complete`. Each agent passes
+  `task.contextSnapshot.agentConfig.llm` as the second argument,
+  so per-agent `temperature` + `max_tokens` land on the wire.
+  Per-agent `model` override is parsed and surfaced on the type
+  but is a no-op today (the LLMClient is wired as a singleton at
+  startup; per-agent model routing is captured as a follow-up)
+- **`gestalt init` seeds `agents.yaml`** in the harness file map
+  (alongside `HARNESS.json` / `AGENTS.md` / context files). The
+  seeded content matches the loader's per-role defaults exactly,
+  so a project with the seed file and a project without it
+  behave identically out of the box. Operators tune by editing +
+  pushing
+- **`HarnessEngine.validate()` recognises `agents.yaml` as
+  optional.** Present + parses cleanly → no warning. Present +
+  malformed → `HarnessValidationResult.warnings` carries
+  `"agents.yaml parse error: ..."`. Present + missing `agents`
+  key → `"agents.yaml present but has no agents key — defaults
+  will be used"`. Absent → silent (the common case for projects
+  registered before this change). Validation NEVER fails on
+  agents.yaml — the loader's defaults always carry the cycle
+- Live verified on `trackeros`:
+  - **Without `agents.yaml`** (the existing trackeros state at
+    commit `198aff6`): submitted an intent; `agent_execution_logs`
+    rows for intent / design / code / test agents each show the
+    new persona line at the top of the prompt — every agent gets
+    its own per-role baseline (`Senior software architect` /
+    `Senior software architect` / `Senior TypeScript engineer` /
+    `Senior QA engineer`), not a generic placeholder
+  - **With `agents.yaml`** committed to trackeros main, setting
+    `code-agent.llm.temperature: 0.8` and
+    `prompt_extensions: ["Always add a JSDoc comment to every
+    exported function", "Use Result<T,E> pattern for error
+    handling"]`: submitted a slugify intent; the code-agent's
+    persisted prompt shows both extensions under
+    `## Project-specific instructions`. **The generated
+    `src/shared/utils/slugify.ts` carries the operator's style
+    rules verbatim** — a 4-line JSDoc block with `@param` /
+    `@returns` tags AND a `Result<string, Error>` return type
+    (the LLM even synthesised a helper
+    `src/modules/Utils/result.ts` to provide the type)
+  - The full cycle (generate → gate → deploy) reached the
+    `deployed` status with the operator-tuned extensions in
+    play. End-to-end working
 
 **Alert system — enriched payload + fix-intent flow + CLI:**
 - `GET /alerts` and `GET /alerts/:id` return `{ data: EnrichedAlert[] }`

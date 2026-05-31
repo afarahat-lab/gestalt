@@ -32,6 +32,8 @@ import { simpleGit } from 'simple-git';
 import {
   createContextLogger, getLLMClient,
 } from '@gestalt/core';
+import { loadAgentConfig } from '@gestalt/agents-generate';
+import type { AgentConfig } from '@gestalt/agents-generate';
 import type { MaintenanceIntent } from '../types';
 import { authenticatedGitUrl, maintenanceIntentPrefix } from './util';
 
@@ -109,10 +111,17 @@ export async function applyContextFileFix(
       return { committed: false, reason: 'file-missing' };
     }
 
+    // Step 1 of agent externalisation — context-fixer's role/goal/
+    // extensions + LLM tuning come from agents.yaml in the just-cloned
+    // project repo. Loader falls back to per-role defaults when the
+    // file isn't present.
+    const agentConfig = await loadAgentConfig(workDir, 'context-fixer');
+
     const newContent = await generateUpdatedContent({
       targetFile,
       currentContent,
       intent,
+      agentConfig,
     });
     if (newContent === null) {
       return { committed: false, reason: 'llm-error' };
@@ -190,12 +199,26 @@ async function generateUpdatedContent(args: {
   targetFile: string;
   currentContent: string;
   intent: MaintenanceIntent;
+  agentConfig: AgentConfig;
 }): Promise<string | null> {
-  const { targetFile, currentContent, intent } = args;
+  const { targetFile, currentContent, intent, agentConfig } = args;
   const llm = getLLMClient();
 
+  // Persona built from agents.yaml — the original "technical writer" role
+  // is the per-role default in agent-config-loader.ts, so removing the
+  // agents.yaml file recovers identical behaviour. Operators editing the
+  // file can re-shape the persona; the structural rules below stay
+  // hard-coded because they encode ADR-018 (additive-only).
+  const persona =
+    `You are ${agentConfig.role} working on the Gestalt platform.\n` +
+    `Your goal: ${agentConfig.goal}\n`;
+
+  const extensions = agentConfig.promptExtensions.length > 0
+    ? `\n## Project-specific instructions\n\n${agentConfig.promptExtensions.map((e) => `- ${e}`).join('\n')}\n`
+    : '';
+
   const system =
-    `You are a technical writer making precise, minimal updates to project context files.\n\n` +
+    `${persona}\n` +
     `Rules you MUST follow:\n` +
     `1. Make only the change needed to address the finding. Do not rewrite, restructure, or ` +
     `summarise existing content.\n` +
@@ -207,7 +230,8 @@ async function generateUpdatedContent(args: {
     `4. Your edit must be something that, on the next alignment / drift check, would mean this ` +
     `finding no longer fires. If you cannot achieve that, return the file unchanged.\n` +
     `5. Return only the complete updated file content — no explanation, no preamble, no ` +
-    `markdown code fences.`;
+    `markdown code fences.` +
+    extensions;
 
   const user =
     `File: ${targetFile}\n\n` +
@@ -224,8 +248,8 @@ async function generateUpdatedContent(args: {
       { role: 'system', content: system },
       { role: 'user', content: user },
     ],
-    maxTokens: 8192,
-    temperature: 0.2,
+    ...(agentConfig.llm.maxTokens !== undefined ? { maxTokens: agentConfig.llm.maxTokens } : { maxTokens: 8192 }),
+    ...(agentConfig.llm.temperature !== undefined ? { temperature: agentConfig.llm.temperature } : { temperature: 0.2 }),
     correlationId: `ctxfix-${intent.projectId}-${intent.type}`,
   });
 

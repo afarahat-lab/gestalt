@@ -5,6 +5,7 @@
  */
 
 import type { ContextSnapshot, FeedbackSignal } from '../types';
+import { applyAgentConfig } from './agent-config-helpers';
 
 export function buildCodePrompt(
   ctx: ContextSnapshot,
@@ -41,8 +42,7 @@ export function buildCodePrompt(
     ? (JSON.parse(designArtifact.content) as { apiContracts?: unknown[] }).apiContracts ?? []
     : [];
 
-  return `You are the code agent in the Gestalt platform.
-Generate TypeScript application code based on the design specification.
+  const body = `Generate TypeScript application code based on the design specification.
 ${retry}
 ${gateFeedback}
 
@@ -105,4 +105,5 @@ Code rules:
 - Error handling: return typed Result<T,E> or throw with structured context
 - Zod schema for every request body — validate before business logic
 `;
+  return applyAgentConfig(body, ctx.agentConfig);
 }

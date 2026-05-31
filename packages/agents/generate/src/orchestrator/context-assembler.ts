@@ -11,6 +11,7 @@ import type { ContextSnapshot, ExecutionPlan, GeneratedArtifact, IntentSpec } fr
 import { createHarnessEngine } from '@gestalt/core';
 import { getPriorArtifacts } from './plan-builder';
 import type { AgentRole } from '@gestalt/core';
+import { loadAgentConfig } from '../config/agent-config-loader';
 
 /**
  * Assembles a ContextSnapshot for the given agent role.
@@ -54,6 +55,12 @@ export async function assembleContext(
     rawIntent: baseSpec.rawIntent?.trim() ? baseSpec.rawIntent : intentText,
   };
 
+  // Load per-agent config from `agents.yaml` (Step 1 of agent
+  // externalisation). The loader never throws — absent / malformed
+  // files resolve to defaults — so existing projects keep working
+  // identically without an agents.yaml committed.
+  const agentConfig = await loadAgentConfig(projectRoot, forAgent);
+
   return {
     projectRoot,
     harness: baseSnapshot.harness as ContextSnapshot['harness'],
@@ -65,6 +72,7 @@ export async function assembleContext(
     relevantDecisions: parseDecisions(baseSnapshot.relevantDecisions),
     intentSpec,
     priorArtifacts,
+    agentConfig,
   };
 }
 

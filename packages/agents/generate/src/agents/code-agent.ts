@@ -3,14 +3,14 @@
  * Always runs. Receives design spec and context as prior artifacts.
  */
 
-import type { AgentTask, AgentResult, GeneratedArtifact } from '../types';
+import type { AgentTask, AgentResult, GeneratedArtifact, LlmCallFn } from '../types';
 import { buildCodePrompt } from '../prompts/code-prompt';
 
 const MAX_INTERNAL_RETRIES = 2;
 
 export async function runCodeAgent(
   task: AgentTask,
-  llmCall: (prompt: string) => Promise<string>,
+  llmCall: LlmCallFn,
 ): Promise<AgentResult> {
   const startedAt = Date.now();
   let lastError: Error | undefined;
@@ -21,7 +21,7 @@ export async function runCodeAgent(
     try {
       const prompt = buildCodePrompt(task.contextSnapshot, attempt, task.priorSignals);
       lastPrompt = prompt;
-      const raw = await llmCall(prompt);
+      const raw = await llmCall(prompt, task.contextSnapshot.agentConfig.llm);
       lastLlmResponse = raw;
       const codeFiles = parseCodeFiles(raw, task.correlationId);
       if (codeFiles.length === 0) throw new Error('LLM returned no code files');

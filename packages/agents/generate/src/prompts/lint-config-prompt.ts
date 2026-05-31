@@ -4,10 +4,10 @@
  */
 
 import type { ContextSnapshot } from '../types';
+import { applyAgentConfig } from './agent-config-helpers';
 
 export function buildLintConfigPrompt(ctx: ContextSnapshot, _attempt: number): string {
-  return `You are the lint-config agent in the Gestalt platform.
-Update the ESLint configuration to enforce boundaries for new modules.
+  const body = `Update the ESLint configuration to enforce boundaries for new modules.
 
 ## New domain changes
 
@@ -19,4 +19,5 @@ ${ctx.architectureMd.slice(0, 1000)}
 
 Generate updated ESLint rules as JSON. Return { "rules": { ... } } only.
 `;
+  return applyAgentConfig(body, ctx.agentConfig);
 }

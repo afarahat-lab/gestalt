@@ -4,6 +4,7 @@
  */
 
 import type { ContextSnapshot } from '../types';
+import { applyAgentConfig } from './agent-config-helpers';
 
 export function buildContextPrompt(ctx: ContextSnapshot, attempt: number): string {
   const retry = attempt > 0
@@ -13,8 +14,7 @@ export function buildContextPrompt(ctx: ContextSnapshot, attempt: number): strin
   const designArtifact = ctx.priorArtifacts.find((a) => a.path === '.gestalt/design-spec.json');
   const designSpec = designArtifact ? designArtifact.content : '{}';
 
-  return `You are the context agent in the Gestalt platform.
-Your job is to update context files to reflect domain model changes.
+  const body = `Your job is to update context files to reflect domain model changes.
 ${retry}
 
 ## Current DOMAIN.md
@@ -45,4 +45,5 @@ Rules:
 - Use the same Markdown format and structure as the existing files
 - If no updates are needed, return { "updates": [] }
 `;
+  return applyAgentConfig(body, ctx.agentConfig);
 }

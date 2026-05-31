@@ -3,11 +3,11 @@
  * Can skip: Yes — if no new module boundaries in the intent.
  */
 
-import type { AgentTask, AgentResult } from '../types';
+import type { AgentTask, AgentResult, LlmCallFn } from '../types';
 
 export async function runLintConfigAgent(
   task: AgentTask,
-  _llmCall: (prompt: string) => Promise<string>,
+  _llmCall: LlmCallFn,
 ): Promise<AgentResult> {
   const startedAt = Date.now();
 

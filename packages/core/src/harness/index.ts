@@ -13,6 +13,7 @@
 
 import { readFile, access } from 'fs/promises';
 import { join } from 'path';
+import { parse as parseYaml } from 'yaml';
 import type { SignalType } from '../types';
 import { createContextLogger } from '../logger/index';
 
@@ -28,6 +29,16 @@ export const REQUIRED_CONTEXT_FILES = [
   'docs/GOLDEN_PRINCIPLES.md',
   'docs/DECISIONS.md',
 ] as const;
+
+/**
+ * Optional context files validated when present but not required.
+ *
+ *   agents.yaml — Per-agent prompt + LLM configuration (Step 1 of agent
+ *                 externalisation). Loaded by `loadAgentConfig` in
+ *                 `@gestalt/agents-generate`. Absent → defaults apply.
+ *                 Malformed → warning, defaults still apply.
+ */
+export const OPTIONAL_CONTEXT_FILES = ['agents.yaml'] as const;
 
 export type RequiredContextFile = typeof REQUIRED_CONTEXT_FILES[number];
 
@@ -107,6 +118,27 @@ export class HarnessEngine {
       } catch (e) {
         parseErrors.push(`HARNESS.json parse error: ${e instanceof Error ? e.message : String(e)}`);
       }
+    }
+
+    // agents.yaml — optional. If present, parse it and warn (not fail)
+    // when it's malformed or missing the `agents` key. The per-cycle
+    // loader (`@gestalt/agents-generate/loadAgentConfig`) falls back to
+    // defaults independently, so a bad agents.yaml never breaks a
+    // cycle; the warning surfaces in `gestalt status` and the
+    // dashboard's validation panel.
+    try {
+      const yamlRaw = await readFile(join(this.projectRoot, 'agents.yaml'), 'utf8');
+      try {
+        const parsed = parseYaml(yamlRaw) as { agents?: unknown };
+        if (!parsed || typeof parsed !== 'object' || !parsed.agents) {
+          warnings.push('agents.yaml present but has no "agents" key — defaults will be used');
+        }
+      } catch (e) {
+        warnings.push(`agents.yaml parse error: ${e instanceof Error ? e.message : String(e)} — defaults will be used`);
+      }
+    } catch {
+      // agents.yaml absent — not a warning, this is the common case
+      // for older projects.
     }
 
     const valid = missingFiles.length === 0 && parseErrors.length === 0;

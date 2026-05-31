@@ -10,7 +10,7 @@
  * This agent never skips. If intent is received, this agent runs.
  */
 
-import type { AgentTask, AgentResult, ClarificationNeeded, IntentSpec, Ambiguity } from '../types';
+import type { AgentTask, AgentResult, ClarificationNeeded, IntentSpec, Ambiguity, LlmCallFn } from '../types';
 import { buildIntentPrompt } from '../prompts/intent-prompt';
 
 const MAX_INTERNAL_RETRIES = 2;
@@ -32,7 +32,7 @@ const MAINTENANCE_PREFIX = '[gestalt-maintenance/';
  */
 export async function runIntentAgent(
   task: AgentTask,
-  llmCall: (prompt: string) => Promise<string>,
+  llmCall: LlmCallFn,
 ): Promise<AgentResult> {
   const startedAt = Date.now();
   let lastError: Error | undefined;
@@ -53,7 +53,7 @@ export async function runIntentAgent(
     try {
       const prompt = buildIntentPrompt(task.contextSnapshot, attempt, task.clarification);
       lastPrompt = prompt;
-      const raw = await llmCall(prompt);
+      const raw = await llmCall(prompt, task.contextSnapshot.agentConfig.llm);
       lastLlmResponse = raw;
       const spec = parseIntentSpec(raw, task.correlationId, rawIntentText);
       validateIntentSpec(spec);

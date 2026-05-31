@@ -3,14 +3,14 @@
  * Always runs. Reads IntentSpec from prior artifacts.
  */
 
-import type { AgentTask, AgentResult, DesignArtifact } from '../types';
+import type { AgentTask, AgentResult, DesignArtifact, LlmCallFn } from '../types';
 import { buildDesignPrompt } from '../prompts/design-prompt';
 
 const MAX_INTERNAL_RETRIES = 2;
 
 export async function runDesignAgent(
   task: AgentTask,
-  llmCall: (prompt: string) => Promise<string>,
+  llmCall: LlmCallFn,
 ): Promise<AgentResult> {
   const startedAt = Date.now();
   let lastError: Error | undefined;
@@ -21,7 +21,7 @@ export async function runDesignAgent(
     try {
       const prompt = buildDesignPrompt(task.contextSnapshot, attempt);
       lastPrompt = prompt;
-      const raw = await llmCall(prompt);
+      const raw = await llmCall(prompt, task.contextSnapshot.agentConfig.llm);
       lastLlmResponse = raw;
       const design = parseDesignArtifact(raw, task.correlationId);
 

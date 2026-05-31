@@ -8,7 +8,11 @@ export type {
   ContextSnapshot, GeneratedArtifact, AgentResult, AgentTask,
   ExecutionPlan, PlanStep, GateFeedback, OrchestratorState,
   FeedbackSignal, DesignArtifact, DomainChange, ApiContract, ComponentSpec,
+  AgentConfig, AgentLlmConfig, AgentsYaml,
 } from './types';
+
+// Agent configuration (agents.yaml — Step 1 of agent externalisation)
+export { loadAgentConfig, defaultAgentConfig } from './config/agent-config-loader';
 
 // Orchestrator
 export { buildExecutionPlan, getReadySteps, isPlanComplete, hasPlanFailed, getPriorArtifacts } from './orchestrator/plan-builder';

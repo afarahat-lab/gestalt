@@ -419,12 +419,124 @@ function buildHarnessFiles(inputs: HarnessInputs): Record<string, string> {
   return {
     'AGENTS.md':                  buildAgentsMd(inputs),
     'HARNESS.json':               buildHarnessJson(inputs),
+    'agents.yaml':                buildAgentsYaml(),
     'docs/ARCHITECTURE.md':       buildArchitectureMd(inputs),
     'docs/DOMAIN.md':             buildDomainMd(inputs),
     'docs/GOLDEN_PRINCIPLES.md':  buildGoldenPrinciplesMd(),
     'docs/DECISIONS.md':          buildDecisionsMd(inputs),
     '.github/workflows/gestalt.yml': buildGestaltWorkflowYml(),
   };
+}
+
+/**
+ * Seeded `agents.yaml` written by `gestalt init` alongside HARNESS.json.
+ *
+ * The defaults here MUST match `PER_ROLE_DEFAULTS` in
+ * packages/agents/generate/src/config/agent-config-loader.ts — that way
+ * existing projects without an agents.yaml committed and new projects
+ * with this seed file behave identically out of the box.
+ *
+ * Operators tune prompts, change temperature, or append project-specific
+ * instructions by editing this file and pushing. The server reads it
+ * fresh from each per-cycle clone (ADR-032).
+ */
+function buildAgentsYaml(): string {
+  return `# agents.yaml — Gestalt agent configuration
+#
+# Seeded by 'gestalt init'. Safe to customise — operators tune prompts,
+# change LLM parameters, and add prompt extensions per project without
+# touching framework code.
+#
+# Infrastructure agents (constraint-agent, test-runner-agent,
+# pipeline-agent, promotion-agent, gc-agent) do deterministic work and
+# are NOT configurable here.
+#
+# Key conventions:
+#   role  — short professional title (becomes "You are <role> working on
+#           the Gestalt platform.")
+#   goal  — one sentence stating what the agent is trying to accomplish
+#   llm.temperature, llm.max_tokens — override the platform defaults
+#   prompt_extensions — list of standing project rules appended to every
+#                       prompt under a "Project-specific instructions"
+#                       heading
+
+agents:
+
+  intent-agent:
+    role: "Senior software architect"
+    goal: "Extract a precise, unambiguous specification from a natural language intent"
+    llm:
+      temperature: 0.1
+      max_tokens: 2000
+    prompt_extensions: []
+
+  design-agent:
+    role: "Senior software architect"
+    goal: "Produce domain model changes, API contracts, and component specs"
+    llm:
+      temperature: 0.2
+      max_tokens: 4000
+    prompt_extensions: []
+
+  context-agent:
+    role: "Technical writer"
+    goal: "Keep project context files accurate and up to date"
+    llm:
+      temperature: 0.1
+      max_tokens: 8000
+    prompt_extensions: []
+
+  code-agent:
+    role: "Senior TypeScript engineer"
+    goal: "Generate production-quality TypeScript code that follows the project harness"
+    llm:
+      temperature: 0.2
+      max_tokens: 8000
+    prompt_extensions: []
+      # Example extensions:
+      # - "Always use the Result<T,E> pattern for error handling"
+      # - "Never use class components in React — hooks only"
+
+  test-agent:
+    role: "Senior QA engineer"
+    goal: "Generate comprehensive Vitest tests mapped to success criteria"
+    llm:
+      temperature: 0.1
+      max_tokens: 6000
+    prompt_extensions: []
+
+  review-agent:
+    role: "Senior engineer and code reviewer"
+    goal: "Assess generated code quality and architectural correctness"
+    llm:
+      temperature: 0.1
+      max_tokens: 4000
+    prompt_extensions: []
+
+  drift-agent:
+    role: "Technical documentation specialist"
+    goal: "Detect when project documentation has fallen behind the codebase"
+    llm:
+      temperature: 0.1
+      max_tokens: 2000
+    prompt_extensions: []
+
+  alignment-agent:
+    role: "Technical documentation specialist"
+    goal: "Ensure project context files are internally consistent"
+    llm:
+      temperature: 0.1
+      max_tokens: 2000
+    prompt_extensions: []
+
+  context-fixer:
+    role: "Technical writer"
+    goal: "Apply additive context-file edits that resolve maintenance findings"
+    llm:
+      temperature: 0.2
+      max_tokens: 8192
+    prompt_extensions: []
+`;
 }
 
 function buildAgentsMd({ projectName, projectDescription }: HarnessInputs): string {

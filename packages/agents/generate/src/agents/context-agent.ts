@@ -3,7 +3,7 @@
  * Can skip: Yes — if no context files need updating.
  */
 
-import type { AgentTask, AgentResult } from '../types';
+import type { AgentTask, AgentResult, LlmCallFn } from '../types';
 import { buildContextPrompt } from '../prompts/context-prompt';
 import { createHarnessEngine } from '@gestalt/core';
 
@@ -11,7 +11,7 @@ const MAX_INTERNAL_RETRIES = 2;
 
 export async function runContextAgent(
   task: AgentTask,
-  llmCall: (prompt: string) => Promise<string>,
+  llmCall: LlmCallFn,
 ): Promise<AgentResult> {
   const startedAt = Date.now();
 
@@ -42,7 +42,7 @@ export async function runContextAgent(
     try {
       const prompt = buildContextPrompt(task.contextSnapshot, attempt);
       lastPrompt = prompt;
-      const raw = await llmCall(prompt);
+      const raw = await llmCall(prompt, task.contextSnapshot.agentConfig.llm);
       lastLlmResponse = raw;
       const updates = parseContextUpdates(raw);
 

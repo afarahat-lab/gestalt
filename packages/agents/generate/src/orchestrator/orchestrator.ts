@@ -30,7 +30,7 @@ import { runContextAgent } from '../agents/context-agent';
 import { runLintConfigAgent } from '../agents/lint-config-agent';
 import { runCodeAgent } from '../agents/code-agent';
 import { runTestAgent } from '../agents/test-agent';
-import type { ExecutionPlan, AgentResult, GateFeedback, FeedbackSignal } from '../types';
+import type { ExecutionPlan, AgentResult, GateFeedback, FeedbackSignal, LlmCallFn } from '../types';
 import type { AgentRole } from '@gestalt/core';
 
 /**
@@ -399,10 +399,25 @@ async function drivePlan(
           };
 
           const llmClient = getLLMClient();
-          const llmCall = async (prompt: string): Promise<string> => {
+          // Each agent reads its tuning from `task.contextSnapshot.agentConfig.llm`
+          // (loaded by the context-assembler from agents.yaml; falls back to the
+          // per-role baseline when the file is absent). The agents pass these
+          // overrides explicitly so a single shared `llmCall` doesn't have to
+          // know which agent is calling it.
+          const llmCall = async (
+            prompt: string,
+            overrides?: { temperature?: number; maxTokens?: number; model?: string },
+          ): Promise<string> => {
             const result = await llmClient.complete({
               messages: [{ role: 'user', content: prompt }],
               correlationId: plan.correlationId,
+              ...(overrides?.temperature !== undefined ? { temperature: overrides.temperature } : {}),
+              ...(overrides?.maxTokens !== undefined ? { maxTokens: overrides.maxTokens } : {}),
+              // model is platform-wide today (configured at startup via
+              // `createLLMClient`); per-agent model override would require
+              // routing through a different client instance — left as a
+              // follow-up. The field is parsed from agents.yaml so the
+              // capability surfaces in the type, even if it's a no-op now.
             });
             if (!result.ok) throw new Error(result.error.message);
             return result.value.content;
@@ -567,7 +582,7 @@ async function drivePlan(
 async function runAgent(
   agentRole: AgentRole,
   task: Parameters<typeof runIntentAgent>[0],
-  llmCall: (prompt: string) => Promise<string>,
+  llmCall: LlmCallFn,
 ): Promise<AgentResult> {
   switch (agentRole) {
     case 'intent-agent':      return runIntentAgent(task, llmCall);

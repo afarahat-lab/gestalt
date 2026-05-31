@@ -4,6 +4,7 @@
  */
 
 import type { ContextSnapshot } from '../types';
+import { applyAgentConfig } from './agent-config-helpers';
 
 /**
  * Builds the intent extraction prompt.
@@ -38,8 +39,7 @@ the original intent text alone.
 `
       : '';
 
-  return `You are the intent agent in the Gestalt platform.
-Your job is to parse a human intent statement into a structured IntentSpec JSON object.
+  const body = `Your job is to parse a human intent statement into a structured IntentSpec JSON object.
 
 ${retryGuidance}
 
@@ -106,4 +106,5 @@ Rules:
 - Only mark impactIfWrong as "high" if choosing the wrong interpretation would
   produce functionally incorrect or architecturally incompatible code
 `;
+  return applyAgentConfig(body, ctx.agentConfig);
 }

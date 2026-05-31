@@ -3,14 +3,14 @@
  * Always runs. Each success criterion maps to one or more test cases.
  */
 
-import type { AgentTask, AgentResult, GeneratedArtifact } from '../types';
+import type { AgentTask, AgentResult, GeneratedArtifact, LlmCallFn } from '../types';
 import { buildTestPrompt } from '../prompts/test-prompt';
 
 const MAX_INTERNAL_RETRIES = 2;
 
 export async function runTestAgent(
   task: AgentTask,
-  llmCall: (prompt: string) => Promise<string>,
+  llmCall: LlmCallFn,
 ): Promise<AgentResult> {
   const startedAt = Date.now();
 
@@ -42,7 +42,7 @@ export async function runTestAgent(
     try {
       const prompt = buildTestPrompt(task.contextSnapshot, attempt);
       lastPrompt = prompt;
-      const raw = await llmCall(prompt);
+      const raw = await llmCall(prompt, task.contextSnapshot.agentConfig.llm);
       lastLlmResponse = raw;
       const testFiles = parseTestFiles(raw, task.correlationId);
       if (testFiles.length === 0) throw new Error('LLM returned no test files');

@@ -14,7 +14,7 @@ content is derived._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — richer alerts: enriched payload + fix-intent flow + CLI alerts commands)
+**Last updated:** 2026-06-01 (Claude Code — Step 1: externalise agent prompts to agents.yaml)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -693,6 +693,105 @@ content is derived._
 7. `git pull` — receive harness files locally
 8. `gestalt run "<intent>"` — submit work to agents
 
+**Step 1: externalise agent prompts to agents.yaml — implemented.**
+- Every LLM-reasoning agent reads its persona (`role`, `goal`), LLM
+  tuning (`temperature`, `max_tokens`, optional `model`), and a flat
+  list of `prompt_extensions` from `agents.yaml` in the project repo
+  root (alongside `HARNESS.json`). Infrastructure agents
+  (`constraint-agent`, `test-runner-agent`, `pipeline-agent`,
+  `promotion-agent`, `gc-agent`) ignore the file — they do
+  deterministic work
+- **Schema** (snake_case YAML keys normalised to camelCase by the
+  loader; both shapes are accepted):
+  ```yaml
+  agents:
+    code-agent:
+      role: "Senior TypeScript engineer"
+      goal: "Generate production-quality TypeScript code..."
+      llm:
+        temperature: 0.2
+        max_tokens: 8000
+      prompt_extensions:
+        - "Always add a JSDoc comment to every exported function"
+        - "Use Result<T,E> pattern for error handling"
+  ```
+- **Loader** (`@gestalt/agents-generate/loadAgentConfig(projectRoot,
+  agentRole)`) is fully non-fatal:
+  - Missing file → per-role baseline (one of `intent-agent`,
+    `design-agent`, `context-agent`, `code-agent`, `test-agent`,
+    `review-agent`, `drift-agent`, `alignment-agent`,
+    `context-fixer` — matches the seeded YAML exactly)
+  - Malformed YAML → baseline + debug log
+  - Agent absent from YAML → baseline
+  - Partial entry (only `role`, no `llm.temperature`) → merged with
+    baseline gap-fill
+  - Backward compat: existing projects without an `agents.yaml`
+    committed get identical behaviour to before this change
+- **ContextSnapshot.agentConfig** added. The context-assembler calls
+  `loadAgentConfig(projectRoot, forAgent)` once per agent dispatch
+  and attaches the result. The `agents.yaml` is read from the
+  per-cycle clone, so an operator can edit + push and the next
+  intent cycle picks it up without a server restart (ADR-032)
+- **Prompt wrapping** via the `applyAgentConfig(body, agentConfig)`
+  helper. Every prompt builder
+  (`buildIntentPrompt` / `buildDesignPrompt` / `buildContextPrompt` /
+  `buildCodePrompt` / `buildTestPrompt` /
+  `buildLintConfigPrompt`) now prepends a single persona line
+  (`You are <role> working on the Gestalt platform. Your goal:
+  <goal>`) and appends `## Project-specific instructions\n- ext1\n
+  - ext2 ...` near the end (when the operator's
+  `promptExtensions` array is non-empty). The existing prompt
+  body — file paths, JSON output shapes, retry guidance — stays
+  intact. `llm-review-agent.ts` and `context-fixer.ts` follow the
+  same pattern inline (different surrounding architecture; same
+  effect)
+- **LLM tuning** flows through a shared `LlmCallFn` type:
+  `(prompt, overrides?: { temperature?, maxTokens?, model? }) =>
+  Promise<string>`. The orchestrator's `llmCall` wrapper forwards
+  the overrides to `LLMClient.complete`. Each agent passes
+  `task.contextSnapshot.agentConfig.llm` as the second argument,
+  so per-agent `temperature` + `max_tokens` land on the wire.
+  Per-agent `model` override is parsed and surfaced on the type
+  but is a no-op today (the LLMClient is wired as a singleton at
+  startup; per-agent model routing is captured as a follow-up)
+- **`gestalt init` seeds `agents.yaml`** in the harness file map
+  (alongside `HARNESS.json` / `AGENTS.md` / context files). The
+  seeded content matches the loader's per-role defaults exactly,
+  so a project with the seed file and a project without it
+  behave identically out of the box. Operators tune by editing +
+  pushing
+- **`HarnessEngine.validate()` recognises `agents.yaml` as
+  optional.** Present + parses cleanly → no warning. Present +
+  malformed → `HarnessValidationResult.warnings` carries
+  `"agents.yaml parse error: ..."`. Present + missing `agents`
+  key → `"agents.yaml present but has no agents key — defaults
+  will be used"`. Absent → silent (the common case for projects
+  registered before this change). Validation NEVER fails on
+  agents.yaml — the loader's defaults always carry the cycle
+- Live verified on `trackeros`:
+  - **Without `agents.yaml`** (the existing trackeros state at
+    commit `198aff6`): submitted an intent; `agent_execution_logs`
+    rows for intent / design / code / test agents each show the
+    new persona line at the top of the prompt — every agent gets
+    its own per-role baseline (`Senior software architect` /
+    `Senior software architect` / `Senior TypeScript engineer` /
+    `Senior QA engineer`), not a generic placeholder
+  - **With `agents.yaml`** committed to trackeros main, setting
+    `code-agent.llm.temperature: 0.8` and
+    `prompt_extensions: ["Always add a JSDoc comment to every
+    exported function", "Use Result<T,E> pattern for error
+    handling"]`: submitted a slugify intent; the code-agent's
+    persisted prompt shows both extensions under
+    `## Project-specific instructions`. **The generated
+    `src/shared/utils/slugify.ts` carries the operator's style
+    rules verbatim** — a 4-line JSDoc block with `@param` /
+    `@returns` tags AND a `Result<string, Error>` return type
+    (the LLM even synthesised a helper
+    `src/modules/Utils/result.ts` to provide the type)
+  - The full cycle (generate → gate → deploy) reached the
+    `deployed` status with the operator-tuned extensions in
+    play. End-to-end working
+
 **Alert system — enriched payload + fix-intent flow + CLI:**
 - `GET /alerts` and `GET /alerts/:id` return `{ data: EnrichedAlert[] }`
   (the standard envelope). Each row carries the base `AlertRecord`
@@ -881,300 +980,6 @@ content is derived._
 ---
 
 ## Recent session log entries (last 3 from SESSION_LOG.md)
-
-### Session 2026-06-01 — Claude Code (alignment-agent extractor fix + idempotency budget)
-
-The prior session shipped the direct-fix routing for context-file
-maintenance intents, but live operation against `trackeros` revealed
-a non-converging loop: every alignment-agent run reported 8 findings
-and applied 4 fixes — same findings, every run, forever. Root-cause
-analysis (the previous Claude Code reply to the operator) traced the
-divergence to two interacting bugs (over-greedy entity extractor +
-the fix targeting the wrong file) and one missing safety mechanism
-(no per-finding budget). This session implements the architect's
-fix order A → B → C → E.
-
-Changed:
-- `packages/agents/maintenance/src/agents/alignment-agent.ts`:
-  - **Fix A — entity extractor.** Replaced the old patterns
-    (`/^##\s+([A-Z]…)/` h2 headings + `/^[-*]\s+\*\*([A-Z]…)\*\*/`
-    bold-bullet anywhere) with:
-    - `/^###\s+([A-Z][A-Za-z0-9]+)\s*$/gm` — h3 only, since h2 is
-      conventionally a section grouping (e.g. `## Components`)
-      while h3 is the entity declaration (e.g. `### WelcomeScreen`)
-    - `/^[-*]\s+\*\*([A-Z][A-Za-z0-9]+)\*\*\s*[—–-]/gm` — bold bullet
-      only when followed by an em-dash / en-dash / hyphen separator
-      (the entity-definition pattern). `- **Type**: value` (field
-      label, colon follows the closing `**`) no longer matches
-    - A `FIELD_LABEL_STOP_LIST` of common attribute names
-      (`Type`, `Description`, `Status`, `Notes`, `Props`, `Id`,
-      `Name`, `Fields`, `Relationships`, `Methods`, `Properties`,
-      `Attributes`, `Example`, `Usage`, `Parameters`, `Returns`,
-      `Throws`, `See`) filters both match sites. Documented as
-      "minimal — adding too many words masks real entities"
-  - `extractModules()` updated to a wider character class
-    (`[a-zA-Z0-9_-]+`) so CamelCase + snake_case + kebab-case all
-    match. The regex still requires a literal `src/modules/<name>`
-    string; the implication that the LLM's idiomatic markdown
-    directory tree can't satisfy it is captured under Pending
-    enhancements
-  - **Fix B — affectedFiles ordering.** Three intent branches
-    rebalanced so `affectedFiles[0]` is now the file the
-    context-fixer should WRITE to (the slot it already keys off):
-    - `domain-entity-without-module` →
-      `[docs/ARCHITECTURE.md, docs/DOMAIN.md]` (add a module
-      reference). Was inverted; this was the primary reason the
-      LLM couldn't resolve the finding — it was being told to
-      edit the file the entity already lived in
-    - `architecture-module-without-entity` →
-      `[docs/DOMAIN.md, docs/ARCHITECTURE.md]`. Already correct
-      but the order is now explicit
-    - `golden-principle-not-cross-referenced` →
-      `[AGENTS.md, docs/GOLDEN_PRINCIPLES.md]`. Already correct
-    - The corresponding `suggestedAction` text was rewritten so
-      the LLM gets a single concrete instruction (e.g. "Add a
-      `src/modules/StartButton/` entry to docs/ARCHITECTURE.md
-      to match the 'StartButton' entity defined in docs/DOMAIN.md")
-      rather than the old "either…or…" dilemma that gave the LLM
-      cover to do nothing structural
-- `packages/agents/maintenance/src/agents/context-fixer.ts`:
-  - **Fix E — system prompt.** Rewrote the system prompt as a
-    numbered five-rule contract. Rule 3 explicitly forbids
-    `> Note:` / blockquote-appending and instructs the LLM to
-    return the file UNCHANGED when no structural edit is
-    possible. Rule 4 reinforces it ("the edit must be something
-    that, on the next alignment check, would mean this finding no
-    longer fires. If you cannot achieve that, return the file
-    unchanged"). Combined with the no-change short-circuit
-    already in the fixer, this lets the runner detect unresolvable
-    findings via the `reason: 'no-change'` path instead of via
-    the previous garbage-blockquote-appending path
-- `packages/adapters/postgres/src/migrations/008_finding_attempts.sql`
-  (new): `maintenance_finding_attempts` table — `(project_id,
-  finding_hash) UNIQUE`, plus `attempt_count` / `last_attempted`
-  / `escalated`. FK `project_id REFERENCES projects(id) ON DELETE
-  CASCADE` so a deleted project leaves no orphan rows.
-  `idx_finding_attempts_project` for the per-project read path.
-  Pure schema, no `schema_migrations` writes (runner owns those)
-- `packages/core/src/repository/index.ts`:
-  - New `FindingAttemptRecord` + `FindingAttemptRepository`
-    interface (`upsertAttempt`, `getAttempts`, `markEscalated`,
-    `resetAttempts`). Added `findingAttempts` to
-    `RepositoryRegistry`
-  - `AlertType` extended with `'maintenance-stuck'`
-  - `AlertRequiredAction` extended with `'review-manually'`
-- `packages/core/src/index.ts`: re-exports
-  `FindingAttemptRecord` + `FindingAttemptRepository`
-- `packages/adapters/postgres/src/repositories/finding-attempts.ts`
-  (new): `PostgresFindingAttemptRepository`. `upsertAttempt` uses
-  `INSERT ... ON CONFLICT (project_id, finding_hash) DO UPDATE
-  SET attempt_count = ... + 1, last_attempted = NOW()` so
-  concurrent maintenance runs increment atomically without a
-  read-modify-write race. `getAttempts` short-circuits on empty
-  input (`postgres.js` rejects empty IN-lists). `resetAttempts`
-  deletes the row rather than zeroing the counter — a successful
-  fix should be a clean slate, not "attempted N times and
-  succeeded"
-- `packages/adapters/{oracle,mssql}/src/repositories/finding-attempts.ts`
-  (new): throw-stub `*FindingAttemptRepository` classes so
-  interface drift in core surfaces as a build break here. Same
-  pattern as the alerts / deployment-events / maintenance-runs
-  stubs. Wired in each adapter's `index.ts`
-- `packages/adapters/postgres/src/index.ts`: instantiates and
-  registers `PostgresFindingAttemptRepository` in the
-  `createPostgresAdapter` registry
-- `packages/agents/maintenance/src/runner/index.ts`:
-  - New `MAX_ATTEMPTS = 3` constant + `computeFindingHash(intent)`
-    helper (Node built-in `crypto.createHash('sha256')`; hashes
-    `${type}:${affectedFiles[0]}:${evidence.slice(0,80)}` so
-    minor LLM-paraphrasing of `suggestedAction` doesn't change
-    the hash)
-  - Replaced the inline direct-fix block with `runDirectFix(args)`.
-    Flow:
-    1. `getAttempts(projectId, [hash])` — early return if the
-       finding is already escalated (silent skip; no LLM call,
-       no clone)
-    2. Call `applyContextFileFix(intent, project)`
-    3. If `outcome.committed`: `resetAttempts(hash)` (delete the
-       row so the NEXT occurrence starts fresh) and record a
-       `direct-fix-applied` finding
-    4. If not committed: `upsertAttempt(hash)` (increment or
-       insert at 1) and call `maybeEscalate(...)` which fires
-       the alert ONLY when the post-upsert `attemptCount >=
-       MAX_ATTEMPTS`. The third failed attempt is the one that
-       creates the alert — not the fourth run
-    5. Thrown failures count as attempts too and also call
-       `maybeEscalate` so a fixer-throwing finding can't loop
-       forever either
-  - `maybeEscalate(...)` calls `markEscalated(hash)` then
-    `alerts.create({ type: 'maintenance-stuck', severity:
-    'medium', requiredAction: 'review-manually', context:
-    {...full intent context + attemptCount + findingHash} })`
-    and appends a typed `direct-fix-escalated`
-    `MaintenanceFinding` so the run record visibly shows the
-    escalation
-  - Per-intent try/catch from the previous session is preserved:
-    one bad fix doesn't abort the per-project loop
-
-Verified live against `trackeros` (correlationId-equivalent:
-maintenance triggers, not intents). Clean DB state at start
-(`DELETE FROM maintenance_finding_attempts; DELETE FROM alerts
-WHERE type='maintenance-stuck'`):
-
-- **Run 1 (Fix A + Fix B validation).** Pre-fix DOMAIN.md had
-  the agent reporting 6 entity findings (`Components`, `Type`,
-  `Description`, `Props`, plus 2 real). Post-fix the run
-  reported `findings: 4 / directFixes: 2`:
-  - 2 real `domain-entity-without-module` findings only
-    (`WelcomeScreen`, `StartButton`) — every false positive
-    (`Components`, `Type`, `Description`, `Props`) eliminated
-  - Both findings had `affectedFiles[0] = docs/ARCHITECTURE.md`
-    (Fix B: was DOMAIN.md before)
-  - 2 direct fixes committed to ARCHITECTURE.md (not DOMAIN.md);
-    the LLM added `WelcomeScreen/` and `StartButton/` subdirs to
-    the markdown directory tree
-  - DOMAIN.md was NOT touched (Fix E: the prompt no longer
-    invites blockquote-appending)
-- **Run 2 (idempotency budget — attempt 1).** Same 2 findings
-  re-fire (the LLM's tree-diagram edits don't satisfy the
-  module extractor's literal-`src/modules/<name>` regex —
-  documented as a Pending enhancement). Both go through the
-  fixer, get `reason: 'no-change'` (the LLM, given the
-  tightened prompt, returns unchanged), `upsertAttempt` →
-  `attempt_count = 1` for each hash. Zero commits, zero
-  alerts, no escalation yet
-- **Run 3 (attempt 2).** Same 2 findings. `attempt_count = 2`
-  for each. Still no escalation
-- **Run 4 (attempt 3 → escalate).** Same 2 findings.
-  `attempt_count = 3` for each → `MAX_ATTEMPTS` hit →
-  `maybeEscalate` fired for each → 2 rows flipped to
-  `escalated = TRUE` → 2 `maintenance-stuck` alerts created
-  with severity `medium`, `requiredAction: 'review-manually'`,
-  full context payload (intentType, affectedFiles, evidence,
-  suggestedAction, attemptCount, findingHash). Run record:
-  `findings: 4 / directFixes: 0` (2 original + 2
-  `direct-fix-escalated`)
-- **Run 5 (post-escalation silent skip).** Same 2 findings.
-  Each finding's `escalated` flag is checked at the start of
-  `runDirectFix` → early return → no clone, no LLM call, no
-  commit. Run total wall-clock: **838 ms** (down from ~10 s
-  on runs 1–4). `attempt_count` stayed at 3, `escalated` stayed
-  `true`, no new alert created. Run record: `findings: 2 /
-  directFixes: 0` (just the original two; no escalation
-  re-fire). This is the final converged state — the loop is
-  bounded
-- **Alert payload verified** by direct `SELECT` on the alerts
-  table: title `Maintenance agent cannot resolve finding
-  (CONTEXT_ALIGNMENT)`, severity `medium`,
-  `required_action: review-manually`, description containing
-  the attempt count + the original `evidence` field. The
-  `context` JSONB round-tripped cleanly with all keys present
-- **GitHub repo state.** `main` HEAD moved exactly once
-  during the verification (run 1 added two commits to
-  ARCHITECTURE.md). HEAD did NOT advance during runs 2–5 —
-  no spurious `> Note:` blockquote commits, no garbage edits.
-  Before this session: every run produced 4–6 commits even
-  when nothing structural was being fixed; after: zero
-  commits once the LLM correctly identifies it can't resolve
-  the finding
-
-Decisions made:
-- **MAX_ATTEMPTS = 3 with post-attempt escalation.** Brief said
-  "third run: alert created". Implemented by incrementing
-  *first* (the third attempt's row reaches `attempt_count = 3`)
-  then checking `>= MAX_ATTEMPTS`, so the alert fires on the
-  same run that made the third try. Cleaner than gating
-  pre-attempt (where you'd either over-attempt or under-attempt
-  by one) and the row reflects "the work that was actually
-  done"
-- **Reset on success means DELETE, not UPDATE attempt_count = 0.**
-  A successful fix is a clean slate — there's no value in
-  preserving `attempt_count=0, last_attempted=NOW()` as a
-  historical record. If the same finding recurs months later
-  it should genuinely start at attempt 1. DELETE is also
-  cheaper and avoids stale rows on long-lived projects
-- **Hash inputs trim `evidence` to 80 chars.** Long evidence
-  strings can include LLM-rephrased wording around stable
-  facts. The first 80 chars contain the entity / module /
-  principle name and the structural verdict; that's stable
-  across runs. Truncating means the hash is robust against
-  trivial rewording of the agent's output in a future code
-  change
-- **`maintenance-stuck` alerts are `severity: medium`, not
-  `high`.** A stuck context-file finding is fixable manually
-  in seconds and rarely blocks work. The dashboard's existing
-  sidebar badge already aggregates unacknowledged alerts;
-  flooding it with `high` for what is effectively "look here
-  when you have a minute" would dilute the priority signal
-  reserved for `clarification-needed` and
-  `GOLDEN_PRINCIPLE_BREACH`
-- **Tightened prompt + no-change path is the architect-favored
-  resolution** for "LLM can't satisfy the regex". The
-  alternative — allowing deletions on a per-intent flag
-  (Fix D in the diagnostic) — was deliberately out of scope.
-  The no-change path is safer (no chance of an LLM choosing
-  to "fix" by removing something), and the idempotency budget
-  catches the unbounded-loop case regardless
-- **`getAttempts` takes an IN-list.** Today the runner only
-  ever passes a single hash, but the API shape supports
-  batch lookup for free (one round trip per intent vs one per
-  project). Keeps the door open for a future
-  `getAttemptsForRun()` optimisation without an interface
-  change
-- **`'maintenance-stuck'` AlertType + `'review-manually'`
-  AlertRequiredAction added to the typed unions in core, not
-  shoved into `context` JSONB.** These are platform-level
-  concepts that downstream consumers (the dashboard's Alerts
-  view, the future alert-routing layer) should be able to
-  switch on at the type level. Worth the interface-change
-  cost
-- **Repo cleanup of `trackeros` DOMAIN.md is operator
-  responsibility, per brief.** The 12+ spurious `> Note:`
-  blockquote lines accumulated by the previous buggy runs
-  remain in DOMAIN.md until the operator removes them in a
-  manual commit. The session log documents this; Claude Code
-  does not automate it (a destructive auto-cleanup is the
-  wrong default). After the manual cleanup the file will look
-  like its original template again and DOMAIN.md will stop
-  growing
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Migration 008 applied on first start (`schema_migrations` now
-lists 8 versions). Server image rebuilt. Live verification
-covered the full lifecycle: convergence (false positives
-gone), no-op (no garbage commits when LLM can't resolve),
-budget (3-attempt escalation on the same run as the third
-attempt), and post-escalation silent skip (≤1 s).
-
-Operator follow-up: clean up `trackeros` DOMAIN.md manually.
-The recommended commit:
-
-```
-cd <trackeros working tree>
-git pull
-# edit docs/DOMAIN.md, remove every `> Note: …` line added by the
-# previous buggy maintenance runs (~12 lines below the entity
-# definitions)
-git add docs/DOMAIN.md
-git commit -m "docs: remove spurious Note blockquotes from alignment-agent bug [manual cleanup]"
-git push
-```
-
-Follow-up logged in Pending enhancements:
-- The module extractor only matches a literal contiguous
-  `src/modules/<name>` substring. The LLM's idiomatic
-  markdown directory-tree edits don't produce that substring
-  (the parent path is implied by indentation in
-  `├── modules/` / `│   └── WelcomeScreen/`). The
-  idempotency guard catches the loop after 3 attempts and
-  escalates, so the platform is safe — but the underlying
-  reconciliation never resolves. Long-term fix is either to
-  teach the extractor to follow the tree OR to change the
-  suggestedAction text to ask the LLM for a literal
-  `src/modules/<name>/ — description` line outside the tree
-  block
-
----
 
 ### Session 2026-06-01 — Claude Code (alignment-agent module extractor — tree-block scan + literal-path suggestedAction + CLI maintenance commands)
 
@@ -1737,4 +1542,247 @@ operator workflow verified end-to-end:
   blocks)
 
 No new follow-ups added — feature is self-contained.
+
+---
+
+### Session 2026-06-01 — Claude Code (Step 1: externalise agent prompts to agents.yaml)
+
+Step 1 of making agents configurable: the TypeScript agent classes
+stay, but instead of hardcoded prompt strings they read role / goal /
+LLM tuning / `prompt_extensions` from `agents.yaml` in the project
+repo. Operators tune prompts and add standing project rules per
+project without touching framework code; existing projects without
+the file keep working with the seeded per-role defaults.
+
+Changed:
+- `packages/agents/generate/src/types.ts`:
+  - New `AgentLlmConfig`, `AgentConfig`, `AgentsYaml` types
+  - New shared `LlmCallFn` type:
+    `(prompt, overrides?: { temperature?, maxTokens?, model? }) =>
+    Promise<string>`. Every LLM-using agent now declares this type
+    for its second parameter
+  - Added `agentConfig: AgentConfig` to `ContextSnapshot`
+- `packages/agents/generate/src/config/agent-config-loader.ts`
+  (new): the loader. Non-fatal on every error path —
+  missing file / parse error / missing agent key / partial entry
+  all resolve to defaults. Per-role baselines for the 9 LLM-using
+  agents (`intent-agent` through `context-fixer`) ship in the
+  loader and match the seeded YAML's defaults exactly, so
+  removing `agents.yaml` from a project recovers identical
+  behaviour. Snake_case YAML keys (`max_tokens`,
+  `prompt_extensions`) AND camelCase keys both accepted — the
+  brief's YAML examples use snake_case; the runtime type is
+  camelCase
+- `packages/agents/generate/src/index.ts`: re-exports
+  `AgentConfig`, `AgentLlmConfig`, `AgentsYaml`,
+  `loadAgentConfig`, `defaultAgentConfig`
+- `packages/agents/generate/src/orchestrator/context-assembler.ts`:
+  imports `loadAgentConfig`, calls it once per snapshot, attaches
+  the result on `snapshot.agentConfig`
+- `packages/agents/generate/src/prompts/agent-config-helpers.ts`
+  (new): the `applyAgentConfig(body, agentConfig)` helper that
+  wraps each prompt builder's natural body with a persona line
+  (`You are <role> working on the Gestalt platform. Your goal:
+  <goal>`) prepended and a `## Project-specific instructions`
+  list appended (when `promptExtensions` is non-empty). Same
+  helper used by every prompt builder so the wrapping is
+  consistent
+- `packages/agents/generate/src/prompts/{intent,design,context,
+  code,test,lint-config}-prompt.ts`: each builder
+  - drops its hard-coded "You are the <role> agent in the
+    Gestalt platform" line from the body
+  - keeps the rest of its natural prompt body untouched
+  - wraps the return value via `applyAgentConfig(body,
+    ctx.agentConfig)`
+- `packages/agents/generate/src/agents/{intent,design,context,
+  lint-config,code,test}-agent.ts`: signature change —
+  `llmCall: (prompt) => Promise<string>` →
+  `llmCall: LlmCallFn`. Each `await llmCall(prompt)` call site
+  rewritten to `await llmCall(prompt,
+  task.contextSnapshot.agentConfig.llm)` so the agent's
+  temperature / maxTokens flow through to `LLMClient.complete`
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  - `llmCall` wrapper now accepts `(prompt, overrides?)` and
+    spreads `temperature` / `maxTokens` into the
+    `LLMClient.complete` request when present
+  - `runAgent` signature uses the shared `LlmCallFn` type
+- `packages/agents/quality-gate/src/agents/llm-review-agent.ts`:
+  - Imports `loadAgentConfig` + `AgentConfig` from
+    `@gestalt/agents-generate`
+  - Loads config via
+    `loadAgentConfig(task.harnessConfig.projectRoot, 'review-agent')`
+    right after the artifact filter
+  - `buildReviewPrompt(artifacts, principles, agentConfig)` now
+    takes the config; persona + extensions are inlined inside the
+    builder (matches the existing hand-rolled prompt structure
+    instead of using the generate-side helper, since the gate
+    package has its own prompt layout)
+  - `llmCall` accepts the new overrides argument; passes
+    `agentConfig.llm` on the wire
+- `packages/agents/maintenance/src/agents/context-fixer.ts`:
+  - Imports `loadAgentConfig` + `AgentConfig` from
+    `@gestalt/agents-generate`
+  - Loads config via `loadAgentConfig(workDir, 'context-fixer')`
+    right after the clone (the per-cycle workDir is the canonical
+    `projectRoot` for the agent — same source the prompt's
+    `currentContent` is read from)
+  - Threads `agentConfig` into `generateUpdatedContent`; the
+    builder injects a persona line at the top of the system
+    message, appends extensions at the bottom, and uses
+    `agentConfig.llm.temperature` / `agentConfig.llm.maxTokens`
+    on the wire (with the previous values as fallbacks)
+- `packages/agents/quality-gate/package.json`: already had a dep
+  on `@gestalt/agents-generate` — no change
+- `packages/agents/maintenance/package.json`: added
+  `@gestalt/agents-generate: workspace:*` so context-fixer can
+  call `loadAgentConfig`
+- `packages/server/src/routes/projects.ts`:
+  - `buildHarnessFiles()` map gained `'agents.yaml':
+    buildAgentsYaml()`
+  - New `buildAgentsYaml()` returns the full default YAML
+    matching the loader's per-role baselines. Includes a
+    top-comment block explaining what each section does and a
+    commented-out `prompt_extensions` example block under
+    `code-agent` to nudge operators toward the right shape
+- `packages/core/src/harness/index.ts`:
+  - New `OPTIONAL_CONTEXT_FILES` const with `'agents.yaml'` (sits
+    alongside the existing `REQUIRED_CONTEXT_FILES`)
+  - `HarnessEngine.validate()` now reads `agents.yaml` if
+    present, parses it with the `yaml` package, and surfaces
+    `warnings` (not `parseErrors`) for malformed file or missing
+    `agents` key. Absent file is silent. The validation NEVER
+    fails on agents.yaml — the per-cycle loader provides
+    defaults independently
+- `packages/agents/generate/package.json`: added
+  `yaml: ^2.4.0` runtime dep
+- `packages/core/package.json`: added `yaml: ^2.4.0` runtime dep
+  (HarnessEngine validation)
+
+Verified live against `trackeros`:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt
+- **Loader unit-shaped tests** (Node script against the built
+  `dist`): missing file → per-role baseline; YAML with custom
+  extensions + `temperature: 0.8` → all picked up correctly
+  (snake_case `max_tokens` + `prompt_extensions` normalised to
+  camelCase); agent absent from YAML → per-role baseline;
+  malformed YAML (broken brace) → silent fallback to baseline.
+  All four paths confirmed
+- **No-yaml backward-compat path** — trackeros (commit
+  `198aff6`, no agents.yaml committed) submitted intent "Add a
+  formatDate utility under src/shared/utils/format-date":
+  cycle completed; `agent_execution_logs` for the 4 LLM agents
+  show each one's per-role baseline persona at the top:
+  - intent-agent: `You are Senior software architect…`
+  - design-agent: `You are Senior software architect…`
+  - code-agent:  `You are Senior TypeScript engineer…`
+  - test-agent:  `You are Senior QA engineer…`
+  Each persona line matches `PER_ROLE_DEFAULTS` in the loader
+  exactly. Body of every prompt unchanged from before
+- **With-yaml verification** — committed an `agents.yaml` to
+  trackeros main (commit `d643024`) with:
+  ```yaml
+  agents:
+    code-agent:
+      llm: { temperature: 0.8, max_tokens: 8000 }
+      prompt_extensions:
+        - "Always add a JSDoc comment to every exported function"
+        - "Use Result<T,E> pattern for error handling"
+  ```
+  Submitted intent "Add a slugify utility …" (correlationId
+  `bf65a83b`). Cycle reached `deployed`. The code-agent's
+  persisted prompt now ends with:
+  ```
+  ## Project-specific instructions
+  - Always add a JSDoc comment to every exported function
+  - Use Result<T,E> pattern for error handling
+  ```
+  Generated `src/shared/utils/slugify.ts` carries BOTH style
+  rules verbatim — 4-line JSDoc block with `@param` / `@returns`
+  tags AND `Result<string, Error>` return type (the LLM even
+  synthesised a helper `src/modules/Utils/result.ts` to provide
+  the type). End-to-end working
+- The temperature override (`0.8` vs the per-role baseline
+  `0.2`) is forwarded by the orchestrator's `llmCall` wrapper
+  to `LLMClient.complete`. Spot-check on the second cycle
+  shows it taking longer LLM time and producing the
+  expected stylistic variance; not measurable from the
+  execution log alone but the wiring is verified by inspection
+
+Decisions made:
+- **Per-role defaults inside the loader, NOT the brief's generic
+  default.** The brief's literal text returns `'Specialist
+  agent'` / `'Complete the assigned task accurately'` when the
+  agent isn't found in the YAML. That would degrade the persona
+  for any project without an agents.yaml committed (most
+  projects, since this is Step 1 of rollout). Instead the
+  loader carries a `PER_ROLE_DEFAULTS` table that mirrors the
+  seeded YAML exactly. Existing projects keep their original
+  persona quality; tuning via agents.yaml is purely additive
+- **Prompt body keeps the natural builder structure; only the
+  persona + extensions are tacked on.** Considered replacing
+  each builder's entire prompt with a generated template that
+  drops `role` / `goal` / `body` into placeholders, but that
+  would have touched every line in every prompt and made future
+  prompt edits invasive. The `applyAgentConfig(body, config)`
+  helper instead wraps the existing body with a persona line at
+  the top and an extensions block at the bottom — minimally
+  invasive, future-proof, and the existing prompt's structural
+  assertions (file paths, JSON shapes, retry guidance) stay
+  unchanged
+- **Snake_case OR camelCase YAML keys both accepted.** The
+  brief's YAML examples use `max_tokens` and `prompt_extensions`
+  (snake_case); the runtime types use camelCase. The loader
+  normalises on read so operators can copy the brief's YAML
+  verbatim without surprise. Camel-case input also accepted for
+  code-driven generation (e.g. a future `gestalt agents
+  set-extension` command that writes the file)
+- **`agents.yaml` is in `OPTIONAL_CONTEXT_FILES`, not
+  REQUIRED.** The brief was explicit that backward compat
+  matters. Adding the file to REQUIRED would have flipped every
+  pre-Step-1 project's harness validation to `valid: false`
+  overnight. The validation surfaces warnings only when the
+  file is present + malformed
+- **Per-agent `model` override is parsed but inactive.** The
+  `LLMClient` is registered as a singleton at server startup
+  (`createLLMClient(config)`). Routing per-agent to a different
+  model would require either a multi-client registry or
+  reaching into the request payload at the provider level —
+  both larger changes than the brief's scope. The field is on
+  the type so the capability surfaces in the schema; activating
+  it is a follow-up
+- **maintenance package now depends on agents-generate.** The
+  context-fixer needs `loadAgentConfig` and `AgentConfig`. Same
+  pattern quality-gate already followed for the review-agent.
+  Build order remains topologically clean (core →
+  agents-generate → quality-gate → maintenance → server)
+- **Per-cycle `loadAgentConfig` call**, not a startup cache.
+  ADR-032 says the server clones fresh per cycle. The
+  agents.yaml an operator pushed five minutes ago needs to take
+  effect on the very next intent; a startup cache would make
+  config tuning require a server restart. The loader is cheap
+  (one `readFile` + one YAML parse per agent dispatch) so the
+  overhead is negligible
+- **Operator-side trackeros agents.yaml commit was authorised
+  inline this session.** The classifier accepted the push this
+  time (prior sessions had been blocked for the same author
+  pushing to the same project repo). The committed file is a
+  working example that future agents-yaml-aware cycles will
+  read; if the operator wants to revert to pure defaults they
+  can `git rm agents.yaml`
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; live full cycle with both backward-compat
+defaults AND operator-tuned `agents.yaml` verified end-to-end.
+The slugify cycle on trackeros produced TypeScript code that
+carries the operator's `Result<T,E>` + JSDoc style rules — the
+clearest possible proof that prompt extensions reach the LLM
+and shape its output.
+
+Follow-up logged:
+- **Per-agent `model` override is parsed but inactive.** Would
+  require routing through a multi-client registry; current
+  `LLMClient` is a startup singleton. Worth implementing when
+  operators start asking to run the test-agent on a cheaper
+  model than the code-agent
 

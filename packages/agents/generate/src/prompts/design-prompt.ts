@@ -4,6 +4,7 @@
  */
 
 import type { ContextSnapshot } from '../types';
+import { applyAgentConfig } from './agent-config-helpers';
 
 export function buildDesignPrompt(ctx: ContextSnapshot, attempt: number): string {
   const retry = attempt > 0
@@ -17,8 +18,7 @@ export function buildDesignPrompt(ctx: ContextSnapshot, attempt: number): string
 
   const existingEntities = ctx.domain.entities.map((e) => e.name).join(', ') || 'none';
 
-  return `You are the design agent in the Gestalt platform.
-Your job is to produce a design specification from an intent statement.
+  const body = `Your job is to produce a design specification from an intent statement.
 ${retry}
 
 ## Project context
@@ -85,4 +85,5 @@ Rules:
 - Component specs only needed if intent affects the UI layer
 - If no domain changes are needed, return empty arrays
 `;
+  return applyAgentConfig(body, ctx.agentConfig);
 }

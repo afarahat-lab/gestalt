@@ -5,6 +5,58 @@
 
 import type { AgentRole, ArtifactType, SignalType } from '@gestalt/core';
 
+// ─── Shared LLM call shape ───────────────────────────────────────────────────
+
+/**
+ * Function the orchestrator hands every LLM-using agent. Agents pass
+ * their `agentConfig.llm` as the second argument so per-agent
+ * temperature / maxTokens land on the wire.
+ */
+export type LlmCallFn = (
+  prompt: string,
+  overrides?: { temperature?: number; maxTokens?: number; model?: string },
+) => Promise<string>;
+
+// ─── Agent configuration (agents.yaml) ───────────────────────────────────────
+
+/**
+ * Per-agent LLM tuning. Each field is optional — anything absent falls
+ * back to either the platform default (`loadConfig().llm.model`,
+ * provider's defaults for temperature / max tokens) or the loader's
+ * baseline value, depending on the field.
+ */
+export interface AgentLlmConfig {
+  temperature?: number;
+  maxTokens?: number;
+  /** If absent, use the platform default from loadConfig().llm.model. */
+  model?: string;
+}
+
+/**
+ * One agent's configurable surface. `role` and `goal` become the LLM
+ * persona; `promptExtensions` is a flat list of standing project rules
+ * the prompt builder appends verbatim under "Project-specific
+ * instructions" near the end of every prompt.
+ */
+export interface AgentConfig {
+  role: string;
+  goal: string;
+  llm: AgentLlmConfig;
+  promptExtensions: string[];
+}
+
+/**
+ * Top-level shape of `agents.yaml`. The keys under `agents` map to the
+ * platform's `AgentRole` values (intent-agent, design-agent, code-agent,
+ * test-agent, review-agent, drift-agent, alignment-agent, context-fixer,
+ * etc.) — only LLM-using agents are addressable here. Infrastructure
+ * agents (constraint-agent, test-runner-agent, pipeline-agent,
+ * promotion-agent, gc-agent) ignore the file.
+ */
+export interface AgentsYaml {
+  agents: Record<string, AgentConfig>;
+}
+
 // ─── Execution graph ─────────────────────────────────────────────────────────
 
 export type ArchLayer = 'domain' | 'api' | 'ui' | 'infra' | 'test' | 'config';
@@ -134,6 +186,13 @@ export interface ContextSnapshot {
   relevantDecisions: ADR[];
   intentSpec: IntentSpec;
   priorArtifacts: GeneratedArtifact[];
+  /**
+   * Agent-specific configuration loaded from `agents.yaml` in the
+   * project repo. The assembler calls `loadAgentConfig(projectRoot,
+   * forAgent)` and attaches the result; absent / malformed YAML
+   * resolves to platform defaults so existing projects keep working.
+   */
+  agentConfig: AgentConfig;
 }
 
 // ─── Artifacts ────────────────────────────────────────────────────────────────
