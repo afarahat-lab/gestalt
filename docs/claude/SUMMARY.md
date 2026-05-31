@@ -14,7 +14,7 @@ content is derived._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-31 (Claude Code — agent execution logs + IntentDetail accordion)
+**Last updated:** 2026-05-31 (Claude Code — richer ActiveAgents + Deployments views with pipeline timeline)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -153,6 +153,51 @@ content is derived._
   failed intents had no trace in the dashboard). No status filter
   is applied to `listIntents` — the feed shows the full intent
   timeline for the project
+- **Active Agents card shows intent + cycle progress + tokens.**
+  `GET /status/agents` is enriched per row with `intentText`,
+  `cycleProgress: { completed, total }`, and `tokensSoFar` (the
+  running total across all agents in the cycle so far). Same
+  endpoint, same auth; the dashboard's `ActiveAgents.tsx` now
+  renders each card with the agent role + pulsing ◎, an
+  elapsed-time stamp in the top-right (`1s` / `1m 23s`), the
+  intent text quoted and truncated to 55 chars, a segmented
+  progress bar (one block per planned agent), the
+  `step N of M` label, and the token count. Auto-refresh every
+  5 s plus `agent.started` / `agent.completed` SSE-triggered
+  refresh kept from the previous implementation. Server-side
+  the enrichment de-dupes per-correlation lookups so a
+  multi-agent cycle triggers one `intents.findByCorrelationId`
+  and one `executions.findByCorrelationId` instead of N each
+- **Deployments view renders a 4-node pipeline timeline.** New
+  `GET /deployments?projectId=…&limit=…` returns one row per
+  intent that has at least one `deployment_events` row,
+  enriched with the full event timeline (ASC by `created_at`),
+  `prUrl` / `prNumber` / `branch` (from the `pr-opened` event's
+  metadata) / `runId` / `deploymentUrl`. Three intent statuses
+  scanned in parallel (`deploying`, `deployed`, `failed`);
+  cycles with no events are dropped client-side so a
+  gate-failed intent never reaches an empty card. Dashboard's
+  `Deployments.tsx` renders three sections (In progress /
+  Deployed / Failed) — each card has the status badge, branch
+  tag, timestamp, intent text (65-char truncation), the
+  4-node timeline (PR → Pipeline → Staging → Production)
+  with green ●-filled / muted ○-empty / blue ◎-in-progress /
+  red ✗-failed nodes, green connectors between completed
+  nodes, status labels (opened/passed/promoted/deployed) and
+  HH:MM timestamps under each filled node. Footer has
+  `[↗ View PR #N]` and `[↗ View deployment]` links —
+  `target="_blank" rel="noopener noreferrer"`. Pipeline-failed
+  flips the Pipeline node red; downstream nodes stay muted.
+  Pipeline-triggered (no -passed yet) shows the Pipeline node
+  pulsing blue
+- **Postgres `deployment_events.metadata` JSONB read path
+  patched** to defensively `JSON.parse` when postgres.js
+  returns the column as a string instead of an object. Same
+  pattern as `parseContext` in the alerts repo and
+  `parseFindings` in the maintenance-runs repo. Before this
+  fix the `branch` extraction in `/deployments` returned null
+  for every deployment because `metadata['branch']` against a
+  string is `undefined`
 - **Agent execution logs populated for every agent run, accordion
   in IntentDetail.** Migration 007 added `agent_execution_logs`
   (1:1 with `agent_executions`, FK cascades on delete). All three
@@ -558,162 +603,6 @@ content is derived._
 
 ## Recent session log entries (last 3 from SESSION_LOG.md)
 
-### Session 2026-05-31 — Claude Code (global dashboard project selector + per-view localStorage cleanup)
-
-Closes the per-view project-id divergence that the previous
-clarification session only partially fixed. IntentFeed had been
-updated to read from `localStorage.gestalt_project_id` with a real
-project hydrate, but Deployments and QualityGate still read the OLD
-`gestalt_project` key with the `'default'` fallback bug. Every
-project-scoped view should now derive its current project from one
-shared source.
-
-Changed:
-- `packages/dashboard/src/context/ProjectContext.tsx` (new):
-  Provider + `useProject()` hook. On mount it calls
-  `/projects` once; selection rule is
-  `localStorage.gestalt_project_id → projects[0] → null`. Writes
-  the chosen id back to localStorage eagerly so the next reload
-  takes the fast path. Registers a `window 'focus'` handler that
-  re-fetches `/projects` — picks up a new project registered in
-  another terminal without needing a server-side
-  `project.created` SSE event. `setCurrentProjectId(id)` is
-  exposed to consumers and persists on every change. The provider
-  preserves the operator's in-session choice when the server's
-  ordering of `/projects` shifts (no surprise switching mid-session)
-- `packages/dashboard/src/App.tsx`: wraps the authenticated route
-  tree in `<ProjectProvider>` (inside `<RequireAuth>` so the
-  `/projects` fetch only fires for signed-in sessions, outside
-  the `<Routes>` so every view sees the same context)
-- `packages/dashboard/src/components/layout/Layout.tsx`: sidebar
-  gained a `<select>` between the logo and the navigation list —
-  reads from `useProject()`, calls `setCurrentProjectId` on
-  change. While `projectsLoading` it shows `loading...` in
-  muted text; with zero projects it shows
-  `No projects — run gestalt init`. Single-project case still
-  renders the select so the operator can see which project is
-  active. Styled with existing CSS variables
-  (`var(--bg-subtle)` / `var(--border)` / `var(--font-mono)` /
-  `var(--text-primary)` / `var(--text-dim)`)
-- `packages/dashboard/src/views/IntentFeed.tsx`: removed the
-  per-view `/projects` fetch and the in-header `<select>` added
-  in the clarification session. Now reads
-  `useProject().currentProjectId` + `currentProject`. Subtitle
-  becomes `${total} total · ${currentProject.name}`. Empty state
-  distinguishes "no project registered" (run gestalt init) from
-  "no intents yet"
-- `packages/dashboard/src/views/Deployments.tsx`,
-  `QualityGate.tsx`: replaced
-  `localStorage.getItem('gestalt_project') ?? 'default'` (the
-  pre-existing bug) with `useProject().currentProjectId` +
-  guard-return EmptyState when no project is selected
-- `packages/dashboard/src/views/Maintenance.tsx`: passes
-  `projectId` through `listMaintenanceRuns` and
-  `triggerMaintenanceAgent`. The API client's
-  `triggerMaintenanceAgent(agentRole, projectId)` is now
-  required-param (the server has always required `projectId`
-  on `POST /maintenance/trigger`; previously the dashboard
-  call would have 400'd)
-- `packages/dashboard/src/views/Alerts.tsx`: project-scoped
-  client-side. Loads both `/alerts?acknowledged=false` and the
-  current project's intents in parallel, builds a Set of
-  intent IDs, filters alerts whose `context.intentId` matches
-  (alerts without an intentId pass through — none exist today
-  but the contract leaves room). Guard-returns when no project
-  is selected. New `intent.created` SSE subscription keeps the
-  filter set fresh as new intents arrive in the project
-- `packages/dashboard/src/views/ActiveAgents.tsx`: unchanged.
-  Agent executions span all projects (the operator wants to
-  see every running agent, not just those for the current
-  project)
-- `packages/dashboard/src/api/client.ts`:
-  - `listMaintenanceRuns` gained `projectId?` param
-  - `triggerMaintenanceAgent` signature widened to
-    `(agentRole, projectId)` — required-param to match the
-    server contract
-
-Verified live against the running platform:
-- `pnpm --filter @gestalt/dashboard build` clean; `pnpm -r build`
-  clean across all 12 packages
-- Docker server image rebuilt; the new dashboard bundle
-  (`/app/assets/index-Bf8qYMe-.js`, 204 KB) lands cleanly
-- **Headless Chrome drive captured** the IntentFeed with the
-  sidebar selector showing `trackeros` selected, the IntentFeed
-  body showing "3 total · trackeros" with three intents (`make
-  it better` ×2 with `! escalated` + `? needs input` and the
-  older `start implementation` `✗ failed`). Screenshot saved
-- **Navigation drive** (`/app/agents`, `/app/gate`,
-  `/app/deployments`, `/app/maintenance`, `/app/alerts`)
-  confirmed every view renders without crashing and that the
-  sidebar selector value stays at the same UUID across every
-  navigation. The Alerts tab badge in the sidebar shows the
-  global unack count (1) — the in-view list filters to the
-  current project's alerts
-- **Three reload-persistence probes:**
-  - hard reload → selector + localStorage retain the chosen id
-  - clear `gestalt_project_id` + reload → selector
-    auto-selects `projects[0]` and writes the id back to
-    localStorage so the next reload is sticky
-  - set a bogus UUID + reload → selector ignores the stale
-    value, picks `projects[0]`, and overwrites the storage
-- The previous session's two unacknowledged data points (the
-  earlier `61fd59a6` intent at `waiting-for-clarification` and
-  its alert) are visible in the dashboard for the first time —
-  the per-view `'default'` fallback was masking them
-
-Decisions made:
-- **`<ProjectProvider>` lives inside `<RequireAuth>`**, not at
-  the top of the tree. The `/projects` call requires an auth
-  token; mounting the provider outside the auth guard would
-  trigger the fetch on the public `/app/login` page and
-  produce noisy 401s. Inside the guard, the provider mounts
-  exactly when there's a token available
-- **Selector renders even when there is only one project**, per
-  the brief. Hiding a "trivial" dropdown would surprise an
-  operator who registers a second project mid-session — the
-  control just suddenly appears. Always-visible is the kinder
-  affordance
-- **Window-focus refetch, not a new SSE event.** The brief
-  explicitly suggested either; window-focus is one event
-  handler with zero server-side changes and catches the
-  realistic case (operator runs `gestalt init` in a terminal,
-  alt-tabs back to the dashboard). A `project.created` SSE
-  event would be more proactive but is out of scope and would
-  require server-side wiring
-- **Alerts filter client-side, not via a new API parameter.**
-  Brief constraint: no new endpoints. The dashboard's existing
-  `/alerts` + `/intents` calls are enough to compute the
-  filter; the cost is one extra `/intents` request per refresh
-  on the Alerts tab. Pending enhancement logged for a
-  server-side `projectId` filter on `/alerts`
-- **Layout sidebar badge stays global.** It reflects the
-  count of unacknowledged alerts across every project, which
-  matches the bell-icon convention ("you have N things to
-  attend to anywhere"). Scoping the badge to the current
-  project would require the same client-side join the Alerts
-  view does, plus a refresh on project change, for marginal
-  UX gain. Documented this trade-off so the next refresh of
-  the alerts surface picks it up
-- **`gestalt_project_id` is the canonical localStorage key.**
-  Established in the clarification session; this session
-  fixes the two views that were still reading the legacy
-  `gestalt_project` key. No old-key migration code is added —
-  the legacy reads pointed at the literal string `'default'`
-  which never matched a real project anyway, so there is
-  nothing to migrate from
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Dashboard bundle rebuilt; SPA loads under `/app/*`; the global
-project selector is the new single point of truth for which
-project the dashboard is showing.
-
-Follow-up added to Pending enhancements:
-- `GET /alerts` projectId filter (server-side) — would let the
-  dashboard skip the client-side join and let the sidebar
-  badge match the filtered list in the Alerts view
-
----
-
 ### Session 2026-05-31 — Claude Code (`/projects` returns all projects + 401 → /login)
 
 Operator reported the previous session's dashboard saying
@@ -1049,4 +938,168 @@ accordion panel with copy + show-full controls.
 
 No follow-ups added — this feature is self-contained and
 GP-006-compliant by design.
+
+---
+
+### Session 2026-05-31 — Claude Code (richer ActiveAgents + Deployments + JSONB metadata fix)
+
+Both views had everything they needed in the database already; this
+session surfaces it. No new migrations, no new DB tables.
+
+Changed:
+- `packages/server/src/routes/status.ts` — `GET /status/agents`
+  enriched per-row with `intentText`, `cycleProgress` (completed
+  vs total executions in the cycle), and `tokensSoFar` (running
+  total across the cycle's executions). De-dupes per-correlation
+  lookups via two `Map`s so a six-agent cycle triggers two
+  queries, not twelve
+- `packages/server/src/routes/deployments.ts` (new) — new
+  `GET /deployments?projectId=<id>&limit=20`,
+  `requireRole('viewer')`. Returns `DeploymentSummary[]`:
+  intentId / correlationId / intentText / status / events
+  (ASC by createdAt) / prUrl / prNumber / branch / runId /
+  deploymentUrl / startedAt / completedAt. Fetches the three
+  deploy-related status buckets (`deploying`, `deployed`,
+  `failed`) in parallel via `intents.list` (the repo only
+  takes one status at a time), merges, sorts newest-first,
+  caps to `limit`. Per-intent `deploymentEvents.findByCorrelationId`,
+  drops cycles with no events (gate-failed intents that never
+  reached pr-agent). Branch lifted from the `pr-opened`
+  event's `metadata['branch']`; `prUrl` / `prNumber` from
+  `pr-opened`; `runId` from `pipeline-passed` (fallback to
+  triggered / failed); `deploymentUrl` from production
+  promotion (fallback to staging)
+- `packages/server/src/app.ts` — registers the new route
+- `packages/adapters/postgres/src/repositories/deployment-events.ts`
+  — new `parseMetadata` helper. postgres.js returns the JSONB
+  `metadata` column as either an object OR a JSON-encoded
+  string depending on how the row was written and what type
+  adapters are registered. Same trap as the alerts repo
+  (`parseContext`) and maintenance-runs repo
+  (`parseFindings`). Without it, the `branch` extraction in
+  `/deployments` returned null for every cycle because
+  `metadata['branch']` against a string is `undefined`. The
+  helper short-circuits on object / null / undefined, then
+  defensively `JSON.parse`s strings and falls back to `{}` on
+  any failure. Mirrors the pattern in the other two repos
+- `packages/dashboard/src/types.ts`:
+  - `AgentExecutionSummary` gained optional `intentText`,
+    `cycleProgress`, `tokensSoFar`. Optional so the
+    IntentDetail timeline (which doesn't need them) is
+    unchanged
+  - new `DeploymentEvent`, `DeploymentEventType`,
+    `DeploymentSummary` types
+  - kept the old Phase-2-aspirational `DeploymentStatus` /
+    `PendingPromotion` / `PromotionHistoryItem` types since
+    `IntentDetail.deploymentStatus` still references them.
+    Marked with a comment for the next cleanup pass
+- `packages/dashboard/src/api/client.ts` — new
+  `listDeployments({ projectId, limit? })` method
+- `packages/dashboard/src/views/ActiveAgents.tsx` — rewrote
+  the card:
+  - Header row: agent role + elapsed time (top-right,
+    `1s` / `1m 23s` formatter)
+  - Intent text line: 55-char truncation, muted monospace,
+    quoted, omitted if `intentText` is null
+  - Progress row: segmented bar (one `var(--green)` block
+    per completed step, muted bordered block for each
+    remaining step), `step N of M` label, token count
+    `2,847 tokens` formatted with `toLocaleString()`
+  - Progress row omitted entirely when `cycleProgress.total
+    === 0`
+  - Auto-refresh 5 s + SSE refresh kept
+- `packages/dashboard/src/views/Deployments.tsx` — rewrote:
+  - Three sections: In progress / Deployed / Failed (each
+    only rendered when non-empty, except Deployed which
+    always renders with empty-state hint)
+  - Each row: top row with status badge + branch tag (small
+    monospace chip) + timestamp; intent text (65-char
+    truncation); 4-node pipeline timeline; footer links
+  - Timeline node states: filled (green ●), in-progress
+    (blue ◎ with pulse animation), failed (red ✗), empty
+    (muted ○). `classifyNode` maps node index → event type;
+    Pipeline node has the most failure modes (failed
+    overrides passed overrides triggered)
+  - Connectors between nodes turn green when both ends are
+    filled; otherwise muted
+  - HH:MM time under each filled node from the event's
+    `createdAt`
+  - `[↗ View PR #N]` link uses `prUrl` + `prNumber` (the PR
+    number appears only when known). `[↗ View deployment]`
+    link uses `deploymentUrl`. Both
+    `target="_blank" rel="noopener noreferrer"`
+
+Verified live against `trackeros`:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt
+- `GET /deployments?projectId=...&limit=20` returned 9 deployments,
+  every one with a real `branch` value (e.g.
+  `gestalt/9c28d399-add-a-titlecase-utility-under`), a real
+  `prUrl` (NoOp adapter produces `noop://pr/<projectId>/<n>`),
+  a real `runId` (`noop-run-9c28d399-<ts>`), and 5 events per
+  cycle in the right order (`pr-opened`,
+  `pipeline-triggered`, `pipeline-passed`, `promoted-staging`,
+  `promoted-production`). Pre-`parseMetadata`-fix the same
+  call returned `"branch":null` for every row
+- **Browser drive (headless Chrome):**
+  - `/app/deployments`: subtitle reads
+    "9 total · 0 in progress · 9 deployed"; each card shows
+    the deployed badge, the branch chip, the timestamp, the
+    truncated intent, and the four-node pipeline (`PR ●
+    PIPELINE ● STAGING ● PRODUCTION ●`) with the green
+    connectors between every filled node, status labels
+    underneath (opened / passed / promoted / deployed), and
+    `08:20 PM` timestamps. Both `View PR #N` and
+    `View deployment` buttons render. Screenshot captured
+  - `/app/agents` first navigation: idle ("No agents
+    running · platform is idle"). Submitted a fresh intent
+    via the in-page API client, refreshed → "1 running"
+    with the intent-agent card showing `1s` elapsed, the
+    intent text quoted and truncated, and `step 0 of 1`
+    (the cycle was on its first agent at the moment of the
+    query). Two pulsing dots in the DOM (the agent ◎ and
+    the connection pill). Screenshot captured
+
+Decisions made:
+- **De-dupe per-correlation lookups in `/status/agents`** via
+  two Maps. A cycle with six concurrent agents would
+  otherwise fire twelve queries (one `intents.findByCorrelationId`
+  and one `executions.findByCorrelationId` per row). With
+  the cache it's two queries per unique correlationId
+- **Drop cycles with no events** in `/deployments` rather
+  than rendering empty cards. A gate-failed intent that
+  never reached pr-agent has no deployment_events but its
+  status is `failed` — the dashboard's Deployments view
+  should not show it. Gate failures live in QualityGate
+- **`metadata.branch` extracted server-side**, not in the
+  dashboard. The route owns the JSONB parse (via
+  `parseMetadata` in the repo) so the dashboard receives a
+  flat `branch: string | null` and doesn't have to do
+  another JSON parse client-side. Keeps the dashboard
+  decoupled from the JSONB shape
+- **Pipeline node has its own state machine.** The other
+  three nodes are a single event type → filled. Pipeline
+  has three possible events (`pipeline-triggered`,
+  `pipeline-passed`, `pipeline-failed`) with priority:
+  `failed` wins, then `passed`, then `triggered` (which
+  maps to in-progress). Captured in `classifyNode`'s
+  index === 1 branch
+- **Old `DeploymentStatus` types kept** for
+  back-compat with `IntentDetail.deploymentStatus`. That
+  field on `IntentDetail` was never populated by any
+  current API path; removing the types would require
+  touching `IntentDetail.tsx` too. Out of scope. Marked
+  with a "delete when IntentDetail stops referencing it"
+  comment so the next cleanup pass picks it up
+
+Build status: `pnpm -r build` clean. Server image rebuilt;
+both views render with real deployment_events + active
+executions data. The JSONB-metadata-as-string bug is fixed
+on the same pattern as the prior alerts + maintenance-runs
+fixes.
+
+No new follow-ups. The old `DeploymentStatus` /
+`PromotionHistoryItem` types are flagged in a code comment
+rather than the Pending enhancements list — they're
+mechanical cleanup that doesn't need design conversation.
 

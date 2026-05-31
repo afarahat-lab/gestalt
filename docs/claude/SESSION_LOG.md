@@ -2678,3 +2678,167 @@ accordion panel with copy + show-full controls.
 No follow-ups added — this feature is self-contained and
 GP-006-compliant by design.
 
+---
+
+### Session 2026-05-31 — Claude Code (richer ActiveAgents + Deployments + JSONB metadata fix)
+
+Both views had everything they needed in the database already; this
+session surfaces it. No new migrations, no new DB tables.
+
+Changed:
+- `packages/server/src/routes/status.ts` — `GET /status/agents`
+  enriched per-row with `intentText`, `cycleProgress` (completed
+  vs total executions in the cycle), and `tokensSoFar` (running
+  total across the cycle's executions). De-dupes per-correlation
+  lookups via two `Map`s so a six-agent cycle triggers two
+  queries, not twelve
+- `packages/server/src/routes/deployments.ts` (new) — new
+  `GET /deployments?projectId=<id>&limit=20`,
+  `requireRole('viewer')`. Returns `DeploymentSummary[]`:
+  intentId / correlationId / intentText / status / events
+  (ASC by createdAt) / prUrl / prNumber / branch / runId /
+  deploymentUrl / startedAt / completedAt. Fetches the three
+  deploy-related status buckets (`deploying`, `deployed`,
+  `failed`) in parallel via `intents.list` (the repo only
+  takes one status at a time), merges, sorts newest-first,
+  caps to `limit`. Per-intent `deploymentEvents.findByCorrelationId`,
+  drops cycles with no events (gate-failed intents that never
+  reached pr-agent). Branch lifted from the `pr-opened`
+  event's `metadata['branch']`; `prUrl` / `prNumber` from
+  `pr-opened`; `runId` from `pipeline-passed` (fallback to
+  triggered / failed); `deploymentUrl` from production
+  promotion (fallback to staging)
+- `packages/server/src/app.ts` — registers the new route
+- `packages/adapters/postgres/src/repositories/deployment-events.ts`
+  — new `parseMetadata` helper. postgres.js returns the JSONB
+  `metadata` column as either an object OR a JSON-encoded
+  string depending on how the row was written and what type
+  adapters are registered. Same trap as the alerts repo
+  (`parseContext`) and maintenance-runs repo
+  (`parseFindings`). Without it, the `branch` extraction in
+  `/deployments` returned null for every cycle because
+  `metadata['branch']` against a string is `undefined`. The
+  helper short-circuits on object / null / undefined, then
+  defensively `JSON.parse`s strings and falls back to `{}` on
+  any failure. Mirrors the pattern in the other two repos
+- `packages/dashboard/src/types.ts`:
+  - `AgentExecutionSummary` gained optional `intentText`,
+    `cycleProgress`, `tokensSoFar`. Optional so the
+    IntentDetail timeline (which doesn't need them) is
+    unchanged
+  - new `DeploymentEvent`, `DeploymentEventType`,
+    `DeploymentSummary` types
+  - kept the old Phase-2-aspirational `DeploymentStatus` /
+    `PendingPromotion` / `PromotionHistoryItem` types since
+    `IntentDetail.deploymentStatus` still references them.
+    Marked with a comment for the next cleanup pass
+- `packages/dashboard/src/api/client.ts` — new
+  `listDeployments({ projectId, limit? })` method
+- `packages/dashboard/src/views/ActiveAgents.tsx` — rewrote
+  the card:
+  - Header row: agent role + elapsed time (top-right,
+    `1s` / `1m 23s` formatter)
+  - Intent text line: 55-char truncation, muted monospace,
+    quoted, omitted if `intentText` is null
+  - Progress row: segmented bar (one `var(--green)` block
+    per completed step, muted bordered block for each
+    remaining step), `step N of M` label, token count
+    `2,847 tokens` formatted with `toLocaleString()`
+  - Progress row omitted entirely when `cycleProgress.total
+    === 0`
+  - Auto-refresh 5 s + SSE refresh kept
+- `packages/dashboard/src/views/Deployments.tsx` — rewrote:
+  - Three sections: In progress / Deployed / Failed (each
+    only rendered when non-empty, except Deployed which
+    always renders with empty-state hint)
+  - Each row: top row with status badge + branch tag (small
+    monospace chip) + timestamp; intent text (65-char
+    truncation); 4-node pipeline timeline; footer links
+  - Timeline node states: filled (green ●), in-progress
+    (blue ◎ with pulse animation), failed (red ✗), empty
+    (muted ○). `classifyNode` maps node index → event type;
+    Pipeline node has the most failure modes (failed
+    overrides passed overrides triggered)
+  - Connectors between nodes turn green when both ends are
+    filled; otherwise muted
+  - HH:MM time under each filled node from the event's
+    `createdAt`
+  - `[↗ View PR #N]` link uses `prUrl` + `prNumber` (the PR
+    number appears only when known). `[↗ View deployment]`
+    link uses `deploymentUrl`. Both
+    `target="_blank" rel="noopener noreferrer"`
+
+Verified live against `trackeros`:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt
+- `GET /deployments?projectId=...&limit=20` returned 9 deployments,
+  every one with a real `branch` value (e.g.
+  `gestalt/9c28d399-add-a-titlecase-utility-under`), a real
+  `prUrl` (NoOp adapter produces `noop://pr/<projectId>/<n>`),
+  a real `runId` (`noop-run-9c28d399-<ts>`), and 5 events per
+  cycle in the right order (`pr-opened`,
+  `pipeline-triggered`, `pipeline-passed`, `promoted-staging`,
+  `promoted-production`). Pre-`parseMetadata`-fix the same
+  call returned `"branch":null` for every row
+- **Browser drive (headless Chrome):**
+  - `/app/deployments`: subtitle reads
+    "9 total · 0 in progress · 9 deployed"; each card shows
+    the deployed badge, the branch chip, the timestamp, the
+    truncated intent, and the four-node pipeline (`PR ●
+    PIPELINE ● STAGING ● PRODUCTION ●`) with the green
+    connectors between every filled node, status labels
+    underneath (opened / passed / promoted / deployed), and
+    `08:20 PM` timestamps. Both `View PR #N` and
+    `View deployment` buttons render. Screenshot captured
+  - `/app/agents` first navigation: idle ("No agents
+    running · platform is idle"). Submitted a fresh intent
+    via the in-page API client, refreshed → "1 running"
+    with the intent-agent card showing `1s` elapsed, the
+    intent text quoted and truncated, and `step 0 of 1`
+    (the cycle was on its first agent at the moment of the
+    query). Two pulsing dots in the DOM (the agent ◎ and
+    the connection pill). Screenshot captured
+
+Decisions made:
+- **De-dupe per-correlation lookups in `/status/agents`** via
+  two Maps. A cycle with six concurrent agents would
+  otherwise fire twelve queries (one `intents.findByCorrelationId`
+  and one `executions.findByCorrelationId` per row). With
+  the cache it's two queries per unique correlationId
+- **Drop cycles with no events** in `/deployments` rather
+  than rendering empty cards. A gate-failed intent that
+  never reached pr-agent has no deployment_events but its
+  status is `failed` — the dashboard's Deployments view
+  should not show it. Gate failures live in QualityGate
+- **`metadata.branch` extracted server-side**, not in the
+  dashboard. The route owns the JSONB parse (via
+  `parseMetadata` in the repo) so the dashboard receives a
+  flat `branch: string | null` and doesn't have to do
+  another JSON parse client-side. Keeps the dashboard
+  decoupled from the JSONB shape
+- **Pipeline node has its own state machine.** The other
+  three nodes are a single event type → filled. Pipeline
+  has three possible events (`pipeline-triggered`,
+  `pipeline-passed`, `pipeline-failed`) with priority:
+  `failed` wins, then `passed`, then `triggered` (which
+  maps to in-progress). Captured in `classifyNode`'s
+  index === 1 branch
+- **Old `DeploymentStatus` types kept** for
+  back-compat with `IntentDetail.deploymentStatus`. That
+  field on `IntentDetail` was never populated by any
+  current API path; removing the types would require
+  touching `IntentDetail.tsx` too. Out of scope. Marked
+  with a "delete when IntentDetail stops referencing it"
+  comment so the next cleanup pass picks it up
+
+Build status: `pnpm -r build` clean. Server image rebuilt;
+both views render with real deployment_events + active
+executions data. The JSONB-metadata-as-string bug is fixed
+on the same pattern as the prior alerts + maintenance-runs
+fixes.
+
+No new follow-ups. The old `DeploymentStatus` /
+`PromotionHistoryItem` types are flagged in a code comment
+rather than the Pending enhancements list — they're
+mechanical cleanup that doesn't need design conversation.
+

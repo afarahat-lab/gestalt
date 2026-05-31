@@ -51,6 +51,16 @@ export interface AgentExecutionSummary {
   signalCount: number;
   startedAt: string | null;
   completedAt: string | null;
+  /**
+   * Active-agents enrichment (GET /status/agents only). Lets the
+   * ActiveAgents card show which cycle the agent belongs to,
+   * how far through the plan it is, and a running token total.
+   * Other consumers of `AgentExecutionSummary` (the IntentDetail
+   * timeline) ignore them — they don't need cycle-level aggregates.
+   */
+  intentText?: string | null;
+  cycleProgress?: { completed: number; total: number };
+  tokensSoFar?: number;
 }
 
 export interface IntentDetail extends IntentSummary {
@@ -95,6 +105,54 @@ export interface ArtifactSummary {
 
 // ─── Deployments ──────────────────────────────────────────────────────────────
 
+export type DeploymentEventType =
+  | 'pr-opened'
+  | 'pipeline-triggered'
+  | 'pipeline-passed'
+  | 'pipeline-failed'
+  | 'promoted-staging'
+  | 'promoted-production';
+
+export interface DeploymentEvent {
+  id: string;
+  correlationId: string;
+  intentId: string;
+  eventType: DeploymentEventType;
+  environment: string | null;
+  prUrl: string | null;
+  prNumber: number | null;
+  runId: string | null;
+  deploymentUrl: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+}
+
+/**
+ * One row per intent that has at least one `deployment_events` row,
+ * enriched with the full timeline. Powers the Deployments view's
+ * four-node pipeline timeline (PR → Pipeline → Staging → Production).
+ */
+export interface DeploymentSummary {
+  intentId: string;
+  correlationId: string;
+  intentText: string;
+  status: string;                  // intent status (deploying / deployed / failed)
+  events: DeploymentEvent[];       // ordered ASC by createdAt
+  prUrl: string | null;
+  prNumber: number | null;
+  branch: string | null;
+  runId: string | null;
+  deploymentUrl: string | null;
+  startedAt: string;               // ISO timestamp of first event
+  completedAt: string | null;      // ISO timestamp of last event when status === 'deployed'
+}
+
+/**
+ * Old (Phase-2 aspirational) deployment surface — kept as types for
+ * back-compat with IntentDetail's `IntentDetail.deploymentStatus`
+ * field; not produced by any current API path. Delete when
+ * IntentDetail stops referencing it.
+ */
 export interface DeploymentStatus {
   currentEnvironment: string;
   pendingPromotion: PendingPromotion | null;

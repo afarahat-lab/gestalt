@@ -9,6 +9,7 @@ import type {
   IntentSummary, IntentDetail, Alert, InterventionRequest,
   InterventionRecord, MaintenanceRunSummary, LiveEvent, DashboardUser,
   AgentExecutionSummary, ProjectSummary, SignalSummary,
+  DeploymentSummary,
 } from '../types';
 
 export class DashboardApiClient {
@@ -97,6 +98,15 @@ export class DashboardApiClient {
 
   async getActiveAgents(): Promise<{ data: AgentExecutionSummary[] }> {
     return this.get('/status/agents');
+  }
+
+  // ─── Deployments ───────────────────────────────────────────────────────────
+
+  async listDeployments(params: {
+    projectId: string;
+    limit?: number;
+  }): Promise<{ data: DeploymentSummary[] }> {
+    return this.get('/deployments', params);
   }
 
   // ─── Alerts ────────────────────────────────────────────────────────────────

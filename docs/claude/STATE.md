@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-31 (Claude Code — agent execution logs + IntentDetail accordion)
+**Last updated:** 2026-05-31 (Claude Code — richer ActiveAgents + Deployments views with pipeline timeline)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -147,6 +147,51 @@ the historical record of how the state evolved._
   failed intents had no trace in the dashboard). No status filter
   is applied to `listIntents` — the feed shows the full intent
   timeline for the project
+- **Active Agents card shows intent + cycle progress + tokens.**
+  `GET /status/agents` is enriched per row with `intentText`,
+  `cycleProgress: { completed, total }`, and `tokensSoFar` (the
+  running total across all agents in the cycle so far). Same
+  endpoint, same auth; the dashboard's `ActiveAgents.tsx` now
+  renders each card with the agent role + pulsing ◎, an
+  elapsed-time stamp in the top-right (`1s` / `1m 23s`), the
+  intent text quoted and truncated to 55 chars, a segmented
+  progress bar (one block per planned agent), the
+  `step N of M` label, and the token count. Auto-refresh every
+  5 s plus `agent.started` / `agent.completed` SSE-triggered
+  refresh kept from the previous implementation. Server-side
+  the enrichment de-dupes per-correlation lookups so a
+  multi-agent cycle triggers one `intents.findByCorrelationId`
+  and one `executions.findByCorrelationId` instead of N each
+- **Deployments view renders a 4-node pipeline timeline.** New
+  `GET /deployments?projectId=…&limit=…` returns one row per
+  intent that has at least one `deployment_events` row,
+  enriched with the full event timeline (ASC by `created_at`),
+  `prUrl` / `prNumber` / `branch` (from the `pr-opened` event's
+  metadata) / `runId` / `deploymentUrl`. Three intent statuses
+  scanned in parallel (`deploying`, `deployed`, `failed`);
+  cycles with no events are dropped client-side so a
+  gate-failed intent never reaches an empty card. Dashboard's
+  `Deployments.tsx` renders three sections (In progress /
+  Deployed / Failed) — each card has the status badge, branch
+  tag, timestamp, intent text (65-char truncation), the
+  4-node timeline (PR → Pipeline → Staging → Production)
+  with green ●-filled / muted ○-empty / blue ◎-in-progress /
+  red ✗-failed nodes, green connectors between completed
+  nodes, status labels (opened/passed/promoted/deployed) and
+  HH:MM timestamps under each filled node. Footer has
+  `[↗ View PR #N]` and `[↗ View deployment]` links —
+  `target="_blank" rel="noopener noreferrer"`. Pipeline-failed
+  flips the Pipeline node red; downstream nodes stay muted.
+  Pipeline-triggered (no -passed yet) shows the Pipeline node
+  pulsing blue
+- **Postgres `deployment_events.metadata` JSONB read path
+  patched** to defensively `JSON.parse` when postgres.js
+  returns the column as a string instead of an object. Same
+  pattern as `parseContext` in the alerts repo and
+  `parseFindings` in the maintenance-runs repo. Before this
+  fix the `branch` extraction in `/deployments` returned null
+  for every deployment because `metadata['branch']` against a
+  string is `undefined`
 - **Agent execution logs populated for every agent run, accordion
   in IntentDetail.** Migration 007 added `agent_execution_logs`
   (1:1 with `agent_executions`, FK cascades on delete). All three

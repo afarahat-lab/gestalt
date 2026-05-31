@@ -43,9 +43,48 @@ export async function registerStatusRoutes(app: FastifyInstance): Promise<void> 
   });
 
   // GET /status/agents — active agent detail
+  //
+  // Enriched per request brief: each row includes the intent text (so the
+  // ActiveAgents card can render which cycle the agent belongs to),
+  // cycle progress (completed-or-skipped vs total steps in the plan
+  // so the card can show "step N of M"), and the running token total
+  // across every agent in the cycle.
+  //
+  // De-dupes the per-correlation lookups so a cycle with 6 concurrent
+  // agents triggers one `intents.findByCorrelationId` and one
+  // `executions.findByCorrelationId` instead of six of each.
   app.get('/status/agents', async (_request, reply) => {
-    const { executions } = getRepositories();
+    const { executions, intents } = getRepositories();
     const active = await executions.findActive();
-    return reply.send({ data: active });
+
+    // One unique correlationId may have multiple active agents; cache
+    // both lookups per id.
+    const uniqueCorrIds = Array.from(new Set(active.map((e) => e.correlationId)));
+    const intentCache = new Map<string, string | null>();
+    const cycleCache = new Map<string, Awaited<ReturnType<typeof executions.findByCorrelationId>>>();
+
+    await Promise.all(uniqueCorrIds.map(async (id) => {
+      const [intent, cycle] = await Promise.all([
+        intents.findByCorrelationId(id),
+        executions.findByCorrelationId(id),
+      ]);
+      intentCache.set(id, intent?.text ?? null);
+      cycleCache.set(id, cycle);
+    }));
+
+    const enriched = active.map((exec) => {
+      const cycle = cycleCache.get(exec.correlationId) ?? [];
+      const completed = cycle.filter((e) => e.status === 'completed' || e.status === 'skipped').length;
+      const total = cycle.length;
+      const tokensSoFar = cycle.reduce((sum, e) => sum + (e.tokensUsed ?? 0), 0);
+      return {
+        ...exec,
+        intentText: intentCache.get(exec.correlationId) ?? null,
+        cycleProgress: { completed, total },
+        tokensSoFar,
+      };
+    });
+
+    return reply.send({ data: enriched });
   });
 }
