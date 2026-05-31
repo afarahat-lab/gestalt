@@ -14,7 +14,7 @@ content is derived._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-31 (Claude Code — Maintenance Recent Runs accordion + findings detail panel)
+**Last updated:** 2026-05-31 (Claude Code — context-file maintenance intents take the direct-fix path)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -291,11 +291,16 @@ content is derived._
     against the most recent commit timestamp on the global context
     files; for modules drifted by > 7 days appends a timestamped HTML
     comment to `docs/DOMAIN.md` (ADR-018 additive-only exception, direct
-    commit + push) and queues a `CONTEXT_UPDATE` MaintenanceIntent
+    commit + push) and queues a `CONTEXT_UPDATE` MaintenanceIntent that
+    the runner routes through the **context-fixer direct-fix path** —
+    one LLM-driven minimal additive edit per intent, committed directly
+    to `defaultBranch`. See the "Maintenance intent routing" bullet below
   - **alignment-agent** (daily 03:00 UTC) — reads context files,
     cross-checks DOMAIN.md entities ↔ ARCHITECTURE.md modules, and
     GP-NNN cross-references in AGENTS.md; queues `CONTEXT_ALIGNMENT`
-    intents per misalignment
+    intents per misalignment. Same routing — the runner sends them
+    through the context-fixer rather than the generate loop because
+    the test-agent can't generate tests for a markdown edit
   - **gc-agent** (weekly Fri 04:00 UTC) — deletes remote `gestalt/*`
     branches older than 30 days, `.gestalt/*` spec files older than 90
     days (committed deletion), and `deployment_events` rows older than
@@ -307,10 +312,48 @@ content is derived._
     any candidate whose `[gestalt-maintenance/<type>]` prefix already
     appears on an open intent (status `pending` / `generating`)
   - All four agents share a runner (`runMaintenanceAgent`) that creates
-    a `maintenance_runs` row, dispatches queued intents into the
-    `gestalt-generate` queue with `source: 'maintenance-agent'` and the
-    operator-supplied `suggestedAction` as intent text, updates the row
-    on completion, and emits a `maintenance.run-completed` SSE event
+    a `maintenance_runs` row, routes each queued `MaintenanceIntent`
+    based on its class (see "Maintenance intent routing" below),
+    updates the row on completion, and emits a
+    `maintenance.run-completed` SSE event
+  - **Maintenance intent routing (ADR-018).** Every
+    `MaintenanceIntent` is classified by
+    `classifyMaintenanceIntent(type)`:
+    - `'context-file-update'` (`CONTEXT_ALIGNMENT` / `CONTEXT_UPDATE`)
+      → the runner calls `applyContextFileFix(intent, project)` in-
+      process; the **context-fixer** clones the repo to a temp dir,
+      calls the LLM with a "minimal additive edit" prompt + the
+      current file content + the finding evidence + the suggested
+      action, validates the result against a **truncation guard**
+      (output must be ≥ 50% of original length — short output is
+      refused as suspected LLM truncation), writes the file, commits
+      as `docs: <suggestedAction (prefix stripped, 72-char cap)>
+      [gestalt-maintenance/<TYPE>]` authored by
+      `Gestalt Maintenance Agent <maintenance-agent@gestalt.local>`,
+      and pushes to `defaultBranch`. Each successful commit
+      increments `directFixes` on the run record and appends a
+      `direct-fix-applied` finding (commit-sha lifted out for the
+      operator). Path guard hard-throws BEFORE any clone or LLM call
+      if `intent.affectedFiles[0]` is not in `docs/*` or exactly
+      `AGENTS.md` — ADR-018 forbids the direct-fix path from
+      touching `src/`. Temp dir cleaned in `finally`
+    - `'code-change'` (`PERFORMANCE_DEGRADATION` / `SECURITY_FINDING`)
+      → unchanged: the runner writes an `intents` row
+      (`source: 'maintenance-agent'`) and dispatches a
+      `generate:intent` BullMQ task. The generate orchestrator
+      handles these like any human-submitted intent with the full
+      generate → gate → deploy loop
+    - Live verified on `trackeros`: a manual alignment-agent trigger
+      produced 6 findings; the runner classified all 6 as
+      `context-file-update` and applied 6 direct fixes (4 to
+      `docs/DOMAIN.md`, 2 to `AGENTS.md`) in ~32 s wall-clock.
+      `intentsQueued: 0`, `directFixes: 6` on the run record;
+      6 new commits on `main` authored by `Gestalt Maintenance Agent`;
+      every commit subject starts with `docs:` and ends with
+      `[gestalt-maintenance/CONTEXT_ALIGNMENT]`. A second run
+      applied 4 more fixes for the entity findings (the GP-NNN
+      findings were resolved by the first run's AGENTS.md edits
+      and so were absent the second time)
   - Manual operator trigger via `POST /maintenance/trigger { agentRole,
     projectId }` (requireRole operator); same runner code path as the
     cron schedules
@@ -637,106 +680,6 @@ content is derived._
 
 ## Recent session log entries (last 3 from SESSION_LOG.md)
 
-### Session 2026-05-31 — Claude Code (consolidated postgres JSONB parser into shared parseJsonb)
-
-Refactor only. Pre-fix: three repo-local helpers (`parseContext`
-in alerts, `parseFindings` in maintenance-runs, `parseMetadata` in
-deployment-events) all solved the same problem — postgres.js can
-return JSONB as either a parsed JS value or a raw JSON-encoded
-string, and the read path has to defend against both. Every time
-a new JSONB column landed on the schema (latest: deployment_events
-`metadata` in the prior session) the same fix had to be copy-
-pasted, and the JSON-shape-rejection logic (object vs array) drifted
-slightly between the three.
-
-Changed:
-- `packages/adapters/postgres/src/utils.ts` (new): shared
-  `parseJsonb<T>(value: unknown, fallback: T): T`. Returns the
-  fallback on null/undefined input, on non-string non-object
-  input, on a `JSON.parse` failure, and on a parsed value whose
-  shape doesn't match the fallback's. Shape is inferred from
-  `fallback`: array fallback → only accept arrays (preserves the
-  prior `parseFindings` "non-array → []" rule); non-null object
-  fallback → accept any non-null object including arrays
-  (preserves `parseContext` / `parseMetadata`). Signature note
-  in the JSDoc — the user's brief sketched
-  `parseJsonb<T>(value): T`, but a single-arg version can't
-  carry shape information to runtime, so `fallback: T` was
-  added; the three call sites are still one line each
-- `packages/adapters/postgres/src/repositories/alerts.ts`:
-  removed local `parseContext` helper. `rowToRecord` now calls
-  `parseJsonb<Record<string, unknown>>(row.context, {})`. Same
-  result on every input the prior helper handled
-- `packages/adapters/postgres/src/repositories/deployment-events.ts`:
-  removed local `parseMetadata` helper. `rowToRecord` now calls
-  `parseJsonb<Record<string, unknown>>(row.metadata, {})`. The
-  Deployments view's branch chip (extracted from
-  `pr-opened.metadata['branch']`) continues to work
-- `packages/adapters/postgres/src/repositories/maintenance-runs.ts`:
-  removed local `parseFindings` helper. `rowToRecord` now calls
-  `parseJsonb<MaintenanceFinding[]>(row.findings, [])`. The
-  array fallback tells the helper to reject non-array parsed
-  values, preserving the legacy `Array.isArray(parsed) ? parsed
-  : []` rule
-
-Verified live (refactor must preserve every read path):
-- `pnpm -r build` clean across all 12 packages; `tsc` happy
-  with the new generic
-- Server image rebuilt
-- `GET /deployments?projectId=…&limit=2` returned both
-  recent cycles with `branch` populated as real strings
-  (`'gestalt/45b71ffc-add-a-humanreadable-bytes-formatter'`,
-  `'gestalt/9c28d399-add-a-titlecase-utility-under'`). Pre-
-  refactor and pre-fix: this was `null`. Post-refactor: still
-  populated correctly
-- `GET /maintenance/runs?limit=4` returned 4 runs with
-  `findings` rendered as real JS arrays (length 0 for the
-  recent evaluation-agent / drift-agent runs that had no
-  findings to record). Pre-refactor: also worked. Confirmed
-  the array-shape rejection path still functions
-- `GET /alerts/<acknowledged-id>` (direct fetch on a
-  previously-acknowledged clarification alert) returned
-  `context` as a real object with the original `intentId` +
-  `suggestions[3]` keys intact. Pre-refactor: also worked.
-  Confirmed the object-shape acceptance path still functions
-
-Decisions made:
-- **`parseJsonb<T>(value, fallback)`, not the brief's
-  single-arg `parseJsonb<T>(value)`.** The brief said "no
-  behaviour change". A single-arg generic helper can't preserve
-  the per-repo shape-rejection logic — `parseFindings` rejected
-  non-array parsed JSON (returned `[]`); `parseContext` and
-  `parseMetadata` rejected non-object parsed JSON (returned
-  `{}`). Without runtime shape information the helper can't
-  pick the right rejection rule. Adding `fallback: T` carries
-  the shape implicitly (via `Array.isArray(fallback)`) AND
-  gives the caller a typed, non-null return value. JSDoc on
-  the helper documents the deviation
-- **Object fallback accepts arrays.** Mirrors the previous
-  `parseContext` behaviour exactly — `typeof === 'object' &&
-  !== null` is true for arrays. If a caller passes `{}` as
-  fallback and the column holds an array, they get the array
-  back as a cast. None of the three current callers exercise
-  this path, but documenting it now prevents the next JSONB
-  column from being surprised
-- **Did NOT introduce a generic `parsedShapeMatches(T)` type
-  guard.** Could have built a richer signature with a
-  user-supplied predicate; over-engineered for three call
-  sites that all want either "is array" or "is non-null
-  object". The `matchesShape(value, fallback)` two-line
-  helper does exactly what's needed and is readable at the
-  glance the next reviewer will give it
-
-Build status: `pnpm -r build` clean. No behaviour change at
-any of the three read paths.
-
-No follow-ups. The shared helper is the canonical answer for
-the next JSONB column; the per-row `::jsonb` cast on the WRITE
-path remains the matching write-side defence (see the
-maintenance-runs and alerts repos).
-
----
-
 ### Session 2026-05-31 — Claude Code (Maintenance view: Recent Runs populated + Run now error UX)
 
 Two adjacent dashboard bugs in the Maintenance view, both rooted
@@ -1059,4 +1002,205 @@ findings render correctly in the live browser; DOM probe
 confirms every expected element shape.
 
 No follow-ups added — feature is self-contained.
+
+---
+
+### Session 2026-05-31 — Claude Code (context-file maintenance intents take the direct-fix path)
+
+Fixed a long-standing routing bug in the maintenance layer. Both
+`alignment-agent` and `drift-agent` queue `CONTEXT_ALIGNMENT` /
+`CONTEXT_UPDATE` intents whose suggested-action text is a *documentation
+instruction* ("Update AGENTS.md to reference GP-003 …"). Previously the
+runner unconditionally dispatched every queued intent into the generate
+queue. The generate loop is the wrong tool — design-agent has no
+architecture to design, code-agent produces nothing actionable, and
+test-agent has nothing to test. Cycles either failed silently or burned
+LLM budget producing no value. ADR-018 explicitly permits maintenance
+agents to apply direct fixes for additive context-file edits; this
+session wires that path through the runner.
+
+Changed:
+- `packages/agents/maintenance/src/types.ts`:
+  - New `MaintenanceIntentClass` union
+    (`'context-file-update' | 'code-change'`) + a pure switch
+    `classifyMaintenanceIntent(type)` that maps `CONTEXT_UPDATE` /
+    `CONTEXT_ALIGNMENT` → `'context-file-update'` and
+    `PERFORMANCE_DEGRADATION` / `SECURITY_FINDING` → `'code-change'`.
+    Both exported from the package's public surface
+- `packages/agents/maintenance/src/agents/context-fixer.ts` (new):
+  - `applyContextFileFix(intent, project)` — the direct-fix path.
+    Signature returns
+    `{ committed: boolean; commitSha?: string; reason?: 'no-change' |
+    'truncation-guard' | 'file-missing' | 'llm-error' }` so the
+    runner can branch on the outcome without catching the success
+    case as an error
+  - **Path guard runs BEFORE the clone OR the LLM call.** If
+    `intent.affectedFiles[0]` is not in `docs/*` and is not exactly
+    `AGENTS.md`, throws with a clear ADR-018 reference. Empty
+    `affectedFiles` also throws. ADR-018 forbids the direct-fix path
+    from touching `src/`; the guard makes that structural
+  - Clone via `simple-git` to a `mkdtemp` dir; checkout
+    `defaultBranch` (best-effort — a brand-new repo may have an
+    unborn branch); read the target file, return `file-missing`
+    cleanly if not present
+  - LLM prompt: system message instructs "preserve all existing
+    content … return the complete updated file content with no
+    commentary or fences"; user message includes the current
+    content wrapped in `<<<FILE` / `FILE>>>` markers + the
+    finding's `evidence` + the `suggestedAction` (maintenance
+    prefix stripped). `getLLMClient().complete()` with
+    `maxTokens: 8192`, `temperature: 0.2`,
+    `correlationId: 'ctxfix-<projectId>-<TYPE>'`. Defensive
+    `stripFences` on the response just in case
+  - **Truncation guard.** If the LLM-generated content is shorter
+    than 50% of the original, log a warning and return
+    `{ committed: false, reason: 'truncation-guard' }`. The most
+    common LLM failure mode for "return the full file" tasks is to
+    return only the delta or a summary; the guard catches that
+    before the wrong content reaches Git
+  - No-op short-circuits — `newContent === currentContent` and
+    `repo.status().files.length === 0` both return cleanly without
+    a commit
+  - Commit author is `Gestalt Maintenance Agent
+    <maintenance-agent@gestalt.local>`; subject is
+    `docs: <cleanSubject (72-char cap)>
+    [gestalt-maintenance/<TYPE>]` so
+    `git log --grep='[gestalt-maintenance]'` enumerates every
+    direct-fix commit. Push goes to `defaultBranch`. Temp dir
+    cleaned in `finally` on every path
+- `packages/agents/maintenance/src/runner/index.ts`:
+  - Imports `classifyMaintenanceIntent` and `applyContextFileFix`
+  - In the per-project loop, replaced the unconditional
+    `dispatchMaintenanceIntent(intent)` call with a switch on
+    `classifyMaintenanceIntent(intent.type)`:
+    - `'context-file-update'`: call `applyContextFileFix` in-process;
+      on success, increment `totalDirectFixes` and append a typed
+      `direct-fix-applied` finding (with commit-sha lifted out for
+      the operator). On thrown failure, append a typed
+      `direct-fix-failed` finding (`severity: 'high'`,
+      `suggestedAction: 'Check server logs for the full error and
+      apply the fix manually.'`) and continue — one fix failing
+      should not blow up an alignment-agent run with 6 candidates.
+      On non-thrown skip (`reason !== undefined`), log at info and
+      continue
+    - `'code-change'`: unchanged path through
+      `dispatchMaintenanceIntent` (writes an `intents` row + a
+      `generate:intent` BullMQ task)
+  - `dispatchMaintenanceIntent` is now only called for code-change
+    intents
+- `packages/agents/maintenance/src/index.ts`:
+  - Re-exports `applyContextFileFix` + types so tests / advanced
+    wiring can call it without going through the runner
+  - Re-exports `MaintenanceIntentClass` + `classifyMaintenanceIntent`
+- The alignment-agent and drift-agent themselves are unchanged —
+  they already accumulated `intentsQueued: MaintenanceIntent[]` and
+  returned it (they never called `dispatch()` directly). The brief's
+  "Change 4" (turn the agents into pure detectors) was already true
+  in the codebase
+
+Verified live against `trackeros`:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt; `Up (healthy)`. Pre-trigger `main` HEAD on
+  GitHub: `7feaf3d9`
+- **First manual trigger** of alignment-agent via
+  `POST /maintenance/trigger`. Response shape:
+  ```
+  status: completed
+  intentsQueued: 0          (was 6 before this session)
+  directFixes:   6          (was 0 before this session)
+  findings:     12          (6 alignment findings + 6 direct-fix-applied)
+  durationMs:    ~32 s
+  ```
+- Server logs show the expected sequence: `Applying direct context
+  fix` × 6 / `Direct context fix committed` × 6, all from the
+  `module: "context-fixer"` logger, with no errors or warnings.
+  Each fix took 5–7 s end-to-end (clone + LLM call + commit + push)
+- Post-trigger `main` HEAD: `46cace91`. Re-cloning the repo
+  anonymously shows 6 new commits on top of `7feaf3d9` in the
+  expected order, each authored by `Gestalt Maintenance Agent
+  <maintenance-agent@gestalt.local>`, each with a subject starting
+  `docs:` and a `[gestalt-maintenance/CONTEXT_ALIGNMENT]` trailer:
+  - 4 commits to `docs/DOMAIN.md` (1–2 line additive tweaks for
+    the four `entity-without-module` findings: `components`,
+    `type`, `description`, `props`)
+  - 2 commits to `AGENTS.md` (1-line additions adding `GP-003`
+    and `GP-004` references for the orphan-principle findings)
+- **Second manual trigger** to confirm the routing holds and that
+  prior fixes carried through: `intentsQueued: 0`,
+  `directFixes: 4` (the entity findings re-fire because the
+  regex extractor still finds them in DOMAIN.md after the LLM's
+  minimal edits — the LLM chose to refine descriptions rather
+  than remove the entities; the GP-003 / GP-004 findings did NOT
+  re-fire because the first run's AGENTS.md edits resolved them
+  permanently). Four additional commits on `main`, same shape.
+  The path guard, truncation guard, no-change short-circuit, and
+  Git author config all continued to work as designed
+- Final `main` HEAD: `af8d5747`. Ten total
+  `[gestalt-maintenance]` commits landed in the two runs
+- The Maintenance dashboard view already renders both stats
+  (`intents queued` + `fixes applied`); no UI change was needed.
+  The dashboard now shows `0 intents queued · 6 fixes applied
+  · 32.1 s` on the post-fix runs, which is exactly the correct
+  reading
+
+Decisions made:
+- **Path guard runs BEFORE the clone**, not before the LLM call only.
+  Cloning a multi-MB repo to attempt a fix to a file the path guard
+  would reject anyway is pointless. The guard's purpose — "this code
+  path will never touch src/" — is best expressed by failing as
+  early as possible. The LLM call is bypassed as a consequence
+- **`MaintenanceIntent.affectedFiles[0]` is the canonical target.**
+  Every existing call site for `CONTEXT_ALIGNMENT` / `CONTEXT_UPDATE`
+  puts the file to *update* in slot 0 and the file *to compare
+  against* in slot 1 (alignment-agent's three branches: DOMAIN.md
+  first / ARCHITECTURE.md first / AGENTS.md first, depending on
+  which side has the orphan). Documented in the agent's signal
+  generation code. The fixer treats slot 0 as the authority
+- **Truncation floor 50%** matches the brief. Empirically, even
+  the most minimal LLM additive edit to a typical context file
+  produces output > 95% of the original length (you have to copy
+  the whole file just to add one line). 50% is generous against
+  legitimate edits and decisive against "the LLM returned only
+  the new section" failures
+- **No-op short-circuits return reasons, not throws.** The runner
+  needs to log "fix-not-needed" cases as info, not as errors —
+  treating "the LLM happened to produce the same content" as a
+  failure would noise the alerts view. The `reason: 'no-change'`
+  / `'file-missing'` / `'truncation-guard'` / `'llm-error'` union
+  gives the runner enough to record cleanly without an exception
+  catch
+- **`direct-fix-applied` and `direct-fix-failed` are surfaced as
+  `MaintenanceFinding` rows on the run.** The dashboard's
+  per-run findings panel already renders them — they show up
+  alongside the original alignment findings so the operator can
+  see the full causal chain in one expanded panel. `severity:
+  'low'` on applied (informational) and `severity: 'high'` on
+  failed (operator needs to intervene)
+- **Commit author is `Gestalt Maintenance Agent`.** drift-agent's
+  pre-existing additive-note path uses `Gestalt Drift Agent`;
+  consistent naming pattern. Email is `*@gestalt.local`, same
+  as drift-agent — the platform doesn't talk to a real mail
+  server so the local TLD is fine
+- **Failures are per-intent, not per-run.** A single intent failing
+  (LLM error, push rejected, etc.) records a `direct-fix-failed`
+  finding and continues to the next intent. The brief's "alignment
+  agent produces 6 findings → 6 fixes" pattern only works if one
+  bad fix doesn't abort the other 5. A try/catch around each
+  applyContextFileFix call gives us that
+- **`PERFORMANCE_DEGRADATION` / `SECURITY_FINDING` continue to
+  flow through the generate orchestrator unchanged.** These need
+  real code changes, real tests, real review — the generate →
+  gate → deploy loop is correct for them. The classification
+  switch is the *only* control flow change in the runner; the
+  legacy `dispatchMaintenanceIntent` is still called for those
+  cases
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; manual triggers verified end-to-end.
+Pending alignment-agent regex tightening (already on the
+follow-ups list) would reduce repeat fixes per run, but the
+routing fix is correct independently.
+
+No new follow-ups added — feature is self-contained and lives
+behind the existing ADR-018 / classification surface.
 

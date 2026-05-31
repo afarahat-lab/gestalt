@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-31 (Claude Code — Maintenance Recent Runs accordion + findings detail panel)
+**Last updated:** 2026-05-31 (Claude Code — context-file maintenance intents take the direct-fix path)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -285,11 +285,16 @@ the historical record of how the state evolved._
     against the most recent commit timestamp on the global context
     files; for modules drifted by > 7 days appends a timestamped HTML
     comment to `docs/DOMAIN.md` (ADR-018 additive-only exception, direct
-    commit + push) and queues a `CONTEXT_UPDATE` MaintenanceIntent
+    commit + push) and queues a `CONTEXT_UPDATE` MaintenanceIntent that
+    the runner routes through the **context-fixer direct-fix path** —
+    one LLM-driven minimal additive edit per intent, committed directly
+    to `defaultBranch`. See the "Maintenance intent routing" bullet below
   - **alignment-agent** (daily 03:00 UTC) — reads context files,
     cross-checks DOMAIN.md entities ↔ ARCHITECTURE.md modules, and
     GP-NNN cross-references in AGENTS.md; queues `CONTEXT_ALIGNMENT`
-    intents per misalignment
+    intents per misalignment. Same routing — the runner sends them
+    through the context-fixer rather than the generate loop because
+    the test-agent can't generate tests for a markdown edit
   - **gc-agent** (weekly Fri 04:00 UTC) — deletes remote `gestalt/*`
     branches older than 30 days, `.gestalt/*` spec files older than 90
     days (committed deletion), and `deployment_events` rows older than
@@ -301,10 +306,48 @@ the historical record of how the state evolved._
     any candidate whose `[gestalt-maintenance/<type>]` prefix already
     appears on an open intent (status `pending` / `generating`)
   - All four agents share a runner (`runMaintenanceAgent`) that creates
-    a `maintenance_runs` row, dispatches queued intents into the
-    `gestalt-generate` queue with `source: 'maintenance-agent'` and the
-    operator-supplied `suggestedAction` as intent text, updates the row
-    on completion, and emits a `maintenance.run-completed` SSE event
+    a `maintenance_runs` row, routes each queued `MaintenanceIntent`
+    based on its class (see "Maintenance intent routing" below),
+    updates the row on completion, and emits a
+    `maintenance.run-completed` SSE event
+  - **Maintenance intent routing (ADR-018).** Every
+    `MaintenanceIntent` is classified by
+    `classifyMaintenanceIntent(type)`:
+    - `'context-file-update'` (`CONTEXT_ALIGNMENT` / `CONTEXT_UPDATE`)
+      → the runner calls `applyContextFileFix(intent, project)` in-
+      process; the **context-fixer** clones the repo to a temp dir,
+      calls the LLM with a "minimal additive edit" prompt + the
+      current file content + the finding evidence + the suggested
+      action, validates the result against a **truncation guard**
+      (output must be ≥ 50% of original length — short output is
+      refused as suspected LLM truncation), writes the file, commits
+      as `docs: <suggestedAction (prefix stripped, 72-char cap)>
+      [gestalt-maintenance/<TYPE>]` authored by
+      `Gestalt Maintenance Agent <maintenance-agent@gestalt.local>`,
+      and pushes to `defaultBranch`. Each successful commit
+      increments `directFixes` on the run record and appends a
+      `direct-fix-applied` finding (commit-sha lifted out for the
+      operator). Path guard hard-throws BEFORE any clone or LLM call
+      if `intent.affectedFiles[0]` is not in `docs/*` or exactly
+      `AGENTS.md` — ADR-018 forbids the direct-fix path from
+      touching `src/`. Temp dir cleaned in `finally`
+    - `'code-change'` (`PERFORMANCE_DEGRADATION` / `SECURITY_FINDING`)
+      → unchanged: the runner writes an `intents` row
+      (`source: 'maintenance-agent'`) and dispatches a
+      `generate:intent` BullMQ task. The generate orchestrator
+      handles these like any human-submitted intent with the full
+      generate → gate → deploy loop
+    - Live verified on `trackeros`: a manual alignment-agent trigger
+      produced 6 findings; the runner classified all 6 as
+      `context-file-update` and applied 6 direct fixes (4 to
+      `docs/DOMAIN.md`, 2 to `AGENTS.md`) in ~32 s wall-clock.
+      `intentsQueued: 0`, `directFixes: 6` on the run record;
+      6 new commits on `main` authored by `Gestalt Maintenance Agent`;
+      every commit subject starts with `docs:` and ends with
+      `[gestalt-maintenance/CONTEXT_ALIGNMENT]`. A second run
+      applied 4 more fixes for the entity findings (the GP-NNN
+      findings were resolved by the first run's AGENTS.md edits
+      and so were absent the second time)
   - Manual operator trigger via `POST /maintenance/trigger { agentRole,
     projectId }` (requireRole operator); same runner code path as the
     cron schedules

@@ -24,6 +24,31 @@ export type MaintenanceIntentType =
   | 'PERFORMANCE_DEGRADATION'  // evaluation-agent: metrics threshold breached
   | 'SECURITY_FINDING';        // evaluation-agent: security signal from monitoring
 
+/**
+ * Maintenance intents split into two routing classes (ADR-018):
+ *
+ *   - `context-file-update` — additive docs-only fixes that the
+ *     maintenance layer applies *directly* to `defaultBranch` via the
+ *     context-fixer. The generate → gate → deploy loop is the wrong
+ *     tool for a markdown edit (the test-agent has nothing to test,
+ *     the gate's constraint regex finds nothing actionable).
+ *   - `code-change` — performance + security findings that need a
+ *     code change and full review. These continue to flow through the
+ *     generate orchestrator like every human-submitted intent.
+ */
+export type MaintenanceIntentClass = 'context-file-update' | 'code-change';
+
+export function classifyMaintenanceIntent(type: MaintenanceIntentType): MaintenanceIntentClass {
+  switch (type) {
+    case 'CONTEXT_UPDATE':
+    case 'CONTEXT_ALIGNMENT':
+      return 'context-file-update';
+    case 'PERFORMANCE_DEGRADATION':
+    case 'SECURITY_FINDING':
+      return 'code-change';
+  }
+}
+
 export type MaintenancePriority = 'critical' | 'high' | 'normal' | 'low';
 
 export interface MaintenanceIntent {

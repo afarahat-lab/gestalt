@@ -3267,3 +3267,204 @@ confirms every expected element shape.
 
 No follow-ups added — feature is self-contained.
 
+---
+
+### Session 2026-05-31 — Claude Code (context-file maintenance intents take the direct-fix path)
+
+Fixed a long-standing routing bug in the maintenance layer. Both
+`alignment-agent` and `drift-agent` queue `CONTEXT_ALIGNMENT` /
+`CONTEXT_UPDATE` intents whose suggested-action text is a *documentation
+instruction* ("Update AGENTS.md to reference GP-003 …"). Previously the
+runner unconditionally dispatched every queued intent into the generate
+queue. The generate loop is the wrong tool — design-agent has no
+architecture to design, code-agent produces nothing actionable, and
+test-agent has nothing to test. Cycles either failed silently or burned
+LLM budget producing no value. ADR-018 explicitly permits maintenance
+agents to apply direct fixes for additive context-file edits; this
+session wires that path through the runner.
+
+Changed:
+- `packages/agents/maintenance/src/types.ts`:
+  - New `MaintenanceIntentClass` union
+    (`'context-file-update' | 'code-change'`) + a pure switch
+    `classifyMaintenanceIntent(type)` that maps `CONTEXT_UPDATE` /
+    `CONTEXT_ALIGNMENT` → `'context-file-update'` and
+    `PERFORMANCE_DEGRADATION` / `SECURITY_FINDING` → `'code-change'`.
+    Both exported from the package's public surface
+- `packages/agents/maintenance/src/agents/context-fixer.ts` (new):
+  - `applyContextFileFix(intent, project)` — the direct-fix path.
+    Signature returns
+    `{ committed: boolean; commitSha?: string; reason?: 'no-change' |
+    'truncation-guard' | 'file-missing' | 'llm-error' }` so the
+    runner can branch on the outcome without catching the success
+    case as an error
+  - **Path guard runs BEFORE the clone OR the LLM call.** If
+    `intent.affectedFiles[0]` is not in `docs/*` and is not exactly
+    `AGENTS.md`, throws with a clear ADR-018 reference. Empty
+    `affectedFiles` also throws. ADR-018 forbids the direct-fix path
+    from touching `src/`; the guard makes that structural
+  - Clone via `simple-git` to a `mkdtemp` dir; checkout
+    `defaultBranch` (best-effort — a brand-new repo may have an
+    unborn branch); read the target file, return `file-missing`
+    cleanly if not present
+  - LLM prompt: system message instructs "preserve all existing
+    content … return the complete updated file content with no
+    commentary or fences"; user message includes the current
+    content wrapped in `<<<FILE` / `FILE>>>` markers + the
+    finding's `evidence` + the `suggestedAction` (maintenance
+    prefix stripped). `getLLMClient().complete()` with
+    `maxTokens: 8192`, `temperature: 0.2`,
+    `correlationId: 'ctxfix-<projectId>-<TYPE>'`. Defensive
+    `stripFences` on the response just in case
+  - **Truncation guard.** If the LLM-generated content is shorter
+    than 50% of the original, log a warning and return
+    `{ committed: false, reason: 'truncation-guard' }`. The most
+    common LLM failure mode for "return the full file" tasks is to
+    return only the delta or a summary; the guard catches that
+    before the wrong content reaches Git
+  - No-op short-circuits — `newContent === currentContent` and
+    `repo.status().files.length === 0` both return cleanly without
+    a commit
+  - Commit author is `Gestalt Maintenance Agent
+    <maintenance-agent@gestalt.local>`; subject is
+    `docs: <cleanSubject (72-char cap)>
+    [gestalt-maintenance/<TYPE>]` so
+    `git log --grep='[gestalt-maintenance]'` enumerates every
+    direct-fix commit. Push goes to `defaultBranch`. Temp dir
+    cleaned in `finally` on every path
+- `packages/agents/maintenance/src/runner/index.ts`:
+  - Imports `classifyMaintenanceIntent` and `applyContextFileFix`
+  - In the per-project loop, replaced the unconditional
+    `dispatchMaintenanceIntent(intent)` call with a switch on
+    `classifyMaintenanceIntent(intent.type)`:
+    - `'context-file-update'`: call `applyContextFileFix` in-process;
+      on success, increment `totalDirectFixes` and append a typed
+      `direct-fix-applied` finding (with commit-sha lifted out for
+      the operator). On thrown failure, append a typed
+      `direct-fix-failed` finding (`severity: 'high'`,
+      `suggestedAction: 'Check server logs for the full error and
+      apply the fix manually.'`) and continue — one fix failing
+      should not blow up an alignment-agent run with 6 candidates.
+      On non-thrown skip (`reason !== undefined`), log at info and
+      continue
+    - `'code-change'`: unchanged path through
+      `dispatchMaintenanceIntent` (writes an `intents` row + a
+      `generate:intent` BullMQ task)
+  - `dispatchMaintenanceIntent` is now only called for code-change
+    intents
+- `packages/agents/maintenance/src/index.ts`:
+  - Re-exports `applyContextFileFix` + types so tests / advanced
+    wiring can call it without going through the runner
+  - Re-exports `MaintenanceIntentClass` + `classifyMaintenanceIntent`
+- The alignment-agent and drift-agent themselves are unchanged —
+  they already accumulated `intentsQueued: MaintenanceIntent[]` and
+  returned it (they never called `dispatch()` directly). The brief's
+  "Change 4" (turn the agents into pure detectors) was already true
+  in the codebase
+
+Verified live against `trackeros`:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt; `Up (healthy)`. Pre-trigger `main` HEAD on
+  GitHub: `7feaf3d9`
+- **First manual trigger** of alignment-agent via
+  `POST /maintenance/trigger`. Response shape:
+  ```
+  status: completed
+  intentsQueued: 0          (was 6 before this session)
+  directFixes:   6          (was 0 before this session)
+  findings:     12          (6 alignment findings + 6 direct-fix-applied)
+  durationMs:    ~32 s
+  ```
+- Server logs show the expected sequence: `Applying direct context
+  fix` × 6 / `Direct context fix committed` × 6, all from the
+  `module: "context-fixer"` logger, with no errors or warnings.
+  Each fix took 5–7 s end-to-end (clone + LLM call + commit + push)
+- Post-trigger `main` HEAD: `46cace91`. Re-cloning the repo
+  anonymously shows 6 new commits on top of `7feaf3d9` in the
+  expected order, each authored by `Gestalt Maintenance Agent
+  <maintenance-agent@gestalt.local>`, each with a subject starting
+  `docs:` and a `[gestalt-maintenance/CONTEXT_ALIGNMENT]` trailer:
+  - 4 commits to `docs/DOMAIN.md` (1–2 line additive tweaks for
+    the four `entity-without-module` findings: `components`,
+    `type`, `description`, `props`)
+  - 2 commits to `AGENTS.md` (1-line additions adding `GP-003`
+    and `GP-004` references for the orphan-principle findings)
+- **Second manual trigger** to confirm the routing holds and that
+  prior fixes carried through: `intentsQueued: 0`,
+  `directFixes: 4` (the entity findings re-fire because the
+  regex extractor still finds them in DOMAIN.md after the LLM's
+  minimal edits — the LLM chose to refine descriptions rather
+  than remove the entities; the GP-003 / GP-004 findings did NOT
+  re-fire because the first run's AGENTS.md edits resolved them
+  permanently). Four additional commits on `main`, same shape.
+  The path guard, truncation guard, no-change short-circuit, and
+  Git author config all continued to work as designed
+- Final `main` HEAD: `af8d5747`. Ten total
+  `[gestalt-maintenance]` commits landed in the two runs
+- The Maintenance dashboard view already renders both stats
+  (`intents queued` + `fixes applied`); no UI change was needed.
+  The dashboard now shows `0 intents queued · 6 fixes applied
+  · 32.1 s` on the post-fix runs, which is exactly the correct
+  reading
+
+Decisions made:
+- **Path guard runs BEFORE the clone**, not before the LLM call only.
+  Cloning a multi-MB repo to attempt a fix to a file the path guard
+  would reject anyway is pointless. The guard's purpose — "this code
+  path will never touch src/" — is best expressed by failing as
+  early as possible. The LLM call is bypassed as a consequence
+- **`MaintenanceIntent.affectedFiles[0]` is the canonical target.**
+  Every existing call site for `CONTEXT_ALIGNMENT` / `CONTEXT_UPDATE`
+  puts the file to *update* in slot 0 and the file *to compare
+  against* in slot 1 (alignment-agent's three branches: DOMAIN.md
+  first / ARCHITECTURE.md first / AGENTS.md first, depending on
+  which side has the orphan). Documented in the agent's signal
+  generation code. The fixer treats slot 0 as the authority
+- **Truncation floor 50%** matches the brief. Empirically, even
+  the most minimal LLM additive edit to a typical context file
+  produces output > 95% of the original length (you have to copy
+  the whole file just to add one line). 50% is generous against
+  legitimate edits and decisive against "the LLM returned only
+  the new section" failures
+- **No-op short-circuits return reasons, not throws.** The runner
+  needs to log "fix-not-needed" cases as info, not as errors —
+  treating "the LLM happened to produce the same content" as a
+  failure would noise the alerts view. The `reason: 'no-change'`
+  / `'file-missing'` / `'truncation-guard'` / `'llm-error'` union
+  gives the runner enough to record cleanly without an exception
+  catch
+- **`direct-fix-applied` and `direct-fix-failed` are surfaced as
+  `MaintenanceFinding` rows on the run.** The dashboard's
+  per-run findings panel already renders them — they show up
+  alongside the original alignment findings so the operator can
+  see the full causal chain in one expanded panel. `severity:
+  'low'` on applied (informational) and `severity: 'high'` on
+  failed (operator needs to intervene)
+- **Commit author is `Gestalt Maintenance Agent`.** drift-agent's
+  pre-existing additive-note path uses `Gestalt Drift Agent`;
+  consistent naming pattern. Email is `*@gestalt.local`, same
+  as drift-agent — the platform doesn't talk to a real mail
+  server so the local TLD is fine
+- **Failures are per-intent, not per-run.** A single intent failing
+  (LLM error, push rejected, etc.) records a `direct-fix-failed`
+  finding and continues to the next intent. The brief's "alignment
+  agent produces 6 findings → 6 fixes" pattern only works if one
+  bad fix doesn't abort the other 5. A try/catch around each
+  applyContextFileFix call gives us that
+- **`PERFORMANCE_DEGRADATION` / `SECURITY_FINDING` continue to
+  flow through the generate orchestrator unchanged.** These need
+  real code changes, real tests, real review — the generate →
+  gate → deploy loop is correct for them. The classification
+  switch is the *only* control flow change in the runner; the
+  legacy `dispatchMaintenanceIntent` is still called for those
+  cases
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; manual triggers verified end-to-end.
+Pending alignment-agent regex tightening (already on the
+follow-ups list) would reduce repeat fixes per run, but the
+routing fix is correct independently.
+
+No new follow-ups added — feature is self-contained and lives
+behind the existing ADR-018 / classification surface.
+

@@ -16,6 +16,12 @@ export { runAlignmentAgent }  from './agents/alignment-agent';
 export { runGCAgent }         from './agents/gc-agent';
 export { runEvaluationAgent } from './agents/evaluation-agent';
 
+// Context-fixer (ADR-018) — direct-fix path for docs-only maintenance
+// intents. Exposed so tests / advanced wiring can call it without going
+// through the runner.
+export { applyContextFileFix } from './agents/context-fixer';
+export type { ContextFixProject, ContextFixOutcome } from './agents/context-fixer';
+
 // Runner — exposed for tests + advanced wiring (skip the scheduler).
 export { runMaintenanceAgent, loadProjectInputs } from './runner';
 export type { RunInput } from './runner';
@@ -30,7 +36,8 @@ export { resolveMonitoringAdapter } from './adapters/resolver';
 
 // Types.
 export type {
-  MaintenanceIntent, MaintenanceIntentType, MaintenancePriority,
+  MaintenanceIntent, MaintenanceIntentType, MaintenanceIntentClass,
+  MaintenancePriority,
   MaintenanceAgentInput, MaintenanceAgentResult,
   MonitoringAdapter, MonitoringAdapterType,
   MonitoringThresholds,
@@ -38,4 +45,5 @@ export type {
   MaintenanceHarnessConfig,
   MaintenanceFinding,
 } from './types';
+export { classifyMaintenanceIntent } from './types';
 export { DEFAULT_MONITORING_THRESHOLDS, DEFAULT_MAINTENANCE_CONFIG } from './types';

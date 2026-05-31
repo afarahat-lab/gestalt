@@ -28,6 +28,8 @@ import type {
   MaintenanceAgentInput, MaintenanceAgentResult, MaintenanceIntent,
   MaintenancePriority, HarnessSubset,
 } from '../types';
+import { classifyMaintenanceIntent } from '../types';
+import { applyContextFileFix } from '../agents/context-fixer';
 
 export interface RunInput {
   agentRole: string;
@@ -73,9 +75,54 @@ export async function runMaintenanceAgent(input: RunInput): Promise<MaintenanceR
         allFindings.push(finding);
       }
       for (const intent of result.intentsQueued) {
-        await dispatchMaintenanceIntent(intent, input.queueConfig);
-        allQueued.push(intent);
-        totalIntents += 1;
+        // ADR-018 routing: docs-only intents take the direct-fix path
+        // (in-process, no generate loop). Code-change intents continue
+        // to flow through the generate orchestrator.
+        if (classifyMaintenanceIntent(intent.type) === 'context-file-update') {
+          try {
+            const outcome = await applyContextFileFix(intent, project);
+            if (outcome.committed) {
+              totalDirectFixes += 1;
+              allFindings.push({
+                type: 'direct-fix-applied',
+                description: `Direct ${intent.type} fix committed to ${intent.affectedFiles[0]} (${outcome.commitSha?.slice(0, 8)})`,
+                affectedFiles: [intent.affectedFiles[0] ?? ''],
+                severity: 'low',
+                suggestedAction: 'Pull defaultBranch to receive the change.',
+              });
+            } else {
+              log.info(
+                {
+                  projectId: project.projectId,
+                  intentType: intent.type,
+                  reason: outcome.reason,
+                },
+                'Direct fix skipped',
+              );
+            }
+          } catch (fixErr) {
+            log.error(
+              {
+                err: fixErr,
+                projectId: project.projectId,
+                intentType: intent.type,
+                affectedFile: intent.affectedFiles[0],
+              },
+              'Direct context fix failed',
+            );
+            allFindings.push({
+              type: 'direct-fix-failed',
+              description: `Direct ${intent.type} fix failed for ${intent.affectedFiles[0]}: ${fixErr instanceof Error ? fixErr.message : String(fixErr)}`,
+              affectedFiles: [intent.affectedFiles[0] ?? ''],
+              severity: 'high',
+              suggestedAction: 'Check server logs for the full error and apply the fix manually.',
+            });
+          }
+        } else {
+          await dispatchMaintenanceIntent(intent, input.queueConfig);
+          allQueued.push(intent);
+          totalIntents += 1;
+        }
       }
     } catch (err) {
       log.error(
