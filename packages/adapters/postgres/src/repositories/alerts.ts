@@ -16,6 +16,7 @@ import type {
   AlertRepository, AlertRecord, AlertType, AlertRequiredAction,
 } from '@gestalt/core';
 import { getDb } from '../client';
+import { parseJsonb } from '../utils';
 
 interface AlertRow {
   id: string;
@@ -31,33 +32,12 @@ interface AlertRow {
   createdAt: Date;
 }
 
-/**
- * Defensive JSONB-array/object parser. postgres.js can return JSONB
- * columns as either a parsed object OR a raw JSON-encoded string,
- * depending on how the column was written and what types are
- * registered. The maintenance-runs repo had the same issue
- * (`parseFindings` — see ADR-035 session); we apply the same pattern
- * here so the dashboard's `alert.context['suggestions']` is always a
- * real array.
- */
-function parseContext(raw: unknown): Record<string, unknown> {
-  if (raw === null || raw === undefined) return {};
-  if (typeof raw === 'object') return raw as Record<string, unknown>;
-  if (typeof raw === 'string') {
-    try {
-      const parsed = JSON.parse(raw) as unknown;
-      return typeof parsed === 'object' && parsed !== null
-        ? (parsed as Record<string, unknown>)
-        : {};
-    } catch {
-      return {};
-    }
-  }
-  return {};
-}
-
 function rowToRecord(row: AlertRow): AlertRecord {
-  const context = parseContext(row.context);
+  // postgres.js may return the JSONB column as a string or an
+  // object; `parseJsonb` (../utils) handles both and falls back to
+  // {} on parse failure. The dashboard relies on
+  // `alert.context['suggestions']` being a real object.
+  const context = parseJsonb<Record<string, unknown>>(row.context, {});
   const intentId = typeof context['intentId'] === 'string'
     ? (context['intentId'] as string)
     : null;

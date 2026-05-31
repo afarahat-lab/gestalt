@@ -2842,3 +2842,103 @@ No new follow-ups. The old `DeploymentStatus` /
 rather than the Pending enhancements list — they're
 mechanical cleanup that doesn't need design conversation.
 
+---
+
+### Session 2026-05-31 — Claude Code (consolidated postgres JSONB parser into shared parseJsonb)
+
+Refactor only. Pre-fix: three repo-local helpers (`parseContext`
+in alerts, `parseFindings` in maintenance-runs, `parseMetadata` in
+deployment-events) all solved the same problem — postgres.js can
+return JSONB as either a parsed JS value or a raw JSON-encoded
+string, and the read path has to defend against both. Every time
+a new JSONB column landed on the schema (latest: deployment_events
+`metadata` in the prior session) the same fix had to be copy-
+pasted, and the JSON-shape-rejection logic (object vs array) drifted
+slightly between the three.
+
+Changed:
+- `packages/adapters/postgres/src/utils.ts` (new): shared
+  `parseJsonb<T>(value: unknown, fallback: T): T`. Returns the
+  fallback on null/undefined input, on non-string non-object
+  input, on a `JSON.parse` failure, and on a parsed value whose
+  shape doesn't match the fallback's. Shape is inferred from
+  `fallback`: array fallback → only accept arrays (preserves the
+  prior `parseFindings` "non-array → []" rule); non-null object
+  fallback → accept any non-null object including arrays
+  (preserves `parseContext` / `parseMetadata`). Signature note
+  in the JSDoc — the user's brief sketched
+  `parseJsonb<T>(value): T`, but a single-arg version can't
+  carry shape information to runtime, so `fallback: T` was
+  added; the three call sites are still one line each
+- `packages/adapters/postgres/src/repositories/alerts.ts`:
+  removed local `parseContext` helper. `rowToRecord` now calls
+  `parseJsonb<Record<string, unknown>>(row.context, {})`. Same
+  result on every input the prior helper handled
+- `packages/adapters/postgres/src/repositories/deployment-events.ts`:
+  removed local `parseMetadata` helper. `rowToRecord` now calls
+  `parseJsonb<Record<string, unknown>>(row.metadata, {})`. The
+  Deployments view's branch chip (extracted from
+  `pr-opened.metadata['branch']`) continues to work
+- `packages/adapters/postgres/src/repositories/maintenance-runs.ts`:
+  removed local `parseFindings` helper. `rowToRecord` now calls
+  `parseJsonb<MaintenanceFinding[]>(row.findings, [])`. The
+  array fallback tells the helper to reject non-array parsed
+  values, preserving the legacy `Array.isArray(parsed) ? parsed
+  : []` rule
+
+Verified live (refactor must preserve every read path):
+- `pnpm -r build` clean across all 12 packages; `tsc` happy
+  with the new generic
+- Server image rebuilt
+- `GET /deployments?projectId=…&limit=2` returned both
+  recent cycles with `branch` populated as real strings
+  (`'gestalt/45b71ffc-add-a-humanreadable-bytes-formatter'`,
+  `'gestalt/9c28d399-add-a-titlecase-utility-under'`). Pre-
+  refactor and pre-fix: this was `null`. Post-refactor: still
+  populated correctly
+- `GET /maintenance/runs?limit=4` returned 4 runs with
+  `findings` rendered as real JS arrays (length 0 for the
+  recent evaluation-agent / drift-agent runs that had no
+  findings to record). Pre-refactor: also worked. Confirmed
+  the array-shape rejection path still functions
+- `GET /alerts/<acknowledged-id>` (direct fetch on a
+  previously-acknowledged clarification alert) returned
+  `context` as a real object with the original `intentId` +
+  `suggestions[3]` keys intact. Pre-refactor: also worked.
+  Confirmed the object-shape acceptance path still functions
+
+Decisions made:
+- **`parseJsonb<T>(value, fallback)`, not the brief's
+  single-arg `parseJsonb<T>(value)`.** The brief said "no
+  behaviour change". A single-arg generic helper can't preserve
+  the per-repo shape-rejection logic — `parseFindings` rejected
+  non-array parsed JSON (returned `[]`); `parseContext` and
+  `parseMetadata` rejected non-object parsed JSON (returned
+  `{}`). Without runtime shape information the helper can't
+  pick the right rejection rule. Adding `fallback: T` carries
+  the shape implicitly (via `Array.isArray(fallback)`) AND
+  gives the caller a typed, non-null return value. JSDoc on
+  the helper documents the deviation
+- **Object fallback accepts arrays.** Mirrors the previous
+  `parseContext` behaviour exactly — `typeof === 'object' &&
+  !== null` is true for arrays. If a caller passes `{}` as
+  fallback and the column holds an array, they get the array
+  back as a cast. None of the three current callers exercise
+  this path, but documenting it now prevents the next JSONB
+  column from being surprised
+- **Did NOT introduce a generic `parsedShapeMatches(T)` type
+  guard.** Could have built a richer signature with a
+  user-supplied predicate; over-engineered for three call
+  sites that all want either "is array" or "is non-null
+  object". The `matchesShape(value, fallback)` two-line
+  helper does exactly what's needed and is readable at the
+  glance the next reviewer will give it
+
+Build status: `pnpm -r build` clean. No behaviour change at
+any of the three read paths.
+
+No follow-ups. The shared helper is the canonical answer for
+the next JSONB column; the per-row `::jsonb` cast on the WRITE
+path remains the matching write-side defence (see the
+maintenance-runs and alerts repos).
+

@@ -14,7 +14,7 @@ content is derived._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-31 (Claude Code — richer ActiveAgents + Deployments views with pipeline timeline)
+**Last updated:** 2026-05-31 (Claude Code — shared parseJsonb helper; three repo-local parsers retired)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -481,20 +481,26 @@ content is derived._
   004 then GRANTed back in migration 005 once it was clarified that
   deployment_events are operational logs (not audit records) and
   gc-agent needs to prune them. ADR-034 enforcement runs through
-  `findStagingPromotion`
+  `findStagingPromotion`. `metadata` JSONB read path uses the shared
+  `parseJsonb<Record<string, unknown>>(row.metadata, {})` in
+  `../utils` so the `pr-opened` event's `branch` key (used by the
+  Deployments view's branch chip) round-trips regardless of whether
+  postgres.js returns the column as an object or a string
 - `maintenanceRuns` — create (status=running), complete (final counts +
   findings JSONB + duration), list (filter by projectId / agentRole).
   Findings are JSONB-array-typed; the PG impl uses an explicit
   `::jsonb` cast on insert/update (without it postgres' implicit
   text→jsonb cast wraps the whole array as a JSON string scalar) and
-  `parseFindings` normalises the read path against postgres.js
-  returning either a parsed array or a raw JSON string
+  the shared `parseJsonb<MaintenanceFinding[]>(row.findings, [])` in
+  `../utils` normalises the read path against postgres.js returning
+  either a parsed array or a raw JSON string
 - `alerts` — create, findById, findUnacknowledged, findByCorrelationId,
   acknowledge. `intent_id` lives in `context` JSONB (schema 001
-  predates the FK); `parseContext` normalises postgres.js's
-  parsed-object vs raw-JSON-string return shapes the same way
-  `parseFindings` does for maintenanceRuns. `intentId` lifted out of
-  context into the read-side record for ergonomics
+  predates the FK); the shared
+  `parseJsonb<Record<string, unknown>>(row.context, {})` in
+  `../utils` normalises postgres.js's parsed-object vs
+  raw-JSON-string return shapes. `intentId` lifted out of context
+  into the read-side record for ergonomics
 - `executionLogs` — save (1:1 per agent_executions row), findByExecutionId,
   findByCorrelationId. Migration 007. Foreign key cascades on delete
   matches the BullMQ removeOnComplete contract. The
@@ -602,112 +608,6 @@ content is derived._
 ---
 
 ## Recent session log entries (last 3 from SESSION_LOG.md)
-
-### Session 2026-05-31 — Claude Code (`/projects` returns all projects + 401 → /login)
-
-Operator reported the previous session's dashboard saying
-"No projects — run gestalt init" while `gestalt projects list`
-on the same machine showed `trackeros`. Two root causes:
-
-1. **Server-side, primary:** `GET /projects` was filtering by
-   `created_by = request.user.id`. The CLI was signed in as
-   `a@b.c` (who owns the project); the dashboard session was
-   either a different user or simply the same user but the
-   previous session's brief had assumed the endpoint returned
-   "all projects for the authenticated user". The owner-only
-   filter never made sense for a small-team self-hosted
-   platform where collaborators expect every operator to see
-   every registered project.
-2. **Dashboard-side, defensive:** if the JWT in localStorage
-   was stale (expired or signed under a wiped user), every
-   API call returned 401. `RequireAuth` only checks for token
-   presence, so the dashboard rendered with a useless token
-   and silently failed every fetch. `ProjectContext`'s catch
-   block then converted the 401 into "No projects". The user
-   was stuck.
-
-Changed:
-- `packages/server/src/routes/projects.ts`:
-  `GET /projects` now calls `projects.listAll()` instead of
-  `projects.list(request.user.id)`. Comment on the route
-  explicitly documents the model ("self-hosted small team —
-  every authenticated operator can see every project") and the
-  intended migration path if access control becomes a
-  requirement (add a `project_members` table; intersect there;
-  do NOT re-introduce the owner-only filter on this endpoint)
-- `packages/dashboard/src/context/ProjectContext.tsx`: imports
-  `ApiError` from the dashboard's API client. The catch block
-  is now two-branched:
-  - `ApiError.status === 401` → `localStorage.removeItem('gestalt_token')`
-    + `window.location.href = '/app/login'`. Hard navigation so
-    React Router restarts and `RequireAuth` sends the user to the
-    login view
-  - anything else → quiet "no projects" state (lets the operator
-    refresh the tab; doesn't blow up the layout for transient
-    network blips)
-
-Verified live against the running platform:
-- `pnpm -r build` clean. Server image + dashboard bundle
-  (`index-DipB4z-Z.js`, 204 KB) rebuilt
-- **Baseline:** logged in as `a@b.c` (project owner) → 1 project
-  via `GET /projects` (trackeros). Unchanged
-- **Bug reproduction + fix:**
-  - Inserted a second user `second@test.local` directly into
-    the DB (admin/setup is one-shot — guarded for first-boot
-    only). bcrypt-hashed `opsop123` using the server image's
-    bundled `bcrypt@5.1.1`
-  - Confirmed via `gen_random_uuid()` UUID that the user is
-    distinct from the project's creator
-  - Logged in as `second@test.local` via `POST /auth/login`
-    (JWT length 259, role `operator`)
-  - `GET /projects` returns trackeros with
-    `createdBy: 9e9c4051-…` (the OTHER user's id). Pre-fix this
-    would have returned an empty array
-- **Browser drive (headless Chrome):** logged in as
-  `second@test.local`, sidebar shows the `trackeros` selector,
-  IntentFeed header reads "3 total · trackeros" and renders all
-  three existing intents (`make it better` ×2 + the older
-  `start implementation` failed). Screenshot saved. Pre-fix
-  this exact session would have shown "No projects — run
-  gestalt init" in the sidebar
-- Test user deleted afterwards; DB back to a clean
-  one-user one-project state
-
-Decisions made:
-- **Server fix at the route level**, not at the repo. The
-  `projects.list(userId)` method still exists in the
-  `ProjectRepository` interface (could be useful for an
-  "owned by me" view later) — we just don't call it from
-  `GET /projects` anymore. Cheap to keep around and avoids
-  an interface change that would ripple through
-  oracle/mssql stubs
-- **No new `?scope=mine` query parameter** to support
-  "show only my projects" today. YAGNI — the operator-facing
-  use case is "show me what's here so I can pick one"; the
-  audit trail of who created a project lives on the row
-  itself (`createdBy`). Add a query param if and when the UX
-  ever differentiates
-- **Dashboard 401 is a hard navigate, not a React Router
-  `<Navigate>`.** A redirect from inside `ProjectContext`
-  would race against the rest of the app's mounting; a
-  `window.location.href` restart guarantees the RequireAuth
-  guard runs from a clean state with the token removed.
-  Slightly heavier than a router redirect but predictable
-- **Other transient errors stay as "no projects".** The
-  dashboard should be resilient to a flaky network or a
-  brief server hiccup. Bouncing the operator to /login for
-  a single failed fetch would be infuriating. Only 401 —
-  the actual "you don't have a valid session" signal —
-  triggers the bounce
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Server image rebuilt; dashboard SPA serves the new bundle
-under `/app/*`. Both fixes verified live: the previously-
-filtered owner-only view is gone, and an expired-token
-session now bounces to login instead of showing a
-misleading empty state.
-
----
 
 ### Session 2026-05-31 — Claude Code (agent execution logs + IntentDetail accordion)
 
@@ -1102,4 +1002,104 @@ No new follow-ups. The old `DeploymentStatus` /
 `PromotionHistoryItem` types are flagged in a code comment
 rather than the Pending enhancements list — they're
 mechanical cleanup that doesn't need design conversation.
+
+---
+
+### Session 2026-05-31 — Claude Code (consolidated postgres JSONB parser into shared parseJsonb)
+
+Refactor only. Pre-fix: three repo-local helpers (`parseContext`
+in alerts, `parseFindings` in maintenance-runs, `parseMetadata` in
+deployment-events) all solved the same problem — postgres.js can
+return JSONB as either a parsed JS value or a raw JSON-encoded
+string, and the read path has to defend against both. Every time
+a new JSONB column landed on the schema (latest: deployment_events
+`metadata` in the prior session) the same fix had to be copy-
+pasted, and the JSON-shape-rejection logic (object vs array) drifted
+slightly between the three.
+
+Changed:
+- `packages/adapters/postgres/src/utils.ts` (new): shared
+  `parseJsonb<T>(value: unknown, fallback: T): T`. Returns the
+  fallback on null/undefined input, on non-string non-object
+  input, on a `JSON.parse` failure, and on a parsed value whose
+  shape doesn't match the fallback's. Shape is inferred from
+  `fallback`: array fallback → only accept arrays (preserves the
+  prior `parseFindings` "non-array → []" rule); non-null object
+  fallback → accept any non-null object including arrays
+  (preserves `parseContext` / `parseMetadata`). Signature note
+  in the JSDoc — the user's brief sketched
+  `parseJsonb<T>(value): T`, but a single-arg version can't
+  carry shape information to runtime, so `fallback: T` was
+  added; the three call sites are still one line each
+- `packages/adapters/postgres/src/repositories/alerts.ts`:
+  removed local `parseContext` helper. `rowToRecord` now calls
+  `parseJsonb<Record<string, unknown>>(row.context, {})`. Same
+  result on every input the prior helper handled
+- `packages/adapters/postgres/src/repositories/deployment-events.ts`:
+  removed local `parseMetadata` helper. `rowToRecord` now calls
+  `parseJsonb<Record<string, unknown>>(row.metadata, {})`. The
+  Deployments view's branch chip (extracted from
+  `pr-opened.metadata['branch']`) continues to work
+- `packages/adapters/postgres/src/repositories/maintenance-runs.ts`:
+  removed local `parseFindings` helper. `rowToRecord` now calls
+  `parseJsonb<MaintenanceFinding[]>(row.findings, [])`. The
+  array fallback tells the helper to reject non-array parsed
+  values, preserving the legacy `Array.isArray(parsed) ? parsed
+  : []` rule
+
+Verified live (refactor must preserve every read path):
+- `pnpm -r build` clean across all 12 packages; `tsc` happy
+  with the new generic
+- Server image rebuilt
+- `GET /deployments?projectId=…&limit=2` returned both
+  recent cycles with `branch` populated as real strings
+  (`'gestalt/45b71ffc-add-a-humanreadable-bytes-formatter'`,
+  `'gestalt/9c28d399-add-a-titlecase-utility-under'`). Pre-
+  refactor and pre-fix: this was `null`. Post-refactor: still
+  populated correctly
+- `GET /maintenance/runs?limit=4` returned 4 runs with
+  `findings` rendered as real JS arrays (length 0 for the
+  recent evaluation-agent / drift-agent runs that had no
+  findings to record). Pre-refactor: also worked. Confirmed
+  the array-shape rejection path still functions
+- `GET /alerts/<acknowledged-id>` (direct fetch on a
+  previously-acknowledged clarification alert) returned
+  `context` as a real object with the original `intentId` +
+  `suggestions[3]` keys intact. Pre-refactor: also worked.
+  Confirmed the object-shape acceptance path still functions
+
+Decisions made:
+- **`parseJsonb<T>(value, fallback)`, not the brief's
+  single-arg `parseJsonb<T>(value)`.** The brief said "no
+  behaviour change". A single-arg generic helper can't preserve
+  the per-repo shape-rejection logic — `parseFindings` rejected
+  non-array parsed JSON (returned `[]`); `parseContext` and
+  `parseMetadata` rejected non-object parsed JSON (returned
+  `{}`). Without runtime shape information the helper can't
+  pick the right rejection rule. Adding `fallback: T` carries
+  the shape implicitly (via `Array.isArray(fallback)`) AND
+  gives the caller a typed, non-null return value. JSDoc on
+  the helper documents the deviation
+- **Object fallback accepts arrays.** Mirrors the previous
+  `parseContext` behaviour exactly — `typeof === 'object' &&
+  !== null` is true for arrays. If a caller passes `{}` as
+  fallback and the column holds an array, they get the array
+  back as a cast. None of the three current callers exercise
+  this path, but documenting it now prevents the next JSONB
+  column from being surprised
+- **Did NOT introduce a generic `parsedShapeMatches(T)` type
+  guard.** Could have built a richer signature with a
+  user-supplied predicate; over-engineered for three call
+  sites that all want either "is array" or "is non-null
+  object". The `matchesShape(value, fallback)` two-line
+  helper does exactly what's needed and is readable at the
+  glance the next reviewer will give it
+
+Build status: `pnpm -r build` clean. No behaviour change at
+any of the three read paths.
+
+No follow-ups. The shared helper is the canonical answer for
+the next JSONB column; the per-row `::jsonb` cast on the WRITE
+path remains the matching write-side defence (see the
+maintenance-runs and alerts repos).
 

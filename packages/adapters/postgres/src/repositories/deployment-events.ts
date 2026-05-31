@@ -16,6 +16,7 @@ import type {
   DeploymentEventRepository, DeploymentEventRecord,
 } from '@gestalt/core';
 import { getDb } from '../client';
+import { parseJsonb } from '../utils';
 
 interface DeploymentEventRow {
   id: string;
@@ -42,33 +43,13 @@ function rowToRecord(row: DeploymentEventRow): DeploymentEventRecord {
     prNumber: row.prNumber,
     runId: row.runId,
     deploymentUrl: row.deploymentUrl,
-    metadata: parseMetadata(row.metadata),
+    // postgres.js may return JSONB as either an object or a JSON-
+    // encoded string. Shared `parseJsonb` (../utils) handles both,
+    // falling back to {} on a parse failure so the dashboard's
+    // `metadata['branch']` lookup is always safe.
+    metadata: parseJsonb<Record<string, unknown>>(row.metadata, {}),
     createdAt: row.createdAt,
   };
-}
-
-/**
- * Defensive JSONB parser — postgres.js can return JSONB as either a
- * parsed object OR a JSON-encoded string depending on how the row was
- * written and what type adapters are registered. Same pattern as
- * `parseFindings` in the maintenance-runs repo and `parseContext` in
- * the alerts repo. Without it, `metadata['branch']` is undefined on
- * the read path and the dashboard's branch tag never renders.
- */
-function parseMetadata(raw: unknown): Record<string, unknown> {
-  if (raw === null || raw === undefined) return {};
-  if (typeof raw === 'object') return raw as Record<string, unknown>;
-  if (typeof raw === 'string') {
-    try {
-      const parsed = JSON.parse(raw) as unknown;
-      return typeof parsed === 'object' && parsed !== null
-        ? (parsed as Record<string, unknown>)
-        : {};
-    } catch {
-      return {};
-    }
-  }
-  return {};
 }
 
 export class PostgresDeploymentEventRepository implements DeploymentEventRepository {

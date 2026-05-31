@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-05-31 (Claude Code — richer ActiveAgents + Deployments views with pipeline timeline)
+**Last updated:** 2026-05-31 (Claude Code — shared parseJsonb helper; three repo-local parsers retired)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -475,20 +475,26 @@ the historical record of how the state evolved._
   004 then GRANTed back in migration 005 once it was clarified that
   deployment_events are operational logs (not audit records) and
   gc-agent needs to prune them. ADR-034 enforcement runs through
-  `findStagingPromotion`
+  `findStagingPromotion`. `metadata` JSONB read path uses the shared
+  `parseJsonb<Record<string, unknown>>(row.metadata, {})` in
+  `../utils` so the `pr-opened` event's `branch` key (used by the
+  Deployments view's branch chip) round-trips regardless of whether
+  postgres.js returns the column as an object or a string
 - `maintenanceRuns` — create (status=running), complete (final counts +
   findings JSONB + duration), list (filter by projectId / agentRole).
   Findings are JSONB-array-typed; the PG impl uses an explicit
   `::jsonb` cast on insert/update (without it postgres' implicit
   text→jsonb cast wraps the whole array as a JSON string scalar) and
-  `parseFindings` normalises the read path against postgres.js
-  returning either a parsed array or a raw JSON string
+  the shared `parseJsonb<MaintenanceFinding[]>(row.findings, [])` in
+  `../utils` normalises the read path against postgres.js returning
+  either a parsed array or a raw JSON string
 - `alerts` — create, findById, findUnacknowledged, findByCorrelationId,
   acknowledge. `intent_id` lives in `context` JSONB (schema 001
-  predates the FK); `parseContext` normalises postgres.js's
-  parsed-object vs raw-JSON-string return shapes the same way
-  `parseFindings` does for maintenanceRuns. `intentId` lifted out of
-  context into the read-side record for ergonomics
+  predates the FK); the shared
+  `parseJsonb<Record<string, unknown>>(row.context, {})` in
+  `../utils` normalises postgres.js's parsed-object vs
+  raw-JSON-string return shapes. `intentId` lifted out of context
+  into the read-side record for ergonomics
 - `executionLogs` — save (1:1 per agent_executions row), findByExecutionId,
   findByCorrelationId. Migration 007. Foreign key cascades on delete
   matches the BullMQ removeOnComplete contract. The

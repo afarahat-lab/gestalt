@@ -11,6 +11,7 @@ import type {
   MaintenanceRunRepository, MaintenanceRunRecord, MaintenanceFinding,
 } from '@gestalt/core';
 import { getDb } from '../client';
+import { parseJsonb } from '../utils';
 
 interface MaintenanceRunRow {
   id: string;
@@ -20,8 +21,8 @@ interface MaintenanceRunRow {
   intentsQueued: number;
   directFixes: number;
   /** postgres.js may return JSONB as either a parsed array or the raw
-   * JSON string depending on how the column was inserted — see
-   * `parseFindings` for the normalisation. */
+   * JSON string depending on how the column was inserted — the shared
+   * `parseJsonb` helper in ../utils normalises both. */
   findings: MaintenanceFinding[] | string | null;
   durationMs: number | null;
   runAt: Date;
@@ -36,31 +37,13 @@ function rowToRecord(row: MaintenanceRunRow): MaintenanceRunRecord {
     status: row.status,
     intentsQueued: row.intentsQueued,
     directFixes: row.directFixes,
-    findings: parseFindings(row.findings),
+    // Array fallback ([]) tells parseJsonb to reject non-array parsed
+    // values — same behaviour as the previous parseFindings helper.
+    findings: parseJsonb<MaintenanceFinding[]>(row.findings, []),
     durationMs: row.durationMs,
     runAt: row.runAt,
     completedAt: row.completedAt,
   };
-}
-
-/**
- * Defensive JSONB→array parser. postgres.js sometimes returns JSONB as
- * a string (when the parameter was bound via `::jsonb` cast on a TEXT
- * payload) and sometimes as a parsed array (when the column has been
- * inserted via JSON_BUILD_ARRAY or similar). Normalise.
- */
-function parseFindings(raw: MaintenanceRunRow['findings']): MaintenanceFinding[] {
-  if (!raw) return [];
-  if (Array.isArray(raw)) return raw;
-  if (typeof raw === 'string') {
-    try {
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
-  }
-  return [];
 }
 
 export class PostgresMaintenanceRunRepository implements MaintenanceRunRepository {
