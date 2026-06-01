@@ -51,7 +51,7 @@ export class AuthManager {
   async authenticate(
     req: IncomingRequest,
     res: OutgoingResponse,
-    upsertUser: (user: Omit<PlatformUser, 'id' | 'createdAt'>) => Promise<PlatformUser>,
+    upsertUser: (user: Omit<PlatformUser, 'id' | 'createdAt' | 'deactivatedAt'>) => Promise<PlatformUser>,
   ): Promise<string | null> {
     // Find the first provider that can handle this request
     const provider = this.providers.find((p) => p.canHandle(req));
@@ -74,14 +74,18 @@ export class AuthManager {
    */
   private async createSession(
     identity: VerifiedIdentity,
-    upsertUser: (user: Omit<PlatformUser, 'id' | 'createdAt'>) => Promise<PlatformUser>,
+    upsertUser: (user: Omit<PlatformUser, 'id' | 'createdAt' | 'deactivatedAt'>) => Promise<PlatformUser>,
   ): Promise<string> {
     let role: UserRole;
 
     if (identity.provider === 'local') {
       const { users } = getRepositories();
       const existing = await users.findByIdpSubject(identity.subject, 'local');
-      role = (existing?.role as UserRole | undefined) ?? 'operator';
+      // Preserve the stored role on every login. The first-boot admin
+      // setup wrote `platform-admin`; subsequent locally-created users
+      // default to `user` (set by `POST /users` or by this fallback
+      // for legacy paths that didn't specify a role).
+      role = (existing?.role as UserRole | undefined) ?? 'user';
     } else {
       const roleResult = resolveRole(
         identity,

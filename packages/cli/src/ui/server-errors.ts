@@ -31,6 +31,58 @@ export function isConnectivityError(err: unknown): boolean {
  * trying to hit. When that URL is still the local-dev default, append the
  * first-run hint nudging the user to configure a remote server.
  */
+/**
+ * Tries to parse the server's typed 403 body
+ * (`{ error, code, message }`) carried inside `ApiClientError.body`.
+ * Returns null when the error isn't a 403 or the body isn't JSON in
+ * the expected shape. Callers use this to render friendly hints for
+ * the project-membership 403 codes (NOT_PROJECT_MEMBER /
+ * INSUFFICIENT_PROJECT_ROLE) without each command duplicating the
+ * JSON-parse boilerplate.
+ */
+export function parseForbiddenBody(err: unknown): { code: string; message: string } | null {
+  if (!(err instanceof Error) || err.name !== 'ApiClientError') return null;
+  const status = (err as { status?: number }).status;
+  if (status !== 403) return null;
+  const body = (err as { body?: string }).body;
+  if (!body) return null;
+  try {
+    const parsed = JSON.parse(body) as { code?: unknown; message?: unknown; error?: unknown };
+    const code = typeof parsed.code === 'string' ? parsed.code : null;
+    const message = typeof parsed.message === 'string'
+      ? parsed.message
+      : (typeof parsed.error === 'string' ? parsed.error : null);
+    if (!code || !message) return null;
+    return { code, message };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Friendly handler for the two project-membership 403 codes raised by
+ * `requireProjectMembership` on the server. Prints a contextual hint
+ * and returns true so the caller knows the error was rendered (it
+ * should not also print a generic "Failed:" line). Returns false for
+ * anything else.
+ */
+export function handleMembershipForbidden(err: unknown): boolean {
+  const parsed = parseForbiddenBody(err);
+  if (!parsed) return false;
+  if (parsed.code === 'NOT_PROJECT_MEMBER') {
+    console.log(c.error('✗ You are not a member of this project.'));
+    console.log(c.dim('  Ask a platform-admin or project-admin to assign you:'));
+    console.log(c.dim('    gestalt users assign <your-email> <project> --role editor'));
+    return true;
+  }
+  if (parsed.code === 'INSUFFICIENT_PROJECT_ROLE') {
+    console.log(c.error(`✗ ${parsed.message}`));
+    console.log(c.dim('  Ask a platform-admin or project-admin to upgrade your role.'));
+    return true;
+  }
+  return false;
+}
+
 export function printConnectionError(url: string): void {
   console.log(c.error(`✗ Cannot reach server at ${url}`));
   console.log(c.dim('  Check the server is running and the URL is correct.'));

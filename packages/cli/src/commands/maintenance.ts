@@ -17,7 +17,9 @@
 
 import { GestaltApiClient } from '../api/client';
 import { loadCliConfig, resolveServerUrl } from '../ui/config';
-import { printConnectionError, isConnectivityError } from '../ui/server-errors';
+import {
+  printConnectionError, isConnectivityError, handleMembershipForbidden,
+} from '../ui/server-errors';
 import { c, blank } from '../ui/prompts';
 
 const VALID_AGENT_ROLES = new Set([
@@ -60,7 +62,7 @@ export async function maintenanceTriggerCommand(
   } catch (err) {
     if (isConnectivityError(err)) {
       printConnectionError(serverUrl);
-    } else {
+    } else if (!handleMembershipForbidden(err)) {
       console.log(c.error(`Failed to trigger ${agentRole}: ${err instanceof Error ? err.message : String(err)}`));
     }
     process.exit(1);
@@ -92,7 +94,7 @@ export async function maintenanceResetFindingsCommand(
   } catch (err) {
     if (isConnectivityError(err)) {
       printConnectionError(serverUrl);
-    } else {
+    } else if (!handleMembershipForbidden(err)) {
       console.log(c.error(`Failed to reset findings: ${err instanceof Error ? err.message : String(err)}`));
     }
     process.exit(1);

@@ -5,10 +5,11 @@
 
 import type { FastifyRequest, FastifyReply, FastifyInstance } from 'fastify';
 import type { PlatformUser } from '../types';
-import type { UserRole } from '@gestalt/core';
-import { getRepositories, createContextLogger } from '@gestalt/core';
+import {
+  getRepositories, createContextLogger,
+  type ProjectMembershipRecord, type ProjectRole,
+} from '@gestalt/core';
 import { verifyToken, extractToken } from './session';
-import { hasPermission } from './role-mapper';
 import type { SessionConfig } from './session';
 
 const log = createContextLogger({ module: 'auth-middleware' });
@@ -33,10 +34,6 @@ const PUBLIC_ROUTES = new Set([
 // auth (the SPA reads the JWT from localStorage and bounces to its own
 // /login view if missing). Everything else is API and goes through the
 // normal auth check.
-//
-// Without this, the auth preHandler returns 401 JSON for every URL the
-// browser asks for (`/app/`, `/app/assets/*.js`, `/app/login`, …) and
-// the dashboard never gets a chance to boot.
 function isSpaPath(url: string): boolean {
   const path = url.split('?')[0] ?? '';
   return path === '/app' || path.startsWith('/app/');
@@ -47,12 +44,6 @@ export async function registerAuthMiddleware(
   sessionConfig: SessionConfig,
 ): Promise<void> {
   app.addHook('preHandler', async (request: FastifyRequest, reply: FastifyReply) => {
-    // GET requests under /app/* are dashboard asset reads or SPA-fallback
-    // hits — let fastify-static or the SPA fallback serve them. The SPA's
-    // `RequireAuth` guard handles unauthenticated access on the client
-    // side (redirect to /app/login). Non-GET methods always require auth
-    // even if the path looks SPA-shaped: a stray write should never land
-    // in the SPA bucket.
     if (request.method === 'GET' && isSpaPath(request.url)) return;
 
     const routeKey = `${request.method} ${request.routerPath ?? request.url}`;
@@ -76,6 +67,18 @@ export async function registerAuthMiddleware(
         return reply.code(401).send({ error: 'User not found' });
       }
 
+      // Migration 010 added the soft-delete column. A JWT issued before
+      // deactivation is otherwise valid until expiry; this check ensures
+      // an admin-driven deactivation takes effect on the very next
+      // request rather than waiting for the session TTL.
+      if (user.deactivatedAt) {
+        log.warn(
+          { userId: user.id, deactivatedAt: user.deactivatedAt },
+          'Deactivated user attempted access',
+        );
+        return reply.code(403).send({ error: 'ACCOUNT_DEACTIVATED' });
+      }
+
       request.user = user as unknown as PlatformUser;
     } catch (err) {
       log.warn({ err }, 'Token validation failed');
@@ -85,20 +88,171 @@ export async function registerAuthMiddleware(
 }
 
 /**
+ * Resolves a project ID for the request, used by the membership-aware
+ * legs of `requireRole`. Only two patterns are considered:
+ *
+ *   1. `/projects/:id/*` — `request.params.id` is the project id
+ *   2. `?projectId=...` query — used by `/deployments`, `/maintenance/runs`,
+ *      `/projects/:id/members` (the last one already covered by #1)
+ *
+ * Routes whose `:id` param is NOT a project ID (e.g.
+ * `POST /intents/:id/clarify`, `GET /executions/:id/log`) MUST NOT
+ * trigger a membership lookup against an unrelated UUID. We restrict
+ * the params lookup to URLs whose router path begins with
+ * `/projects/:id`.
+ */
+function getProjectIdForCheck(request: FastifyRequest): string | null {
+  const routerPath = request.routerPath ?? '';
+  if (routerPath.startsWith('/projects/:id')) {
+    const params = request.params as { id?: string } | undefined;
+    if (params?.id) return params.id;
+  }
+  const query = request.query as { projectId?: string } | undefined;
+  if (query?.projectId) return query.projectId;
+  return null;
+}
+
+/**
  * Route-level preHandler that enforces a minimum role.
+ *
+ * The string signature (`viewer` | `operator` | `admin`) is the legacy
+ * vocabulary — preserved so existing route guards keep compiling. The
+ * mapping after migration 010:
+ *   - `admin` → platform-admin only
+ *   - `operator` → platform-admin OR project (editor|project-admin) when
+ *     the route exposes a project ID; otherwise any authenticated user
+ *   - `viewer` → platform-admin OR any project member when the route
+ *     exposes a project ID; otherwise any authenticated user
+ *
+ * platform-admin always bypasses the project membership check —
+ * regardless of `minimumRole`.
  *
  * @example
  * app.post('/maintenance/trigger', { preHandler: requireRole('operator') }, handler)
  */
-export function requireRole(minimumRole: UserRole) {
+export function requireRole(minimumRole: 'viewer' | 'operator' | 'admin') {
   return async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
-    if (!request.user) {
+    const user = request.user;
+    if (!user) {
       return reply.code(401).send({ error: 'Authentication required' });
     }
-    if (!hasPermission(request.user.role, minimumRole)) {
+
+    const isPlatformAdmin = user.role === 'platform-admin';
+
+    if (minimumRole === 'admin') {
+      if (!isPlatformAdmin) {
+        return reply.code(403).send({
+          error: 'Platform admin required',
+          code: 'FORBIDDEN',
+        });
+      }
+      return;
+    }
+
+    // platform-admin bypasses every project membership check
+    if (isPlatformAdmin) return;
+
+    const projectId = getProjectIdForCheck(request);
+    if (!projectId) {
+      // Route has no project context — authenticated user is enough.
+      // Project-scoped writes that route the projectId through the body
+      // (e.g. POST /intents) enforce membership at the handler level.
+      return;
+    }
+
+    const { memberships } = getRepositories();
+    const membership = await memberships.findMembership(user.id, projectId);
+    if (!membership) {
       return reply.code(403).send({
-        error: `Insufficient permissions. Required: ${minimumRole}. Your role: ${request.user.role}`,
+        error: 'Not a member of this project',
+        code: 'FORBIDDEN',
       });
     }
+
+    if (minimumRole === 'operator' && membership.role === 'reader') {
+      return reply.code(403).send({
+        error: 'Editor or project-admin required',
+        code: 'FORBIDDEN',
+      });
+    }
+    // minimumRole === 'viewer' — any membership is sufficient
   };
+}
+
+/**
+ * Handler-level membership check used by routes whose project context
+ * lives in the request body (so the `requireRole` preHandler couldn't
+ * look it up) or by routes that need a tighter minimum role than the
+ * coarse `viewer/operator/admin` vocabulary of `requireRole`.
+ *
+ * Returns the membership record (or `null` for platform-admin users
+ * who bypass the check) on success. Throws `ProjectMembershipError` on
+ * failure; the caller maps that to a 403 with `code` + `message`.
+ *
+ * The role ranking matches the brief's table:
+ *   project-admin > editor > reader
+ *
+ * Pass `minRole = 'editor'` for "needs to write" (submit intent,
+ * trigger maintenance, clarify, fix-intent) and `'project-admin'` for
+ * "needs to manage" (HARNESS.json config changes, membership
+ * mutations).
+ */
+const PROJECT_ROLE_RANK: Record<ProjectRole, number> = {
+  reader: 1,
+  editor: 2,
+  'project-admin': 3,
+};
+
+export class ProjectMembershipError extends Error {
+  constructor(
+    public readonly code: 'NOT_PROJECT_MEMBER' | 'INSUFFICIENT_PROJECT_ROLE',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ProjectMembershipError';
+  }
+}
+
+export async function requireProjectMembership(
+  userId: string,
+  userPlatformRole: string,
+  projectId: string,
+  minRole: ProjectRole = 'reader',
+): Promise<ProjectMembershipRecord | null> {
+  if (userPlatformRole === 'platform-admin') return null;
+
+  const { memberships } = getRepositories();
+  const membership = await memberships.findMembership(userId, projectId);
+
+  if (!membership) {
+    throw new ProjectMembershipError(
+      'NOT_PROJECT_MEMBER',
+      'You are not a member of this project',
+    );
+  }
+
+  if (PROJECT_ROLE_RANK[membership.role] < PROJECT_ROLE_RANK[minRole]) {
+    throw new ProjectMembershipError(
+      'INSUFFICIENT_PROJECT_ROLE',
+      `Minimum project role required: ${minRole}`,
+    );
+  }
+
+  return membership;
+}
+
+/**
+ * Maps a `ProjectMembershipError` to a Fastify 403 reply with the
+ * canonical body shape `{ error, code, message }`. Use in the catch
+ * block of any handler that calls `requireProjectMembership`.
+ */
+export function sendProjectMembershipError(
+  reply: FastifyReply,
+  err: ProjectMembershipError,
+): FastifyReply {
+  return reply.code(403).send({
+    error: 'FORBIDDEN',
+    code: err.code,
+    message: err.message,
+  });
 }

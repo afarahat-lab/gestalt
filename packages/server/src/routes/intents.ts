@@ -11,7 +11,10 @@ import type { FastifyInstance } from 'fastify';
 import { getRepositories, dispatch, createContextLogger } from '@gestalt/core';
 import type { TaskMessage, TaskPriority } from '@gestalt/core';
 import { emitLiveEvent } from '../events';
-import { requireRole } from '../auth/middleware';
+import {
+  requireRole, requireProjectMembership, sendProjectMembershipError,
+  ProjectMembershipError,
+} from '../auth/middleware';
 
 const log = createContextLogger({ module: 'routes:intents' });
 
@@ -52,6 +55,7 @@ export async function registerIntentRoutes(app: FastifyInstance): Promise<void> 
     '/intents',
     { preHandler: requireRole('operator') },
     async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
       const { text, projectId, priority = 'normal' } = request.body;
 
       if (!text?.trim()) {
@@ -59,6 +63,17 @@ export async function registerIntentRoutes(app: FastifyInstance): Promise<void> 
       }
       if (!projectId?.trim()) {
         return reply.code(400).send({ error: 'projectId is required' });
+      }
+
+      // Handler-level membership guard — `requireRole('operator')` only
+      // resolves projectId from URL params/query, never from the body,
+      // so a regular user could otherwise submit intents against any
+      // project they knew the ID of.
+      try {
+        await requireProjectMembership(request.user.id, request.user.role, projectId, 'editor');
+      } catch (err) {
+        if (err instanceof ProjectMembershipError) return sendProjectMembershipError(reply, err);
+        throw err;
       }
 
       const { intents } = getRepositories();
@@ -190,6 +205,19 @@ export async function registerIntentRoutes(app: FastifyInstance): Promise<void> 
       if (!intent) {
         return reply.code(404).send({ error: 'Intent not found' });
       }
+
+      // Membership guard — `params.id` is the intent UUID, not a project
+      // UUID, so `requireRole('operator')` cannot enforce membership
+      // here. Resolved manually from the intent record's projectId.
+      try {
+        await requireProjectMembership(
+          request.user.id, request.user.role, intent.projectId, 'editor',
+        );
+      } catch (err) {
+        if (err instanceof ProjectMembershipError) return sendProjectMembershipError(reply, err);
+        throw err;
+      }
+
       if (intent.status !== 'waiting-for-clarification') {
         return reply.code(400).send({
           error: `Cannot clarify intent with status '${intent.status}'`,

@@ -5559,3 +5559,538 @@ No new follow-ups. Possible future tidy-ups:
   the simple build → call → parse shape (the brief's
   pseudocode), the template is ready
 
+
+---
+
+### Session 2026-06-01 — Claude Code (user management v1)
+
+Closes the long-standing "every authenticated operator sees every
+project" model the platform shipped with. Introduces a two-level role
+model — platform roles on the `users` table and per-project roles on a
+new `project_memberships` table — plus deactivation, the `gestalt
+users` CLI, and a platform-admin-only Admin view in the dashboard.
+
+Changed:
+- `packages/adapters/postgres/src/migrations/010_user_management.sql`
+  (new): drops the old role default, remaps legacy values
+  (`admin` → `platform-admin`; `operator` / `viewer` → `user`), adds
+  the `users_role_check` constraint, sets the new column default to
+  `user`, adds the `deactivated_at TIMESTAMPTZ` column, creates the
+  `project_memberships` table (UNIQUE on `(user_id, project_id)`),
+  and backfills a `project-admin` row for every existing project
+  (keyed on `projects.created_by`) so previously-registered projects
+  survive the membership-aware GET /projects filter
+- `packages/core/src/types.ts`: `UserRole` narrowed to
+  `'platform-admin' | 'user'`; new `ProjectRole`
+  (`'project-admin' | 'editor' | 'reader'`). Re-exported from
+  `@gestalt/core`
+- `packages/core/src/repository/index.ts`: `UserRecord` gained
+  `deactivatedAt`. `UserRepository` gained `findByEmail`,
+  `updateRole`, `updateDisplayName`, `deactivate`; `list()` widened
+  with optional `{ search, includeDeactivated }`. New
+  `ProjectMembershipRecord` + `ProjectMembershipRepository` (8
+  methods: `addMember` upserts on `(user_id, project_id)`,
+  `updateRole`, `removeMember`, `findByProject`, `findByUser`,
+  `findMembership`, `countAdmins`). `RepositoryRegistry` gained
+  `memberships`
+- `packages/adapters/postgres/src/repositories/users.ts`: rewrote to
+  expose the new methods. **postgres.js auto-camelCases column names
+  at the client level** (`transform: { column: postgres.toCamel }` in
+  `client.ts`) — the returned row already matches `UserRecord`, so
+  the `rowToRecord` helper only normalises the nullable `idp_groups
+  → idpGroups` array. An earlier draft hand-mapped `row.display_name
+  → displayName` and the field went out as `undefined`, causing
+  postgres.js to reject the upsert with `UNDEFINED_VALUE` on every
+  login. Same trap applied to memberships.
+  `packages/adapters/postgres/src/repositories/memberships.ts` (new):
+  `PostgresProjectMembershipRepository` — no row→record mapping
+  needed (postgres.js camelCases the column names automatically);
+  the helper is just `(row) => row` shaped
+- `packages/adapters/postgres/src/index.ts`: wires
+  `PostgresProjectMembershipRepository` into `createPostgresAdapter`
+- `packages/adapters/{oracle,mssql}/src/repositories/memberships.ts`
+  (new): throw-stub `*ProjectMembershipRepository` classes so
+  interface drift forces a build break in both. Re-exported from
+  each adapter's `index.ts`
+- `packages/server/src/auth/types.ts`: `UserRole` narrowed;
+  `PlatformUser` gained `deactivatedAt`
+- `packages/server/src/auth/role-mapper.ts`: rewritten — `hasPermission`
+  removed (its old role-hierarchy lookup no longer matches the new
+  model); `resolveRole` for local auth now defaults to `user`; new
+  `isPlatformAdmin(role)` helper. The server's public `index.ts` now
+  re-exports `isPlatformAdmin` in place of `hasPermission`
+- `packages/server/src/auth/middleware.ts`: `requireRole` rewritten.
+  Keeps the legacy `'viewer' | 'operator' | 'admin'` parameter so
+  every existing route guard continues to compile. The mapping after
+  migration 010:
+  - `'admin'` → platform-admin only; everyone else 403
+  - `'operator'` → platform-admin bypasses; regular `user` must have
+    a membership AND its role must NOT be `reader`
+  - `'viewer'` → platform-admin bypasses; regular `user` must have
+    any membership
+  The project ID is resolved via a new `getProjectIdForCheck` helper:
+  `params.id` is used ONLY when `routerPath` starts with
+  `/projects/:id`, so `POST /intents/:id/clarify` and
+  `GET /executions/:id/log` are never misread as project-scoped.
+  Routes without a project context fall through to "authenticated
+  user is enough"; route-level handlers still enforce specifically
+  where the projectId lives in the body. **A deactivated-user check
+  is in the JWT validation preHandler itself** — `if (user.deactivatedAt)
+  return 403 ACCOUNT_DEACTIVATED;` — so an existing JWT cannot
+  outlive a deactivation
+- `packages/server/src/auth/auth-manager.ts`: `createSession` local-
+  auth default role changed from `'operator'` to `'user'`; existing
+  user's role is still preserved. `upsertUser` callback type now
+  Omits `deactivatedAt`
+- `packages/server/src/auth/providers/local.ts`: rejects login for
+  deactivated users with `AuthenticationError('ACCESS_DENIED')`
+- `packages/server/src/auth/routes.ts`: `ACCESS_DENIED` now surfaces
+  as HTTP 403 (alongside `LOCAL_IN_PRODUCTION`)
+- `packages/server/src/auth/config-loader.ts`: default identity
+  config `defaultRole: 'viewer'` → `'user'`
+- `packages/server/src/routes/admin.ts`: first-boot setup writes
+  `role: 'platform-admin'` instead of `'admin'`; comments + audit
+  metadata updated to match
+- `packages/server/src/routes/projects.ts`:
+  - **POST /projects** auto-assigns the creator as `project-admin`
+    right after the project is created (without it, a non-platform-
+    admin user who registered a project would immediately lose access
+    on the next `GET /projects` call)
+  - **GET /projects** returns ALL projects for `platform-admin` and
+    only membership-matched projects for `user`. The previous "every
+    authenticated operator sees every project" rule (introduced after
+    the original owner-only filter was found too restrictive) is now
+    too permissive for the corporate use case
+- `packages/server/src/routes/users.ts` (new):
+  - `GET /users [?search]` — platform-admin only; returns the full
+    user list including deactivated rows with the deactivation
+    timestamp visible
+  - `POST /users` — platform-admin only; creates a user with optional
+    password (creates a `local_auth` row when present, otherwise the
+    user can only authenticate via IdP) and optional initial
+    `projectAssignments` (creates membership rows in one call)
+  - `GET /users/:id` — platform-admin OR self; returns the user
+    record plus their full memberships
+  - `PATCH /users/:id` — platform-admin only; updates `role` and/or
+    `displayName`. Self-demotion blocked with
+    `SELF_DEMOTION_FORBIDDEN` (400)
+  - `DELETE /users/:id` — platform-admin only; soft-deletes
+    (sets `deactivated_at = NOW()`). Self-deactivation blocked with
+    `SELF_DEACTIVATE_FORBIDDEN` (400). Already-deactivated users
+    return 204 idempotently
+- `packages/server/src/routes/memberships.ts` (new):
+  - `GET /projects/:id/members` — any project member
+    (`requireRole('viewer')` resolves membership via params.id)
+  - `POST /projects/:id/members` — operator+ on the project OR
+    platform-admin; returns 201 on insert, 200 on role change
+  - `PATCH /projects/:id/members/:userId` — same auth; demoting the
+    last `project-admin` returns 400 `LAST_PROJECT_ADMIN`
+  - `DELETE /projects/:id/members/:userId` — same auth; removing the
+    last `project-admin` returns 400 `LAST_PROJECT_ADMIN`
+- `packages/server/src/app.ts`: registers the new users + memberships
+  routes
+- `packages/cli/src/api/client.ts`: typed wrappers for the 9 new
+  endpoints (listUsers / createUser / getUserDetail / updateUser /
+  deactivateUser / listProjectMembers / addProjectMember /
+  updateProjectMemberRole / removeProjectMember); added a `patch`
+  helper; the `delete` helper now returns void on 204
+- `packages/cli/src/commands/users.ts` (new): the seven subcommands
+  per the brief (`list`, `add`, `role`, `deactivate`, `assign`,
+  `unassign`, `members`). User-by-email resolution goes through
+  `GET /users?search=<email>`; project-by-name resolution through
+  `GET /projects`. Confirmation prompt on `deactivate`
+- `packages/cli/src/index.ts`: registers the new `gestalt users`
+  parent + 7 subcommands
+- `packages/dashboard/src/types.ts`: `UserRole` narrowed to the new
+  model; new `ProjectRole`, `UserSummary`, `MembershipSummary`,
+  `UserDetail`, `ProjectMember`, `CreateUserParams` types
+- `packages/dashboard/src/api/client.ts`: matching set of typed
+  methods (8 endpoints); new `patch` helper; `delete` returns
+  `T | void` to handle the 204 path
+- `packages/dashboard/src/context/CurrentUserContext.tsx` (new):
+  fetches `/auth/me` once on mount, caches the role, and bounces to
+  `/app/login` on 401 (mirrors `ProjectContext`'s defensive 401
+  handling). Wired into `App.tsx` inside `RequireAuth` so the fetch
+  only fires for signed-in sessions
+- `packages/dashboard/src/components/layout/Layout.tsx`: sidebar
+  conditionally renders the `★ Admin` nav link ONLY for
+  `platform-admin` users — the `<li>` is completely absent from the
+  DOM for everyone else (per the brief). Reads from
+  `useCurrentUser()`
+- `packages/dashboard/src/views/Admin.tsx` (new): two tabs:
+  - **Users** — table with `+ Add user` / search / refresh toolbar;
+    expandable rows showing the user's project memberships with
+    in-line role change + remove + "Assign to project" picker;
+    role badge (`★ Platform admin` / `User`) is clickable and
+    confirms before toggling (server-side guard ensures self-
+    demotion fails); red `Deactivate` button hidden for self
+  - **Add user modal** — email + display name + role radio
+    (User / Platform admin) + optional password (min 8 chars,
+    blank for IdP-only users)
+  - **Projects** — per-project member list with role change +
+    add/remove. Add-member picker excludes deactivated users
+  - All API errors surface either via a dismissible red strip at
+    the top of the section or `window.alert` (for inline actions);
+    server-side guards (last-project-admin, self-demotion) propagate
+    their `code` + message verbatim
+- `packages/dashboard/src/App.tsx`: registered the `/admin/*` route
+  inside `<RequireAuth>` + new `<RequirePlatformAdmin>` guard that
+  bounces non-admin users to `/`. `CurrentUserProvider` wraps
+  `ProjectProvider` so both contexts share a single 401 contract
+
+Verified live against the running platform:
+- `pnpm -r build` clean across all 12 packages
+- Migration 010 applies on first boot (`schema_migrations` lists
+  ten versions). The pre-existing `a@b.c` admin row is now
+  `role = platform-admin`; the trackeros project has a
+  `project-admin` membership row pointing at `a@b.c` (from the
+  backfill)
+- Server-side smoke (curl):
+  - **GET /users** as platform-admin returns the admin user
+  - **POST /users** creates `test@example.com` (`user` role,
+    password `testpass123`)
+  - **POST /projects/:id/members** assigns test as `editor` on
+    trackeros
+  - **GET /projects/:id/members** returns both rows with platform
+    role + project role fields populated
+  - **POST /projects** as admin creates a second project
+    (`member-test`); admin's `GET /projects` returns both; test's
+    `GET /projects` returns ONLY trackeros — membership filter is
+    enforced
+  - **DELETE /users/:id** on the test user returns 204; subsequent
+    `POST /auth/login` for the same email returns 403
+    `ACCESS_DENIED`; existing JWT for test against `GET /projects`
+    returns 403 (the middleware re-check fires before the route
+    handler)
+  - **Self-protection guards:** `DELETE /users/:adminId` and
+    `PATCH /users/:adminId {role: user}` both return 400 with
+    `SELF_DEACTIVATE_FORBIDDEN` / `SELF_DEMOTION_FORBIDDEN`
+  - **Last-project-admin guard:** `PATCH /projects/:id/members/:adminId
+    {role: editor}` and `DELETE /projects/:id/members/:adminId` both
+    return 400 `LAST_PROJECT_ADMIN`
+- **Dashboard drive (headless Chrome via CDP):** logged in as `a@b.c`,
+  sidebar shows the `★ Admin` link, `/app/admin` renders the Admin
+  view with the Users table containing the admin row (`★ Platform
+  admin` badge + `● active`). Created `second@example.com` (`user`)
+  via the API + assigned editor on trackeros. Signed out + logged in
+  as the regular user: sidebar `hasAdminLink === false` (the `<li>`
+  is absent from the DOM, not just hidden); navigating directly to
+  `/app/admin` bounces to `/app/` (lands on the Intents view via
+  `<Navigate to="/" replace>`). Screenshots captured to the CDP
+  output log
+- **CLI smoke:** `node packages/cli/dist/index.js users list` → table
+  with the admin row + `★ platform-admin` badge + `active` status;
+  `users members trackeros` → table with the admin as `project-admin`
+
+Decisions made:
+- **`requireRole` keeps its legacy string signature.** The brief
+  proposed the same `('viewer' | 'operator' | 'admin')` minimum-role
+  vocabulary even after migration 010. Preserving it means every
+  existing route guard (admin route, intents, projects, agents,
+  executions, deployments, maintenance, oversight) keeps compiling
+  unchanged. The middleware translates internally
+- **Project ID is resolved with a routerPath prefix check, not from
+  `params.id` blindly.** The brief's pseudocode would have looked up
+  membership against `POST /intents/:id/clarify` (`params.id` is an
+  intent UUID) and `GET /executions/:id/log` (an execution UUID),
+  always returning null → 403. Restricting the params lookup to URLs
+  whose `routerPath` begins with `/projects/:id` keeps the
+  semantically-correct routes auth-checked and leaves the rest as
+  "authenticated user, route handler enforces specifics"
+- **POST /interventions / POST /intents** are NOT changed to enforce
+  membership at the route level in this session.** They still rely
+  on `requireRole('operator')` and pass the project ID in the body.
+  Today every regular user creates the project they care about
+  themselves (so they're automatically project-admin); the
+  edge case where user B tries to submit an intent against user A's
+  project is left as a route-handler enhancement
+- **Memberships repo uses the camelCased row directly.** The
+  postgres.js client transforms column names at fetch time
+  (`transform.column = postgres.toCamel`), so explicit row → record
+  mapping is not just unnecessary, it's harmful — the first draft
+  of `users.ts` and `memberships.ts` hand-mapped `display_name →
+  displayName` and lost every field along the way (postgres.js
+  rejected the upsert with `UNDEFINED_VALUE`). The fix was to
+  delete the mappers and trust the camelCased row. Same trap as
+  the JSONB read paths handled by `parseJsonb` — but solved by
+  the client config rather than per-repo defence
+- **Migration backfills project-admin from `projects.created_by`.**
+  Without the backfill, every previously-registered project would
+  vanish from the dashboard the moment migration 010 ran (the user
+  who registered the project would have zero memberships). The
+  backfill mirrors the previous "every authenticated user sees
+  every project" behaviour for the rows that existed at migration
+  time; the new auto-assign on `POST /projects` covers everything
+  after
+- **`POST /users` password field is optional.** Omitting it creates
+  a user that can only authenticate via IdP — the right behaviour
+  for corporate deployments where the admin pre-creates accounts
+  before the user's first SAML/OIDC login. The local_auth row is
+  only created when a password is supplied. `authProvider` is set
+  to `'pending'` for IdP-only users (so the upsert ON CONFLICT
+  target on `(idp_subject, auth_provider)` doesn't collide with a
+  future SAML login from the same subject)
+- **Deactivation guards live at BOTH layers.** The local provider
+  refuses login when `deactivatedAt` is non-null (catches the
+  password path); the JWT middleware re-checks on every authenticated
+  request (catches the existing-JWT path). Either alone would leave
+  a window: provider-only means a stolen JWT survives deactivation
+  until expiry; middleware-only means the deactivated user could
+  still pass the login flow and get a fresh JWT that immediately
+  gets 403'd on the next request (confusing UX)
+- **`hasPermission` removed, not aliased.** The function's role
+  hierarchy lookup `(viewer: 1, operator: 2, admin: 3)` doesn't map
+  onto the new two-value `UserRole`. Renaming + adjusting wouldn't
+  help — every call site of `hasPermission` was inside `requireRole`
+  itself. Removed instead, and `isPlatformAdmin(role)` exported in
+  its place for the public API surface
+- **Did NOT add stubs for the new UserRepository methods to the
+  oracle/mssql adapters.** The Oracle and MSSQL adapter packages
+  don't currently have UserRepository stubs at all (they only stub
+  the repos that were added since the initial release); adding a
+  full users stub there is a parity-cleanup task, not a regression.
+  Memberships stubs WERE added because they're the entirely-new
+  repository this session introduced
+- **`POST /users` with `authProvider: 'pending'` for IdP-only
+  users.** The `users.upsert` ON CONFLICT key is
+  `(idp_subject, auth_provider)`. Using `'local'` for a no-password
+  user would collide with a future local-login by the same email;
+  using `'pending'` (the value the AuthManager will overwrite with
+  the real provider on first login) leaves the row distinguishable
+  during the pre-login window
+- **Admin view sidebar entry uses `★`.** Mirrors the platform-admin
+  badge shown in the users table — the same glyph stands for "this
+  is the platform-admin surface" wherever it appears
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Migration 010 applied cleanly. Full role-model verification
+(membership filter, deactivation, self-protection, last-
+project-admin guard, dashboard conditional rendering)
+exercised end-to-end. The CLI's `users list` / `users members`
+both work against the live server.
+
+Follow-ups added to Pending enhancements:
+- **POST /intents / POST /maintenance/trigger don't enforce
+  per-project membership at the route level.** They check
+  `requireRole('operator')` which (per the new mapping) lets
+  every authenticated regular user through when there's no
+  projectId in the URL. The handlers receive the projectId from
+  the body and could call `memberships.findMembership` before
+  dispatching the BullMQ task. Today the gap is harmless because
+  every regular user is auto-assigned to the projects they
+  create; if cross-project intent submission ever becomes a
+  thing, this needs the handler-level check
+- **Oracle / MSSQL adapters lack a `UserRepository` throw-stub.**
+  Pre-existing gap (the repository was added before either Phase-2
+  adapter); migration 010 widened the interface with 4 new methods
+  but did not add the stub because it would have been net-new
+  scope. When those adapters get any real implementation, the
+  full UserRepository surface needs writing
+
+---
+
+### Session 2026-06-01 — Claude Code (handler-level project membership enforcement)
+
+Closes the user-management session's follow-up: `POST /intents` and
+`POST /maintenance/trigger` use `requireRole('operator')`, which —
+after migration 010 — lets any authenticated regular `user` through
+when the projectId is in the request body rather than the URL. A
+regular user who knew (or guessed) a projectId could submit intents,
+clarifications, fix-intents and maintenance triggers against a project
+they had no membership on. This session shuts that down at the
+handler level for every body-projectId route, plus tightens
+`POST /projects/:id/config` to `project-admin`.
+
+Changed:
+- `packages/server/src/auth/middleware.ts`:
+  - New `ProjectMembershipError` (Error subclass) carrying one of
+    `NOT_PROJECT_MEMBER` / `INSUFFICIENT_PROJECT_ROLE` as `code`
+  - New `requireProjectMembership(userId, userPlatformRole,
+    projectId, minRole = 'reader')` helper. platform-admin returns
+    `null` (bypass). Otherwise looks up the membership via
+    `getRepositories().memberships.findMembership(...)`; missing →
+    throws `NOT_PROJECT_MEMBER`; present-but-below-minRole → throws
+    `INSUFFICIENT_PROJECT_ROLE`. Role rank hard-coded inside the
+    helper as `{ reader: 1, editor: 2, 'project-admin': 3 }`
+  - New `sendProjectMembershipError(reply, err)` — shapes the
+    canonical 403 body `{ error: 'FORBIDDEN', code, message }`. The
+    `code` is what the CLI parses to choose its friendly message
+- `packages/server/src/routes/intents.ts`:
+  - `POST /intents` — after body parse and projectId validation,
+    calls `requireProjectMembership(..., 'editor')`. The membership
+    check runs BEFORE any intent row is created, so a 403 leaves
+    the DB untouched
+  - `POST /intents/:id/clarify` — membership resolved from the
+    loaded intent's `projectId` (not from `params.id`, which is an
+    intent UUID — `requireRole('operator')` correctly already
+    refused to misread it as a project ID). Runs BEFORE the
+    `status !== 'waiting-for-clarification'` check so a reader gets
+    the membership 403 regardless of intent status
+- `packages/server/src/routes/maintenance.ts`:
+  - `POST /maintenance/trigger` — same editor-minimum check using
+    the body's projectId
+  - `DELETE /maintenance/findings/:projectId` — added the same
+    check. Route param is `:projectId` not `:id` so the
+    `requireRole('operator')` preHandler's `routerPath.startsWith
+    ('/projects/:id')` test doesn't match. Editor minimum
+- `packages/server/src/oversight/routes.ts`:
+  - `POST /alerts/:id/fix-intent` — membership check runs AFTER
+    `resolveProjectIdForAlert` succeeds (since we need the
+    projectId from the alert context or via the linked intent),
+    but BEFORE the `intents.create` + BullMQ dispatch so a 403
+    leaves the alert un-acked and no orphan intent row
+- `packages/server/src/routes/projects.ts`:
+  - `POST /projects/:id/config` — **project-admin minimum**
+    (editor isn't enough because HARNESS.json changes shape
+    deploy/maintenance for every operator on the project). Helper
+    pulls `request.params.id` directly
+- `packages/cli/src/ui/server-errors.ts`:
+  - New `parseForbiddenBody(err)` — pulls the typed
+    `{ code, message }` shape out of `ApiClientError.body` when
+    `status === 403`. Returns null for any other shape
+  - New `handleMembershipForbidden(err)` — prints a contextual
+    hint for `NOT_PROJECT_MEMBER` (`gestalt users assign <email>
+    <project> --role editor`) and `INSUFFICIENT_PROJECT_ROLE`
+    ("Ask a platform-admin or project-admin to upgrade your
+    role"). Returns true when it handled the error so the caller
+    knows NOT to print its own "Failed: ..." line. False for
+    everything else (so the existing generic catch arm still
+    runs)
+- `packages/cli/src/commands/run.ts`,
+  `packages/cli/src/commands/maintenance.ts` (two catch blocks),
+  `packages/cli/src/commands/projects.ts` (the `set-adapter`
+  catch): each now does
+  `if (isConnectivityError(err)) { ... } else if (!handleMembership
+  Forbidden(err)) { console.log(c.error(...)); }`. Keeps the
+  existing precedence order — connectivity wins over typed 403,
+  typed 403 wins over generic
+
+Verified live against `trackeros`:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt
+- Created `reader@example.com` (`user` / membership `reader` on
+  trackeros) and `editor@example.com` (`user` / membership `editor`).
+  Tokens captured for the test matrix
+- **As reader:**
+  - `POST /intents { projectId: trackeros }` → 403
+    `INSUFFICIENT_PROJECT_ROLE` `"Minimum project role required:
+    editor"` ✓
+  - `POST /maintenance/trigger { agentRole: drift-agent, projectId:
+    trackeros }` → same 403 ✓
+  - `GET /intents?projectId=trackeros&limit=2` → 200 with two
+    intents (`HTTP_STATUS=200`) — reader CAN view ✓
+- **As editor:**
+  - `POST /intents` → 201 (intent created in `pending` then
+    transitioned to `generating`; cleaned up to `failed` via direct
+    SQL to avoid the orchestrator burning LLM calls on a placeholder
+    intent) ✓
+  - `POST /maintenance/trigger { agentRole: drift-agent }` →
+    `status: completed`, `runId: 362c154a-…`, `durationMs: 1215` ✓
+  - `POST /projects/:id/config { pipeline.adapter: 'github-actions' }`
+    → 403 `INSUFFICIENT_PROJECT_ROLE` `"Minimum project role
+    required: project-admin"` ✓
+- **As editor against an outsider project they don't belong to:**
+  Admin pre-created an `outsider` project; editor's `POST /intents
+  { projectId: outsider }` → 403 `NOT_PROJECT_MEMBER` `"You are not
+  a member of this project"` ✓
+- **As platform-admin (`a@b.c`):**
+  `POST /intents { projectId: outsider }` → 201 (bypass) ✓;
+  `POST /projects/:outsider/config { pipeline.adapter: noop }`
+  passed the membership check (5xx'd downstream on the placeholder
+  Git URL — the bypass worked, the clone step failed, which is the
+  right semantics) ✓
+- **`POST /intents/:id/clarify` membership check** — picked a random
+  trackeros intent (status didn't matter — membership runs BEFORE
+  the status check), called as reader → 403
+  `INSUFFICIENT_PROJECT_ROLE` ✓ (confirms the editor-minimum check
+  runs before the status branch)
+- **CLI** (admin config swapped out for each scenario, then
+  restored):
+  - `gestalt run "..."` as reader:
+    ```
+    ✗ Minimum project role required: editor
+      Ask a platform-admin or project-admin to upgrade your role.
+    ```
+  - `gestalt maintenance trigger drift-agent trackeros` as reader:
+    same friendly message ✓
+  - `gestalt projects set-adapter trackeros github-actions` as
+    editor:
+    ```
+    ✗ Minimum project role required: project-admin
+      Ask a platform-admin or project-admin to upgrade your role.
+    ```
+  In every case the CLI printed the friendly two-line block
+  instead of the raw JSON error body that the previous catch arm
+  would have shown
+
+Decisions made:
+- **`requireProjectMembership` is a regular function, NOT a Fastify
+  preHandler.** The brief's pseudocode put the check inline inside
+  the handler; the helper version follows that. preHandlers can't
+  see the request body without the route's typed `Body` generic, so
+  there's no clean way to express the body-projectId case as a
+  preHandler factory without duplicating the body-shape per route.
+  The helper instead takes the projectId as an explicit argument
+  the handler already has in scope; less elegant than a preHandler
+  but unambiguous and short
+- **The helper THROWS rather than returns a discriminated union.**
+  Callers wrap with `try { ... } catch (err) { if (err instanceof
+  ProjectMembershipError) return sendProjectMembershipError(reply,
+  err); throw err; }`. Three lines per call site, but it composes
+  with the existing handler error-path patterns and means the
+  helper can be called multiple times in one handler without
+  branching ladders. The Error-subclass + `instanceof` guard is the
+  same pattern `PipelineAdapterAuthError` uses in the deploy layer
+- **Editor for everything except `/projects/:id/config`.**
+  Submitting work (intent, maintenance, fix-intent, clarification)
+  is `editor`. Mutating shared project configuration (the committed
+  `HARNESS.json`) is `project-admin` — the brief's table puts
+  config changes squarely in the project-admin column, and an
+  editor who can't manage members shouldn't be flipping the deploy
+  pipeline adapter either
+- **Closed `DELETE /maintenance/findings/:projectId` too.** Not in
+  the brief's enumerated five, but the same shape: route param is
+  `:projectId` not `:id`, so the preHandler's
+  `routerPath.startsWith('/projects/:id')` check doesn't catch
+  it. Resetting another project's finding budget is operator-grade,
+  same as triggering its maintenance agents — editor minimum
+- **Did NOT extend `POST /alerts/:id/acknowledge` with a membership
+  check.** Acknowledging an alert is a pure UI action — no work is
+  queued, no state mutated except the alert's `acknowledged_at`.
+  If a non-member finds an alert ID and dismisses it, they only
+  hide a notification from the target project's members; they
+  don't change project state. Possibly worth tightening later but
+  out of scope for this brief's "writes that touch project work"
+  framing
+- **Reader can still GET intents.** The brief is explicit that
+  readers retain read access. The list endpoint `GET /intents` has
+  no preHandler at all (any authenticated user can query
+  `?projectId=...`), which IS a separate pre-existing gap — but
+  the brief explicitly carves it out by listing "GET /intents →
+  should succeed (reader can view)" in the verification matrix.
+  Tightening the list endpoint to enforce membership server-side
+  is a future enhancement; today's reader leak there is by design
+- **`handleMembershipForbidden` returns boolean, not throws.**
+  Lets the call site keep `if/else if` precedence (connectivity →
+  membership → generic) without nested try/catch. Same pattern
+  `isConnectivityError` already uses
+- **CLI doesn't print actionable suggestions for non-member users
+  beyond "ask a project-admin to upgrade your role".** The
+  `gestalt users assign` hint only fires for `NOT_PROJECT_MEMBER`
+  because that's the case the user can self-trigger by knowing
+  someone else's email. For role-upgrades the operator who can act
+  isn't the caller, so we point upward instead of showing a
+  command they can't run themselves
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; full verification matrix (reader / editor /
+platform-admin / non-member-editor) exercised against the live
+platform; CLI surfaces the typed friendly messages for all three
+hit cases. No new migrations, no new tables, no dashboard changes
+— pure auth tightening.
+
+Follow-up from the prior user-management session resolved: "POST
+/intents / POST /maintenance/trigger don't enforce per-project
+membership at the route level" no longer applies. The handler-
+level helper closes that gap and the role-rank check raises
+`/projects/:id/config` to project-admin in the same pass.

@@ -176,7 +176,7 @@ export interface AuditRepository extends BaseRepository {
 
 // ─── User repository ──────────────────────────────────────────────────────────
 
-import type { UserRole } from '../types';
+import type { UserRole, ProjectRole } from '../types';
 
 export interface UserRecord {
   id: string;
@@ -187,15 +187,71 @@ export interface UserRecord {
   idpSubject: string;
   idpGroups: string[];
   lastLoginAt: Date;
+  /**
+   * Soft-delete marker. Migration 010 added this column; existing rows
+   * have NULL meaning "active". The auth middleware rejects any request
+   * whose user is deactivated (403 ACCOUNT_DEACTIVATED) so an existing
+   * JWT cannot outlive an admin-driven deactivation.
+   */
+  deactivatedAt: Date | null;
   createdAt: Date;
 }
 
 export interface UserRepository extends BaseRepository {
-  upsert(user: Omit<UserRecord, 'id' | 'createdAt'>): Promise<UserRecord>;
+  upsert(user: Omit<UserRecord, 'id' | 'createdAt' | 'deactivatedAt'>): Promise<UserRecord>;
   findById(id: string): Promise<UserRecord | null>;
   findByIdpSubject(subject: string, provider: string): Promise<UserRecord | null>;
-  list(): Promise<UserRecord[]>;
+  /**
+   * Case-insensitive lookup. Returns null when the email is not on file.
+   * Used by the CLI's `gestalt users role|deactivate|assign` flows so the
+   * operator can name a user by email without first calling `list`.
+   */
+  findByEmail(email: string): Promise<UserRecord | null>;
+  /** Search by displayName or email (case-insensitive substring). */
+  list(params?: { search?: string; includeDeactivated?: boolean }): Promise<UserRecord[]>;
   count(): Promise<number>;
+  updateRole(id: string, role: UserRole): Promise<UserRecord>;
+  /** Updates `displayName` (and only `displayName`). */
+  updateDisplayName(id: string, displayName: string): Promise<UserRecord>;
+  /** Sets `deactivated_at = NOW()` so future requests are 403'd. */
+  deactivate(id: string): Promise<UserRecord>;
+}
+
+// ─── Project membership repository ───────────────────────────────────────────
+
+export interface ProjectMembershipRecord {
+  id: string;
+  userId: string;
+  projectId: string;
+  role: ProjectRole;
+  assignedBy: string | null;
+  createdAt: Date;
+}
+
+/**
+ * Project-level access control (one row per (user, project) pair).
+ * `platform-admin` users do NOT need a membership row — the auth
+ * middleware bypasses every project check for them. Regular `user`
+ * accounts must be explicitly assigned.
+ *
+ * `addMember` upserts: if the (user, project) row already exists it
+ * updates the role + assigned_by rather than failing on the UNIQUE
+ * constraint. Makes the `set-role` CLI flow idempotent.
+ */
+export interface ProjectMembershipRepository extends BaseRepository {
+  addMember(params: {
+    userId: string;
+    projectId: string;
+    role: ProjectRole;
+    assignedBy: string;
+  }): Promise<ProjectMembershipRecord>;
+  updateRole(userId: string, projectId: string, role: ProjectRole): Promise<ProjectMembershipRecord>;
+  removeMember(userId: string, projectId: string): Promise<void>;
+  findByProject(projectId: string): Promise<ProjectMembershipRecord[]>;
+  findByUser(userId: string): Promise<ProjectMembershipRecord[]>;
+  findMembership(userId: string, projectId: string): Promise<ProjectMembershipRecord | null>;
+  /** Used by the "cannot remove the last project-admin" guard in the route. */
+  countAdmins(projectId: string): Promise<number>;
 }
 
 // ─── Local auth credentials repository ────────────────────────────────────────
@@ -263,6 +319,7 @@ export interface RepositoryRegistry {
   findingAttempts: FindingAttemptRepository;
   alerts: AlertRepository;
   executionLogs: AgentExecutionLogRepository;
+  memberships: ProjectMembershipRepository;
 }
 
 // ─── Alert repository ─────────────────────────────────────────────────────────

@@ -7,7 +7,9 @@
 
 export type AuthProviderType = 'windows-kerberos' | 'saml' | 'oidc' | 'local';
 
-export type UserRole = 'admin' | 'operator' | 'viewer';
+// Platform-level role. Per-project access is in `project_memberships`
+// — see `@gestalt/core` repository docs.
+export type UserRole = 'platform-admin' | 'user';
 
 // ─── Provider configs ─────────────────────────────────────────────────────────
 
@@ -78,6 +80,7 @@ export interface PlatformUser {
   idpSubject: string;       // IdP's unique identifier (NameID / sub / username)
   idpGroups: string[];      // raw groups from IdP — stored for role re-evaluation
   lastLoginAt: Date;
+  deactivatedAt: Date | null;
   createdAt: Date;
 }
 

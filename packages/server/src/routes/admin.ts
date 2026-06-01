@@ -7,7 +7,7 @@
  *   Returns 403 once any user exists.
  *
  * The route hashes the password with bcrypt, inserts the user with
- * role: 'admin' and authProvider: 'local', creates the local_auth credential
+ * role: 'platform-admin' and authProvider: 'local', creates the local_auth credential
  * row, writes an audit record (GP-002), and issues a JWT so the operator is
  * signed in immediately.
  */
@@ -75,7 +75,7 @@ export async function registerAdminRoutes(
       const user = await users.upsert({
         email: normalisedEmail,
         displayName: displayName.trim(),
-        role: 'admin',
+        role: 'platform-admin',
         authProvider: 'local',
         idpSubject: normalisedEmail,
         idpGroups: [],
@@ -98,7 +98,7 @@ export async function registerAdminRoutes(
         correlationId: request.correlationId,
         metadata: {
           email: normalisedEmail,
-          role: 'admin',
+          role: 'platform-admin',
           authProvider: 'local',
           source: 'first-boot-setup',
           ip: request.ip,

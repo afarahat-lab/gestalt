@@ -2,6 +2,7 @@ import React, { useMemo } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { ApiProvider } from './hooks/useApi';
 import { ProjectProvider } from './context/ProjectContext';
+import { CurrentUserProvider, useCurrentUser } from './context/CurrentUserContext';
 import { DashboardApiClient } from './api/client';
 import { Layout } from './components/layout/Layout';
 import { Login } from './views/Login';
@@ -12,10 +13,18 @@ import { QualityGate } from './views/QualityGate';
 import { Deployments } from './views/Deployments';
 import { Maintenance } from './views/Maintenance';
 import { Alerts } from './views/Alerts';
+import { Admin } from './views/Admin';
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const token = localStorage.getItem('gestalt_token');
   if (!token) return <Navigate to="/login" replace />;
+  return <>{children}</>;
+}
+
+function RequirePlatformAdmin({ children }: { children: React.ReactNode }) {
+  const { user, loading } = useCurrentUser();
+  if (loading) return null;
+  if (!user || user.role !== 'platform-admin') return <Navigate to="/" replace />;
   return <>{children}</>;
 }
 
@@ -40,13 +49,15 @@ export default function App() {
             path="/"
             element={
               <RequireAuth>
-                {/* ProjectProvider sits inside RequireAuth so the
-                    `/projects` call only fires for authenticated
-                    sessions, and outside the Routes so every view
-                    sees the same context. */}
-                <ProjectProvider>
-                  <Layout />
-                </ProjectProvider>
+                {/* CurrentUserProvider + ProjectProvider sit inside
+                    RequireAuth so their fetches only fire for
+                    authenticated sessions, and outside the Routes so
+                    every view sees the same context. */}
+                <CurrentUserProvider>
+                  <ProjectProvider>
+                    <Layout />
+                  </ProjectProvider>
+                </CurrentUserProvider>
               </RequireAuth>
             }
           >
@@ -57,6 +68,14 @@ export default function App() {
             <Route path="deployments" element={<Deployments />} />
             <Route path="maintenance" element={<Maintenance />} />
             <Route path="alerts" element={<Alerts />} />
+            <Route
+              path="admin/*"
+              element={
+                <RequirePlatformAdmin>
+                  <Admin />
+                </RequirePlatformAdmin>
+              }
+            />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

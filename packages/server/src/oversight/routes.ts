@@ -32,7 +32,10 @@ import type {
   AlertRecord, TaskMessage, TaskPriority, CodeLocation,
 } from '@gestalt/core';
 import { emitLiveEvent } from '../events';
-import { requireRole } from '../auth/middleware';
+import {
+  requireRole, requireProjectMembership, sendProjectMembershipError,
+  ProjectMembershipError,
+} from '../auth/middleware';
 import type { InterventionRequest } from './types';
 
 const log = createContextLogger({ module: 'routes:oversight' });
@@ -176,6 +179,17 @@ export async function registerOversightRoutes(app: FastifyInstance): Promise<voi
         return reply.code(400).send({
           error: 'Could not resolve projectId for this alert — fix intent cannot be queued',
         });
+      }
+
+      // Editor or above required — the fix intent will commit code on
+      // the resolved project's repo.
+      try {
+        await requireProjectMembership(
+          request.user.id, request.user.role, projectId, 'editor',
+        );
+      } catch (err) {
+        if (err instanceof ProjectMembershipError) return sendProjectMembershipError(reply, err);
+        throw err;
       }
 
       const correlationId = crypto.randomUUID();

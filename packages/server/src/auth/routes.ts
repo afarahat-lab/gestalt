@@ -110,7 +110,8 @@ export async function registerAuthRoutes(
         });
       } catch (err) {
         if (err instanceof AuthenticationError) {
-          const status = err.code === 'LOCAL_IN_PRODUCTION' ? 403 : 401;
+          const status =
+            err.code === 'LOCAL_IN_PRODUCTION' || err.code === 'ACCESS_DENIED' ? 403 : 401;
           return reply.code(status).send({ error: err.message, code: err.code });
         }
         log.error({ err }, 'Unexpected error during local login');

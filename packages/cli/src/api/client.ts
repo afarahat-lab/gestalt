@@ -124,6 +124,46 @@ export interface AgentsValidateResponse {
   customAgents: number;
 }
 
+// ─── Users + memberships (migration 010) ─────────────────────────────────────
+
+export type UserRoleString = 'platform-admin' | 'user';
+export type ProjectRoleString = 'project-admin' | 'editor' | 'reader';
+
+export interface UserSummary {
+  id: string;
+  email: string;
+  displayName: string;
+  role: UserRoleString;
+  authProvider: string;
+  deactivatedAt: string | null;
+  lastLoginAt: string;
+  createdAt: string;
+}
+
+export interface MembershipRecord {
+  id: string;
+  userId: string;
+  projectId: string;
+  role: ProjectRoleString;
+  assignedBy: string | null;
+  createdAt: string;
+}
+
+export interface UserDetail extends UserSummary {
+  memberships: MembershipRecord[];
+}
+
+export interface ProjectMember {
+  userId: string;
+  email: string;
+  displayName: string;
+  platformRole: UserRoleString;
+  projectRole: ProjectRoleString;
+  deactivatedAt: string | null;
+  assignedBy: string | null;
+  createdAt: string;
+}
+
 export class GestaltApiClient {
   private readonly baseUrl: string;
   private token: string | null;
@@ -289,6 +329,60 @@ export class GestaltApiClient {
     return this.post(`/alerts/${id}/acknowledge`, { notes: notes ?? '' });
   }
 
+  // ─── Users + memberships (migration 010) ──────────────────────────────────
+
+  async listUsers(params?: { search?: string }): Promise<{ data: UserSummary[] }> {
+    return this.get('/users', params);
+  }
+
+  async createUser(params: {
+    email: string;
+    displayName: string;
+    role: 'platform-admin' | 'user';
+    password?: string;
+    projectAssignments?: Array<{ projectId: string; role: ProjectRoleString }>;
+  }): Promise<{ data: UserSummary }> {
+    return this.post('/users', params);
+  }
+
+  async getUserDetail(id: string): Promise<{ data: UserDetail }> {
+    return this.get(`/users/${id}`);
+  }
+
+  async updateUser(
+    id: string,
+    params: { role?: 'platform-admin' | 'user'; displayName?: string },
+  ): Promise<{ data: UserSummary }> {
+    return this.patch(`/users/${id}`, params);
+  }
+
+  async deactivateUser(id: string): Promise<void> {
+    await this.delete(`/users/${id}`);
+  }
+
+  async listProjectMembers(projectId: string): Promise<{ data: ProjectMember[] }> {
+    return this.get(`/projects/${projectId}/members`);
+  }
+
+  async addProjectMember(
+    projectId: string,
+    params: { userId: string; role: ProjectRoleString },
+  ): Promise<{ data: MembershipRecord }> {
+    return this.post(`/projects/${projectId}/members`, params);
+  }
+
+  async updateProjectMemberRole(
+    projectId: string,
+    userId: string,
+    role: ProjectRoleString,
+  ): Promise<{ data: MembershipRecord }> {
+    return this.patch(`/projects/${projectId}/members/${userId}`, { role });
+  }
+
+  async removeProjectMember(projectId: string, userId: string): Promise<void> {
+    await this.delete(`/projects/${projectId}/members/${userId}`);
+  }
+
   // ─── SSE stream ────────────────────────────────────────────────────────────
 
   /**
@@ -340,12 +434,23 @@ export class GestaltApiClient {
     return res.json() as Promise<T>;
   }
 
+  private async patch<T = unknown>(path: string, body: unknown): Promise<T> {
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      method: 'PATCH',
+      headers: { ...this.authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new ApiClientError(res.status, await res.text());
+    return res.json() as Promise<T>;
+  }
+
   private async delete<T = unknown>(path: string): Promise<T> {
     const res = await fetch(`${this.baseUrl}${path}`, {
       method: 'DELETE',
       headers: this.authHeaders(),
     });
     if (!res.ok) throw new ApiClientError(res.status, await res.text());
+    if (res.status === 204) return undefined as unknown as T;
     return res.json() as Promise<T>;
   }
 

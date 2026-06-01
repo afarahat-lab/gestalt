@@ -314,10 +314,54 @@ export interface LiveEvent {
 
 // ─── Dashboard user ───────────────────────────────────────────────────────────
 
-export type UserRole = 'admin' | 'operator' | 'viewer';
+export type UserRole = 'platform-admin' | 'user';
+export type ProjectRole = 'project-admin' | 'editor' | 'reader';
 
 export interface DashboardUser {
   id: string;
   email: string;
   role: UserRole;
+}
+
+export interface UserSummary {
+  id: string;
+  email: string;
+  displayName: string;
+  role: UserRole;
+  authProvider: string;
+  deactivatedAt: string | null;
+  lastLoginAt: string;
+  createdAt: string;
+}
+
+export interface MembershipSummary {
+  id: string;
+  userId: string;
+  projectId: string;
+  role: ProjectRole;
+  assignedBy: string | null;
+  createdAt: string;
+}
+
+export interface UserDetail extends UserSummary {
+  memberships: MembershipSummary[];
+}
+
+export interface ProjectMember {
+  userId: string;
+  email: string;
+  displayName: string;
+  platformRole: UserRole;
+  projectRole: ProjectRole;
+  deactivatedAt: string | null;
+  assignedBy: string | null;
+  createdAt: string;
+}
+
+export interface CreateUserParams {
+  email: string;
+  displayName: string;
+  role: UserRole;
+  password?: string;
+  projectAssignments?: Array<{ projectId: string; role: ProjectRole }>;
 }

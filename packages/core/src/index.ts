@@ -9,7 +9,7 @@ export type {
   TaskMessage, TaskResult, TaskResultStatus,
   PlatformSignal, CodeLocation,
   Artifact, ArtifactType,
-  UserRole,
+  UserRole, ProjectRole,
   Result,
 } from './types';
 export { ok, err } from './types';
@@ -43,6 +43,7 @@ export type {
   FindingAttemptRecord,
   AlertRecord, AlertType, AlertRequiredAction,
   AgentExecutionLogRecord,
+  ProjectMembershipRecord,
   RepositoryRegistry,
   IntentRepository, AgentExecutionRepository,
   ArtifactRepository, SignalRepository,
@@ -50,6 +51,7 @@ export type {
   ProjectRepository, DeploymentEventRepository,
   MaintenanceRunRepository, FindingAttemptRepository, AlertRepository,
   AgentExecutionLogRepository,
+  ProjectMembershipRepository,
 } from './repository/index';
 export { getRepositories, setRepositories } from './repository/index';
 

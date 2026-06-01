@@ -134,8 +134,20 @@ export interface Artifact {
 }
 
 // ─── User roles ───────────────────────────────────────────────────────────────
+//
+// Platform-level roles, stored on the `users` table. `platform-admin`
+// manages users and bypasses every project membership check; `user` only
+// sees projects they are explicitly assigned to via `project_memberships`.
+//
+// The legacy values (`admin` / `operator` / `viewer`) were migrated to the
+// new model in migration 010. Old call sites that read `user.role ===
+// 'admin'` will not match `platform-admin` — search for those before
+// landing changes.
+export type UserRole = 'platform-admin' | 'user';
 
-export type UserRole = 'admin' | 'operator' | 'viewer';
+// Project-level role, stored on `project_memberships.role`. Ordered
+// project-admin > editor > reader.
+export type ProjectRole = 'project-admin' | 'editor' | 'reader';
 
 // ─── Result type (typed error handling) ──────────────────────────────────────
 

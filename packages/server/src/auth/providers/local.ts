@@ -61,6 +61,11 @@ export class LocalProvider implements AuthProvider {
       throw new AuthenticationError('Account is in an invalid state.', 'PROVIDER_ERROR');
     }
 
+    if (user.deactivatedAt) {
+      log.info({ email, userId: user.id }, 'Local auth: deactivated user attempted login');
+      throw new AuthenticationError('Account has been deactivated.', 'ACCESS_DENIED');
+    }
+
     return {
       subject: email,
       email: user.email,

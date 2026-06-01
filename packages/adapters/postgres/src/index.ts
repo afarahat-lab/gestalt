@@ -21,6 +21,7 @@ import { PostgresMaintenanceRunRepository } from './repositories/maintenance-run
 import { PostgresFindingAttemptRepository } from './repositories/finding-attempts';
 import { PostgresAlertRepository } from './repositories/alerts';
 import { PostgresAgentExecutionLogRepository } from './repositories/execution-logs';
+import { PostgresProjectMembershipRepository } from './repositories/memberships';
 import { runMigrations } from './migrations/runner';
 
 export { closeDb, pingDb };
@@ -50,5 +51,6 @@ export async function createPostgresAdapter(databaseUrl: string): Promise<Reposi
     findingAttempts:  new PostgresFindingAttemptRepository(),
     alerts:           new PostgresAlertRepository(),
     executionLogs:    new PostgresAgentExecutionLogRepository(),
+    memberships:      new PostgresProjectMembershipRepository(),
   };
 }

@@ -28,6 +28,8 @@ import { registerMaintenanceRoutes } from './routes/maintenance';
 import { registerStatusRoutes } from './routes/status';
 import { registerEventsRoute } from './routes/events';
 import { registerOversightRoutes } from './oversight/routes';
+import { registerUserRoutes } from './routes/users';
+import { registerMembershipRoutes } from './routes/memberships';
 import { correlationHook } from './middleware/correlation';
 import { auditHook } from './middleware/audit';
 import type { AuthManager } from './auth/auth-manager';
@@ -82,6 +84,8 @@ export async function createApp(
   await registerMaintenanceRoutes(app);
   await registerEventsRoute(app, sessionConfig);
   await registerOversightRoutes(app);
+  await registerUserRoutes(app);
+  await registerMembershipRoutes(app);
 
   // ─── Dashboard static files ────────────────────────────────────────────────
   //

@@ -7,7 +7,9 @@
 
 import { GestaltApiClient } from '../api/client';
 import { loadCliConfig, resolveServerUrl } from '../ui/config';
-import { printConnectionError, isConnectivityError } from '../ui/server-errors';
+import {
+  printConnectionError, isConnectivityError, handleMembershipForbidden,
+} from '../ui/server-errors';
 import {
   c, blank, divider, createSpinner,
   statusBadge,
@@ -59,7 +61,7 @@ export async function runCommand(intentText: string, options: RunOptions): Promi
     submitSpinner.stop();
     if (isConnectivityError(err)) {
       printConnectionError(serverUrl);
-    } else {
+    } else if (!handleMembershipForbidden(err)) {
       console.log(c.error(`Failed: ${err instanceof Error ? err.message : String(err)}`));
     }
     process.exit(1);

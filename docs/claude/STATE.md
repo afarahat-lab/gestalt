@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — BaseLLMAgent refactor: every LLM agent shares one abstract class)
+**Last updated:** 2026-06-01 (Claude Code — Handler-level project membership enforcement on intent submit, clarify, maintenance trigger, alert fix-intent, project config)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -22,10 +22,11 @@ the historical record of how the state evolved._
   are summarised in the "Session log" entries dated 2026-05-29 / 30
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
-- All nine migrations apply on startup: `001_initial`, `002_local_auth`,
+- All ten migrations apply on startup: `001_initial`, `002_local_auth`,
   `003_projects`, `004_deployments`, `005_maintenance`,
   `006_intent_clarification`, `007_execution_logs`,
-  `008_finding_attempts`, `009_execution_log_model`
+  `008_finding_attempts`, `009_execution_log_model`,
+  `010_user_management`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
 - **Dashboard SPA reachable in the browser, deep-linkable, no path
@@ -51,6 +52,142 @@ the historical record of how the state evolved._
   break)
 - First-boot bootstrap verified end-to-end: `gestalt init-admin` creates
   admin + JWT; `gestalt login` authenticates; `GET /auth/me` returns user
+- **Two-level user management wired end-to-end (migration 010).**
+  Platform roles (`platform-admin` | `user`) on `users.role`; per-project
+  roles (`project-admin` | `editor` | `reader`) on the new
+  `project_memberships` table. Legacy `admin` / `operator` / `viewer`
+  values were remapped in the migration so `gestalt init-admin`'s
+  original user is now `platform-admin`; everyone else became `user`.
+  - **`requireRole`** keeps the legacy string signature
+    (`admin` | `operator` | `viewer`) for backward compatibility with
+    every existing route guard. The mapping after 010:
+    `admin` → platform-admin only; `operator` / `viewer` → platform-admin
+    bypasses the project check, regular `user` must have a membership on
+    the project the request targets. The middleware resolves the
+    project ID from `params.id` (only when `routerPath` starts with
+    `/projects/:id`) or `query.projectId` — so `/intents/:id/clarify`
+    and `/executions/:id/log` are NOT mistakenly treated as project-
+    scoped. Routes without a project context fall through to
+    "authenticated user is enough"; route-level handlers enforce
+    further checks where needed (e.g. POST /intents passes the
+    projectId in the body)
+  - **POST /projects** auto-assigns the creator as `project-admin` so
+    they survive the new membership-aware GET /projects filter. The
+    migration also backfills a project-admin row for every previously-
+    registered project (keyed by `projects.created_by`)
+  - **GET /projects** returns ALL projects for `platform-admin` and
+    only membership-matched projects for `user`. The dashboard's
+    sidebar selector + every view that uses ProjectContext picks up
+    the filtered set automatically
+  - **Deactivation is enforced at TWO layers.** `local-provider.authenticate`
+    refuses login for any user whose `deactivated_at` is non-null
+    (returns `ACCESS_DENIED`, surfaced as HTTP 403). The JWT
+    validation middleware re-checks `user.deactivatedAt` on every
+    request so an existing JWT cannot outlive the deactivation —
+    the very next request after the soft-delete returns
+    `403 ACCOUNT_DEACTIVATED`
+  - **Self-protection guards** (server-side, no way to bypass via the
+    API): cannot deactivate yourself, cannot demote yourself from
+    platform-admin, cannot demote/remove the last project-admin from
+    any project. All 400 with explicit error codes
+    (`SELF_DEACTIVATE_FORBIDDEN`, `SELF_DEMOTION_FORBIDDEN`,
+    `LAST_PROJECT_ADMIN`)
+  - **CLI:** `gestalt users list [--search]`, `users add <email>`
+    (TTY prompts for display name, role, optional password), `users
+    role <email> <platform-admin|user>`, `users deactivate <email>`,
+    `users assign <email> <projectName> --role <role>`,
+    `users unassign <email> <projectName>`, `users members
+    <projectName>`. Each command resolves the user by email via
+    `GET /users?search=<email>` and the project by name via
+    `GET /projects` — no UUIDs in the operator's mouth
+  - **Dashboard Admin view** at `/app/admin` — platform-admin only.
+    `RequirePlatformAdmin` guard on the route; the sidebar link is
+    ABSENT FROM THE DOM (not just hidden) for regular users; a
+    regular user typing `/app/admin` directly is bounced via
+    `<Navigate to="/" replace>`. Two tabs: Users (table with
+    expandable rows showing per-user project memberships, in-line
+    role/membership editing, add-user modal supporting an optional
+    password + initial assignments) and Projects (per-project member
+    list with role change + add/remove)
+  - GP-002 — every mutation (`user.created` / `user.updated` /
+    `user.deactivated` / `project.member-added` /
+    `project.member-role-updated` / `project.member-removed`) writes
+    an audit row with previous + new values. No clarification-text-
+    style content is logged
+  - Verified live: migration 010 applies cleanly; the original `a@b.c`
+    admin became `platform-admin`; backfilled membership for
+    trackeros. Created `test@example.com` (`user`), assigned editor
+    on trackeros; admin sees 2 projects (member-test + trackeros)
+    while test sees only 1 (trackeros). Deactivated test user →
+    login 403 + existing JWT 403. Self-protection: tried to
+    deactivate / demote self → 400. Last project-admin guard:
+    tried to demote and remove → 400 `LAST_PROJECT_ADMIN`. Dashboard
+    drive (headless Chrome + CDP): platform-admin sees the `★ Admin`
+    nav link, `/app/admin` renders Users table; regular `user` has
+    NO admin link in the DOM and `/app/admin` bounces to `/app/`
+- **Handler-level project membership enforcement on body-projectId
+  routes.** Closes the gap the prior user-management session left
+  open: `requireRole('operator')` only resolves projectId from
+  `params.id` or `query.projectId`, so a regular `user` could
+  otherwise submit intents against any project ID they knew (no
+  membership row required). New `requireProjectMembership(userId,
+  platformRole, projectId, minRole)` helper in
+  `packages/server/src/auth/middleware.ts` returns the membership
+  record on success (or `null` for platform-admins who bypass) and
+  throws `ProjectMembershipError` with one of
+  `NOT_PROJECT_MEMBER` / `INSUFFICIENT_PROJECT_ROLE` on failure.
+  `sendProjectMembershipError(reply, err)` shapes the canonical
+  403 body (`{ error: 'FORBIDDEN', code, message }`).
+  Five route handlers now call the helper:
+  - **`POST /intents`** — editor minimum on the body's projectId
+  - **`POST /intents/:id/clarify`** — editor minimum, resolved from
+    the loaded intent's `projectId` (not `params.id`, which is an
+    intent UUID)
+  - **`POST /maintenance/trigger`** — editor minimum on the body's
+    projectId
+  - **`DELETE /maintenance/findings/:projectId`** — editor minimum
+    (route param is `:projectId` not `:id`, so the preHandler's
+    routerPath check doesn't match; same shape as the trigger gap)
+  - **`POST /alerts/:id/fix-intent`** — editor minimum on the
+    resolved-from-alert projectId
+  - **`POST /projects/:id/config`** — **project-admin minimum**
+    (editing HARNESS.json shapes deploy/maintenance for every
+    operator on the project; editor isn't enough)
+  Role rank `project-admin > editor > reader` is hard-coded in the
+  helper as `{reader:1, editor:2, 'project-admin':3}`; comparison
+  is `< minRole rank → INSUFFICIENT_PROJECT_ROLE`. platform-admin
+  bypasses every check (early return inside the helper).
+  CLI surfaces the new codes: new `handleMembershipForbidden(err)`
+  in `packages/cli/src/ui/server-errors.ts` parses
+  `ApiClientError.body` for the `{ code, message }` shape and
+  prints a contextual hint (`gestalt users assign ...` for
+  `NOT_PROJECT_MEMBER`; "ask a project-admin to upgrade your role"
+  for `INSUFFICIENT_PROJECT_ROLE`). Wired into the catch blocks of
+  `gestalt run`, `gestalt maintenance trigger`,
+  `gestalt maintenance reset-findings`, and
+  `gestalt projects set-adapter`. Generic 5xx / non-403 paths
+  unchanged — `handleMembershipForbidden` returns false so the
+  existing "Failed: ..." branch still runs.
+  Verified live against `trackeros`:
+  - **Reader** (`reader@example.com`, role `reader`) — `POST
+    /intents` → 403 `INSUFFICIENT_PROJECT_ROLE`; `POST
+    /maintenance/trigger` → same; `GET /intents?projectId=…` →
+    200 with the project's intents (reader CAN view)
+  - **Editor** (`editor@example.com`, role `editor`) — `POST
+    /intents` → 201 (intent queued); `POST /maintenance/trigger`
+    (drift-agent) → 200 with the completed run record; `POST
+    /projects/:id/config` → 403 `INSUFFICIENT_PROJECT_ROLE`
+    "Minimum project role required: project-admin"; trying to
+    submit an intent against a different project (where they are
+    NOT a member) → 403 `NOT_PROJECT_MEMBER`
+  - **Platform-admin** (`a@b.c`) — every operation succeeds
+    regardless of membership; created an intent against a project
+    they were not a member of, set its config — both passed the
+    auth check (the second 500'd on the placeholder Git URL, which
+    is downstream of the auth check)
+  - **CLI** — `gestalt run` / `gestalt maintenance trigger` /
+    `gestalt projects set-adapter` as a non-member each print the
+    typed friendly message instead of a raw JSON dump
 - **CLI server URL is fully configurable.** `gestalt config show` /
   `gestalt config set-server <url>` / `gestalt config reset` let
   operators inspect and change `~/.gestalt/config.json` without going
@@ -629,7 +766,19 @@ the historical record of how the state evolved._
 - `signals`     — save, findByCorrelationId, findUnresolved, markResolved
   (with GOLDEN_PRINCIPLE_BREACH human-only guard)
 - `audit`       — append-only, query with filters
-- `users`       — upsert, findById, findByIdpSubject, list, count
+- `users`       — upsert, findById, findByIdpSubject, findByEmail,
+  list (with search + includeDeactivated filters), count, updateRole,
+  updateDisplayName, deactivate. `role` column constrained to
+  (`platform-admin` | `user`); `deactivated_at` column nullable, set
+  by the soft-delete path; auth middleware rejects any request whose
+  user has a non-null value
+- `memberships` — addMember (UPSERT on `(user_id, project_id)` — second
+  call updates the role and `assigned_by`), updateRole, removeMember,
+  findByProject, findByUser, findMembership, countAdmins (used by the
+  last-project-admin guard in the route). Migration 010 backfills a
+  `project-admin` row for every existing project keyed on
+  `projects.created_by` so previously-registered projects survive the
+  membership-aware GET /projects filter
 - `localAuth`   — create, findByEmail
 - `projects`    — create, findById, findByName, list, saveCredential,
   getCredential (token stored plain — TODO: encrypt at rest)

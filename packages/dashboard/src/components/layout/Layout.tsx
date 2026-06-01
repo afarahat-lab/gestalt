@@ -3,6 +3,7 @@ import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { useDashboardApi } from '../../hooks/useApi';
 import { useLiveEvent } from '../../hooks/useLiveEvents';
 import { useProject } from '../../context/ProjectContext';
+import { useCurrentUser } from '../../context/CurrentUserContext';
 
 const NAV_ITEMS = [
   { path: '/',             label: 'Intents',     icon: '◈' },
@@ -13,10 +14,15 @@ const NAV_ITEMS = [
   { path: '/alerts',       label: 'Alerts',      icon: '!' },
 ];
 
+// platform-admin only — see CurrentUserProvider and RequirePlatformAdmin.
+const ADMIN_NAV_ITEM = { path: '/admin', label: 'Admin', icon: '★' };
+
 export function Layout() {
   const api = useDashboardApi();
   const navigate = useNavigate();
   const { projects, currentProjectId, setCurrentProjectId, loading: projectsLoading } = useProject();
+  const { user: currentUser } = useCurrentUser();
+  const isPlatformAdmin = currentUser?.role === 'platform-admin';
   const [alertCount, setAlertCount] = useState(0);
   const [connected] = useState(true);
 
@@ -95,6 +101,22 @@ export function Layout() {
               </NavLink>
             </li>
           ))}
+          {/* Admin entry is rendered only for platform-admin —
+              completely absent from the DOM for everyone else. */}
+          {isPlatformAdmin && (
+            <li key={ADMIN_NAV_ITEM.path}>
+              <NavLink
+                to={ADMIN_NAV_ITEM.path}
+                style={({ isActive }) => ({
+                  ...styles.navItem,
+                  ...(isActive ? styles.navItemActive : {}),
+                })}
+              >
+                <span style={styles.navIcon}>{ADMIN_NAV_ITEM.icon}</span>
+                <span>{ADMIN_NAV_ITEM.label}</span>
+              </NavLink>
+            </li>
+          )}
         </ul>
 
         {/* Footer */}

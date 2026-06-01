@@ -16,7 +16,10 @@ import {
 } from '@gestalt/core';
 import { triggerMaintenanceRun } from '@gestalt/agents-maintenance';
 import type { MaintenanceAgentName } from '@gestalt/agents-maintenance';
-import { requireRole } from '../auth/middleware';
+import {
+  requireRole, requireProjectMembership, sendProjectMembershipError,
+  ProjectMembershipError,
+} from '../auth/middleware';
 
 const log = createContextLogger({ module: 'routes:maintenance' });
 
@@ -71,6 +74,21 @@ export async function registerMaintenanceRoutes(app: FastifyInstance): Promise<v
         return reply.code(400).send({ error: 'projectId is required' });
       }
 
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+
+      // projectId is in the body, so `requireRole('operator')` can't
+      // check membership for us — do it here. Editor is the minimum:
+      // readers shouldn't be triggering maintenance work that could
+      // queue an intent against the project.
+      try {
+        await requireProjectMembership(
+          request.user.id, request.user.role, projectId, 'editor',
+        );
+      } catch (err) {
+        if (err instanceof ProjectMembershipError) return sendProjectMembershipError(reply, err);
+        throw err;
+      }
+
       const { projects } = getRepositories();
       const project = await projects.findById(projectId);
       if (!project) {
@@ -106,6 +124,21 @@ export async function registerMaintenanceRoutes(app: FastifyInstance): Promise<v
       const { projectId } = request.params;
       if (!projectId?.trim()) {
         return reply.code(400).send({ error: 'projectId is required' });
+      }
+
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+
+      // Route param is `:projectId` not `:id` so `requireRole('operator')`
+      // doesn't resolve membership for us. Same editor-minimum as the
+      // trigger above — resetting another project's finding budget is
+      // not something a reader of THIS project should be able to do.
+      try {
+        await requireProjectMembership(
+          request.user.id, request.user.role, projectId, 'editor',
+        );
+      } catch (err) {
+        if (err instanceof ProjectMembershipError) return sendProjectMembershipError(reply, err);
+        throw err;
       }
 
       const { projects, findingAttempts, audit } = getRepositories();

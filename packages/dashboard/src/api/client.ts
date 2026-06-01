@@ -10,6 +10,8 @@ import type {
   InterventionRecord, MaintenanceRunSummary, LiveEvent, DashboardUser,
   AgentExecutionSummary, ProjectSummary, SignalSummary,
   DeploymentSummary,
+  UserSummary, UserDetail, MembershipSummary, ProjectMember,
+  CreateUserParams, UserRole, ProjectRole,
 } from '../types';
 
 export class DashboardApiClient {
@@ -212,6 +214,44 @@ export class DashboardApiClient {
     return () => source.close();
   }
 
+  // ─── Users + memberships (migration 010) ──────────────────────────────────
+
+  async listUsers(params?: { search?: string }): Promise<{ data: UserSummary[] }> {
+    return this.get('/users', params);
+  }
+
+  async createUser(params: CreateUserParams): Promise<{ data: UserSummary }> {
+    return this.post('/users', params);
+  }
+
+  async getUser(id: string): Promise<{ data: UserDetail }> {
+    return this.get(`/users/${id}`);
+  }
+
+  async updateUser(id: string, params: { role?: UserRole; displayName?: string }): Promise<{ data: UserSummary }> {
+    return this.patch(`/users/${id}`, params);
+  }
+
+  async deactivateUser(id: string): Promise<void> {
+    await this.delete(`/users/${id}`);
+  }
+
+  async listMembers(projectId: string): Promise<{ data: ProjectMember[] }> {
+    return this.get(`/projects/${projectId}/members`);
+  }
+
+  async addMember(projectId: string, params: { userId: string; role: ProjectRole }): Promise<{ data: MembershipSummary }> {
+    return this.post(`/projects/${projectId}/members`, params);
+  }
+
+  async updateMemberRole(projectId: string, userId: string, role: ProjectRole): Promise<{ data: MembershipSummary }> {
+    return this.patch(`/projects/${projectId}/members/${userId}`, { role });
+  }
+
+  async removeMember(projectId: string, userId: string): Promise<void> {
+    await this.delete(`/projects/${projectId}/members/${userId}`);
+  }
+
   // ─── HTTP helpers ──────────────────────────────────────────────────────────
 
   private async get<T>(path: string, params?: Record<string, unknown>): Promise<T> {
@@ -233,6 +273,26 @@ export class DashboardApiClient {
       body: JSON.stringify(body),
     });
     if (!res.ok) throw new ApiError(res.status, await res.text());
+    return res.json() as Promise<T>;
+  }
+
+  private async patch<T>(path: string, body: unknown): Promise<T> {
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      method: 'PATCH',
+      headers: { ...this.headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new ApiError(res.status, await res.text());
+    return res.json() as Promise<T>;
+  }
+
+  private async delete<T>(path: string): Promise<T | void> {
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      method: 'DELETE',
+      headers: this.headers(),
+    });
+    if (!res.ok) throw new ApiError(res.status, await res.text());
+    if (res.status === 204) return;
     return res.json() as Promise<T>;
   }
 

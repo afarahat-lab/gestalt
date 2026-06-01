@@ -26,7 +26,10 @@ import {
   getRepositories, createContextLogger,
   type ProjectRecord,
 } from '@gestalt/core';
-import { requireRole } from '../auth/middleware';
+import {
+  requireRole, requireProjectMembership, sendProjectMembershipError,
+  ProjectMembershipError,
+} from '../auth/middleware';
 import { loadTemplate, resolveTemplatesDir } from '../templates/engine';
 
 /** ADR-036 — every project today gets the Tier 1 template. Future
@@ -134,6 +137,17 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
 
       await projects.saveCredential(project.id, gitToken);
 
+      // Auto-assign the creator as project-admin (migration 010 model).
+      // Without this, a non-platform-admin user who registers a project
+      // immediately loses access to it on the next `GET /projects` call.
+      const { memberships } = getRepositories();
+      await memberships.addMember({
+        userId: request.user.id,
+        projectId: project.id,
+        role: 'project-admin',
+        assignedBy: request.user.id,
+      });
+
       await audit.append({
         actor: request.user.id,
         action: 'project.created',
@@ -153,26 +167,36 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
     },
   );
 
-  // GET /projects — list every registered project.
+  // GET /projects — list projects the caller can see.
   //
-  // Returns ALL projects, not just those owned by `request.user.id`.
-  // Gestalt is a small-team self-hosted platform: collaborators expect
-  // every operator to be able to see and submit intents against every
-  // project. The previous owner-only filter meant a project registered
-  // by operator A was invisible to operator B (the dashboard then
-  // rendered "No projects — run gestalt init" even though `gestalt
-  // projects list` worked because the CLI's JWT belonged to A).
+  // After migration 010 the rule is membership-based:
+  //   - platform-admin → every registered project
+  //   - user           → only projects they are a member of
   //
-  // If per-project access control becomes a requirement, add a
-  // `project_members` table and intersect there; do NOT re-introduce
-  // the owner-only filter at this endpoint.
+  // The previous "every authenticated user sees every project" rule
+  // (which itself replaced an earlier owner-only filter) is now too
+  // permissive: corporate operators expect to see only their own
+  // workspace. platform-admin still sees everything for cross-cutting
+  // administration.
   app.get(
     '/projects',
     async (request, reply) => {
       if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
-      const { projects } = getRepositories();
-      const rows = await projects.listAll();
-      return reply.send({ data: rows.map(toPublic) });
+      const { projects, memberships } = getRepositories();
+
+      if (request.user.role === 'platform-admin') {
+        const rows = await projects.listAll();
+        return reply.send({ data: rows.map(toPublic) });
+      }
+
+      const userMemberships = await memberships.findByUser(request.user.id);
+      if (userMemberships.length === 0) return reply.send({ data: [] });
+
+      const rows = await Promise.all(
+        userMemberships.map((m) => projects.findById(m.projectId)),
+      );
+      const visible = rows.filter((r): r is ProjectRecord => r !== null);
+      return reply.send({ data: visible.map(toPublic) });
     },
   );
 
@@ -306,6 +330,18 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
     { preHandler: requireRole('operator') },
     async (request, reply) => {
       if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+
+      // Editing HARNESS.json shapes how the deploy chain runs for every
+      // operator on this project. Editor isn't enough — must be a
+      // project-admin (or platform-admin via the helper's bypass).
+      try {
+        await requireProjectMembership(
+          request.user.id, request.user.role, request.params.id, 'project-admin',
+        );
+      } catch (err) {
+        if (err instanceof ProjectMembershipError) return sendProjectMembershipError(reply, err);
+        throw err;
+      }
 
       const body = request.body ?? ({} as UpdateConfigBody);
       const requestedAdapter = body.pipeline?.adapter;

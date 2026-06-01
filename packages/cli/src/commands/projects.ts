@@ -13,7 +13,9 @@
 
 import { GestaltApiClient } from '../api/client';
 import { loadCliConfig, resolveServerUrl, updateCliConfig } from '../ui/config';
-import { printConnectionError, isConnectivityError } from '../ui/server-errors';
+import {
+  printConnectionError, isConnectivityError, handleMembershipForbidden,
+} from '../ui/server-errors';
 import { c, blank, divider, printTable } from '../ui/prompts';
 
 export async function projectsListCommand(options: { server?: string } = {}): Promise<void> {
@@ -118,7 +120,7 @@ export async function setAdapterCommand(
   } catch (err) {
     if (isConnectivityError(err)) {
       printConnectionError(serverUrl);
-    } else {
+    } else if (!handleMembershipForbidden(err)) {
       console.log(c.error(`Failed to update adapter: ${err instanceof Error ? err.message : String(err)}`));
     }
     process.exit(1);

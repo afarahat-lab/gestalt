@@ -20,7 +20,7 @@ const DEFAULT_IDENTITY_CONFIG: IdentityConfig = {
     },
   ],
   roleMapping: [],
-  defaultRole: 'viewer',
+  defaultRole: 'user',
   sessionTtlMinutes: 480,
 };
 

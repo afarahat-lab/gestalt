@@ -47,6 +47,10 @@ import {
 import {
   agentsListCommand, agentsValidateCommand,
 } from './commands/agents';
+import {
+  usersListCommand, usersAddCommand, usersRoleCommand, usersDeactivateCommand,
+  usersAssignCommand, usersUnassignCommand, usersMembersCommand,
+} from './commands/users';
 
 const pkg = { version: '0.1.0' };  // replaced by package.json at build time
 
@@ -217,6 +221,69 @@ agents
   .option('--server <url>', 'Server URL (one-shot override for this invocation)')
   .action(async (projectName: string, opts: { server?: string }) => {
     await agentsValidateCommand(projectName, { server: opts.server }).catch(fatalError);
+  });
+
+// gestalt users — platform user management (migration 010)
+const users = program
+  .command('users')
+  .description('Manage platform users and project memberships (platform-admin)');
+
+users
+  .command('list')
+  .description('List users registered on the platform')
+  .option('--search <text>', 'Substring match on email or display name')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (opts: { server?: string; search?: string }) => {
+    await usersListCommand({ server: opts.server, search: opts.search }).catch(fatalError);
+  });
+
+users
+  .command('add <email>')
+  .description('Create a user (prompts for display name, role, password)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (email: string, opts: { server?: string }) => {
+    await usersAddCommand(email, { server: opts.server }).catch(fatalError);
+  });
+
+users
+  .command('role <email> <role>')
+  .description('Set platform role (platform-admin | user)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (email: string, role: string, opts: { server?: string }) => {
+    await usersRoleCommand(email, role, { server: opts.server }).catch(fatalError);
+  });
+
+users
+  .command('deactivate <email>')
+  .description('Soft-delete a user (blocks all subsequent requests)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (email: string, opts: { server?: string }) => {
+    await usersDeactivateCommand(email, { server: opts.server }).catch(fatalError);
+  });
+
+users
+  .command('assign <email> <projectName>')
+  .description('Assign a user to a project with a role (default: editor)')
+  .option('--role <role>', 'Project role (project-admin | editor | reader)', 'editor')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (email: string, projectName: string, opts: { server?: string; role?: string }) => {
+    await usersAssignCommand(email, projectName, { server: opts.server, role: opts.role }).catch(fatalError);
+  });
+
+users
+  .command('unassign <email> <projectName>')
+  .description('Remove a user from a project')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (email: string, projectName: string, opts: { server?: string }) => {
+    await usersUnassignCommand(email, projectName, { server: opts.server }).catch(fatalError);
+  });
+
+users
+  .command('members <projectName>')
+  .description('List members of a project')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (projectName: string, opts: { server?: string }) => {
+    await usersMembersCommand(projectName, { server: opts.server }).catch(fatalError);
   });
 
 // gestalt run
