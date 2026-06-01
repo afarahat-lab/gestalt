@@ -19,7 +19,8 @@ import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { parse } from 'yaml';
 import { createContextLogger } from '@gestalt/core';
-import type { AgentConfig, AgentsYaml, CustomAgentDefinition, AgentLlmConfig } from '../types';
+import type { AgentConfig, AgentsYaml, CustomAgentDefinition, AgentLlmConfig, AgentToolConfig } from '../types';
+import type { BuiltInToolName } from '@gestalt/core';
 
 const log = createContextLogger({ module: 'agent-config-loader' });
 
@@ -34,6 +35,16 @@ const GENERIC_FALLBACK: AgentConfig = {
   goal: 'Complete the assigned task accurately',
   llm: { temperature: 0.2, maxTokens: 4096 },
   promptExtensions: [],
+  tools: { builtin: [] },
+};
+
+/**
+ * The full built-in file-tool set (ADR-038). Used by the per-role
+ * defaults for code-agent and context-agent so those agents can
+ * discover the existing codebase before generating output.
+ */
+const ALL_FILE_TOOLS: AgentToolConfig = {
+  builtin: ['readFile', 'listDirectory', 'searchFiles', 'getFileTree'],
 };
 
 /**
@@ -53,61 +64,82 @@ const PER_ROLE_DEFAULTS: Record<string, AgentConfig> = {
     goal: 'Extract a precise, unambiguous specification from a natural language intent',
     llm: { temperature: 0.1, maxTokens: 2000 },
     promptExtensions: [],
+    tools: { builtin: [] },
   },
   'design-agent': {
     role: 'Senior software architect',
     goal: 'Produce domain model changes, API contracts, and component specs',
     llm: { temperature: 0.2, maxTokens: 4000 },
     promptExtensions: [],
+    tools: { builtin: [] },
   },
   'context-agent': {
     role: 'Technical writer',
     goal: 'Keep project context files accurate and up to date',
     llm: { temperature: 0.1, maxTokens: 8000 },
     promptExtensions: [],
+    tools: { ...ALL_FILE_TOOLS },
   },
   'code-agent': {
     role: 'Senior TypeScript engineer',
     goal: 'Generate production-quality TypeScript code that follows the project harness',
     llm: { temperature: 0.2, maxTokens: 8000 },
     promptExtensions: [],
+    tools: { ...ALL_FILE_TOOLS },
   },
   'test-agent': {
     role: 'Senior QA engineer',
     goal: 'Generate comprehensive Vitest tests mapped to success criteria',
     llm: { temperature: 0.1, maxTokens: 6000 },
     promptExtensions: [],
+    tools: { builtin: [] },
   },
   'review-agent': {
     role: 'Senior engineer and code reviewer',
     goal: 'Assess generated code quality and architectural correctness',
     llm: { temperature: 0.1, maxTokens: 4000 },
     promptExtensions: [],
+    tools: { builtin: [] },
   },
   'drift-agent': {
     role: 'Technical documentation specialist',
     goal: 'Detect when project documentation has fallen behind the codebase',
     llm: { temperature: 0.1, maxTokens: 2000 },
     promptExtensions: [],
+    tools: { builtin: [] },
   },
   'alignment-agent': {
     role: 'Technical documentation specialist',
     goal: 'Ensure project context files are internally consistent',
     llm: { temperature: 0.1, maxTokens: 2000 },
     promptExtensions: [],
+    tools: { builtin: [] },
   },
   'context-fixer': {
     role: 'Technical writer',
     goal: 'Apply additive context-file edits that resolve maintenance findings',
     llm: { temperature: 0.2, maxTokens: 8192 },
     promptExtensions: [],
+    tools: { builtin: [] },
   },
 };
 
 function fallbackFor(agentRole: string): AgentConfig {
   const seeded = PER_ROLE_DEFAULTS[agentRole];
-  return seeded ? { ...seeded, llm: { ...seeded.llm }, promptExtensions: [...seeded.promptExtensions] }
-                : { ...GENERIC_FALLBACK, llm: { ...GENERIC_FALLBACK.llm }, promptExtensions: [] };
+  if (seeded) {
+    return {
+      ...seeded,
+      llm: { ...seeded.llm },
+      promptExtensions: [...seeded.promptExtensions],
+      tools: { builtin: [...(seeded.tools.builtin ?? [])] },
+    };
+  }
+  return {
+    ...GENERIC_FALLBACK,
+    llm: { ...GENERIC_FALLBACK.llm },
+    promptExtensions: [],
+    tools: { builtin: [] },
+  };
 }
 
 /**
@@ -166,7 +198,35 @@ export async function loadAgentConfig(
       ...(typeof llmIn['model'] === 'string' ? { model: llmIn['model'] as string } : {}),
     },
     promptExtensions: extractPromptExtensions(entry),
+    tools: extractTools(entry, baseline.tools),
   };
+}
+
+/**
+ * Reads `tools.builtin` from a YAML agent entry. Unknown tool names
+ * are dropped (operator typos should not crash a cycle); missing key
+ * falls back to the per-role baseline. The set of accepted built-in
+ * names is the `BuiltInToolName` union — `@gestalt/core` owns the
+ * canonical list.
+ */
+const VALID_BUILTIN_TOOLS = new Set<BuiltInToolName>([
+  'readFile', 'listDirectory', 'searchFiles', 'getFileTree',
+]);
+
+function extractTools(entry: AgentConfig, baseline: AgentToolConfig): AgentToolConfig {
+  const e = entry as unknown as Record<string, unknown>;
+  const toolsKey = e['tools'];
+  if (!toolsKey || typeof toolsKey !== 'object') {
+    return { builtin: [...(baseline.builtin ?? [])] };
+  }
+  const builtinIn = (toolsKey as Record<string, unknown>)['builtin'];
+  if (!Array.isArray(builtinIn)) {
+    return { builtin: [...(baseline.builtin ?? [])] };
+  }
+  const filtered = builtinIn.filter(
+    (s): s is BuiltInToolName => typeof s === 'string' && VALID_BUILTIN_TOOLS.has(s as BuiltInToolName),
+  );
+  return { builtin: filtered };
 }
 
 function extractPromptExtensions(entry: AgentConfig): string[] {

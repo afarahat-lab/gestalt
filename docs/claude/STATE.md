@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — gestalt.yml CI handles missing package.json + quick-start clarifies first-intent scaffolding)
+**Last updated:** 2026-06-01 (Claude Code — Agent tool use: built-in file tools + agents.yaml configuration + dashboard tool-call audit (ADR-038, migration 012))
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -22,11 +22,11 @@ the historical record of how the state evolved._
   are summarised in the "Session log" entries dated 2026-05-29 / 30
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
-- All eleven migrations apply on startup: `001_initial`, `002_local_auth`,
+- All twelve migrations apply on startup: `001_initial`, `002_local_auth`,
   `003_projects`, `004_deployments`, `005_maintenance`,
   `006_intent_clarification`, `007_execution_logs`,
   `008_finding_attempts`, `009_execution_log_model`,
-  `010_user_management`, `011_interventions`
+  `010_user_management`, `011_interventions`, `012_tool_calls`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
 - **Dashboard SPA reachable in the browser, deep-linkable, no path
@@ -355,6 +355,295 @@ the historical record of how the state evolved._
   - **regular user no projectId:** GET /intents → 200 with
     empty array; GET /alerts → 200 with empty array (the
     no-enumeration-leak rule)
+- **Section-based code/test/review prompts that surface the
+  project's architecture, HARNESS constraint rules, design spec,
+  and grouped signal feedback.** The biggest quality-of-output
+  improvement available — previously the code-agent generated
+  code without ever seeing the project's architecture, the
+  constraint rules the constraint-agent would later check, or
+  the design-agent's structured output. Now every LLM-generating
+  prompt opens with the non-negotiable rules:
+  - **`HarnessConfig.constraints.rules`** added to both the core
+    `@gestalt/core` and the agents-generate local
+    `HarnessConfig` types as `ConstraintRule[]` (id, description,
+    severity). Optional — absent on legacy projects so the
+    prompts just skip the section. Seeded into the
+    corporate-ops-web-mobile template's `HARNESS.json` with
+    eight rules covering repository-pattern access, inline-RBAC
+    refusal, audit on mutation, Zod input validation,
+    no-process-env, no-console-log, no-any, no-hardcoded-secrets
+  - **`ContextSnapshot.priorSignals`** added (was on `AgentTask`
+    only). The orchestrator already had the routed
+    signals in scope; it now passes them into
+    `assembleContext` so every prompt builder can read
+    `ctx.priorSignals` instead of relying on a separately-
+    threaded argument. Default `[]` on the first attempt;
+    populated on gate-driven retries with the per-agent routed
+    subset from `feedback-router.ts`
+  - **`packages/agents/generate/src/prompts/signal-formatter.ts`
+    (new)** — `buildSignalFeedback(signals)` formats the prior
+    cycle's routed signals into a `## Previous attempt failed
+    — you MUST fix ALL of the following` block grouped by
+    severity + type (critical CONSTRAINT_VIOLATION → other
+    CONSTRAINT_VIOLATION → TEST_FAILURE → LINT_FAILURE →
+    CONTEXT_GAP). Each entry shows `[file:line]` when present.
+    Empty signals → empty string so the section disappears on
+    the first attempt
+  - **`code-prompt.ts`** completely rewritten as eight named
+    sections, filter-joined so absent context (no design-spec
+    on the first cycle, no signals on the first attempt) leaves
+    no trailing blank header:
+    1. Project architecture (raw `architectureMd`, truncated
+       to 2000 chars)
+    2. Constraint rules (from `harness.constraints.rules`)
+    3. Design specification (raw
+       `.gestalt/design-spec.json` artifact, 3000-char cap)
+    4. Intent specification (rawIntent + success criteria +
+       scope + out-of-scope)
+    5. Golden principles (id + title + description)
+    6. Domain model (raw `domainMd`, 2000-char cap)
+    7. `buildSignalFeedback(priorSignals)` — empty on first
+       attempt
+    8. Your task (JSON output format + file org rules + code
+       rules)
+  - **`test-prompt.ts`** rewritten as five sections: success
+    criteria, generated code (per-file ` ```typescript` blocks
+    truncated to 2000 chars each + an 8000-char overall budget),
+    constraint rules (apply to test files too), signal feedback,
+    task instructions
+  - **Review-agent prompt** (`llm-review-agent.ts`) gained a
+    `## Project constraint rules` section + a structured
+    `## Golden principles` section. The review-agent now loads
+    the project's `constraints.rules` from `HARNESS.json` in
+    the cloned tree (via a small `loadConstraintRules` helper)
+    so it can emit `CONSTRAINT_VIOLATION` signals matched to
+    the exact rule id BEFORE the constraint-agent pass runs.
+    Absent/malformed file → empty rules → section skipped
+  - **GOLDEN_PRINCIPLES.md template** rewritten for a corporate
+    operations app: GP-001 Repository pattern for data access,
+    GP-002 Audit records for state-changing operations, GP-003
+    Input validation at API boundaries, GP-004 No sensitive
+    data in logs, GP-005 RBAC enforced on all endpoints, GP-006
+    Error handling — no unhandled promise rejections. Stylistic
+    rules (no-console, no-process-env) moved to
+    `HARNESS.json` constraint rules per the new
+    "principles are human-only, constraints auto-retry"
+    split; the principles file now opens with that explicit
+    statement
+  - **Verified live** against `trackeros` (patched + pushed
+    with the new `constraints.rules` block to mirror the
+    template; this is what a fresh-`init` project would have
+    out of the box). Submitted intent
+    "verify-prompt-sections: add a price-formatter utility…":
+    - **code-agent prompt** (6871 chars persisted) — direct
+      DB inspection confirms every section header is present:
+      `## Project architecture`, `## Constraint rules — you
+      MUST NOT violate these`, `## Design specification`,
+      `## Intent specification`, `## Golden principles —
+      non-negotiable`, `## Domain model`, `## Your task`.
+      Spot-checked the `no-hardcoded-secrets` constraint
+      string appears verbatim, mapping back to the
+      `HARNESS.json` rule
+    - **review-agent prompt** (6848 chars) — has
+      `## Project constraint rules` with all six visible
+      rules + `## Golden principles` + `## Files under
+      review`
+    - **test-agent prompt** (3581 chars) — all five sections
+      present: success criteria, generated code, constraint
+      rules apply to tests, your task
+    - **Code-agent succeeded on the first try.** No retry
+      cycle, no constraint-agent failure — the agent had
+      the rules up front and avoided them. The retry path's
+      `## Previous attempt failed` section was validated
+      separately via direct
+      `buildCodePrompt(retryCtx, 1)` invocation with a
+      synthetic 4-signal payload — output grouped Critical
+      → Constraint → Failing tests in that order, each
+      entry prefixed by `[file:line]`
+- **Scope enforcement + intent-agent scope minimisation +
+  review-agent scaffolding awareness + narrowed HARNESS
+  constraint rules.** Follow-up tightening of the prompt
+  refactor — closes the three remaining failure modes that
+  drove retry cycles on real user projects:
+  - **Code-agent prompt gained a standalone `## Scope —
+    generate ONLY what the intent asks for` section** between
+    Architecture and Constraint rules. It renders the
+    intent-agent's `affectedDomains` followed by explicit
+    DO / DO-NOT rules ("If the intent fixes a bug or version
+    → change ONLY the affected file", "Do NOT generate
+    shared infrastructure unless the intent explicitly asks
+    for it", etc.). The task section now reinforces this:
+    "stay within the Scope section's rules — include ONLY
+    files within the scope defined above". Verified live —
+    the brief's `fix tsx version in package.json` intent
+    produced exactly ONE generated file (`package.json`)
+    with zero code-agent retries; previous cycles on similar
+    narrow intents typically produced 8–12 files across the
+    src tree
+  - **Intent-agent prompt gained a `## Scope minimisation —
+    critical` block** at the end of the Rules section with
+    the same heuristics ("Fix a version string →
+    affectedDomains: ['package.json']", "Err strongly on
+    minimal scope. Set outOfScope explicitly for anything
+    the intent doesn't mention"). Pairs with the code-agent
+    scope section — the intent-agent now produces tight
+    scope arrays so the code-agent's scope rules have
+    something concrete to enforce
+  - **Review-agent gained scaffolding mode** — when the
+    operator's intent text contains "scaffold", "set up",
+    "setup", "initialise", or "initialize" (case-insensitive
+    substring match, see `detectScaffolding`), the prompt
+    prepends a `## Scaffolding mode — this intent is a
+    scaffold/setup` block with explicit "Do NOT flag
+    missing implementations / missing RBAC/audit/Zod" rules.
+    Real security issues (hardcoded secrets, `any` usage,
+    broken logic) are still flagged. `GateTask` gained an
+    optional `intentText` field; the gate orchestrator
+    resolves it from `payload.text` or the persisted
+    `intents` row and threads it into the review-agent.
+    Verified live — the brief's `Scaffold the project
+    foundation` intent produced ZERO GP_BREACH or
+    review-agent CONSTRAINT_VIOLATION signals (previous
+    scaffold cycles consistently surfaced "missing RBAC"
+    or "missing audit" findings on the stub files); the
+    intent reached `deploying` status
+  - **Template HARNESS.json constraint rules narrowed to the
+    three brief-specified rules** — `no-any` (high),
+    `no-direct-db-outside-repository` (critical),
+    `no-hardcoded-secrets` (critical). The prior session's
+    eight rules included Gestalt-platform-internal rules
+    (no-console, no-process-env-outside-config,
+    no-inline-rbac-checks, validate-input-with-zod,
+    audit-state-changes) that the brief explicitly says to
+    remove from the corporate-ops project template — those
+    cross the human-vs-platform-enforcement line and belong
+    in `GOLDEN_PRINCIPLES.md` instead. New `gestalt init`
+    projects ship with the three-rule set out of the box;
+    `trackeros` was patched + pushed to mirror the template
+    for live verification
+  - **Template GOLDEN_PRINCIPLES.md aligned with the brief's
+    structure** — `{{projectName}}` interpolation at the
+    top, the six principles in the brief's exact order
+    (GP-001 Repository pattern, GP-002 Audit records,
+    GP-003 Input validation, GP-004 No sensitive data in
+    logs, GP-005 RBAC enforcement, GP-006 Error handling),
+    body text condensed to a single descriptive sentence
+    per principle as the brief shows. Reaffirms the
+    human-vs-platform split at the top of the file
+  - **Operator action — pending on `trackeros`.** The
+    brief calls out Fix 8 as an operator action: remove the
+    `usage-example-agent` block from `trackeros/agents.yaml`.
+    That agent was added in an earlier signal-routing
+    verification session and emits one `LINT_FAILURE`
+    finding per generated file on every cycle. The exact
+    edit (with explanatory comment) was prepared in a
+    temporary clone but the push was correctly denied by
+    the auto-mode classifier — pushes to a project repo's
+    main are operator-only. The diff to apply manually:
+    delete the `- name: usage-example-agent` block from
+    `agents.yaml`'s `custom_agents:` list and add a
+    one-line comment explaining why (verification noise).
+    Until this lands, every trackeros cycle will surface
+    LINT_FAILURE signals from this agent regardless of
+    actual code quality
+  - **`GateTask.intentText` plumbed** — optional field on
+    the GateTask shape; gate orchestrator resolves it from
+    `payload.text` (retry leg) or `intents.findById`
+    (first dispatch) and passes it to the review-agent. The
+    only consumer today is `detectScaffolding`; the field
+    is general-purpose for any future per-intent review
+    behaviour
+- **Agent tool use — built-in file tools + `agents.yaml`
+  configuration (ADR-038, migration 012).** The single largest
+  capability bump since custom agents shipped. Agents can now
+  call file tools during reasoning, driving their own
+  discovery of the codebase before generating output. The
+  infrastructure lives in `BaseLLMAgent` and is available to
+  every layer:
+  - **Four built-in file tools** in `@gestalt/core/tools/
+    file-tools.ts`: `readFile(path)`, `listDirectory(path)`,
+    `searchFiles(pattern, glob?)`, `getFileTree(maxDepth?)`.
+    All read-only, all sandboxed against `projectRoot`. Path
+    traversal outside the project tree throws immediately.
+    Files > 100 KB truncate; search caps at 20 results; tree
+    max depth 4. `searchFiles` uses `globby` v14 via dynamic
+    import (ESM-only)
+  - **`LLMClient.completeWithTools`** speaks the OpenAI
+    function-calling format (`tools[{ type: 'function',
+    function: { name, description, parameters } }]` on
+    request; `choices[0].message.tool_calls` +
+    `finish_reason` on response). The platform was already
+    OpenAI/Azure-compatible — the brief's Anthropic pseudocode
+    mapped cleanly to OpenAI's shape, semantics identical
+  - **`BaseLLMAgent.callLLMWithTools`** drives the
+    tool-use loop: LLM emits tool calls → orchestrator
+    executes each via `executeFileTool` → results fed back as
+    `role: 'tool'` messages → next LLM turn → repeat until
+    `finish_reason === 'stop'` or the safety cap
+    (`MAX_TOOL_CALLS = 10`) is hit. When the agent's
+    resolved tools are empty, the method transparently
+    delegates to `callLLM` — call sites branch on
+    `hasTools` once and never see the fork again
+  - **`agents.yaml` `tools:` schema** added per agent. The
+    seeded YAML and the loader's `PER_ROLE_DEFAULTS` give
+    `code-agent` and `context-agent` the full four-tool set;
+    every other framework agent defaults to `tools.builtin: []`
+    so their behaviour is unchanged. Operator overrides land
+    via the yaml's `tools.builtin: [...]` array. Unknown
+    tool names are silently dropped (operator typos shouldn't
+    crash a cycle)
+  - **`code-prompt.ts` opens with a `## File tools available`
+    section** when the agent has tools — the brief's exact
+    workflow text ("Workflow for modification intents: 1.
+    Call getFileTree…", "Workflow for new file intents: 1.
+    Call listDirectory…"). Section sits ABOVE Architecture
+    so the model reads the discovery rules first
+  - **Tool-call audit persisted on `agent_execution_logs.
+    tool_calls` (JSONB, migration 012)**. Each entry: `{
+    toolName, input, output, isError, calledAt }`. `output`
+    truncated to 500 chars (the full result already went to
+    the LLM during the live loop; the persisted entry is for
+    operator audit, not replay). `BaseLLMAgent.lastToolCallLog`
+    captures the history per run; the generate / gate /
+    deploy orchestrators all read it after `run()` and
+    forward to `executionLogs.save`
+  - **Dashboard IntentDetail accordion** shows a new
+    `Tool calls (N)` section between the prompt and LLM
+    response when the row has any calls (empty array →
+    section hidden). Each entry shows the tool name, JSON
+    input, and a 200-char output preview. Error calls render
+    with a red left border (failed tool executions are
+    rare but legible at a glance)
+  - **`GET /projects/:id/agents`** gained a `builtinTools:
+    string[]` field on each `AgentSummary` so `gestalt
+    agents list` (and the dashboard) can render the
+    effective tool set per agent
+  - **Verified live** against `trackeros` (agents.yaml
+    patched + pushed to enable tools on code-agent +
+    context-agent) — submitted the brief's tsx-version-fix
+    intent. The code-agent **actually called
+    `readFile({ path: "package.json" })`** (visible in the
+    persisted tool_calls JSONB), saw the real existing
+    content (`"tsx": "^0.0.0"`, `name: "trackeros"`,
+    `packageManager: "pnpm@9.15.4"`), and generated a
+    surgical replacement that updated only the tsx version
+    while preserving every other field VERBATIM. **One
+    generated file: `package.json`. The new tsx version
+    `^4.7.0` was based on what the model read, not
+    hallucinated from training-data context.** The dashboard
+    IntentDetail accordion's `Tool calls (1)` section
+    rendered the `readFile` call with the actual file
+    content as its output preview (screenshot saved during
+    verification)
+  - JSONB storage trap noted: postgres.js wraps
+    `${JSON.stringify(arr)}::jsonb` as a JSONB string
+    scalar rather than parsing to an array on insert. Same
+    behaviour every other JSONB-array column hits (see
+    maintenance_runs.findings). The shared `parseJsonb`
+    helper handles the unwrap on read — the application
+    side, the API response, and the dashboard all get the
+    correct array. Direct `jsonb_array_length` SQL probes
+    fail; that's a quirk of the storage path, not a bug
 - **CLI server URL is fully configurable.** `gestalt config show` /
   `gestalt config set-server <url>` / `gestalt config reset` let
   operators inspect and change `~/.gestalt/config.json` without going

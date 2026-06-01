@@ -149,6 +149,69 @@ export type UserRole = 'platform-admin' | 'user';
 // project-admin > editor > reader.
 export type ProjectRole = 'project-admin' | 'editor' | 'reader';
 
+// ─── Tool use (ADR-038) ──────────────────────────────────────────────────────
+//
+// `BaseLLMAgent.callLLMWithTools` drives the loop: LLM emits tool calls,
+// the orchestrator dispatches each through `executeFileTool` (built-in
+// file tools today; MCP integrations planned in ADR-039), results are
+// fed back, the loop continues until the model stops calling tools or
+// `MAX_TOOL_CALLS = 10` is reached. Each call lands one entry in
+// `agent_execution_logs.tool_calls` (JSONB, migration 012).
+
+/**
+ * A tool the LLM can call. Sent verbatim as the OpenAI
+ * `tools[{ type: 'function', function: {...} }]` request parameter
+ * (with `inputSchema` mapping to `parameters`).
+ */
+export interface ToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
+/**
+ * A single tool call emitted by the LLM. The orchestrator dispatches
+ * `name` to the matching `executeFileTool` branch with `input` as the
+ * arguments object.
+ */
+export interface ToolCall {
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+/**
+ * The result of executing one tool call. `content` is the textual
+ * result fed back to the LLM as the next user turn; `isError: true`
+ * sets `is_error` on the OpenAI tool result message so the model can
+ * react to the failure rather than silently re-trying.
+ */
+export interface ToolResult {
+  toolCallId: string;
+  content: string;
+  isError: boolean;
+}
+
+export type BuiltInToolName =
+  | 'readFile'
+  | 'listDirectory'
+  | 'searchFiles'
+  | 'getFileTree';
+
+/**
+ * Persisted history of one tool call. `output` is truncated to 500
+ * chars before storage. The full result has already been fed back to
+ * the LLM in the live loop; the persisted entry is for operator
+ * audit, not for re-execution.
+ */
+export interface ToolCallLogEntry {
+  toolName: string;
+  input: Record<string, unknown>;
+  output: string;
+  isError: boolean;
+  calledAt: Date;
+}
+
 // ─── Result type (typed error handling) ──────────────────────────────────────
 
 export type Result<T, E = Error> =

@@ -662,3 +662,91 @@ properties follow:
   `agent_executions` and `agent_execution_logs` tables with
   `agentRole` widened informally to accept any string (TypeScript
   cast `as AgentRole` at insert time).
+
+---
+
+## ADR-038 — Agent tool use: built-in file tools + agents.yaml configuration
+
+**Date:** 2026-06
+**Status:** Accepted
+
+### Context
+
+Agents currently receive a static `ContextSnapshot` and make a single
+LLM call. They cannot read existing project files during reasoning,
+which produces two visible failure modes:
+
+1. **`code-agent` over-generates.** Without being able to inspect
+   what already exists, it falls back to its training-data prior and
+   produces wholesale module trees for narrow intents (the
+   `fix tsx version in package.json` motivating case generated 8–12
+   files until the scope-enforcement session of 2026-06-01).
+2. **Maintenance agents work from regex approximations** instead of
+   real file content. `alignment-agent` parses Markdown via
+   handwritten regexes; an LLM-driven agent with `readFile` access
+   could read the file directly and reason about it instead.
+
+### Decision
+
+Agents declare available tools in `agents.yaml` under a new `tools:`
+key. Four built-in file tools (`readFile`, `listDirectory`,
+`searchFiles`, `getFileTree`) execute against the cloned project repo
+in a read-only sandbox. Tool definitions ship in
+`@gestalt/core/tools/file-tools.ts` and are sent to the LLM via the
+OpenAI chat-completions `tools` parameter on the request.
+
+`BaseLLMAgent.callLLMWithTools` runs the tool-use loop: LLM emits
+`tool_calls` → orchestrator executes each call via `executeFileTool` →
+results are added as `role: 'tool'` messages → next LLM call →
+repeat until `finish_reason === 'stop'` or the safety cap
+(`MAX_TOOL_CALLS = 10`) is reached. Each tool call is persisted as
+one entry of `agent_execution_logs.tool_calls` (JSONB array,
+migration 012) so the dashboard's IntentDetail accordion can show
+what the agent read before generating.
+
+MCP servers are the planned extension mechanism for external
+integrations (separate ADR-039); the `AgentToolConfig` type reserves
+a `mcp?:` field so the schema doesn't shift when ADR-039 lands.
+
+### Rationale
+
+- **Agents that can read existing files make surgical changes
+  instead of wholesale regeneration.** This is the immediate
+  practical impact; the tool-use loop is the mechanism, not the
+  goal.
+- **The tool approach lets the agent drive its own discovery.**
+  Pre-assembling context dumps in the prompt (the previous approach)
+  either includes too much (token bloat, model confusion) or misses
+  the relevant file (no escape hatch).
+- **Built-in file tools are sufficient for the immediate problem.**
+  MCP extends this to external systems without changing the core
+  architecture — `BaseLLMAgent.callLLMWithTools` doesn't know or
+  care which tool registry produced its tool definitions.
+- **OpenAI chat-completions tools format, not Anthropic.** The
+  platform's `LLMClient` already speaks OpenAI / Azure
+  OpenAI-compatible providers (see ADR-001 in spirit — the
+  `baseUrl/chat/completions` shape). The brief used Anthropic
+  pseudocode; the implementation maps to OpenAI's
+  `tools[{type: 'function', function: {...}}]` request shape and the
+  `choices[0].message.tool_calls` response shape. Semantics identical.
+
+### Consequences
+
+- `BaseLLMAgent` gains `callLLMWithTools` alongside `callLLM`.
+- `BaseLLMAgent.lastToolCallLog` captures the per-run tool history;
+  the orchestrator reads it after `run()` and persists into
+  `agent_execution_logs.tool_calls`.
+- `code-agent` and `context-agent` use file tools by default (set in
+  `PER_ROLE_DEFAULTS`); all other agents default to no tools so their
+  behaviour is unchanged.
+- Operators can override tool configuration per agent in
+  `agents.yaml` (`tools.builtin: [...]`).
+- Path traversal outside `projectRoot` throws immediately. Files
+  larger than 100 KB are truncated with a clear marker. Search
+  returns at most 20 matches. Tree max depth is 4.
+- Migration 012 adds the `tool_calls JSONB` column; legacy rows
+  default to `[]`. Oracle and MSSQL stubs default the field at the
+  type level — neither adapter persists rows yet.
+- Dashboard IntentDetail accordion renders a "Tool calls (N)"
+  section between the prompt and the LLM response when the row has
+  any tool_calls entries; empty array → section hidden.

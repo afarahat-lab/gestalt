@@ -22,6 +22,19 @@ interface ExecutionLogResponse {
      * promotion-agent) and for pre-migration-009 rows.
      */
     modelUsed: string | null;
+    /**
+     * Tool-call history persisted by the orchestrator after the
+     * agent's run completes (ADR-038). Empty for agents that didn't
+     * use tools — the section is hidden in that case. Each `output`
+     * is truncated to 500 chars by the BaseLLMAgent loop.
+     */
+    toolCalls?: Array<{
+      toolName: string;
+      input: Record<string, unknown>;
+      output: string;
+      isError: boolean;
+      calledAt: string;
+    }>;
   } | null;
   artifacts: Array<{ id: string; type: string; path: string; content: string }>;
   signals: SignalSummary[];
@@ -417,6 +430,32 @@ function ExecutionLogPanel({ data, showFull, onToggleFull, onCopy }: ExecutionLo
           </pre>
         )}
       </Section>
+
+      {/* Tool calls (ADR-038) — empty array → section hidden */}
+      {(log.toolCalls?.length ?? 0) > 0 && (
+        <Section title={`Tool calls (${log.toolCalls!.length})`}>
+          {log.toolCalls!.map((tc, i) => (
+            <div
+              key={i}
+              style={{
+                borderLeft: tc.isError ? '2px solid var(--red)' : '2px solid var(--accent)',
+                paddingLeft: '10px',
+                marginBottom: '8px',
+              }}
+            >
+              <div style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', color: 'var(--text-primary)' }}>
+                {i + 1}. <strong>{tc.toolName}</strong>(
+                {JSON.stringify(tc.input)}
+                )
+              </div>
+              <div style={{ fontFamily: 'var(--font-mono)', fontSize: '11px', color: 'var(--text-dim)', marginTop: '4px', whiteSpace: 'pre-wrap' }}>
+                {tc.isError ? '✗ ' : '→ '}
+                {tc.output.length > 200 ? tc.output.slice(0, 200) + ' ...' : tc.output}
+              </div>
+            </div>
+          ))}
+        </Section>
+      )}
 
       {/* LLM response */}
       <Section

@@ -7,7 +7,7 @@
  * Agents never read files directly — they consume the snapshot.
  */
 
-import type { ContextSnapshot, ExecutionPlan, GeneratedArtifact, IntentSpec } from '../types';
+import type { ContextSnapshot, ExecutionPlan, FeedbackSignal, GeneratedArtifact, IntentSpec } from '../types';
 import { createHarnessEngine } from '@gestalt/core';
 import { getPriorArtifacts } from './plan-builder';
 import type { AgentRole } from '@gestalt/core';
@@ -31,6 +31,7 @@ export async function assembleContext(
   plan: ExecutionPlan,
   forAgent: AgentRole,
   intentText: string,
+  priorSignals: FeedbackSignal[] = [],
 ): Promise<ContextSnapshot> {
   const engine = createHarnessEngine(projectRoot);
   const baseSnapshot = await engine.buildSnapshot(plan.correlationId);
@@ -72,6 +73,7 @@ export async function assembleContext(
     relevantDecisions: parseDecisions(baseSnapshot.relevantDecisions),
     intentSpec,
     priorArtifacts,
+    priorSignals,
     agentConfig,
   };
 }

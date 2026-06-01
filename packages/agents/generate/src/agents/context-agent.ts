@@ -41,12 +41,20 @@ export class ContextAgent extends BaseLLMAgent {
     }
 
     let lastError: Error | undefined;
+    const hasTools = (agentConfig.tools?.builtin?.length ?? 0) > 0;
+    const projectRoot = task.contextSnapshot.projectRoot;
 
     for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
       try {
         const rawPrompt = buildContextPrompt(task.contextSnapshot, attempt);
         const prompt = applyAgentConfig(rawPrompt, agentConfig);
-        const raw = await this.callLLM(prompt, agentConfig, task.correlationId);
+        // ADR-038 — read existing context files via tools before
+        // proposing updates (context-agent's risk is over-writing
+        // accurate prose, so reading first matters more here than
+        // anywhere else).
+        const raw = hasTools
+          ? (await this.callLLMWithTools(prompt, agentConfig, projectRoot, task.correlationId)).response
+          : await this.callLLM(prompt, agentConfig, task.correlationId);
         const updates = parseContextUpdates(raw);
 
         const artifacts: AgentResult['artifacts'] = [];

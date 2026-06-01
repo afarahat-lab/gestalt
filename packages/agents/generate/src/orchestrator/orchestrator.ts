@@ -409,8 +409,8 @@ async function drivePlan(
         // persist whatever model the failing call routed to.
         let agentInstance: BaseLLMAgent | null = null;
         try {
-          const context = await assembleContext(projectRoot, plan, agentRole, intentText);
           const routedSignals = signalsForAgent(agentRole);
+          const context = await assembleContext(projectRoot, plan, agentRole, intentText, routedSignals);
           const task = {
             taskId: crypto.randomUUID(),
             correlationId: plan.correlationId,
@@ -499,6 +499,7 @@ async function drivePlan(
               ? (result.signals[0]?.message ?? 'Unknown error')
               : null,
             modelUsed: agentInstance?.lastModelUsed ?? null,
+            toolCalls: agentInstance?.lastToolCallLog ?? [],
           }).catch((err) => {
             childLog.warn({ err, executionId, agentRole }, 'executionLogs.save failed');
           });
@@ -585,6 +586,7 @@ async function drivePlan(
             // triggered the throw, or null if the throw happened
             // before any LLM call.
             modelUsed: agentInstance?.lastModelUsed ?? null,
+            toolCalls: agentInstance?.lastToolCallLog ?? [],
           }).catch(() => undefined);
           emitLiveEvent('agent.completed', plan.correlationId, {
             executionId,
@@ -729,6 +731,7 @@ async function runCustomAgentsForCycle(args: {
       signalTypes: signalTypesForResult(result),
       errorMessage: result.status === 'error' ? (result.errorMessage ?? result.summary) : null,
       modelUsed: result.modelUsed,
+      toolCalls: [],
     }).catch((err) => {
       childLog.warn({ err, executionId, agentRole: def.name }, 'executionLogs.save failed (custom)');
     });

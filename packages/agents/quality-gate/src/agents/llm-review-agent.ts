@@ -24,8 +24,10 @@
  * `parseResponse` from the base template are stubbed.
  */
 
+import { readFile } from 'fs/promises';
+import { join } from 'path';
 import type { ArtifactRef, GateAgentResult, GateSignal, GateTask } from '../types';
-import type { Artifact, SignalSeverity } from '@gestalt/core';
+import type { Artifact, ConstraintRule, SignalSeverity } from '@gestalt/core';
 import { loadAgentConfig, BaseLLMAgent } from '@gestalt/agents-generate';
 import type { AgentConfig, AgentResult } from '@gestalt/agents-generate';
 
@@ -84,7 +86,27 @@ export class ReviewAgent extends BaseLLMAgent {
     // Step 1 agent externalisation — role / goal / extensions /
     // model from agents.yaml. Loader never throws.
     const agentConfig = await loadAgentConfig(task.harnessConfig.projectRoot, 'review-agent');
-    const prompt = buildReviewPrompt(codeArtifacts, task.harnessConfig.goldenPrinciples, agentConfig);
+
+    // Read project-defined constraint rules from HARNESS.json in the
+    // cloned tree so the review-agent can flag violations the same way
+    // the code-agent's prompt did. Absent / malformed file falls
+    // through to empty rules.
+    const projectRules = await loadConstraintRules(task.harnessConfig.projectRoot);
+
+    // Scaffolding detection — when the intent says "scaffold", "set
+    // up", "create", or "initialise" the model should NOT flag
+    // missing implementations or absent RBAC/audit as violations.
+    // Stubs are intentional in setup intents; flagging them produces
+    // noise that drives retry cycles to no useful end.
+    const isScaffolding = detectScaffolding(task.intentText);
+
+    const prompt = buildReviewPrompt(
+      codeArtifacts,
+      task.harnessConfig.goldenPrinciples,
+      projectRules,
+      agentConfig,
+      isScaffolding,
+    );
 
     let review: LLMReview;
     let raw: string | undefined;
@@ -139,10 +161,48 @@ export class ReviewAgent extends BaseLLMAgent {
 
 // ─── Prompt + parsing ────────────────────────────────────────────────────────
 
+/**
+ * True when the intent text reads as a scaffolding / setup intent.
+ * The review-agent suppresses "missing implementation" findings on
+ * stub code in that case — operators submitting a "scaffold the
+ * project foundation" intent expect skeletons, not finished features,
+ * and flagging the missing pieces produces noise that drives the
+ * retry budget without yielding better output.
+ *
+ * Keep the keyword list short and unambiguous — false positives here
+ * would let real missing-implementation bugs slip past the review.
+ */
+const SCAFFOLDING_KEYWORDS = ['scaffold', 'set up', 'setup', 'initialise', 'initialize'];
+function detectScaffolding(intentText?: string): boolean {
+  if (!intentText) return false;
+  const lower = intentText.toLowerCase();
+  return SCAFFOLDING_KEYWORDS.some((k) => lower.includes(k));
+}
+
+/**
+ * Reads `HARNESS.json` from the cloned project root and returns the
+ * `constraints.rules` array. Returns `[]` for any failure (missing
+ * file, malformed JSON, no constraints key) — the prompt simply
+ * omits the constraint section in that case.
+ */
+async function loadConstraintRules(projectRoot: string): Promise<ConstraintRule[]> {
+  try {
+    const raw = await readFile(join(projectRoot, 'HARNESS.json'), 'utf8');
+    const parsed = JSON.parse(raw) as {
+      constraints?: { rules?: ConstraintRule[] };
+    };
+    return parsed.constraints?.rules ?? [];
+  } catch {
+    return [];
+  }
+}
+
 function buildReviewPrompt(
   artifacts: ArtifactRef[],
   goldenPrinciples: string[],
+  constraintRules: ConstraintRule[],
   agentConfig: AgentConfig,
+  isScaffolding: boolean,
 ): string {
   let used = 0;
   const files: string[] = [];
@@ -155,16 +215,57 @@ function buildReviewPrompt(
     used += slice.length;
   }
 
-  const principles = goldenPrinciples.length
-    ? goldenPrinciples.map((p) => `- ${p}`).join('\n')
-    : '- (none supplied)';
-
   const persona =
     `You are ${agentConfig.role} working on the Gestalt platform.\n` +
     `Your goal: ${agentConfig.goal}\n`;
 
+  // Project constraint rules from HARNESS.json — checked verbatim by
+  // the constraint-agent after generation; flagging them here lets
+  // the review-agent emit CONSTRAINT_VIOLATION signals before that
+  // pass runs.
+  const constraintsSection = constraintRules.length > 0
+    ? `\n## Project constraint rules\n\n` +
+      `These are the project's automated constraint rules. Check ` +
+      `whether the generated code violates any of them. Flag each ` +
+      `violation as a separate item with category "architecture" or ` +
+      `"security" (whichever fits) and severity matching the rule's ` +
+      `severity:\n\n` +
+      constraintRules
+        .map((r) => `- **${r.id}** (${r.severity}): ${r.description}`)
+        .join('\n') +
+      `\n`
+    : '';
+
+  // Golden principles — already passed in as preformatted strings
+  // (one per principle). Surface in full so the review-agent can map
+  // each violation to a specific GP id when flagging.
+  const principlesSection = goldenPrinciples.length > 0
+    ? `\n## Golden principles\n\n` +
+      `These are the project's non-negotiable principles. Flag any ` +
+      `violations as items with category "golden-principle":\n\n` +
+      goldenPrinciples.map((p) => `- ${p}`).join('\n') +
+      `\n`
+    : '';
+
   const extensions = agentConfig.promptExtensions.length > 0
     ? `\n\n## Project-specific instructions\n\n${agentConfig.promptExtensions.map((e) => `- ${e}`).join('\n')}\n`
+    : '';
+
+  // Scaffolding mode — when the intent reads as "scaffold / set up /
+  // initialise" the model should NOT flag missing implementations or
+  // absent RBAC/audit as violations. Stubs are intentional in setup
+  // intents. Real security issues (hardcoded secrets, broken logic)
+  // still get flagged.
+  const scaffoldingSection = isScaffolding
+    ? `\n## Scaffolding mode — this intent is a scaffold/setup\n\n` +
+      `The operator's intent reads as a scaffolding or setup task. ` +
+      `Adjust your review accordingly:\n\n` +
+      `- Do NOT flag missing implementations as violations\n` +
+      `- Do NOT flag missing RBAC/audit/Zod as GP violations in stub code\n` +
+      `- DO still flag: hardcoded secrets, use of \`any\`, obviously broken logic, ` +
+      `bad imports, syntax errors\n` +
+      `- If everything in the artifacts is intentional skeleton, return ` +
+      `overallVerdict: "pass" and an empty items array\n`
     : '';
 
   return `${persona}
@@ -172,11 +273,7 @@ You are reviewing code generated by upstream agents. Your job is to
 identify concerns the generate layer missed. Be specific and concrete —
 no generic advice. Only flag concerns that are actually present in the
 code below.
-
-## Golden principles for this project
-
-${principles}
-
+${scaffoldingSection}${constraintsSection}${principlesSection}
 ## Files under review
 
 ${files.join('\n\n')}

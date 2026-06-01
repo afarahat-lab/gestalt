@@ -24,6 +24,25 @@
     "autoResolvableSignals": ["LINT_FAILURE", "TEST_FAILURE"],
     "maxRetries": 3
   },
+  "constraints": {
+    "rules": [
+      {
+        "id": "no-any",
+        "description": "Use unknown with type guards instead of any",
+        "severity": "high"
+      },
+      {
+        "id": "no-direct-db-outside-repository",
+        "description": "Database calls must go through repository pattern",
+        "severity": "critical"
+      },
+      {
+        "id": "no-hardcoded-secrets",
+        "description": "No hardcoded passwords, API keys, or tokens",
+        "severity": "critical"
+      }
+    ]
+  },
   "pipeline": {
     "adapter": "noop"
   },

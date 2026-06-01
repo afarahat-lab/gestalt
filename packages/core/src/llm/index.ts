@@ -47,6 +47,56 @@ export interface LLMResponse {
   durationMs: number;
 }
 
+// ─── Tool use (ADR-038) ──────────────────────────────────────────────────────
+
+import type { ToolDefinition } from '../types';
+
+/**
+ * One assistant-turn tool call as received from the provider. The
+ * OpenAI shape carries the argument list as a JSON-string; we parse
+ * it once here so callers can dispatch on an already-typed
+ * `Record<string, unknown>`.
+ */
+export interface LLMToolCall {
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+}
+
+/**
+ * One conversation turn. The user/assistant variants mirror the
+ * normal chat-completions shape; the `tool` variant is the
+ * provider-fed-back tool result message (OpenAI: `role: 'tool',
+ * tool_call_id, content`).
+ */
+export type ToolLoopMessage =
+  | { role: 'system' | 'user'; content: string }
+  | { role: 'assistant'; content: string | null; toolCalls?: LLMToolCall[] }
+  | { role: 'tool'; toolCallId: string; content: string };
+
+export interface CompleteWithToolsRequest {
+  messages: ToolLoopMessage[];
+  tools: ToolDefinition[];
+  temperature?: number;
+  maxTokens?: number;
+  correlationId?: string;
+}
+
+export interface CompleteWithToolsResponse {
+  /** Text content the assistant emitted on this turn — may be empty
+   *  when the assistant only emitted tool calls. */
+  text: string;
+  /** Tool calls the assistant emitted on this turn. Empty array when
+   *  the model decided not to call any tool. */
+  toolCalls: LLMToolCall[];
+  /** OpenAI finish_reason. The agent loop stops on `stop`; `tool_calls`
+   *  means "execute these and call me again". */
+  stopReason: 'stop' | 'tool_calls' | 'length' | 'content_filter' | 'unknown';
+  tokensUsed: number;
+  model: string;
+  durationMs: number;
+}
+
 export interface LLMError {
   type: 'timeout' | 'rate-limit' | 'provider-error' | 'parse-error';
   message: string;
@@ -108,6 +158,46 @@ export class LLMClient {
     }
 
     return err({ type: 'provider-error', message: 'Max retries exceeded', retryable: false });
+  }
+
+  /**
+   * Single-turn tool-call completion (ADR-038).
+   *
+   * Sends the conversation + tool definitions in the OpenAI
+   * `tools[{ type: 'function', function: { name, description,
+   * parameters } }]` shape. Returns whatever the assistant emitted on
+   * THIS turn — the agent loop (`BaseLLMAgent.callLLMWithTools`) calls
+   * this method repeatedly, executing tool calls between turns, until
+   * `stopReason === 'stop'` or the safety cap is reached.
+   *
+   * No retries today — the caller's loop is the retry boundary, and
+   * the tool-use loop's own iteration cap (`MAX_TOOL_CALLS`) bounds
+   * total provider calls per agent run.
+   */
+  async completeWithTools(
+    request: CompleteWithToolsRequest,
+  ): Promise<Result<CompleteWithToolsResponse, LLMError>> {
+    const childLog = createContextLogger({
+      module: 'llm',
+      correlationId: request.correlationId,
+      model: this.config.model,
+    });
+    try {
+      const result = await this.callProviderWithTools(request);
+      childLog.info(
+        {
+          tokensUsed: result.tokensUsed,
+          stopReason: result.stopReason,
+          toolCallCount: result.toolCalls.length,
+        },
+        'LLM tool-loop turn completed',
+      );
+      return ok(result);
+    } catch (error) {
+      const llmError = classifyError(error);
+      childLog.warn({ error: llmError }, 'LLM tool-loop turn failed');
+      return err(llmError);
+    }
   }
 
   /**
@@ -177,6 +267,131 @@ export class LLMClient {
       clearTimeout(timeout);
     }
   }
+
+  // ─── Tool-loop provider call ──────────────────────────────────────────────
+
+  private async callProviderWithTools(
+    request: CompleteWithToolsRequest,
+  ): Promise<CompleteWithToolsResponse> {
+    const startedAt = Date.now();
+
+    // ToolDefinition → OpenAI function tool format. The wire shape
+    // is `tools: [{ type: 'function', function: { name, description,
+    // parameters } }]`. `inputSchema` IS the parameters JSON Schema.
+    const tools = request.tools.map((t) => ({
+      type: 'function' as const,
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: t.inputSchema,
+      },
+    }));
+
+    const messages = request.messages.map(toolLoopMessageToOpenAI);
+
+    const body = {
+      model: this.config.model,
+      messages,
+      tools,
+      tool_choice: 'auto',
+      max_tokens: request.maxTokens ?? 4096,
+      temperature: request.temperature ?? 0.2,
+    };
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
+
+    try {
+      const response = await fetch(`${this.config.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.config.apiKey}`,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new ProviderError(response.status, text);
+      }
+
+      const data = await response.json() as OpenAIResponse;
+      const choice = data.choices[0];
+      const message = choice?.message ?? {};
+      const text = typeof message.content === 'string' ? message.content : '';
+      const rawToolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+
+      const toolCalls: LLMToolCall[] = rawToolCalls.map((c) => {
+        let parsed: Record<string, unknown> = {};
+        try {
+          parsed = c.function?.arguments ? JSON.parse(c.function.arguments) as Record<string, unknown> : {};
+        } catch {
+          // Provider returned non-JSON arguments — pass the raw string
+          // through under `raw` so the agent loop's `executeFileTool`
+          // call can produce a typed error result rather than throwing.
+          parsed = { raw: c.function?.arguments ?? '' };
+        }
+        return {
+          id: c.id,
+          name: c.function?.name ?? '',
+          input: parsed,
+        };
+      });
+
+      const finishReason = choice?.finish_reason;
+      const stopReason: CompleteWithToolsResponse['stopReason'] =
+        finishReason === 'stop' || finishReason === 'tool_calls' ||
+        finishReason === 'length' || finishReason === 'content_filter'
+          ? finishReason
+          : 'unknown';
+
+      return {
+        text,
+        toolCalls,
+        stopReason,
+        tokensUsed: data.usage?.total_tokens ?? 0,
+        model: data.model ?? this.config.model,
+        durationMs: Date.now() - startedAt,
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+/**
+ * Maps the platform-facing tool-loop message shape to the OpenAI wire
+ * shape. Keeps the wrapping logic local so callers (BaseLLMAgent) deal
+ * with platform types only.
+ */
+function toolLoopMessageToOpenAI(m: ToolLoopMessage): Record<string, unknown> {
+  switch (m.role) {
+    case 'system':
+    case 'user':
+      return { role: m.role, content: m.content };
+    case 'assistant':
+      return {
+        role: 'assistant',
+        content: m.content,
+        ...(m.toolCalls && m.toolCalls.length > 0
+          ? {
+              tool_calls: m.toolCalls.map((c) => ({
+                id: c.id,
+                type: 'function',
+                function: { name: c.name, arguments: JSON.stringify(c.input) },
+              })),
+            }
+          : {}),
+      };
+    case 'tool':
+      return {
+        role: 'tool',
+        tool_call_id: m.toolCallId,
+        content: m.content,
+      };
+  }
 }
 
 // ─── Factory ──────────────────────────────────────────────────────────────────
@@ -235,7 +450,20 @@ export function createLLMClient(config: LLMConfig): LLMClient {
 
 interface OpenAIResponse {
   model: string;
-  choices: Array<{ message: { content: string } }>;
+  choices: Array<{
+    message: {
+      content?: string | null;
+      // OpenAI tool-call response shape (ADR-038). Present when the
+      // model emitted tool calls on this turn; `arguments` is a
+      // JSON-encoded string the caller parses.
+      tool_calls?: Array<{
+        id: string;
+        type: 'function';
+        function: { name: string; arguments: string };
+      }>;
+    };
+    finish_reason?: string;
+  }>;
   usage?: { total_tokens: number };
 }
 

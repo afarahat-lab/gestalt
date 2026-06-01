@@ -39,11 +39,29 @@
  *                          a result as `status: 'failed'`.
  */
 
-import { getLLMClient } from '@gestalt/core';
+import {
+  getLLMClient, FILE_TOOL_DEFINITIONS, executeFileTool,
+  type ToolDefinition, type ToolCall, type ToolResult, type ToolCallLogEntry,
+  type BuiltInToolName,
+  type ToolLoopMessage,
+} from '@gestalt/core';
 import type {
   AgentTask, AgentResult, AgentConfig, FeedbackSignal,
 } from '../types';
 import { applyAgentConfig } from '../prompts/agent-config-helpers';
+
+/**
+ * Safety cap on tool calls per agent run (ADR-038). Prevents an
+ * agent from chewing through provider quota on a runaway plan.
+ * Reached → the loop bails out with whatever text has already been
+ * emitted.
+ */
+const MAX_TOOL_CALLS = 10;
+
+/** Tool-call output truncated to this many chars before storage in
+ *  `agent_execution_logs.tool_calls`. Full results still go to the LLM
+ *  via the live loop. */
+const TOOL_OUTPUT_LOG_TRUNCATE = 500;
 
 export abstract class BaseLLMAgent {
   protected readonly agentRole: AgentTask['agentRole'];
@@ -65,6 +83,18 @@ export abstract class BaseLLMAgent {
    *  lint-config-agent when it skips). Persisted into
    *  `agent_execution_logs.model_used`. */
   lastModelUsed: string | null = null;
+
+  /**
+   * Tool-call history from the most recent `callLLMWithTools`
+   * invocation (ADR-038). Empty array when the agent didn't use
+   * tools (default for `callLLM` callers and for tool-enabled
+   * agents whose model decided not to call anything). The
+   * orchestrator reads this after `run()` returns and persists it
+   * into `agent_execution_logs.tool_calls`. Each entry's `output`
+   * is truncated to 500 chars; the full result was already fed
+   * back to the LLM during the live loop.
+   */
+  lastToolCallLog: ToolCallLogEntry[] = [];
 
   constructor(agentRole: AgentTask['agentRole']) {
     this.agentRole = agentRole;
@@ -149,6 +179,135 @@ export abstract class BaseLLMAgent {
     }
     this.lastLlmResponse = result.value.content;
     return result.value.content;
+  }
+
+  /**
+   * Tool-loop LLM call (ADR-038).
+   *
+   * Runs the OpenAI function-calling loop:
+   *   1. Send prompt + tool definitions.
+   *   2. Read the assistant turn — text + tool calls.
+   *   3. If `stop_reason === 'stop'` or no tool calls → return text.
+   *   4. Execute each tool call via `executeFileTool(call,
+   *      projectRoot)`.
+   *   5. Append assistant + tool result messages to the history.
+   *   6. Repeat from (1) until the safety cap (`MAX_TOOL_CALLS`) is
+   *      reached.
+   *
+   * `lastPrompt` / `lastLlmResponse` / `lastModelUsed` are captured
+   * just like `callLLM` does — the orchestrator's existing
+   * `agent_execution_logs` persistence still works without extra
+   * plumbing. `lastToolCallLog` carries the per-call history (output
+   * truncated to 500 chars per entry) for operator audit.
+   *
+   * When the agent's resolved tool config is empty, this method
+   * delegates to `callLLM` so callers can branch on `hasTools` at the
+   * call site without writing two branches.
+   */
+  protected async callLLMWithTools(
+    prompt: string,
+    agentConfig: AgentConfig,
+    projectRoot: string,
+    correlationId: string,
+  ): Promise<{ response: string; toolCallLog: ToolCallLogEntry[] }> {
+    const tools = this.resolveToolDefinitions(agentConfig.tools);
+    if (tools.length === 0) {
+      const response = await this.callLLM(prompt, agentConfig, correlationId);
+      this.lastToolCallLog = [];
+      return { response, toolCallLog: [] };
+    }
+
+    const client = getLLMClient(agentConfig.llm.model);
+    this.lastModelUsed = client.getModel();
+    this.lastPrompt = prompt;
+
+    const history: ToolLoopMessage[] = [
+      { role: 'user', content: prompt },
+    ];
+    const toolCallLog: ToolCallLogEntry[] = [];
+    let totalToolCalls = 0;
+    let finalText = '';
+
+    for (let turn = 0; turn < MAX_TOOL_CALLS + 1; turn++) {
+      const result = await client.completeWithTools({
+        messages: history,
+        tools,
+        ...(agentConfig.llm.temperature !== undefined ? { temperature: agentConfig.llm.temperature } : {}),
+        ...(agentConfig.llm.maxTokens !== undefined ? { maxTokens: agentConfig.llm.maxTokens } : {}),
+        correlationId,
+      });
+      if (!result.ok) {
+        throw new Error(`LLM call failed: ${result.error.message}`);
+      }
+
+      const { text, toolCalls, stopReason } = result.value;
+      if (text.length > 0) finalText = text;
+
+      // No tool calls OR provider says we're done → exit.
+      if (stopReason === 'stop' || toolCalls.length === 0) {
+        break;
+      }
+
+      // Append the assistant turn carrying its tool_calls so the
+      // provider can match the tool_result messages we add next.
+      history.push({
+        role: 'assistant',
+        content: text.length > 0 ? text : null,
+        toolCalls,
+      });
+
+      // Execute each tool call and append the result messages.
+      for (const call of toolCalls) {
+        if (totalToolCalls >= MAX_TOOL_CALLS) break;
+        totalToolCalls++;
+
+        const platformCall: ToolCall = {
+          id: call.id,
+          name: call.name,
+          input: call.input,
+        };
+        const toolResult: ToolResult = await executeFileTool(platformCall, projectRoot);
+
+        history.push({
+          role: 'tool',
+          toolCallId: call.id,
+          content: toolResult.content,
+        });
+
+        toolCallLog.push({
+          toolName: call.name,
+          input: call.input,
+          output: toolResult.content.slice(0, TOOL_OUTPUT_LOG_TRUNCATE),
+          isError: toolResult.isError,
+          calledAt: new Date(),
+        });
+      }
+
+      if (totalToolCalls >= MAX_TOOL_CALLS) {
+        // Safety cap hit — give the model one more turn with the
+        // existing tool results so it can synthesise an answer rather
+        // than getting cut off mid-thought. The break above prevented
+        // any further calls; this iteration runs without appending new
+        // tool requests, then the next stop_reason check exits.
+        // Intentionally fall through.
+      }
+    }
+
+    this.lastLlmResponse = finalText;
+    this.lastToolCallLog = toolCallLog;
+    return { response: finalText, toolCallLog };
+  }
+
+  /**
+   * Resolves `tools.builtin` into the matching ToolDefinition list.
+   * Unknown names are silently dropped — operator typos in
+   * `agents.yaml` should not crash a cycle.
+   */
+  private resolveToolDefinitions(tools: AgentConfig['tools']): ToolDefinition[] {
+    const builtin = tools?.builtin ?? [];
+    if (builtin.length === 0) return [];
+    const allowed = new Set<BuiltInToolName>(builtin);
+    return FILE_TOOL_DEFINITIONS.filter((d) => allowed.has(d.name as BuiltInToolName));
   }
 
   /**

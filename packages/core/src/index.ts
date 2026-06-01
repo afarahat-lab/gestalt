@@ -10,9 +10,13 @@ export type {
   PlatformSignal, CodeLocation,
   Artifact, ArtifactType,
   UserRole, ProjectRole,
+  ToolDefinition, ToolCall, ToolResult, BuiltInToolName, ToolCallLogEntry,
   Result,
 } from './types';
 export { ok, err } from './types';
+
+// Tools (ADR-038)
+export { FILE_TOOL_DEFINITIONS, executeFileTool } from './tools/file-tools';
 
 // Config
 export type { GestaltConfig, ServerConfig, DatabaseConfig, QueueConfig, LLMConfig, AuthConfig } from './config/index';
@@ -23,7 +27,11 @@ export type { LogLevel, LogContext } from './logger/index';
 export { logger, createContextLogger, logSignal } from './logger/index';
 
 // LLM
-export type { LLMMessage, LLMRequest, LLMResponse, LLMError } from './llm/index';
+export type {
+  LLMMessage, LLMRequest, LLMResponse, LLMError,
+  LLMToolCall, ToolLoopMessage,
+  CompleteWithToolsRequest, CompleteWithToolsResponse,
+} from './llm/index';
 export { LLMClient, getLLMClient, createLLMClient } from './llm/index';
 
 // Queue
@@ -58,7 +66,7 @@ export type {
 export { getRepositories, setRepositories } from './repository/index';
 
 // Harness
-export type { HarnessConfig, ContextSnapshot, HarnessValidationResult } from './harness/index';
+export type { HarnessConfig, ConstraintRule, ContextSnapshot, HarnessValidationResult } from './harness/index';
 export { HarnessEngine, createHarnessEngine, REQUIRED_CONTEXT_FILES } from './harness/index';
 
 // Events

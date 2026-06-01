@@ -33,16 +33,37 @@ export interface AgentLlmConfig {
 }
 
 /**
+ * Per-agent tool configuration (ADR-038).
+ *
+ * `builtin` lists the built-in file tools the agent may call —
+ * `readFile`, `listDirectory`, `searchFiles`, `getFileTree`. Empty
+ * array (the default for most roles) means "no tools, plain
+ * single-shot LLM call".
+ *
+ * `mcp` is reserved for ADR-039 (MCP server integration). Today the
+ * field is absent and the loader doesn't read it; declaring it here
+ * means the schema doesn't shift when ADR-039 lands.
+ */
+export interface AgentToolConfig {
+  builtin?: BuiltInToolName[];
+  // mcp: []  ← reserved for ADR-039
+}
+
+import type { BuiltInToolName } from '@gestalt/core';
+
+/**
  * One agent's configurable surface. `role` and `goal` become the LLM
  * persona; `promptExtensions` is a flat list of standing project rules
  * the prompt builder appends verbatim under "Project-specific
- * instructions" near the end of every prompt.
+ * instructions" near the end of every prompt. `tools` (ADR-038)
+ * controls whether `BaseLLMAgent.callLLMWithTools` is wired in.
  */
 export interface AgentConfig {
   role: string;
   goal: string;
   llm: AgentLlmConfig;
   promptExtensions: string[];
+  tools: AgentToolConfig;
 }
 
 /**
@@ -194,6 +215,17 @@ export interface IntentSpec {
 
 // ─── Context snapshot ─────────────────────────────────────────────────────────
 
+/**
+ * Project-defined constraint rule (HARNESS.json `constraints.rules`).
+ * Inlined verbatim in the code-agent and review-agent prompts. Kept
+ * in sync with the `ConstraintRule` type in `@gestalt/core`.
+ */
+export interface ConstraintRule {
+  id: string;
+  description: string;
+  severity: 'critical' | 'high' | 'medium' | 'low';
+}
+
 export interface HarnessConfig {
   name: string;
   version: string;
@@ -203,6 +235,15 @@ export interface HarnessConfig {
     maxRetries: number;
     blockingSignals: SignalType[];
     autoResolvableSignals: SignalType[];
+  };
+  /**
+   * Optional project-specific constraint rules. Mirrors
+   * `HarnessConfig.constraints` in `@gestalt/core`. When present the
+   * prompts read `harness.constraints.rules` and skip the inline
+   * hardcoded fallback rules.
+   */
+  constraints?: {
+    rules: ConstraintRule[];
   };
 }
 
@@ -250,6 +291,16 @@ export interface ContextSnapshot {
   relevantDecisions: ADR[];
   intentSpec: IntentSpec;
   priorArtifacts: GeneratedArtifact[];
+  /**
+   * Signals from a previous attempt that the orchestrator has routed
+   * to the agent currently running. Empty array on the first attempt;
+   * populated on gate-driven retries with the signal subset the
+   * feedback-router determined this agent is responsible for fixing
+   * (e.g. code-agent gets CONSTRAINT_VIOLATION + LINT_FAILURE +
+   * TEST_FAILURE; context-agent gets CONTEXT_GAP). Surfaces to every
+   * prompt via the shared `buildSignalFeedback` formatter.
+   */
+  priorSignals: FeedbackSignal[];
   /**
    * Agent-specific configuration loaded from `agents.yaml` in the
    * project repo. The assembler calls `loadAgentConfig(projectRoot,

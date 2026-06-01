@@ -10,7 +10,7 @@
  */
 
 import type {
-  Artifact, ArtifactType, PlatformSignal, AgentRole,
+  Artifact, ArtifactType, PlatformSignal, AgentRole, ToolCallLogEntry,
 } from '../types';
 
 // ─── Base repository ──────────────────────────────────────────────────────────
@@ -136,6 +136,16 @@ export interface AgentExecutionLogRecord {
    * rows. Migration 009.
    */
   modelUsed: string | null;
+  /**
+   * History of tool calls the agent made during its run (ADR-038).
+   * `[]` for agents that didn't use tools (the default for every
+   * agent before migration 012, and for agents whose `agents.yaml`
+   * `tools.builtin` is empty). Each entry carries the truncated
+   * output (≤ 500 chars) — the full result was already fed back to
+   * the LLM during the live tool loop; the persisted entry exists
+   * for operator audit, not re-execution. Migration 012.
+   */
+  toolCalls: ToolCallLogEntry[];
   createdAt: Date;
 }
 

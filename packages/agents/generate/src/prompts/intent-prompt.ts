@@ -105,6 +105,25 @@ Rules:
 - If the intent is clear with no ambiguity, return an empty ambiguities array
 - Only mark impactIfWrong as "high" if choosing the wrong interpretation would
   produce functionally incorrect or architecturally incompatible code
+
+## Scope minimisation — critical
+
+The IntentSpec scope MUST match exactly what the intent asks for. The
+code-agent reads your affectedDomains + outOfScope verbatim and refuses
+to generate files outside that scope. Over-broad scope produces over-broad
+code; under-broad scope produces an incomplete fix.
+
+Heuristics for sizing scope correctly:
+- Fix a bug or error → affectedDomains: the specific file only
+- Fix a version string → affectedDomains: ['package.json']
+- Add one function → affectedDomains: that module only
+- "Scaffold" or "set up" → broader scope is appropriate
+
+Err strongly on minimal scope. Set outOfScope explicitly for anything the
+intent doesn't mention so the downstream agents don't drift into adjacent
+files. If the intent mentions a single file path, that file goes in
+affectedDomains and the rest of the project goes in outOfScope (e.g.
+outOfScope: ["everything outside package.json"]).
 `;
   return applyAgentConfig(body, ctx.agentConfig);
 }

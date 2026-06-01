@@ -200,6 +200,16 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
     childLog.info({ workDir }, 'Cloning project repo for gate review');
     await simpleGit().clone(cloneUrl, workDir);
 
+    // Resolve the operator's intent text. The payload usually carries
+    // it on a retry leg; on a first dispatch we fall back to the
+    // persisted intent row. The review-agent uses this for scaffolding
+    // detection — absent text falls through to a normal review.
+    let intentText: string | undefined = payload.text;
+    if (!intentText) {
+      const intentRow = await getRepositories().intents.findById(payload.intentId);
+      intentText = intentRow?.text ?? undefined;
+    }
+
     const gateTask: GateTask = {
       taskId: message.id,
       correlationId,
@@ -210,6 +220,7 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
         content: a.content,
       })) as ArtifactRef[],
       harnessConfig: defaultGateHarnessConfig(workDir),
+      intentText,
     };
 
     // BaseLLMAgent now owns LLM-call routing + lastModelUsed capture.
@@ -396,6 +407,7 @@ async function runWithObservability<T extends GateAgentResult>(
       signalTypes: [],
       errorMessage: err instanceof Error ? err.message : String(err),
       modelUsed: null,
+      toolCalls: [],
     }).catch(() => undefined);
     emitLiveEvent('agent.completed', correlationId, {
       executionId,
@@ -457,6 +469,7 @@ async function runWithObservability<T extends GateAgentResult>(
     errorMessage: result.status === 'errored'
       ? 'Gate agent threw before producing a structured response'
       : null,
+    toolCalls: [],
   }).catch((err) => {
     childLog.warn({ err, executionId, agentRole }, 'executionLogs.save failed');
   });

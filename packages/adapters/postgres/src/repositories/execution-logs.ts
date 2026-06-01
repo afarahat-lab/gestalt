@@ -8,9 +8,10 @@
  */
 
 import type {
-  AgentExecutionLogRepository, AgentExecutionLogRecord,
+  AgentExecutionLogRepository, AgentExecutionLogRecord, ToolCallLogEntry,
 } from '@gestalt/core';
 import { getDb } from '../client';
+import { parseJsonb } from '../utils';
 
 interface LogRow {
   id: string;
@@ -24,6 +25,11 @@ interface LogRow {
   signalTypes: string[] | null;
   errorMessage: string | null;
   modelUsed: string | null;
+  // postgres.js may return JSONB as a parsed object/array OR as a raw
+  // JSON-encoded string; the shared `parseJsonb` helper normalises
+  // both. Migration 012 added the column with `DEFAULT '[]'::jsonb`
+  // so pre-migration rows + non-LLM agents come back as `[]`.
+  toolCalls: unknown;
   createdAt: Date;
 }
 
@@ -42,6 +48,7 @@ function rowToRecord(row: LogRow): AgentExecutionLogRecord {
     signalTypes: row.signalTypes ?? [],
     errorMessage: row.errorMessage,
     modelUsed: row.modelUsed,
+    toolCalls: parseJsonb<ToolCallLogEntry[]>(row.toolCalls, []),
     createdAt: row.createdAt,
   };
 }
@@ -58,12 +65,17 @@ export class PostgresAgentExecutionLogRepository implements AgentExecutionLogRep
     log: Omit<AgentExecutionLogRecord, 'id' | 'createdAt'>,
   ): Promise<AgentExecutionLogRecord> {
     const db = getDb();
+    // Explicit `::jsonb` cast on tool_calls — without it postgres'
+    // implicit text→jsonb conversion wraps the whole array as a JSONB
+    // string scalar instead of an array. Same trap maintenance_runs +
+    // alerts handle.
+    const toolCallsJson = JSON.stringify(log.toolCalls ?? []);
     const [row] = await db<LogRow[]>`
       INSERT INTO agent_execution_logs (
         execution_id, correlation_id, agent_role,
         prompt, llm_response, result_status,
         artifact_paths, signal_types, error_message,
-        model_used
+        model_used, tool_calls
       ) VALUES (
         ${log.executionId},
         ${log.correlationId},
@@ -74,7 +86,8 @@ export class PostgresAgentExecutionLogRepository implements AgentExecutionLogRep
         ${log.artifactPaths},
         ${log.signalTypes},
         ${log.errorMessage},
-        ${log.modelUsed}
+        ${log.modelUsed},
+        ${toolCallsJson}::jsonb
       )
       RETURNING *
     `;

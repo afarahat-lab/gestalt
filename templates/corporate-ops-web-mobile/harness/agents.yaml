@@ -49,6 +49,12 @@ agents:
       model: ~
       temperature: 0.1
       max_tokens: 8000
+    tools:
+      builtin:
+        - readFile          # read existing context files before updating
+        - listDirectory     # explore the docs/ structure
+        - searchFiles       # find where references need to change
+        - getFileTree       # understand project layout
     prompt_extensions: []
 
   code-agent:
@@ -58,6 +64,12 @@ agents:
       model: ~          # Example: set to "gpt-4o" to use a specific model
       temperature: 0.2
       max_tokens: 8000
+    tools:
+      builtin:
+        - readFile          # read existing files before modifying
+        - listDirectory     # explore the project structure
+        - searchFiles       # find where things are defined
+        - getFileTree       # understand project layout
     prompt_extensions: []
       # Example extensions:
       # - "Always use the Result<T,E> pattern for error handling"

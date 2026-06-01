@@ -137,6 +137,15 @@ export interface GateTask {
   correlationId: string;
   artifacts: ArtifactRef[];
   harnessConfig: GateHarnessConfig;
+  /**
+   * The operator's original intent text. Optional because legacy
+   * dispatchers may not thread it; the review-agent treats absence as
+   * "no scaffolding hints available" and falls through to the normal
+   * review path. Used by the review-agent to detect scaffolding /
+   * setup intents and suppress "missing implementation" findings on
+   * intentional stubs.
+   */
+  intentText?: string;
 }
 
 export interface ArtifactRef {

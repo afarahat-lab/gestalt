@@ -44,6 +44,19 @@ export type RequiredContextFile = typeof REQUIRED_CONTEXT_FILES[number];
 
 // ─── Harness config (parsed from HARNESS.json) ────────────────────────────────
 
+/**
+ * Project-defined constraint rule (HARNESS.json `constraints.rules`).
+ * Surfaced verbatim in code-agent and review-agent prompts so the
+ * model knows what the automated constraint-agent will flag after
+ * generation. Severity hints the LLM at fix priority but is also the
+ * value used to bucket the resulting CONSTRAINT_VIOLATION signal.
+ */
+export interface ConstraintRule {
+  id: string;
+  description: string;
+  severity: 'critical' | 'high' | 'medium' | 'low';
+}
+
 export interface HarnessConfig {
   name: string;
   version: string;
@@ -59,6 +72,16 @@ export interface HarnessConfig {
     blockingSignals: SignalType[];
     autoResolvableSignals: SignalType[];
     required: string[];
+  };
+  /**
+   * Optional project-specific constraint rules. When present the
+   * code/test/review prompts inline `constraints.rules` verbatim so
+   * the LLM knows what the automated constraint-agent will check.
+   * Absent on legacy projects — prompts fall back to the inline rules
+   * baked into the agent definitions.
+   */
+  constraints?: {
+    rules: ConstraintRule[];
   };
   identity?: Record<string, unknown>;
   pipeline?: Record<string, unknown>;

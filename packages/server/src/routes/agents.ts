@@ -49,6 +49,12 @@ interface AgentSummary {
   temperature: number | null;
   maxTokens: number | null;
   promptExtensionCount: number;
+  /**
+   * ADR-038 — resolved built-in tool list. Empty array for agents
+   * whose `agents.yaml` `tools.builtin` is empty or absent; the four
+   * built-in file tool names when the agent has full access.
+   */
+  builtinTools: string[];
 }
 
 function authenticatedGitUrl(gitUrl: string, token: string): string {
@@ -246,6 +252,7 @@ function buildAgentSummary(role: string, yamlRaw: string | null): AgentSummary {
     temperature: merged.llm.temperature ?? null,
     maxTokens: merged.llm.maxTokens ?? null,
     promptExtensionCount: merged.promptExtensions.length,
+    builtinTools: merged.tools?.builtin ?? [],
   };
 }
 
@@ -268,5 +275,31 @@ function mergeAgentEntry(baseline: AgentConfig, entry: Record<string, unknown>):
     promptExtensions: extIn
       ? extIn.filter((s): s is string => typeof s === 'string')
       : baseline.promptExtensions,
+    // ADR-038 — resolve `tools.builtin` from the YAML entry when
+    // present (operator override), else fall through to the per-role
+    // baseline. The summary endpoint surfaces this so `gestalt agents
+    // list` shows the effective tool set.
+    tools: extractToolsFromEntry(entry, baseline.tools),
+  };
+}
+
+function extractToolsFromEntry(
+  entry: Record<string, unknown>,
+  baselineTools: AgentConfig['tools'],
+): AgentConfig['tools'] {
+  const toolsKey = entry['tools'];
+  if (!toolsKey || typeof toolsKey !== 'object') {
+    return { builtin: [...(baselineTools?.builtin ?? [])] };
+  }
+  const builtinIn = (toolsKey as Record<string, unknown>)['builtin'];
+  if (!Array.isArray(builtinIn)) {
+    return { builtin: [...(baselineTools?.builtin ?? [])] };
+  }
+  const validNames = new Set(['readFile', 'listDirectory', 'searchFiles', 'getFileTree']);
+  return {
+    builtin: builtinIn.filter(
+      (s): s is 'readFile' | 'listDirectory' | 'searchFiles' | 'getFileTree' =>
+        typeof s === 'string' && validNames.has(s),
+    ),
   };
 }

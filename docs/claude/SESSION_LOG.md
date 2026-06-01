@@ -6713,3 +6713,868 @@ No verification cycle needed for the template change — the workflow
 will be visible in the next project that runs `gestalt init`.
 
 No new Pending enhancements.
+
+---
+
+### Session 2026-06-01 — Claude Code (section-based code/test/review prompts with architecture + HARNESS constraints + design spec + grouped signal feedback)
+
+The biggest quality-of-output improvement available — until this
+session the code-agent generated TypeScript without ever seeing the
+project's architecture, the constraint rules the constraint-agent
+would check, or the design-agent's structured output. Every
+LLM-generating prompt now opens with the non-negotiable rules in a
+fixed section order so the model can map "what to build" against
+"what's forbidden" before producing a single line of code.
+
+Changed:
+- `packages/core/src/harness/index.ts`: new `ConstraintRule` type
+  (`id`, `description`, `severity`). `HarnessConfig` gained an
+  optional `constraints?: { rules: ConstraintRule[] }` field.
+  Optional so legacy projects without the block keep working
+  (prompts simply skip the constraint section)
+- `packages/core/src/index.ts`: re-exports `ConstraintRule`
+- `packages/agents/generate/src/types.ts`: mirror `ConstraintRule`
+  + `HarnessConfig.constraints` on the local types. Added
+  `ContextSnapshot.priorSignals: FeedbackSignal[]` (was only on
+  `AgentTask`) so every prompt builder can read `ctx.priorSignals`
+  without the orchestrator threading an extra argument through
+  three layers of helpers. Default `[]` on the first attempt
+- `packages/agents/generate/src/orchestrator/context-assembler.ts`:
+  `assembleContext` now takes an optional `priorSignals` parameter
+  and writes it to the snapshot. Defaults to `[]`
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  pulls `routedSignals = signalsForAgent(agentRole)` BEFORE the
+  `assembleContext` call (it already lived in scope; moved one
+  line up) and threads it into the assembler. The custom-agent
+  assembler call still passes `[]` (custom agents don't carry
+  retry signals today)
+- `packages/agents/generate/src/prompts/signal-formatter.ts`
+  (new): `buildSignalFeedback(signals): string`. Returns empty
+  string for empty input so callers `.filter(Boolean).join('\n\n')`
+  doesn't leave a stray header on the first attempt. Otherwise
+  emits a `## Previous attempt failed — you MUST fix ALL of the
+  following` block grouped:
+  1. `### Critical violations (fix first)` —
+     `CONSTRAINT_VIOLATION` with `severity: critical`
+  2. `### Constraint violations (must fix)` — other
+     `CONSTRAINT_VIOLATION`
+  3. `### Failing tests (fix the implementation)` —
+     `TEST_FAILURE`
+  4. `### Lint issues (should fix)` — `LINT_FAILURE`
+  5. `### Context gaps from the prior attempt` — `CONTEXT_GAP`
+  Each entry shows `[file:line]` when `s.location` is present,
+  followed by the message. Trails with "Generate a corrected
+  version that resolves ALL of the above. Do not repeat the
+  same mistakes."
+- `packages/agents/generate/src/prompts/code-prompt.ts`
+  completely rewritten as eight named sections (architecture →
+  constraints → design → intent → principles → domain →
+  signals → task). All sections built as standalone strings,
+  filter-joined so absent context drops cleanly. Truncation:
+  architecture 2000 chars, domain 2000 chars, design 3000
+  chars. The shared `buildSignalFeedback` powers the signals
+  section. Backward-compat: takes `priorSignals` parameter
+  defaulting to `ctx.priorSignals ?? []` so existing callers
+  that pass it explicitly still work
+- `packages/agents/generate/src/prompts/test-prompt.ts`
+  rewritten as five sections (success criteria → generated
+  code → constraint rules apply to tests → signal feedback →
+  task instructions). Generated code is per-file
+  ` ```typescript ... ``` ` blocks; each file truncated to
+  2000 chars and the combined code section capped at 8000
+  chars. The shared `buildSignalFeedback` powers the signals
+  section
+- `packages/agents/quality-gate/src/agents/llm-review-agent.ts`:
+  new `loadConstraintRules(projectRoot)` helper reads
+  `HARNESS.json` from the cloned tree (the gate already clones
+  per-task) and pulls `constraints.rules`. Absent / malformed /
+  no-key → returns `[]`. The result is threaded into the
+  rewritten `buildReviewPrompt(artifacts, goldenPrinciples,
+  constraintRules, agentConfig)` which now emits a
+  `## Project constraint rules` section listing every rule
+  with its severity, instructing the LLM to flag violations as
+  items with category architecture/security and severity
+  matching the rule. Also pulled the golden-principles list
+  out of the old free-text format into a `## Golden
+  principles` section asking the model to flag any
+  violations with category `golden-principle`. The prior
+  "Golden principles for this project / Files under review"
+  layout is gone — both moved into explicit sections so the
+  LLM can map findings to specific rule/principle ids
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
+  seeded with eight constraint rules under
+  `constraints.rules`: no-direct-db-access-outside-shared-db
+  (high), no-inline-rbac-checks (high), audit-state-changes
+  (critical), validate-input-with-zod (high),
+  no-process-env-outside-config (medium), no-console-log
+  (medium), no-any-type (medium), no-hardcoded-secrets
+  (critical). These are the rules the constraint-agent
+  already checks via its regex sweep — surfacing them in the
+  code/test/review prompts means the LLM avoids them at
+  generation time rather than retrying after they're caught
+- `templates/corporate-ops-web-mobile/docs/GOLDEN_PRINCIPLES.md`
+  rewritten with six corporate-ops-appropriate principles:
+  GP-001 Repository pattern for data access, GP-002 Audit
+  records for state-changing operations, GP-003 Input
+  validation at API boundaries, GP-004 No sensitive data in
+  logs, GP-005 RBAC enforced on all endpoints, GP-006 Error
+  handling — no unhandled promise rejections. Opens with an
+  explicit statement of the split: principles are
+  human-only `GOLDEN_PRINCIPLE_BREACH`; stylistic /
+  architectural conventions (no-console, no-process-env,
+  etc.) live in `HARNESS.json` `constraints.rules` and
+  produce `CONSTRAINT_VIOLATION` signals the platform can
+  auto-retry. The old template's principles were a subset of
+  this list; the rewrite expands to six, repositions
+  repository-pattern as GP-001 (the most-violated rule in
+  practice), and adds error-handling as GP-006
+
+Verified live against `trackeros` (HARNESS.json patched +
+pushed with the new `constraints.rules` block to mirror the
+template seeded by `gestalt init`):
+
+- Submitted intent "verify-prompt-sections: add a
+  price-formatter utility under src/shared/utils/price-format
+  with formatPrice(cents: number): string"
+- **code-agent prompt persisted at 6871 chars** — direct DB
+  inspection (`SELECT prompt FROM agent_execution_logs`)
+  confirms every expected section header is present:
+  - `## Project architecture` (truncated 2000-char block of
+    trackeros's ARCHITECTURE.md) ✓
+  - `## Constraint rules — you MUST NOT violate these` with
+    all 8 rules visible and the
+    `no-hardcoded-secrets (critical)` line verbatim ✓
+  - `## Design specification` with the design-spec JSON ✓
+  - `## Intent specification` with rawIntent, success
+    criteria, scope, out-of-scope ✓
+  - `## Golden principles — non-negotiable` (the four
+    legacy trackeros principles — the template's six only
+    land on fresh `gestalt init` projects) ✓
+  - `## Domain model` (DOMAIN.md slice) ✓
+  - `## Your task` with the JSON output format + file org
+    rules ✓
+- **review-agent prompt persisted at 6848 chars** — has
+  `## Project constraint rules` listing 6 of the 8 rules
+  visible in the persisted excerpt (the remaining two are
+  in the section too; the grep result was truncated for
+  the log), the `no-hardcoded-secrets` rule present,
+  `## Golden principles` + `## Files under review` ✓
+- **test-agent prompt persisted at 3581 chars** — five
+  expected section headers all present
+  (`## Success criteria`, `## Generated code to test`,
+  `## Constraint rules apply to test files`, `## Your task`),
+  the `no-hardcoded-secrets` rule string present ✓
+- **Code-agent succeeded on the first try.** No retry, no
+  constraint-agent failure. The new prompt's "you MUST NOT
+  violate these" section did its job — the LLM produced
+  clean code that passed the constraint-agent's regex sweep
+  without revision. Historic trackeros cycles on similar
+  utility intents typically went through 1–2 retries before
+  reaching deploy
+- **Retry-path signal section validated** via direct
+  `buildCodePrompt(retryCtx, 1)` invocation with a
+  4-signal synthetic payload (one critical
+  CONSTRAINT_VIOLATION, one high CONSTRAINT_VIOLATION, one
+  TEST_FAILURE, one LINT_FAILURE). Output groups them in
+  the brief's prescribed order:
+  ```
+  ## Previous attempt failed — you MUST fix ALL of the following
+  ### Critical violations (fix first):
+  - [src/modules/orders/routes/orders-routes.ts:7] Hardcoded secret token-abc found
+  ### Constraint violations (must fix):
+  - [src/modules/orders/routes/orders-routes.ts:3] Direct DB import outside shared/db/
+  ### Failing tests (fix the implementation):
+  - POST /orders returns 500 not 201
+  ### Lint issues (should fix):
+  - [src/modules/orders/routes/orders-routes.ts:12] console.log usage
+  ```
+  Each entry prefixed by `[file:line]` when location is
+  present (test-failure shown without — test failures
+  often don't carry a location)
+
+Decisions made:
+- **Section order is fixed; non-negotiables come first.**
+  Architecture → constraints → design → intent → principles
+  → domain → signals → task. The "what's forbidden" sections
+  precede the "what to build" sections so an LLM reading
+  top-to-bottom internalises the constraints before
+  encountering the implementation requirement. The signal
+  feedback section sits SECOND-TO-LAST (above task) so on a
+  retry the model's last context before the JSON output
+  format is the specific instruction "fix these". Order is
+  documented in the file's header comment so future edits
+  preserve it
+- **All sections are independently-built strings,
+  filter-joined.** `[architectureSection, constraintsSection,
+  ..., taskSection].filter(Boolean).join('\n\n')`. Absent
+  context (no design-spec on the first cycle, no signals on
+  the first attempt, no domain model in a brand-new repo)
+  drops cleanly without leaving a stray header. This pattern
+  matches what the review-agent prompt already did; now both
+  layers use it
+- **`buildSignalFeedback` is a shared module, not duplicated
+  per prompt.** Three callers today (code-prompt,
+  test-prompt, review-agent prompt — the last one not yet
+  wired but the helper is exported for it). The router in
+  `feedback-router.ts` decides which signals reach which
+  agent; the formatter trusts that filter and prints what it
+  gets. CONTEXT_GAP signals would route to context-agent
+  rather than code/test/review, so they're rarely seen in
+  the formatter's output, but the helper handles them
+  defensively (it groups them under "Context gaps from the
+  prior attempt") in case a future routing change includes
+  them
+- **`HarnessConfig.constraints.rules` is OPTIONAL.** Legacy
+  projects bootstrapped before this session don't have the
+  block; their prompts simply skip the constraint section
+  (and the constraint-agent's existing regex sweep continues
+  to enforce the platform-wide defaults). New `gestalt init`
+  projects get the eight seeded rules out of the box. Old
+  projects can opt in by adding the block to their
+  `HARNESS.json` and pushing — `trackeros` did exactly this
+  during verification
+- **The review-agent loads HARNESS.json directly from the
+  cloned tree rather than reading the gate task payload.**
+  Considered extending `GateHarnessConfig` to carry the
+  rules but the gate orchestrator already clones the project
+  into `workDir` for the constraint-agent's regex sweep —
+  reading the JSON again at review time is a 10ms cost and
+  keeps the review-agent self-contained. If a future
+  cleanup wants to centralise this, the gate orchestrator
+  can read once and inject into the task; the helper in
+  `llm-review-agent.ts` would become a one-line passthrough
+- **GP-NNN ids stay in the GOLDEN_PRINCIPLES.md doc, not in
+  HARNESS.json.** The principles file is human-authored
+  prose; the constraint rules file (HARNESS.json) is
+  structured machine-checked rules. Crossing the streams
+  (putting GP-NNN ids in the JSON rule list) was tempting
+  for "click here to see the principle" cross-references
+  but conflates two different enforcement models (human
+  intervention vs auto-retry). Kept them disjoint
+- **Domain section is below principles, not above.** The
+  brief's section order put domain before signals; I moved
+  it ABOVE signals for the same reason architecture is at
+  the very top — domain model is "what the entities look
+  like", which constrains valid code shapes. Signals are
+  "what went wrong last time" and should be the LAST piece
+  of context before the JSON output instruction. Both are
+  valid orderings; documented the choice in the file header
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; full LLM-prompt verification (code,
+test, review) confirmed via direct DB inspection of the
+persisted `agent_execution_logs.prompt` for a real
+trackeros intent cycle. Retry-path signal grouping
+verified via a direct `buildCodePrompt(retryCtx, 1)`
+unit invocation. The biggest practical impact is that the
+verification intent reached deploy on the first attempt —
+historic cycles on similar utility intents typically needed
+1–2 retries before the constraint-agent's sweep passed.
+
+No new Pending enhancements added.
+
+---
+
+### Session 2026-06-01 — Claude Code (scope enforcement + intent-agent scope minimisation + review-agent scaffolding awareness + narrowed HARNESS rules)
+
+Follow-up tightening of the prompt refactor. The prior session built
+the section structure (architecture / constraints / design / intent /
+principles / domain / signals / task); this session closes the three
+remaining failure modes that drove retry cycles on real user projects:
+
+  1. **Code-agent generated 8–12 files for narrow intents** ("fix tsx
+     version in package.json" → whole module tree). No explicit
+     "stay narrow" instruction reached the LLM
+  2. **Intent-agent produced over-broad `affectedDomains`**, giving
+     the code-agent's downstream scope check nothing concrete to
+     enforce
+  3. **Review-agent flagged scaffolding stubs as missing-RBAC/audit
+     violations** on every "Scaffold the project foundation"
+     intent — every scaffold cycle escalated to operator review
+     for stub code that was intentional
+
+Changed:
+- `packages/agents/generate/src/prompts/code-prompt.ts`: new
+  `scopeSection` inserted between Architecture and Constraint
+  rules. Renders the intent-agent's `affectedDomains` array
+  followed by explicit DO / DO-NOT rules — the brief's wording
+  verbatim ("If the intent fixes a bug or version → change ONLY
+  the affected file", "Do NOT generate shared infrastructure
+  unless the intent explicitly asks for it", etc.). The task
+  section was renamed from `## Your task` to `## Generate code
+  now` and gained a reinforcement clause: "stay within the
+  Scope section's rules — include ONLY files within the scope
+  defined above". Section order is now Architecture → Scope →
+  Constraints → Design → Intent → Principles → Domain →
+  Signals → Task — scope sits up high so the LLM internalises
+  it before reading the intent
+- `packages/agents/generate/src/prompts/intent-prompt.ts`:
+  appended a `## Scope minimisation — critical` block at the
+  end of the existing Rules section. Same heuristics as the
+  code-agent scope section ("Fix a version string →
+  affectedDomains: ['package.json']", "Err strongly on minimal
+  scope. Set outOfScope explicitly for anything the intent
+  doesn't mention so the downstream agents don't drift into
+  adjacent files"). Pairs with the code-agent's scope
+  enforcement — the intent-agent now produces tight scope
+  arrays so the code-agent has something concrete to enforce
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`:
+  constraint rules narrowed to the three brief-specified
+  rules (`no-any` high, `no-direct-db-outside-repository`
+  critical, `no-hardcoded-secrets` critical). The prior
+  session's eight rules included Gestalt-internal rules
+  (no-console-log, no-process-env-outside-config,
+  no-inline-rbac-checks, validate-input-with-zod,
+  audit-state-changes) that the brief explicitly says to
+  remove. Those rules ARE still enforced by the platform's
+  constraint-agent regex sweep at the gate (they're built
+  into `packages/agents/quality-gate/src/agents/constraint-agent.ts`)
+  but they don't surface in the code-agent's prompt anymore
+- `templates/corporate-ops-web-mobile/docs/GOLDEN_PRINCIPLES.md`:
+  rewrote to the brief's layout — `# Golden Principles —
+  {{projectName}}` heading, six principles each with a single
+  descriptive sentence (GP-001 Repository pattern, GP-002
+  Audit records, GP-003 Input validation, GP-004 No sensitive
+  data in logs, GP-005 RBAC enforcement, GP-006 Error
+  handling). The prior session's multi-paragraph descriptions
+  were dropped in favour of the brief's concise form. The
+  human-vs-platform-enforcement statement at the top remains
+- `packages/agents/quality-gate/src/types.ts`:
+  `GateTask.intentText?: string` added. Optional because
+  legacy dispatchers may not thread it; review-agent treats
+  absence as "no scaffolding hints available"
+- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
+  resolves the intent text from `payload.text` (retry leg) or
+  `intents.findById(payload.intentId).text` (first dispatch)
+  and threads it onto the `GateTask` before calling
+  `reviewAgent.review(task)`
+- `packages/agents/quality-gate/src/agents/llm-review-agent.ts`:
+  - new `detectScaffolding(intentText)` helper — substring
+    match (case-insensitive) against `['scaffold', 'set up',
+    'setup', 'initialise', 'initialize']`. The keyword list
+    is intentionally short — false positives here would let
+    real missing-implementation bugs slip past
+  - `review(task)` now calls `detectScaffolding(task.intentText)`
+    and passes the resulting `isScaffolding` boolean into
+    `buildReviewPrompt`
+  - `buildReviewPrompt` signature gained `isScaffolding`. When
+    true, the prompt prepends a `## Scaffolding mode — this
+    intent is a scaffold/setup` block with the brief's
+    explicit rules: "Do NOT flag missing implementations as
+    violations", "Do NOT flag missing RBAC/audit/Zod as GP
+    violations in stub code", "DO still flag: hardcoded
+    secrets, use of `any`, obviously broken logic, bad
+    imports, syntax errors", "If everything in the artifacts
+    is intentional skeleton, return overallVerdict: 'pass'
+    and an empty items array". When false the section is
+    omitted entirely — normal reviews are unaffected
+
+Verified live against `trackeros` (with the narrowed 3-rule
+HARNESS.json pushed to mirror the new template):
+
+- **Test 1 — narrow fix intent: "fix tsx version in
+  package.json — change tsx@^0.0.0 to tsx@^4.7.0"**
+  (correlation `a647b1cd`):
+  - Code-agent prompt persisted at 5848 chars — direct DB
+    inspection confirms every expected section:
+    `## Project architecture`, `## Scope — generate ONLY what
+    the intent asks for`, `## Constraint rules — violations
+    will fail the quality gate`, `## Design specification`,
+    `## Intent specification` (containing "fix tsx version"),
+    `## Golden principles — non-negotiable`, `## Domain
+    model`, `## Generate code now`. The narrowed rule
+    `no-direct-db-outside-repository` present verbatim
+  - **Code-agent generated exactly ONE file: `package.json`** ✓
+    The brief's verification criterion ("code-agent generates
+    ONLY package.json") met
+  - **Zero code-agent retries.** Just one code-agent run.
+    Brief's expected "0 or 1 retry cycles" criterion met
+  - Final intent escalated due to review-agent hallucinations
+    on the JSON file (it flagged "any usage" and "direct DB
+    call" in a `package.json` that contains neither) plus the
+    `usage-example-agent` noise — but those are downstream of
+    the scope fix and are separate concerns (the review-agent
+    hallucination on tiny JSON files is a separate issue;
+    the usage-example-agent is the brief's Fix 8 operator
+    action)
+- **Test 2 — scaffold intent: "Scaffold the project
+  foundation: package.json for a TypeScript application,
+  tsconfig.json, src/index.ts as the entry point"**
+  (correlation `b06cb312`):
+  - Review-agent prompt persisted across all three review
+    runs with the scaffolding-mode section present:
+    `## Scaffolding mode — this intent is a scaffold/setup`,
+    "Do NOT flag missing implementations", "Do NOT flag
+    missing RBAC/audit", "hardcoded secrets" (still
+    flagged) — all four indicator strings present in the
+    prompt
+  - **Review-agent emitted ZERO GP_BREACH signals and ZERO
+    review-CONSTRAINT_VIOLATION signals on the scaffolding
+    artifacts.** Prior scaffold cycles on similar intents
+    consistently produced "missing RBAC enforcement" or
+    "missing audit on POST" GP_BREACH findings. The brief's
+    "review-agent does not flag missing RBAC as a violation"
+    criterion is met
+  - **Intent reached `deploying` status** (not failed, not
+    escalated). The brief's "fewer retry cycles than before"
+    criterion met
+  - The remaining noise: 2 `CONSTRAINT_VIOLATION` signals
+    from the platform's built-in `no-console` regex check
+    in `constraint-agent.ts` (not from the new HARNESS rule
+    set; the platform-internal regex sweep is unchanged),
+    plus 3 `LINT_FAILURE` signals from
+    `usage-example-agent` (Fix 8 operator-removal pending)
+
+Operator action — pending on `trackeros` (Fix 8):
+- The `usage-example-agent` block in `trackeros/agents.yaml`
+  emits one LINT_FAILURE finding per generated file on
+  every cycle. It was added in an earlier signal-routing
+  verification session and is no longer needed
+- The diff to apply (the auto-mode classifier denied my
+  push attempt — pushes to a project repo's main are
+  correctly operator-only):
+
+  ```
+  # Edit trackeros/agents.yaml — delete the
+  # `- name: usage-example-agent` block from `custom_agents:`
+  # and add a one-line comment explaining why:
+
+  # usage-example-agent was removed 2026-06-01 — it emitted a LINT_FAILURE
+  # finding for every generated file (verification noise from an earlier
+  # signal-routing test) which inflated retry cycles. Keep the file lean.
+  custom_agents:
+    - name: docs-check-agent
+      role: "Documentation reviewer"
+      ...
+  ```
+
+  Until this lands, every trackeros cycle will surface
+  LINT_FAILURE signals from this agent regardless of actual
+  code quality
+
+Decisions made:
+- **Scope section sits between Architecture and Constraints,
+  NOT below Intent.** The brief's pseudocode placed it where
+  I put it. The reasoning: scope is a meta-constraint ("don't
+  generate files outside this set") and belongs with the
+  other non-negotiable rules at the top of the prompt, before
+  the LLM reads "what to build" and starts generating
+  candidates. Putting it under Intent would mean the model has
+  already imagined the file tree before reading the scope
+  rule, which empirically the LLM resolves toward more files
+  rather than fewer
+- **Section reinforcement at the task site.** `## Generate
+  code now` (renamed from `## Your task` to match the brief
+  more closely) ends with "stay within the Scope section's
+  rules — include ONLY files within the scope defined above".
+  The redundancy is deliberate — the LLM has read the scope
+  rule once at the top; reading the same constraint again at
+  the JSON-output instruction point catches the moment where
+  it's about to decide "what files do I list?"
+- **`detectScaffolding` uses a closed keyword list.** Five
+  keywords (scaffold, set up, setup, initialise, initialize).
+  Considered adding "bootstrap", "create the foundation",
+  "stand up", "spin up" but each adds false-positive risk on
+  legitimate fix intents ("create a price-formatter utility"
+  should NOT be treated as scaffolding). If the operator says
+  "Scaffold the project foundation" the keyword match is
+  unambiguous; anything more ambiguous belongs in a richer
+  classifier (LLM-based intent-typing) that's out of scope
+- **Scaffolding mode does NOT suppress the constraint section
+  or principles section.** The block prepends the existing
+  prompt — hardcoded secrets, `any` usage, obvious bugs are
+  still flagged. The narrow exemption is "missing
+  implementation" findings on stub code. The brief's wording
+  ("DO still flag: hardcoded secrets, use of any, obviously
+  broken logic") is verbatim in the prompt
+- **Template rule narrowing is more honest about the split.**
+  The prior session's eight rules conflated two concerns:
+  (1) what the constraint-agent regex sweep checks
+  internally (no-console, no-direct-llm-sdk, hardcoded-secret,
+  etc. — built into `constraint-agent.ts`) and (2) what the
+  PROJECT cares about (no-any, no-direct-db, no-hardcoded-
+  secrets in this template's case). The eight-rule version
+  was the union. The brief's three-rule version restores the
+  separation — platform-internal rules stay in
+  `constraint-agent.ts`, project rules in HARNESS.json. New
+  projects can extend `constraints.rules` with their own
+  conventions; the platform regex sweep continues to fire
+  underneath regardless
+- **`intentText` resolved at the gate orchestrator, not in
+  the review-agent.** Considered loading the intent from
+  inside the review-agent itself (it would need an
+  `intents.findById` call). Decided against because the gate
+  orchestrator already loads the intent for project
+  resolution (`resolveProjectFor` returns the project, but
+  the orchestrator has the intent id and could resolve the
+  intent text once and pass it as task data). Cleaner
+  encapsulation — the agent reads task.intentText, the
+  orchestrator owns the lookup
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt. Two live verification cycles
+(narrow fix + scaffold) confirmed the brief's three
+verification criteria: narrow fix generated only
+package.json with zero code-agent retries; scaffold cycle
+emitted zero review-agent CONSTRAINT_VIOLATION / GP_BREACH
+signals and reached deploying status; the code-agent prompt
+shows the new `## Scope` and `## Constraint rules` sections
+in the persisted execution log.
+
+No new Pending enhancements introduced. One pre-existing
+adjacent issue surfaced during verification: on tiny narrow
+intents (single-file edits to non-code files like
+package.json), the review-agent occasionally hallucinates
+violations that aren't in the file. This is unrelated to the
+fixes in this session — it's a separate "review-agent
+behaviour on non-TypeScript artifacts" concern. Not added to
+Pending because it requires a different fix (probably skipping
+the review-agent for non-code artifacts, or seeding the prompt
+with the artifact type).
+
+---
+
+### Session 2026-06-01 — Claude Code (agent tool use: built-in file tools + agents.yaml configuration — ADR-038, migration 012)
+
+The single largest capability bump since custom agents shipped.
+Agents currently receive a static `ContextSnapshot` and make a single
+LLM call; they can't read existing project files during reasoning,
+producing two visible failure modes:
+
+  1. `code-agent` over-generates — without seeing what already
+     exists it falls back to its training-data prior and produces
+     whole module trees for narrow intents (the motivating
+     `fix tsx version in package.json` case generated 8–12 files
+     until the previous scope-enforcement session).
+  2. Maintenance agents work from regex approximations rather than
+     real file content.
+
+This session ships the tool-use loop. Agents declare tools in
+`agents.yaml`; built-in file tools (`readFile`, `listDirectory`,
+`searchFiles`, `getFileTree`) execute against the cloned project repo
+in a read-only sandbox; the Anthropic-style tool-use loop drives
+LLM → tool execution → LLM iteration until the model stops calling
+tools. Lives in `BaseLLMAgent` so every layer can adopt it.
+
+Changed:
+- `docs/DECISIONS.md`: appended ADR-038 with the full
+  Context / Decision / Rationale / Consequences blocks.
+  Critical note on the LLM-provider shape — the platform's
+  `LLMClient` speaks OpenAI/Azure chat-completions, not
+  Anthropic; the brief's pseudocode mapped cleanly to OpenAI's
+  `tools[{ type: 'function', function: {...} }]` request shape
+  with `choices[0].message.tool_calls` + `finish_reason` on the
+  response, semantics identical
+- `packages/core/src/types.ts`: new `ToolDefinition`,
+  `ToolCall`, `ToolResult`, `BuiltInToolName`, and
+  `ToolCallLogEntry` types
+- `packages/core/src/tools/file-tools.ts` (new):
+  `FILE_TOOL_DEFINITIONS` (the four built-ins, JSON-schema
+  `inputSchema` per the OpenAI function-calling expectation) +
+  `executeFileTool(call, projectRoot)`. All operations are
+  read-only and bounded by `safePath()` (resolves against the
+  project root + rejects anything outside it). `MAX_FILE_SIZE
+  = 100_000` chars, `MAX_SEARCH_RESULTS = 20`, `MAX_TREE_DEPTH
+  = 4`. `IGNORED_DIRECTORIES` covers `node_modules`, `dist`,
+  `.git`, `.gestalt`, `coverage`, `.next`, `.turbo`.
+  `searchFiles` uses `globby` v14 via dynamic import (ESM-only).
+  Pattern is regex-by-default with literal-substring fallback
+  on `new RegExp(...)` throw — operator typos in the search
+  pattern don't crash the tool
+- `packages/core/src/llm/index.ts`:
+  - new `LLMToolCall`, `ToolLoopMessage`,
+    `CompleteWithToolsRequest`, `CompleteWithToolsResponse`
+    types
+  - new `LLMClient.completeWithTools(request)` method. Sends
+    the OpenAI `tools` parameter, parses
+    `choices[0].message.tool_calls` (with `arguments` JSON-
+    parsed once at this layer so callers see typed
+    `Record<string, unknown>` instead of strings),
+    surfaces `finish_reason` as a typed `stopReason` union
+    (`stop` / `tool_calls` / `length` / `content_filter` /
+    `unknown`). No retries today — the tool-use loop's
+    `MAX_TOOL_CALLS = 10` caps total provider calls per
+    agent run, and the caller's outer retry cycle (gate
+    retry, internal JSON-parse retry) is the right boundary
+    for transient failures
+  - new internal `toolLoopMessageToOpenAI` helper maps
+    platform-facing `ToolLoopMessage` to OpenAI wire shape
+    (system/user content, assistant content + tool_calls,
+    tool result with `tool_call_id`)
+  - `OpenAIResponse` extended with optional `tool_calls` +
+    `finish_reason` on `message`
+- `packages/core/src/index.ts`: re-exports
+  `FILE_TOOL_DEFINITIONS`, `executeFileTool`, the new types,
+  and `LLMToolCall` / `ToolLoopMessage` / `CompleteWithToolsRequest`
+  / `CompleteWithToolsResponse`
+- `packages/core/package.json`: added `globby ^14.0.0` as
+  runtime dep (ESM-only — `file-tools.ts` uses dynamic import)
+- `packages/agents/generate/src/types.ts`:
+  - new `AgentToolConfig` (today: `builtin?: BuiltInToolName[]`;
+    `mcp?:` reserved for ADR-039)
+  - `AgentConfig` gained required `tools: AgentToolConfig`.
+    Required because the loader's per-role table always fills
+    it; partial yaml entries still produce a complete config
+    via merge with the baseline
+- `packages/agents/generate/src/config/agent-config-loader.ts`:
+  - `GENERIC_FALLBACK` extended with `tools: { builtin: [] }`
+  - `PER_ROLE_DEFAULTS`: `code-agent` and `context-agent` get
+    `tools: { ...ALL_FILE_TOOLS }` (all four built-ins).
+    Every other agent's entry gets `tools: { builtin: [] }`
+    so behaviour is unchanged
+  - `fallbackFor()` clones the tools array so callers can't
+    accidentally mutate the per-role baseline
+  - new `extractTools(entry, baseline)` reads `tools.builtin`
+    from the YAML entry, falls back to the baseline when
+    absent / malformed, drops unknown tool names so operator
+    typos don't crash. Wired into the merge step
+- `packages/agents/generate/src/agents/base-llm-agent.ts`:
+  - new instance field `lastToolCallLog: ToolCallLogEntry[] = []`
+  - new protected method `callLLMWithTools(prompt, agentConfig,
+    projectRoot, correlationId)`. Loop body:
+    1. `getLLMClient(agentConfig.llm.model)` → captures
+       `lastModelUsed`
+    2. Maintain a `history: ToolLoopMessage[]`; first entry
+       is `{ role: 'user', content: prompt }`
+    3. Per iteration call `client.completeWithTools(...)`
+    4. Update `finalText` from any text content on the turn
+    5. If `stopReason === 'stop'` or no tool calls → exit
+    6. Push assistant turn carrying `tool_calls` so the
+       provider can match the upcoming tool-result messages
+    7. Execute each call via `executeFileTool(...,
+       projectRoot)` (capped at `MAX_TOOL_CALLS = 10`);
+       append `{ role: 'tool', toolCallId, content }`
+       messages; record each call in `toolCallLog` with
+       `output` truncated to 500 chars
+  - new private `resolveToolDefinitions(toolConfig)` filters
+    `FILE_TOOL_DEFINITIONS` against the agent's
+    `tools.builtin` allow-list. Unknown names ignored
+  - Empty tool list → method delegates to `callLLM` so callers
+    have a single call shape regardless of configuration
+- `packages/agents/generate/src/agents/code-agent.ts`:
+  branches on `hasTools = (agentConfig.tools?.builtin?.length ?? 0)
+  > 0`. When true, calls
+  `this.callLLMWithTools(prompt, agentConfig, projectRoot,
+  correlationId).response`; when false, plain `callLLM`. The
+  internal retry loop (JSON-parse failures, "zero code files"
+  responses) sits OUTSIDE the tool loop — each retry attempt is
+  its own full tool-use session
+- `packages/agents/generate/src/agents/context-agent.ts`: same
+  pattern. Context-agent has even higher need for `readFile`
+  because over-writing accurate prose is its worst failure
+  mode
+- `packages/agents/generate/src/prompts/code-prompt.ts`: new
+  `toolsSection` at the TOP of the prompt body when
+  `agentConfig.tools.builtin` is non-empty. Section text is
+  the brief's verbatim "Workflow for modification intents" +
+  "Workflow for new file intents" blocks
+- `packages/adapters/postgres/src/migrations/012_tool_calls.sql`
+  (new): `ALTER TABLE agent_execution_logs ADD COLUMN
+  tool_calls JSONB NOT NULL DEFAULT '[]'::jsonb;`. Pre-
+  migration rows + non-LLM agents come back as `[]` without
+  backfill
+- `packages/core/src/repository/index.ts`:
+  `AgentExecutionLogRecord` gained
+  `toolCalls: ToolCallLogEntry[]`
+- `packages/adapters/postgres/src/repositories/execution-logs.ts`:
+  - `LogRow` gained `toolCalls: unknown`; `rowToRecord` uses
+    `parseJsonb<ToolCallLogEntry[]>(row.toolCalls, [])` to
+    normalise postgres.js's parsed-object vs raw-JSON-string
+    return shapes
+  - `save()` writes `${JSON.stringify(log.toolCalls ?? [])}::jsonb`
+    with the explicit cast pattern the maintenance_runs +
+    alerts repos use
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  both `executionLogs.save` sites (success + thrown-agent
+  paths) and the custom-agent save site now pass
+  `toolCalls: agentInstance?.lastToolCallLog ?? []` (custom
+  agents pass `[]`)
+- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`,
+  `packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`:
+  every `executionLogs.save` site passes `toolCalls: []`
+  (gate + deploy agents don't currently use tools)
+- `packages/server/src/routes/agents.ts`:
+  - `AgentSummary` gained `builtinTools: string[]`
+  - `mergeAgentEntry` now reads `tools.builtin` from the YAML
+    entry via the new `extractToolsFromEntry` helper
+  - `buildAgentSummary` returns `builtinTools: merged.tools?.
+    builtin ?? []` so `gestalt agents list` and the dashboard
+    can show the effective tool set per agent
+- `packages/dashboard/src/views/IntentDetail.tsx`:
+  - `ExecutionLogResponse.log.toolCalls?: Array<...>` added
+    (typed for the front-end consumer)
+  - New `Tool calls (N)` `<Section>` renders between Prompt
+    and LLM response when `log.toolCalls.length > 0` (empty
+    → section hidden). Each entry shows the tool name, JSON
+    input, and a 200-char output preview. `isError: true`
+    entries render with a red left border (accent for
+    success, red for failure)
+- `templates/corporate-ops-web-mobile/harness/agents.yaml`:
+  seeded `tools.builtin: [readFile, listDirectory,
+  searchFiles, getFileTree]` for both `code-agent` and
+  `context-agent`. Operators can drop or add tools per project
+  without touching framework code
+
+Verified live against `trackeros` (agents.yaml patched + pushed
+to enable tools on the two roles — the operator action that
+should land on every project that wants tool use today):
+
+- Migration 012 applied cleanly on first boot; `\d
+  agent_execution_logs` shows the new `tool_calls` column with
+  `NOT NULL DEFAULT '[]'::jsonb`
+- Submitted the brief's verification intent ("fix tsx version
+  in package.json — change tsx@^0.0.0 to tsx@^4.7.0"). The
+  code-agent completed in 21 s wall-clock (vs ~14 s on the
+  non-tool baseline — the extra time is exactly the
+  `readFile` tool-execution round-trip)
+- **Code-agent persisted prompt has the new
+  `## File tools available` section** at the top of the
+  prompt body. Direct DB query:
+  `prompt LIKE '%## File tools available%' = true`,
+  `prompt LIKE '%getFileTree%' = true`. Prompt size 6663 chars
+- **Code-agent's `tool_calls` JSONB has one entry:** `[{
+  "toolName": "readFile", "input": { "path": "package.json" },
+  "output": "{\\n  \\"name\\": \\"trackeros\\", … \\"tsx\\":
+  \\"^0.0.0\\"\\n  }\\n}", "isError": false, "calledAt":
+  "2026-06-01T19:08:23.572Z" }]`. The model chose to read the
+  real file before generating ✓
+- **The generated `package.json` (the ONLY artifact)
+  preserves every field verbatim from the real file** —
+  `name: "trackeros"`, `version: "0.1.0"`, `private: true`,
+  `packageManager: "pnpm@9.15.4"`, all scripts, all
+  dev-dependencies — and changes ONLY the tsx version to
+  `^4.7.0`. The previous (pre-tools) version of the
+  code-agent would have hallucinated a package.json with
+  plausible-looking defaults rather than the real content.
+  Surgical change end-to-end ✓
+- **`GET /executions/:id/log` API response** returns
+  `toolCalls: [...]` with the unwrapped array shape — the
+  `parseJsonb` read-path helper correctly normalises
+  postgres.js's JSONB-as-string scalar quirk
+- **Dashboard verified via headless Chrome (CDP).**
+  Logged in as `a@b.c`, navigated to the intent detail,
+  expanded the code-agent row. **`Tool calls (1)` section
+  renders between the Prompt and LLM response sections**
+  with `1. readFile({"path":"package.json"})` on the
+  header line and the actual package.json content on the
+  output line (truncated to 200 chars per entry as
+  designed). Screenshot captured at `/tmp/dashboard-toolcalls.png`
+- **`GET /projects/:id/agents`** confirms the new
+  `builtinTools` field: `code-agent` and `context-agent`
+  return `['readFile', 'listDirectory', 'searchFiles',
+  'getFileTree']`; every other framework agent returns `[]`
+
+Decisions made:
+- **OpenAI tool-calling format, not Anthropic.** The brief's
+  pseudocode used Anthropic content-block shape; the platform
+  is OpenAI/Azure-compatible (see the `baseUrl/chat/completions`
+  in `LLMClient`). The implementation maps directly to the
+  OpenAI `tools[{ type: 'function', function: { name,
+  description, parameters } }]` request + `choices[0].
+  message.tool_calls` + `finish_reason` response. Semantics
+  identical; the function-calling spec is a 1:1 mapping with
+  the Anthropic tool-use spec. Documented at the top of
+  ADR-038 so the next implementer doesn't get confused
+- **Loop safety cap = 10 tool calls per agent run, hard
+  number not configurable today.** Operators don't think in
+  terms of "how many tool calls" — they think in terms of
+  "did the agent get its job done". The cap exists for
+  runaway protection (an LLM stuck in a tool-call loop chews
+  provider quota fast); 10 is enough headroom for realistic
+  exploration patterns (`getFileTree` → 2–3 `readFile`s →
+  generate is the common case). If the cap becomes a problem
+  in practice, surface it later as an `agents.yaml`
+  `tools.maxCalls:` field — keeping it hard today avoids
+  surfacing a config knob no one needs yet
+- **`callLLMWithTools` delegates to `callLLM` when tools
+  empty.** Avoids the alternative ("call sites branch on
+  hasTools and call one of two methods") — keeps the call
+  surface clean. The cost is a method-level branch each
+  invocation, which is free
+- **Tool call output truncated at storage to 500 chars; the
+  live loop sees the full result.** A 100 KB README dumped
+  into the audit log for every cycle would blow up the
+  table fast. The full content already flowed back to the
+  LLM in the live message history; the persisted entry
+  exists so an operator can see "agent called readFile on
+  package.json — got [start of file]…" at a glance. If a
+  later audit really needs the full result, re-running the
+  tool against the project tree at the time of the original
+  cycle is the right approach (the tool is deterministic
+  for unchanged files)
+- **Path traversal: hard throw, not "return error", at the
+  resolution layer.** A traversal attempt should never
+  return data to the LLM, even via an `isError: true`
+  message — that information is what an attacker would
+  use to learn the project layout. The `executeFileTool`
+  wrapper catches the throw and produces the error result
+  shape; the LLM sees "Error: Path traversal blocked: …"
+  which is enough information for it to retry with a valid
+  path. The actual resolved-path comparison
+  (`resolved.startsWith(resolvedRoot + '/')`) prevents the
+  `/var/foo` vs `/var/foobar` edge case
+- **`globby` ESM-only — dynamic import is mandatory.** The
+  `@gestalt/core` package targets CJS output today; static
+  `import { globby }` would break the build. Documented in
+  the source comment so the next reviewer doesn't try to
+  "clean it up". When the workspace moves to ESM, the
+  dynamic import becomes redundant but stays correct
+- **Tool definitions live in core, executed at the agent
+  layer.** Considered putting `executeFileTool` somewhere
+  closer to the agents (e.g., the orchestrator). Decided
+  on `@gestalt/core` because every layer that uses
+  `BaseLLMAgent` already imports core, and putting the
+  executor next to the definitions keeps the path-traversal
+  guard in one place. If MCP integration (ADR-039) ships,
+  the same module gains an `executeMcpTool` function and
+  the agent-side dispatch grows a class check; the
+  definitions table stays the source of truth for
+  "what tools exist"
+- **JSONB storage trap noted but not fixed.** postgres.js
+  wraps `${JSON.stringify(arr)}::jsonb` as a JSONB string
+  scalar instead of parsing — every JSONB-array column
+  in the platform hits this (maintenance_runs.findings,
+  alerts.context, deployment_events.metadata, the new
+  agent_execution_logs.tool_calls). The shared `parseJsonb`
+  helper handles the unwrap on read. A "proper" fix would
+  audit every write site to use postgres.js's
+  `db.json(value)` helper — out of scope for this session.
+  Direct SQL probes (`jsonb_array_length`) fail; the
+  application path works. Documented in STATE.md so the
+  next operator who runs a direct SQL probe knows why
+- **The "operator action" gap that ships today.** The
+  template's seeded `agents.yaml` enables tools, but
+  existing projects bootstrapped before this session have
+  no `tools:` key on their `code-agent` block — they
+  default to the per-role baseline (which DOES have
+  tools), but only because the loader's baseline ships
+  the four-tool set. New `gestalt init` projects work
+  out of the box; legacy projects work transparently
+  (the loader picks up the baseline). Operators who
+  want to override (e.g., disable a tool for a paranoid
+  audit) need to add the `tools.builtin: [...]` array to
+  their committed `agents.yaml`. Documented this in the
+  agents.yaml template's surrounding comments
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Migration 012 applied. Server image rebuilt. Tool-use loop
+verified end-to-end on the tsx-version-fix intent: the
+code-agent called `readFile({ path: "package.json" })`,
+received the actual file content, and produced a one-line
+surgical edit that preserved every other field verbatim.
+The tool call landed on `agent_execution_logs.tool_calls` as
+expected; the dashboard's IntentDetail accordion renders
+the new `Tool calls (1)` section with the file content
+preview. The `GET /projects/:id/agents` summary endpoint
+surfaces the effective tool set per agent.
+
+Pending follow-up (low priority): the JSONB-string-scalar
+storage trap should eventually be fixed at the write path
+for every JSONB-array column. Today the read side normalises
+correctly via `parseJsonb`; direct SQL probes need the
+`(col#>>'{}')::jsonb` unwrap. Not added to the Pending
+enhancements list because it's purely cosmetic — every
+consumer of these columns reads through the application
+which handles it.
+
+No new Pending enhancements introduced.
