@@ -4,7 +4,7 @@ import { useDashboardApi } from '../hooks/useApi';
 import { useLiveEvent } from '../hooks/useLiveEvents';
 import { StatusBadge, SignalBadge } from '../components/shared/StatusBadge';
 import { PageHeader, Card, LoadingSpinner, Button } from '../components/shared/PageHeader';
-import type { IntentDetail as IntentDetailType, AgentExecutionSummary, SignalSummary } from '../types';
+import type { IntentDetail as IntentDetailType, AgentExecutionSummary, SignalSummary, InterventionRecord } from '../types';
 
 interface ExecutionLogResponse {
   execution: AgentExecutionSummary;
@@ -56,6 +56,25 @@ export function IntentDetail() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [logs, setLogs] = useState<Record<string, ExecutionLogResponse | 'loading' | 'error'>>({});
   const [showFull, setShowFull] = useState<Record<string, { prompt?: boolean; response?: boolean }>>({});
+
+  // Intervention history (ADR-021). Loaded on mount when the intent is
+  // in a status where an intervention could exist; refreshed on
+  // `intent.status-changed` so the section updates atomically when an
+  // operator resumes/aborts/acknowledges from elsewhere.
+  const [interventions, setInterventions] = useState<InterventionRecord[]>([]);
+  const showInterventionsFor = new Set(['escalated', 'failed', 'deployed', 'deploying', 'waiting-for-clarification']);
+  useEffect(() => {
+    if (!intent || !showInterventionsFor.has(intent.status)) {
+      setInterventions([]);
+      return;
+    }
+    let cancelled = false;
+    api.listInterventions(intent.id)
+      .then((res) => { if (!cancelled) setInterventions(res.data ?? []); })
+      .catch(() => { if (!cancelled) setInterventions([]); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [intent?.id, intent?.status]);
 
   const load = async () => {
     if (!id) return;
@@ -232,6 +251,51 @@ export function IntentDetail() {
                   </div>
                 );
               })}
+            </div>
+          </Card>
+        )}
+
+        {/* Intervention history (ADR-021) — operator decisions on
+            escalated / failed / deployed cycles. Hidden for active
+            cycles (pending/generating/in-review) where no
+            intervention has happened yet. */}
+        {interventions.length > 0 && (
+          <Card>
+            <div style={{ padding: '14px 16px', borderBottom: '1px solid var(--border)' }}>
+              <p style={sectionTitle}>Interventions ({interventions.length})</p>
+            </div>
+            <div style={{ padding: '8px 0' }}>
+              {interventions.map((iv) => (
+                <div key={iv.id} style={{ padding: '10px 16px', borderBottom: '1px solid var(--border)' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '5px' }}>
+                    <span style={{
+                      ...monoText,
+                      fontSize: '11px',
+                      padding: '2px 8px',
+                      borderRadius: '3px',
+                      background:
+                        iv.action === 'resume'                ? 'var(--bg-subtle)' :
+                        iv.action === 'abort'                 ? 'rgba(220, 38, 38, 0.18)' :
+                        iv.action === 'acknowledge-breach'    ? 'rgba(245, 158, 11, 0.18)' :
+                        /* request-clarification */              'rgba(59, 130, 246, 0.18)',
+                      color:
+                        iv.action === 'resume'                ? 'var(--text-primary)' :
+                        iv.action === 'abort'                 ? 'var(--red)' :
+                        iv.action === 'acknowledge-breach'    ? 'var(--amber)' :
+                        /* request-clarification */              'var(--accent)',
+                    }}>{iv.action}</span>
+                    <span style={{ ...monoText, color: 'var(--text-dim)' }}>by {iv.actorId.slice(0, 8)}</span>
+                    <span style={{ ...monoText, color: 'var(--text-dim)', marginLeft: 'auto' }}>
+                      {new Date(iv.createdAt).toLocaleString()}
+                    </span>
+                  </div>
+                  {iv.notes ? (
+                    <p style={{ fontSize: '12px', color: 'var(--text-secondary)', whiteSpace: 'pre-wrap' }}>{iv.notes}</p>
+                  ) : (
+                    <p style={{ fontSize: '11px', color: 'var(--text-dim)', fontStyle: 'italic' }}>(no notes)</p>
+                  )}
+                </div>
+              ))}
             </div>
           </Card>
         )}

@@ -232,33 +232,35 @@ export interface Alert {
 
 // ─── Interventions ────────────────────────────────────────────────────────────
 
-export type InterventionType =
-  | 'approve-promotion'
-  | 'reject-promotion'
-  | 'provide-clarification'
-  | 'acknowledge-breach';
+// ─── Interventions (ADR-021, migration 011) ──────────────────────────────────
+
+export type InterventionAction =
+  | 'resume'
+  | 'abort'
+  | 'acknowledge-breach'
+  | 'request-clarification';
 
 export interface InterventionRequest {
-  alertId: string;
-  correlationId: string;
-  type: InterventionType;
-  payload: InterventionPayload;
+  intentId: string;
+  action: InterventionAction;
+  notes?: string;
 }
-
-export type InterventionPayload =
-  | { type: 'approve-promotion'; environment: string }
-  | { type: 'reject-promotion'; environment: string; reason: string }
-  | { type: 'provide-clarification'; clarification: string; ambiguityId: string }
-  | { type: 'acknowledge-breach'; decision: 'resume' | 'abort'; notes: string };
 
 export interface InterventionRecord {
   id: string;
-  alertId: string;
   correlationId: string;
-  type: InterventionType;
-  performedBy: string;   // user ID
-  payload: InterventionPayload;
+  intentId: string;
+  alertId: string | null;
+  action: InterventionAction;
+  actorId: string;
+  notes: string | null;
   createdAt: string;
+}
+
+export interface InterventionResponse {
+  action: InterventionAction;
+  intentId: string;
+  status: string;
 }
 
 // ─── Maintenance ──────────────────────────────────────────────────────────────

@@ -7,7 +7,8 @@
 
 import type {
   IntentSummary, IntentDetail, Alert, InterventionRequest,
-  InterventionRecord, MaintenanceRunSummary, LiveEvent, DashboardUser,
+  InterventionRecord, InterventionResponse,
+  MaintenanceRunSummary, LiveEvent, DashboardUser,
   AgentExecutionSummary, ProjectSummary, SignalSummary,
   DeploymentSummary,
   UserSummary, UserDetail, MembershipSummary, ProjectMember,
@@ -149,10 +150,16 @@ export class DashboardApiClient {
     return this.get(`/alerts/${id}`);
   }
 
-  // ─── Interventions ─────────────────────────────────────────────────────────
+  // ─── Interventions (ADR-021) ───────────────────────────────────────────────
 
-  async submitIntervention(request: InterventionRequest): Promise<InterventionRecord> {
+  async submitIntervention(
+    request: InterventionRequest,
+  ): Promise<{ data: InterventionResponse }> {
     return this.post('/interventions', request);
+  }
+
+  async listInterventions(intentId: string): Promise<{ data: InterventionRecord[] }> {
+    return this.get('/interventions', { intentId });
   }
 
   // ─── Maintenance ───────────────────────────────────────────────────────────

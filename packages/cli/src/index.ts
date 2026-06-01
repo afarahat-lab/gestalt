@@ -43,6 +43,7 @@ import {
 } from './commands/maintenance';
 import {
   alertsListCommand, alertsShowCommand, alertsFixCommand, alertsDismissCommand,
+  alertsResumeCommand, alertsAbortCommand, alertsAcknowledgeCommand,
 } from './commands/alerts';
 import {
   agentsListCommand, agentsValidateCommand,
@@ -200,6 +201,32 @@ alerts
   .option('--notes <text>', 'Free-form notes')
   .action(async (alertId: string, opts: { server?: string; notes?: string }) => {
     await alertsDismissCommand(alertId, { server: opts.server, notes: opts.notes }).catch(fatalError);
+  });
+
+// gestalt alerts — ADR-021 intervention subcommands (GP_BREACH only)
+alerts
+  .command('resume <alertId>')
+  .description('Intervene RESUME on a GP_BREACH escalation — false positive, dispatch deploy chain (ADR-021)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (alertId: string, opts: { server?: string }) => {
+    await alertsResumeCommand(alertId, { server: opts.server }).catch(fatalError);
+  });
+
+alerts
+  .command('abort <alertId>')
+  .description('Intervene ABORT on a GP_BREACH escalation — real breach, transition intent to failed (ADR-021)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (alertId: string, opts: { server?: string }) => {
+    await alertsAbortCommand(alertId, { server: opts.server }).catch(fatalError);
+  });
+
+alerts
+  .command('acknowledge <alertId>')
+  .description('Intervene ACKNOWLEDGE-BREACH on a GP_BREACH escalation — record notes + transition to failed (ADR-021)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--notes <text>', 'Notes describing why this breach occurred (required; prompts if omitted)')
+  .action(async (alertId: string, opts: { server?: string; notes?: string }) => {
+    await alertsAcknowledgeCommand(alertId, { server: opts.server, notes: opts.notes }).catch(fatalError);
   });
 
 // gestalt agents — read + validate agents.yaml from the project repo (ADR-037)

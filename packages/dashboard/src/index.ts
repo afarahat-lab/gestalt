@@ -6,7 +6,7 @@
 export type {
   IntentSummary, IntentDetail, IntentStatus,
   Alert, AlertSeverity, AlertAction,
-  InterventionRequest, InterventionRecord, InterventionType,
+  InterventionRequest, InterventionRecord, InterventionAction, InterventionResponse,
   MaintenanceRunSummary, LiveEvent, LiveEventType,
   DashboardUser, UserRole,
   GateResultSummary, DeploymentStatus, SignalSummary,

@@ -44,6 +44,7 @@ export type {
   AlertRecord, AlertType, AlertRequiredAction,
   AgentExecutionLogRecord,
   ProjectMembershipRecord,
+  InterventionRecord, InterventionAction,
   RepositoryRegistry,
   IntentRepository, AgentExecutionRepository,
   ArtifactRepository, SignalRepository,
@@ -52,6 +53,7 @@ export type {
   MaintenanceRunRepository, FindingAttemptRepository, AlertRepository,
   AgentExecutionLogRepository,
   ProjectMembershipRepository,
+  InterventionRepository,
 } from './repository/index';
 export { getRepositories, setRepositories } from './repository/index';
 

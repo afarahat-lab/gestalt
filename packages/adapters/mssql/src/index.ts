@@ -10,3 +10,4 @@ export { MssqlFindingAttemptRepository } from './repositories/finding-attempts';
 export { MssqlAlertRepository } from './repositories/alerts';
 export { MssqlAgentExecutionLogRepository } from './repositories/execution-logs';
 export { MssqlProjectMembershipRepository } from './repositories/memberships';
+export { MssqlInterventionRepository } from './repositories/interventions';

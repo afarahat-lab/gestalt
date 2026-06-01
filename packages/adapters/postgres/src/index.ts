@@ -22,6 +22,7 @@ import { PostgresFindingAttemptRepository } from './repositories/finding-attempt
 import { PostgresAlertRepository } from './repositories/alerts';
 import { PostgresAgentExecutionLogRepository } from './repositories/execution-logs';
 import { PostgresProjectMembershipRepository } from './repositories/memberships';
+import { PostgresInterventionRepository } from './repositories/interventions';
 import { runMigrations } from './migrations/runner';
 
 export { closeDb, pingDb };
@@ -52,5 +53,6 @@ export async function createPostgresAdapter(databaseUrl: string): Promise<Reposi
     alerts:           new PostgresAlertRepository(),
     executionLogs:    new PostgresAgentExecutionLogRepository(),
     memberships:      new PostgresProjectMembershipRepository(),
+    interventions:    new PostgresInterventionRepository(),
   };
 }

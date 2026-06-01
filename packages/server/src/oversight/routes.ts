@@ -36,7 +36,6 @@ import {
   requireRole, requireProjectMembership, sendProjectMembershipError,
   ProjectMembershipError,
 } from '../auth/middleware';
-import type { InterventionRequest } from './types';
 
 const log = createContextLogger({ module: 'routes:oversight' });
 
@@ -255,11 +254,11 @@ export async function registerOversightRoutes(app: FastifyInstance): Promise<voi
     },
   );
 
-  // POST /interventions — aspirational. The clarification flow uses
-  // POST /intents/:id/clarify instead (it owns the resume side effect).
-  app.post<{ Body: InterventionRequest }>('/interventions', async (_req, reply) => {
-    return reply.code(501).send({ error: 'POST /interventions not yet implemented — use POST /intents/:id/clarify' });
-  });
+  // POST /interventions lives in routes/interventions.ts now (ADR-021,
+  // migration 011). The earlier 501 stub used to point operators at the
+  // clarification endpoint; that flow is still right for vague intents,
+  // but the four typed actions for GP_BREACH escalation have their own
+  // route now.
 }
 
 // ─── Enrichment helpers ─────────────────────────────────────────────────────

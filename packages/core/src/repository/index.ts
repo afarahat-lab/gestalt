@@ -320,6 +320,45 @@ export interface RepositoryRegistry {
   alerts: AlertRepository;
   executionLogs: AgentExecutionLogRepository;
   memberships: ProjectMembershipRepository;
+  interventions: InterventionRepository;
+}
+
+// ─── Intervention repository (ADR-021) ───────────────────────────────────────
+
+/**
+ * Operator response to a paused intent — typically a
+ * `GOLDEN_PRINCIPLE_BREACH` escalation. The four `action` values are
+ * the only ones ADR-021 defines:
+ *   - `resume`: false positive, dispatch to deploy chain
+ *   - `abort`: real breach, transition to `failed`
+ *   - `acknowledge-breach`: record + notes, transition to `failed`
+ *   - `request-clarification`: need more info, pause as
+ *     waiting-for-clarification
+ *
+ * Stored in the `interventions` table (migration 011). `notes` lives
+ * here for forensic recall; the audit_log row records only the length.
+ */
+export type InterventionAction =
+  | 'resume'
+  | 'abort'
+  | 'acknowledge-breach'
+  | 'request-clarification';
+
+export interface InterventionRecord {
+  id: string;
+  correlationId: string;
+  intentId: string;
+  alertId: string | null;
+  action: InterventionAction;
+  actorId: string;
+  notes: string | null;
+  createdAt: Date;
+}
+
+export interface InterventionRepository extends BaseRepository {
+  create(intervention: Omit<InterventionRecord, 'id' | 'createdAt'>): Promise<InterventionRecord>;
+  findByIntentId(intentId: string): Promise<InterventionRecord[]>;
+  findByCorrelationId(correlationId: string): Promise<InterventionRecord[]>;
 }
 
 // ─── Alert repository ─────────────────────────────────────────────────────────

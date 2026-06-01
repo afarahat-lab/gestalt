@@ -188,6 +188,143 @@ export async function alertsDismissCommand(
   }
 }
 
+// ─── Intervention subcommands (ADR-021) ─────────────────────────────────────
+//
+// The `gestalt alerts list` view only shows GP_BREACH alerts as
+// `severity: critical, type: GOLDEN_PRINCIPLE_BREACH`. These three
+// commands turn a GP_BREACH alert id (8-char prefix) into a
+// `POST /interventions` call. The intentId is lifted from the
+// alert's enriched record (top-level `intentId` after the
+// `GET /alerts/:id` enrichment pass — same field the dashboard
+// reads).
+
+async function intentIdForAlert(client: GestaltApiClient, alertIdPrefix: string): Promise<{ alertId: string; intentId: string } | null> {
+  const alert = await fetchAlertByIdOrPrefix(client, alertIdPrefix);
+  if (!alert) return null;
+  const intentId = alert.intentId
+    ?? (typeof (alert.context as Record<string, unknown> | null | undefined)?.['intentId'] === 'string'
+      ? ((alert.context as Record<string, unknown>)['intentId'] as string)
+      : null);
+  if (!intentId) return null;
+  return { alertId: alert.id, intentId };
+}
+
+export async function alertsResumeCommand(
+  alertId: string,
+  options: { server?: string } = {},
+): Promise<void> {
+  const config = await loadCliConfig();
+  const serverUrl = resolveServerUrl(options, config);
+  if (!config.token) {
+    console.log(c.error('Not authenticated. Run: gestalt login'));
+    process.exit(1);
+  }
+  const client = new GestaltApiClient({ serverUrl, token: config.token });
+  try {
+    const resolved = await intentIdForAlert(client, alertId);
+    if (!resolved) {
+      console.log(c.error(`No alert with id (or id-prefix) '${alertId}', or alert is missing intentId.`));
+      process.exit(1);
+    }
+    const res = await client.submitIntervention({ intentId: resolved.intentId, action: 'resume' });
+    blank();
+    console.log(c.success('✓ Intent resumed — deploy chain started'));
+    console.log(c.dim(`  intentId: ${res.data.intentId}`));
+    console.log(c.dim(`  status:   ${res.data.status}`));
+    blank();
+  } catch (err) {
+    if (isConnectivityError(err)) {
+      printConnectionError(serverUrl);
+    } else {
+      console.log(c.error(`Failed to resume: ${err instanceof Error ? err.message : String(err)}`));
+    }
+    process.exit(1);
+  }
+}
+
+export async function alertsAbortCommand(
+  alertId: string,
+  options: { server?: string } = {},
+): Promise<void> {
+  const config = await loadCliConfig();
+  const serverUrl = resolveServerUrl(options, config);
+  if (!config.token) {
+    console.log(c.error('Not authenticated. Run: gestalt login'));
+    process.exit(1);
+  }
+  const client = new GestaltApiClient({ serverUrl, token: config.token });
+  try {
+    const resolved = await intentIdForAlert(client, alertId);
+    if (!resolved) {
+      console.log(c.error(`No alert with id (or id-prefix) '${alertId}', or alert is missing intentId.`));
+      process.exit(1);
+    }
+    blank();
+    const confirm = (await prompt('Abort this intent? This cannot be undone. (y/N)')).trim().toLowerCase();
+    if (confirm !== 'y' && confirm !== 'yes') {
+      console.log(c.dim('Cancelled.'));
+      return;
+    }
+    const res = await client.submitIntervention({ intentId: resolved.intentId, action: 'abort' });
+    blank();
+    console.log(c.success('✓ Intent aborted'));
+    console.log(c.dim(`  intentId: ${res.data.intentId}`));
+    console.log(c.dim(`  status:   ${res.data.status}`));
+    blank();
+  } catch (err) {
+    if (isConnectivityError(err)) {
+      printConnectionError(serverUrl);
+    } else {
+      console.log(c.error(`Failed to abort: ${err instanceof Error ? err.message : String(err)}`));
+    }
+    process.exit(1);
+  }
+}
+
+export async function alertsAcknowledgeCommand(
+  alertId: string,
+  options: { server?: string; notes?: string } = {},
+): Promise<void> {
+  const config = await loadCliConfig();
+  const serverUrl = resolveServerUrl(options, config);
+  if (!config.token) {
+    console.log(c.error('Not authenticated. Run: gestalt login'));
+    process.exit(1);
+  }
+  const client = new GestaltApiClient({ serverUrl, token: config.token });
+  try {
+    const resolved = await intentIdForAlert(client, alertId);
+    if (!resolved) {
+      console.log(c.error(`No alert with id (or id-prefix) '${alertId}', or alert is missing intentId.`));
+      process.exit(1);
+    }
+    let notes = (options.notes ?? '').trim();
+    if (!notes) {
+      blank();
+      notes = (await prompt('Describe why this breach occurred (required)')).trim();
+    }
+    if (!notes) {
+      console.log(c.error('Notes are required for acknowledge-breach.'));
+      process.exit(1);
+    }
+    const res = await client.submitIntervention({
+      intentId: resolved.intentId, action: 'acknowledge-breach', notes,
+    });
+    blank();
+    console.log(c.success('✓ Breach acknowledged'));
+    console.log(c.dim(`  intentId: ${res.data.intentId}`));
+    console.log(c.dim(`  status:   ${res.data.status}`));
+    blank();
+  } catch (err) {
+    if (isConnectivityError(err)) {
+      printConnectionError(serverUrl);
+    } else {
+      console.log(c.error(`Failed to acknowledge: ${err instanceof Error ? err.message : String(err)}`));
+    }
+    process.exit(1);
+  }
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async function resolveCurrentProjectId(

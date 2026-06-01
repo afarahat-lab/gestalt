@@ -8,7 +8,7 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — Handler-level project membership enforcement on intent submit, clarify, maintenance trigger, alert fix-intent, project config)
+**Last updated:** 2026-06-01 (Claude Code — `POST /interventions` (ADR-021): resume, abort, acknowledge-breach, request-clarification)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -22,11 +22,11 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
   are summarised in the "Session log" entries dated 2026-05-29 / 30
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
-- All ten migrations apply on startup: `001_initial`, `002_local_auth`,
+- All eleven migrations apply on startup: `001_initial`, `002_local_auth`,
   `003_projects`, `004_deployments`, `005_maintenance`,
   `006_intent_clarification`, `007_execution_logs`,
   `008_finding_attempts`, `009_execution_log_model`,
-  `010_user_management`
+  `010_user_management`, `011_interventions`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
 - **Dashboard SPA reachable in the browser, deep-linkable, no path
@@ -188,6 +188,105 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
   - **CLI** — `gestalt run` / `gestalt maintenance trigger` /
     `gestalt projects set-adapter` as a non-member each print the
     typed friendly message instead of a raw JSON dump
+- **`POST /interventions` (ADR-021, migration 011).** Operator
+  responses to escalated intents. Four typed actions — the same
+  vocabulary ADR-021 defined — implemented end-to-end:
+  - `resume` — false positive; marks the GP_BREACH signal resolved
+    by literal `'human'` (the repo-level guard enforces that),
+    acknowledges the alert, creates the intervention row, and
+    dispatches `deploy:pr` with the artifact set rebuilt from
+    `artifacts.findByCorrelationId` (same shape the gate uses on a
+    `pass` verdict). Intent transitions `escalated → deploying`,
+    then NoOp/GitHub Actions adapter completes the cycle to
+    `deployed`
+  - `abort` — real breach; acknowledges the alert, creates the
+    intervention row, transitions intent to `failed`. No deploy
+    dispatch, no signal resolution (the breach IS the truth)
+  - `acknowledge-breach` — **notes are required** (400 if
+    omitted); marks the signal resolved (human), acknowledges the
+    alert, creates the intervention row with the notes persisted
+    to `interventions.notes`, transitions to `failed`. **GP-006:
+    the audit row carries only `notesLength` + `signalId` — the
+    note text never reaches `audit_log`**. The text is auditable
+    via direct query against `interventions`
+  - `request-clarification` — creates a `clarification-needed`
+    alert (severity `high`) carrying `triggeredBy: 'intervention'`
+    + the breach signal ids in JSONB context, transitions intent
+    to `waiting-for-clarification`. The existing
+    `POST /intents/:id/clarify` flow then resumes the cycle on
+    operator follow-up
+  - All four write an `interventions` row (migration 011 —
+    `(intent_id, correlation_id, alert_id, action, actor_id,
+    notes, created_at)`) plus an audit row
+    (`intervention.resume` / `.abort` / `.acknowledge-breach` /
+    `.request-clarification`). The `alert_id` is nullable —
+    `resume` and `abort` populate it from the open GP_BREACH
+    alert when present; `request-clarification` creates a new
+    alert so the audit metadata carries that id instead
+  - **Edge cases:**
+    - Intent not in `escalated` status → 409
+      `INVALID_INTENT_STATUS` with the current status surfaced in
+      the message. Verified live for `failed` and `deployed`
+      callers
+    - Intent not found → 404
+    - Unknown action → 400 with the four valid values listed
+    - `acknowledge-breach` with empty notes → 400
+    - Non-member tries to intervene → 403
+      `INSUFFICIENT_PROJECT_ROLE` (the helper from the prior
+      session — editor minimum)
+  - **`GET /interventions?intentId=<id>`** — viewer minimum.
+    Returns the intent's intervention history (one row per
+    operator decision; ascending by `created_at`) for the
+    dashboard's IntentDetail Interventions section
+  - **Dashboard.** Alerts view: GP_BREACH alert cards render a
+    new `BreachInterventionBlock` with three buttons — `▶ Resume
+    (false positive)`, `✗ Abort intent`, and an `⚑ Acknowledge
+    breach` button gated on a required notes textarea. Submitting
+    sends the typed `POST /interventions` call; on success the
+    card disappears, a green confirmation banner shows for 1.5 s,
+    then the list refreshes. Abort confirms via the browser
+    confirm dialog before firing. The fourth action
+    (request-clarification) is reachable only from the CLI today
+    — the dashboard rarely needs it (operator can submit a fresh
+    intent / use the existing clarification flow)
+  - **IntentDetail Interventions section.** When the intent is in
+    a status where interventions could exist (`escalated`,
+    `failed`, `deploying`, `deployed`,
+    `waiting-for-clarification`), `GET /interventions?intentId=`
+    fetches the history and renders one card per intervention
+    with a coloured action chip, the actor's id-prefix, the
+    timestamp, and the notes prose (or `(no notes)` when null)
+  - **CLI `gestalt alerts`:** three new subcommands —
+    `resume <alertId>`, `abort <alertId>` (prompts `y/N`
+    confirmation), `acknowledge <alertId>` (prompts for required
+    notes when `--notes` is omitted). Each resolves the
+    `intentId` by re-using the existing
+    `fetchAlertByIdOrPrefix(client, alertIdPrefix)` helper and
+    lifting `alert.intentId` (or
+    `alert.context.intentId`) — same 8-char prefix surface the
+    other alerts subcommands use
+  - All four `POST /interventions` actions verified live against
+    `trackeros`: `abort` and `acknowledge-breach` ran against
+    pre-existing escalated intents from prior sessions
+    (`562efa69`, `cd4c1846`); `request-clarification` against a
+    third (`b86e010f` → transitioned to
+    `waiting-for-clarification` with a fresh clarification alert
+    created); `resume` against a synthetic
+    `verify-intervention-resume` intent — full deploy chain
+    completed (5 `deployment_events` rows in order
+    `pr-opened → pipeline-triggered → pipeline-passed →
+    promoted-staging → promoted-production`; intent reached
+    `deployed`). GP_BREACH signal flipped to
+    `resolved_by = 'human'`, alert acknowledged, intervention
+    row carries `alert_id` populated. Audit for the
+    `acknowledge-breach` test: `metadata = {"notesLength": 123,
+    "signalId": "432b33d9-…", "alertId": null, "ip": "…"}` —
+    no `notes` text anywhere in the audit row.
+    `GET /interventions?intentId=<resume_id>` returned the
+    intervention record with the expected shape. CLI
+    `alerts abort` and `alerts acknowledge --notes` both
+    succeeded against synthetic GP_BREACH alerts seeded for
+    each
 - **CLI server URL is fully configurable.** `gestalt config show` /
   `gestalt config set-server <url>` / `gestalt config reset` let
   operators inspect and change `~/.gestalt/config.json` without going
@@ -821,6 +920,13 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
   matches the BullMQ removeOnComplete contract. The
   AgentExecutionRepository also gained `findById(id)` so the
   `/executions/:id/log` endpoint can fetch the join row
+- `interventions` — create, findByIntentId, findByCorrelationId.
+  Migration 011 (ADR-021). One row per `POST /interventions`
+  call; `(intent_id, alert_id)` FK both to live tables (alert_id
+  nullable). `action` constrained to the four ADR-021 values via
+  CHECK; `notes` nullable and stores the operator's
+  acknowledge-breach text (audit_log carries only the length,
+  per GP-006)
 
 **CLI install:**
 - `@gestalt/cli` is private — not on npm
@@ -1299,13 +1405,6 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
   `alerts`) would let the API return the filtered set in one
   call and let the Layout's badge count match the visible list
   without extra plumbing
-- **POST /interventions still a 501 stub.** The
-  clarification flow uses `POST /intents/:id/clarify` (owns the
-  resume side effect) and the new "submit fix intent" path uses
-  `POST /alerts/:id/fix-intent`. Promotion approval (the
-  remaining `approve-promotion` action type) does not have a
-  shipped UI yet and will likely use this endpoint when it
-  does
 - **Return-URL preservation across login.** Pasting `/app/intents/<id>`
   in a fresh tab today bounces to `/app/login` and after sign-in
   lands on `/app/` (the intent ID is dropped). Small SPA-only change —
@@ -1372,246 +1471,6 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
 ---
 
 ## Recent session entries
-
-### Session 2026-06-01 — Claude Code (BaseLLMAgent refactor: every LLM agent shares one abstract class)
-
-Code-quality refactor. No behaviour changes, no new endpoints, no
-migrations. Goal: eliminate the copy-pasted LLM-call pattern that had
-spread across nine agent files (intent / design / context / code /
-test / lint-config / review / context-fixer + the smaller variations).
-Centralises model routing, response capture, and the standard
-`CONTEXT_GAP` failure signal in one abstract base class. Every
-LLM-calling agent in the platform now extends `BaseLLMAgent`.
-
-Changed:
-- `packages/agents/generate/src/agents/base-llm-agent.ts` (new):
-  the abstract base class.
-  - Instance fields `lastPrompt: string | null`,
-    `lastLlmResponse: string | null`, `lastModelUsed: string | null`
-    — captured per call, read back by the orchestrator after
-    `run()` returns to persist into `agent_execution_logs.{prompt,
-    llm_response, model_used}`
-  - Template method `run(task)`: `buildPrompt(task)` → wrap with
-    `applyAgentConfig(rawPrompt, agentConfig)` → `callLLM(prompt,
-    agentConfig, correlationId)` → `parseResponse(raw, task)`.
-    Subclasses that need internal retries override `run()` and
-    call `this.callLLM` inside their own loop (covers intent /
-    design / context / code / test — the JSON-parse retry loop
-    each has)
-  - Two protected LLM helpers:
-    - `callLLM(prompt, agentConfig, correlationId)` — single user
-      message
-    - `callLLMWithMessages(messages, agentConfig, correlationId,
-      promptForLog)` — system + user (or richer) message arrays.
-      `promptForLog` is what gets stored in `lastPrompt` so the
-      dashboard shows a coherent string even when the agent
-      sends multi-message conversations (context-fixer is the
-      one caller today)
-  - Both helpers route via `getLLMClient(agentConfig.llm.model)`
-    so per-agent model overrides from Step 1 + the multi-client
-    registry continue to work unchanged
-  - Throws on LLM call failure; subclass retry loops catch
-  - `makeContextGapSignal(correlationId, message)` builds the
-    canonical `CONTEXT_GAP` (`severity: high`, `autoResolvable:
-    false`, `sourceAgent` from the instance's role) used by every
-    subclass's retry-exhausted failure path
-- `packages/agents/generate/src/types.ts`:
-  - `AgentTask.startedAt?: number` added (Date.now() before
-    `agent.run(task)`; subclasses use it for `durationMs`).
-    Optional so older callers don't break
-  - `AgentResult.lastPrompt` / `llmResponse` REMOVED — moved to
-    the agent instance
-- `packages/agents/generate/src/agents/intent-agent.ts`,
-  `design-agent.ts`, `context-agent.ts`, `code-agent.ts`,
-  `test-agent.ts`, `lint-config-agent.ts`: rewritten as classes
-  (`IntentAgent`, `DesignAgent`, `ContextAgent`, `CodeAgent`,
-  `TestAgent`, `LintConfigAgent`) extending `BaseLLMAgent`. All
-  override `run()` because they have internal retry loops OR
-  pre-flight skip checks. `buildPrompt` / `parseResponse` are
-  stubbed and throw — calling them via the base template would be
-  a misuse. The free `runXxxAgent` function exports are deleted —
-  no backward-compat wrappers per the brief
-- `packages/agents/generate/src/agents/lint-config-agent.ts`:
-  converted to `LintConfigAgent` for consistency. Doesn't call
-  the LLM (Phase 2) so `lastPrompt` / `lastLlmResponse` /
-  `lastModelUsed` stay null on the instance
-- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
-  - `runAgent(agentRole, task, llmCall)` switch replaced by
-    `newAgentForRole(agentRole): BaseLLMAgent` factory
-  - The inline `llmCall` closure that captured
-    `lastModelUsed` is gone — routing happens inside
-    `BaseLLMAgent.callLLM`. The orchestrator reads
-    `agent.lastPrompt` / `agent.lastLlmResponse` /
-    `agent.lastModelUsed` after `run()` returns and passes them
-    into `executionLogs.save(...)`
-  - `AgentTask` construction sets `startedAt: startedAt.getTime()`
-    so subclasses can compute `durationMs` from it
-- `packages/agents/quality-gate/src/agents/llm-review-agent.ts`:
-  rewritten as `ReviewAgent` class extending `BaseLLMAgent`.
-  Custom entry `review(task: GateTask)` because the gate operates
-  on `GateTask`, not `AgentTask`. Uses `this.callLLM(prompt,
-  agentConfig, correlationId)` for the model-routed call;
-  `buildPrompt` / `parseResponse` are stubbed
-- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
-  - The closure-captured `reviewModelUsed` variable and the
-    inline `llmCall` wrapper are gone — `ReviewAgent.lastModelUsed`
-    carries the model now
-  - After `reviewAgent.review(gateTask)` returns, the
-    orchestrator copies `agent.lastPrompt` / `agent.lastLlmResponse`
-    / `agent.lastModelUsed` onto the result so the existing
-    `runWithObservability` save site (which still reads them off
-    `GateAgentResult`) keeps working without further changes
-  - `getLLMClient` import removed from the gate orchestrator
-- `packages/agents/quality-gate/src/index.ts`:
-  `runLlmReviewAgent` export replaced with `ReviewAgent`
-- `packages/agents/maintenance/src/agents/context-fixer.ts`:
-  rewritten as `ContextFixer` class extending `BaseLLMAgent`.
-  Custom entry `applyFix(intent, project)` for the maintenance
-  runner's per-finding loop. The system+user message pair (the
-  ADR-018 rules live in the system role) goes through the new
-  `this.callLLMWithMessages([{role:'system',...},{role:'user',
-  ...}], cfg, ...)` helper. `buildPrompt` / `parseResponse`
-  stubbed
-- `packages/agents/maintenance/src/runner/index.ts`:
-  `applyContextFileFix(intent, project)` call → `new
-  ContextFixer().applyFix(intent, project)`
-- `packages/agents/maintenance/src/index.ts`:
-  `applyContextFileFix` export replaced with `ContextFixer`
-- `packages/core/src/types.ts`: `AgentRole` union gained
-  `'context-fixer'` so the new class's
-  `super('context-fixer')` compiles without a cast. Was
-  informally cast at insert sites before; now first-class
-- `packages/agents/generate/src/index.ts`:
-  - Exports `BaseLLMAgent` (re-used by quality-gate +
-    maintenance)
-  - Class exports `IntentAgent` / `DesignAgent` / `ContextAgent`
-    / `LintConfigAgent` / `CodeAgent` / `TestAgent` replace the
-    six `runXxxAgent` function exports
-
-Decisions made:
-- **drift-agent / alignment-agent / gc-agent / evaluation-agent
-  NOT converted.** The brief lists drift + alignment as ones to
-  convert assuming they make LLM calls. In this codebase they
-  don't — drift-agent does git-log + commit-timestamp comparison;
-  alignment-agent does regex extraction; gc-agent + evaluation-
-  agent are scheduled deterministic tasks. Converting them
-  would add no value (no LLM, no shared logic to factor) and
-  could obscure the semantics — they'd extend a class whose
-  primary method they'd never call. Same rationale the brief
-  applies to constraint-agent and the deploy agents. Documented
-  here so the next agent reviewer knows this is intentional
-- **Custom agents stay on the `runCustomAgent` functional
-  runner.** Brief constraint: "Custom agent runner is NOT
-  converted — it's a generic runner, not a class hierarchy."
-  Held to this — the runner takes a `CustomAgentDefinition`
-  data structure, not a class. Per-instance state (last prompt
-  etc.) doesn't apply the same way; the custom agent runner
-  is one function processing N data definitions
-- **`callLLMWithMessages` is a separate helper, not an overload
-  of `callLLM`.** Two reasons: (1) TypeScript overload
-  signatures get awkward when the parameters differ in count +
-  type; (2) the `promptForLog` parameter is required for
-  callers of the messages variant (so the dashboard can show
-  a single string in the prompt panel), and there's no clean
-  way to make it optional only in one overload. Two methods
-  with clear names is more obvious
-- **`AgentResult.lastPrompt` and `llmResponse` are deleted, not
-  deprecated.** Brief was explicit. Keeping them around as
-  optional would invite drift — agents could populate them or
-  not, the orchestrator wouldn't know which source to trust.
-  Now there's exactly one source: the agent instance after
-  `run()` returns
-- **Subclasses that need internal retries override `run()`
-  instead of having the base class loop.** Considered making
-  `BaseLLMAgent.run` itself loop with a configurable
-  `maxInternalRetries`. Rejected because the retry conditions
-  differ — intent-agent retries on `validateIntentSpec` throw
-  AND on parse failure; code-agent retries on "zero code
-  files"; test-agent retries on "zero test files". Wrapping
-  that in a parameter would create a leaky abstraction. The
-  cleaner pattern is to let subclasses own their retry
-  semantics and just call `this.callLLM` in a loop. Base class
-  template `run()` remains for the simple case (none of the
-  current subclasses use it because they all have retries —
-  but the template is documented for future agents)
-- **`context-fixer` extends `BaseLLMAgent` even though it
-  doesn't follow the standard `run(task)` shape.** The base
-  class is useful for ANY LLM-calling code because of the
-  instance-captured `lastModelUsed` (Step 1) — context-fixer
-  needs to persist which model it routed to. Inheritance gives
-  it `callLLMWithMessages` + `lastModelUsed` for free; the
-  stubbed `buildPrompt` / `parseResponse` are a small ergonomic
-  cost for a real structural win
-- **`AgentRole` union widened to include `'context-fixer'`.**
-  The previous behaviour was to cast `as AgentRole` at every
-  insert site (the maintenance runner's `agent_executions`
-  rows). Now the class's `super('context-fixer')` is typed
-  cleanly and the cast disappears. Made the same union part of
-  the core schema so any future agent reading the role from
-  the DB doesn't have to know about the implicit widening
-- **gate-orchestrator and maintenance-runner CHANGED but no
-  externally-observable behaviour did.** Both went from
-  closure-captured `lastModelUsed` patterns + free-function
-  agent calls to class instantiation. The execution-log
-  contents (prompt, response, model_used) are byte-identical
-  to before for every agent that was already running
-
-Verified live (no behaviour changes, but worth confirming the
-refactor is correct):
-- `pnpm -r build` clean across all 12 packages
-- Server image rebuilt
-- Submitted padLeft intent against `trackeros`. Cycle ran 14
-  agent executions (6 generate / 2 custom / constraint /
-  review / 4 deploy) → reached `deployed` status
-- **Execution-log columns** populated as expected per agent:
-  - intent-agent: prompt 3011 chars, response 902, model
-    `gpt-4o-mini` (Step 1 override from trackeros agents.yaml
-    preserved through the refactor)
-  - design-agent: prompt 2162, response 83, model `gpt-4o`
-  - context-agent: prompt 2217, response 31, model `gpt-4o`
-  - code-agent: prompt 4065, response 1435, model `gpt-4o`
-    (override preserved)
-  - test-agent: prompt 2135, response 1626, model `gpt-4o`
-  - lint-config-agent: prompt NULL, response NULL, model NULL
-    (skipped — no LLM call) ✓
-  - constraint-agent: NULL everywhere (deterministic regex) ✓
-  - review-agent: prompt 4498, response 234, model `gpt-4o`
-    (ReviewAgent now via BaseLLMAgent.callLLM)
-  - custom agents: prompt NULL (custom-agent-runner doesn't
-    persist it per Step 2 design), response populated, model
-    `gpt-4o`
-  - deploy agents: NULL everywhere (non-LLM) ✓
-- `grep "^export async function run" packages/agents/` shows
-  zero matches in the converted files — only infrastructure
-  agents (deploy / gate / maintenance scheduled + the custom
-  runner + the maintenance runner itself) remain as function
-  exports, which the brief specified are NOT to be converted
-- `grep "BaseLLMAgent" packages/agents/generate/src/index.ts`
-  shows the export
-- Maintenance run also exercised — `usage-example-agent` custom
-  finding generated a `LINT_FAILURE` signal; gate retry routing
-  + intent → `deployed` continues to work unchanged
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Server image rebuilt; one full SDLC slice verified end-to-end
-with the new class-based agents + the existing custom-agent
-runner + the maintenance context-fixer all coexisting. The
-copy-pasted LLM call pattern that lived in 8+ files now lives
-in one place.
-
-No new follow-ups. Possible future tidy-ups:
-- Convert deterministic maintenance agents (drift / alignment /
-  gc / evaluation) to a `BaseMaintenanceAgent` of their own if
-  the codebase grows a second deterministic maintenance step
-  worth factoring
-- The base template `run(task)` method is currently unused —
-  every concrete subclass overrides it because each has an
-  internal retry loop or skip check. If a future agent fits
-  the simple build → call → parse shape (the brief's
-  pseudocode), the template is ready
-
-
----
 
 ### Session 2026-06-01 — Claude Code (user management v1)
 
@@ -2145,3 +2004,330 @@ Follow-up from the prior user-management session resolved: "POST
 membership at the route level" no longer applies. The handler-
 level helper closes that gap and the role-rank check raises
 `/projects/:id/config` to project-admin in the same pass.
+
+---
+
+### Session 2026-06-01 — Claude Code (POST /interventions: resume / abort / acknowledge-breach / request-clarification — ADR-021)
+
+Closes the long-standing 501 stub at `POST /interventions`. ADR-021
+defines exactly four typed operator responses to escalated intents;
+this session implements all four end-to-end (server route + dashboard
+buttons + IntentDetail history + CLI subcommands) and bumps the
+schema to 11 migrations.
+
+Changed:
+- `packages/adapters/postgres/src/migrations/011_interventions.sql`
+  (new): single table
+  `(id, correlation_id, intent_id, alert_id, action, actor_id, notes,
+  created_at)`. `intent_id` and `actor_id` non-null FKs; `alert_id`
+  nullable (created on `resume`/`abort`/`acknowledge-breach` from the
+  open GP_BREACH alert; null on `request-clarification` which creates
+  its own new alert). `action` CHECK constraint pins the four
+  ADR-021 values. Indexes on `intent_id` and `correlation_id` for
+  the per-intent history fetch + the per-cycle audit join. No
+  schema_migrations writes
+- `packages/core/src/repository/index.ts`: new
+  `InterventionAction` union (the four ADR-021 values),
+  `InterventionRecord` shape, `InterventionRepository` interface
+  (`create`, `findByIntentId`, `findByCorrelationId`).
+  `RepositoryRegistry` gained `interventions`. Both types re-exported
+  from `@gestalt/core/index.ts`
+- `packages/adapters/postgres/src/repositories/interventions.ts`
+  (new): `PostgresInterventionRepository`. postgres.js camelCases the
+  column names at the client level so the returned rows already match
+  the `InterventionRecord` shape — no per-field mapper needed (same
+  pattern memberships + users use after the migration-010 trap)
+- `packages/adapters/postgres/src/index.ts`: instantiates +
+  registers the postgres impl
+- `packages/adapters/{oracle,mssql}/src/repositories/interventions.ts`
+  (new): throw-stub `*InterventionRepository` classes. Re-exported
+  from each adapter's `index.ts` so interface drift in core surfaces
+  as a build break here
+- `packages/server/src/routes/interventions.ts` (new): registers
+  both `POST /interventions` and `GET /interventions`.
+  - **`POST /interventions`** — `requireRole('operator')` preHandler
+    plus a handler-level
+    `requireProjectMembership(..., intent.projectId, 'editor')`
+    (the projectId lives on the intent record, not the URL —
+    matches the pattern the prior membership-enforcement session
+    introduced for body-projectId routes). Validation order:
+    intentId present → action valid → notes present for
+    `acknowledge-breach` → intent exists (404) → intent status is
+    `escalated` (else 409 `INVALID_INTENT_STATUS` with the actual
+    status in the message) → membership check. The four-way switch
+    follows, each branch:
+    - **resume:** `signals.markResolved(gpBreachSignalId, 'human')`
+      (the repo's GP guard rejects anything other than the literal
+      `'human'` string — the operator's user id goes on the
+      intervention + audit rows instead), `alerts.acknowledge(...)`
+      if a GP_BREACH alert is open, `interventions.create(...)`,
+      `audit.append({ action: 'intervention.resume', metadata:
+      { signalId, alertId, ip } })`. Then dispatches `deploy:pr`
+      with `artifacts = artifacts.findByCorrelationId(correlationId).
+      map(...)` — the same shape `dispatchDeployPR` in the gate
+      orchestrator builds on a `pass` verdict. Transitions intent
+      to `deploying`, emits `intent.status-changed` and (when
+      applicable) `alert.acknowledged` SSE events
+    - **abort:** alert ack, intervention row, audit, transition to
+      `failed`, SSE. No signal resolution (the breach IS the
+      truth); no deploy dispatch
+    - **acknowledge-breach:** signal resolved (`'human'`), alert
+      ack, intervention row with `notes: trimmedNotes`, audit row
+      carrying `notesLength` + `signalId` + `alertId` (**not the
+      notes content** — GP-006), transition to `failed`, SSE
+    - **request-clarification:** intervention row, fresh
+      `clarification-needed` alert (severity `high`,
+      `requiredAction: 'provide-clarification'`,
+      `context: { intentId, triggeredBy: 'intervention',
+      breachSignalIds: [...] }`), transition to
+      `waiting-for-clarification`, audit (`alertId` of the new
+      alert + optional `notesLength`), `alert.created` +
+      `intent.status-changed` SSE
+  - **`GET /interventions?intentId=<id>`** —
+    `requireRole('viewer')`. Returns
+    `{ data: InterventionRecord[] }` ordered ASC by `created_at`.
+    Used by the dashboard's IntentDetail Interventions section
+  - The outer `try/catch` around the action switch returns a
+    500 with the underlying error message on any thrown step so
+    operators don't lose the diagnostic when something downstream
+    (BullMQ enqueue, repo error) blows up mid-action
+- `packages/server/src/oversight/routes.ts`: the 501 stub at
+  `POST /interventions` is gone. The block is now a one-comment
+  pointer telling the next reader where the typed implementation
+  lives. Removed the now-unused `InterventionRequest` import
+- `packages/server/src/app.ts`: registers
+  `registerInterventionRoutes(app)` alongside the existing
+  routes
+- `packages/dashboard/src/types.ts`: replaced the aspirational
+  `InterventionType` / payload-discriminated union (left over
+  from the 501 era — it modelled `approve-promotion`,
+  `reject-promotion`, etc. which never shipped) with the
+  ADR-021-aligned shape: `InterventionAction`,
+  `InterventionRequest { intentId, action, notes? }`,
+  `InterventionRecord` (matches the server shape — `actorId`,
+  `notes`, etc.), `InterventionResponse`
+- `packages/dashboard/src/index.ts`: re-exports adjusted to the
+  new type names
+- `packages/dashboard/src/api/client.ts`: `submitIntervention`
+  rewrapped to the new `{ data: InterventionResponse }` envelope;
+  new `listInterventions(intentId)` calls
+  `GET /interventions?intentId=`
+- `packages/dashboard/src/views/Alerts.tsx`:
+  - New `breachNotes` state slot (keyed by alert.id) for the
+    `acknowledge-breach` required-notes textarea
+  - New `handleIntervention(alert, action)` handler — submits the
+    typed `POST /interventions` call, sets a green confirmation
+    banner on success, collapses the card after 1.5 s, refreshes
+    the list. Resume + abort use the shared handler; abort
+    confirms via `window.confirm` before firing. `acknowledge-
+    breach` requires the textarea to be non-empty (browser alert
+    otherwise)
+  - New `<BreachInterventionBlock>` component rendered only for
+    `alert.type === 'GOLDEN_PRINCIPLE_BREACH'`. Layout: top row
+    is `▶ Resume (false positive)` (primary green) + `✗ Abort
+    intent` (danger red); below them a required notes textarea
+    and the `⚑ Acknowledge breach` button (disabled until the
+    textarea has content). Sits ABOVE the existing
+    `FixIntentBlock` + `DismissBlock` so the typed intervention
+    is the obvious first action for GP_BREACH alerts
+- `packages/dashboard/src/views/IntentDetail.tsx`: new
+  `interventions` state slot + `useEffect` that fetches the
+  history when the intent's status is in the visible set
+  (`escalated`, `failed`, `deploying`, `deployed`,
+  `waiting-for-clarification`). Renders a new "Interventions
+  (N)" Card between the Signals card and Artifacts — one row per
+  intervention with a coloured action chip (resume: muted bg,
+  abort: red, acknowledge-breach: amber,
+  request-clarification: blue), the actor's id-prefix, the
+  timestamp, and the notes prose (or `(no notes)` italic
+  placeholder)
+- `packages/cli/src/api/client.ts`: new
+  `InterventionActionString`, `InterventionResponse`,
+  `InterventionRecordDto` types and `submitIntervention` /
+  `listInterventions` typed methods
+- `packages/cli/src/commands/alerts.ts`: three new exports —
+  `alertsResumeCommand`, `alertsAbortCommand` (prompts `y/N`),
+  `alertsAcknowledgeCommand` (prompts for required notes when
+  `--notes` is omitted). Each resolves the `intentId` from the
+  alert id-prefix via the existing
+  `fetchAlertByIdOrPrefix(client, prefix)` helper +
+  `alert.intentId` / `alert.context.intentId` fallback, then
+  fires the typed POST. Connection errors route through the
+  shared `printConnectionError` / `isConnectivityError` helpers
+- `packages/cli/src/index.ts`: registers `gestalt alerts resume
+  <alertId>`, `gestalt alerts abort <alertId>`, `gestalt alerts
+  acknowledge <alertId> [--notes <text>]`. All three accept the
+  standard `--server <url>` one-shot override
+
+Verified live against `trackeros`:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt; migration 011 applied on first boot
+  (`schema_migrations` now lists 11 versions). `\d interventions`
+  shows the expected shape (CHECK on action, indexes on
+  intent_id + correlation_id, all FK constraints present)
+- **abort** — `POST /interventions { action: 'abort' }` against
+  pre-existing escalated intent `562efa69` (text "make it
+  better"): returned
+  `{ data: { action: 'abort', intentId: '562efa69-…', status:
+  'failed' } }`; DB confirms intent → `failed`, intervention row
+  written with `action: 'abort'`, `actor_id: a@b.c`,
+  `notes: NULL`, `alert_id: NULL` (the existing intent had no
+  open GP_BREACH alert, only the signal — alerts table doesn't
+  have an `intent_id` column; the open-alert lookup goes via
+  correlationId)
+- **acknowledge-breach** — first call without notes returned 400
+  `"notes are required for acknowledge-breach"`. Second call
+  against `cd4c1846` with a 123-char notes payload returned
+  `{ data: { action: 'acknowledge-breach', intentId: 'cd4c1846-…',
+  status: 'failed' } }`. DB: intent → `failed`,
+  `interventions.notes` carries the 123 chars verbatim,
+  **audit_log row carries `metadata = { notesLength: 123,
+  signalId: '432b33d9-…', alertId: null, ip: '…' }`** — no
+  notes text anywhere in the audit metadata. GP-006 verified
+- **request-clarification** — against `b86e010f` (a
+  maintenance-sourced escalated intent): returned `{ data:
+  { action: 'request-clarification', intentId: '…', status:
+  'waiting-for-clarification' } }`. DB confirms intent
+  transitioned and a NEW `clarification-needed` alert with
+  severity `high` and title "Clarification requested for
+  escalated intent" was created against the same correlationId
+- **resume** — couldn't reuse a pre-existing intent for this
+  (none had an unresolved alert AND artifacts to dispatch with),
+  so seeded a synthetic `verify-intervention-resume` intent +
+  GP_BREACH signal + alert + a single code artifact directly via
+  SQL. `POST /interventions { action: 'resume' }` returned
+  `{ data: { action: 'resume', intentId: '4768a6b4-…', status:
+  'deploying' } }`. Within ~6 s the deploy chain ran end-to-end
+  through the NoOp adapter: `deployment_events` shows
+  `pr-opened → pipeline-triggered → pipeline-passed →
+  promoted-staging → promoted-production` in order; intent
+  reached `deployed`. GP_BREACH signal flipped to
+  `resolved_by = 'human'`; alert acknowledged; intervention row
+  carries `action: 'resume'` and a populated `alert_id`. The
+  signal-resolution guard fired correctly — passing the user
+  UUID instead of `'human'` would have thrown, but the route
+  passes the literal as required
+- **`GET /interventions?intentId=<resume_id>`** returned the
+  intervention record with the expected shape — `id`,
+  `correlationId`, `intentId`, `alertId`, `action: 'resume'`,
+  `actorId`, `notes: null`, `createdAt`. Confirms the read path
+  for the dashboard's IntentDetail section
+- **Edge cases:**
+  - non-existent intent id → 404 `"Intent not found"` ✓
+  - already-`failed` intent → 409 `INVALID_INTENT_STATUS`
+    `"Intent is not in escalated status (current: 'failed')"` ✓
+  - already-`deployed` intent (the resume target after the chain
+    completed) → 409 same ✓
+  - bad action string → 400 `"action must be one of: resume,
+    abort, acknowledge-breach, request-clarification"` ✓
+- **Membership guard:** created `reader2@example.com` (`user`,
+  membership `reader` on trackeros), seeded a fresh escalated
+  intent + signal, then POSTed `{ action: 'abort' }` as the
+  reader → 403 `INSUFFICIENT_PROJECT_ROLE` `"Minimum project
+  role required: editor"`. Intent status stayed `escalated` —
+  the helper short-circuits before any state mutation
+- **CLI:**
+  - `gestalt alerts abort <prefix>` (with `y` confirmation
+    response) — seeded a fresh GP_BREACH alert + intent,
+    grabbed its 8-char id-prefix, piped `y` to the prompt →
+    `✓ Intent aborted` + intent transitions to `failed`
+  - `gestalt alerts acknowledge <prefix> --notes "Documented
+    exception for migration script - cleared with tech lead"` —
+    seeded another fresh GP_BREACH escalation, ran the command
+    with `--notes` → `✓ Breach acknowledged` + intent → `failed`,
+    notes persisted on the intervention row
+  - Both commands successfully resolved the 8-char prefix to the
+    full alert + lifted the intentId from `alert.intentId`
+
+Decisions made:
+- **The repo's GP-resolution guard is honoured, not worked
+  around.** `signals.markResolved` rejects anything other than
+  literal `'human'` for GP_BREACH signals. The brief's
+  pseudocode passed `request.user.id`, which would have thrown
+  in the postgres impl. The route passes `'human'` to the repo
+  and writes the actor's uuid on the intervention + audit rows
+  — the operator identity is auditable via
+  `interventions.actor_id` and `audit_log.actor` for the same
+  cycle
+- **The route handles "multiple open GP_BREACH signals"
+  conservatively.** Some review-agent runs emit more than one
+  GP_BREACH signal per cycle. The route resolves the FIRST
+  unresolved one (the repo's per-id `markResolved` call) and
+  attaches the open GP_BREACH ALERT id to the intervention row.
+  Future intervention rows on the same correlationId would mark
+  the next signal resolved, but since the intent transitions out
+  of `escalated` on the first intervention, the 409 status guard
+  prevents that path. Acceptable trade-off — operators rarely
+  see N>1 GP_BREACH signals per cycle, and the audit chain
+  preserves the full signal list via `signals.findByCorrelationId`
+- **alerts table doesn't carry `intent_id` as a column** — the
+  schema-001 design stores it in JSONB context, and the
+  alerts-repo `create()` writes `intentId` there. The route's
+  alert-lookup uses
+  `alerts.findByCorrelationId(intent.correlationId)` instead
+  (one correlationId per cycle, so this finds the right alert
+  unambiguously). My synthetic seeds had to mirror this — the
+  intent-id goes into `context` JSONB, not a table column
+- **request-clarification creates a new alert directly** rather
+  than reusing the original GP_BREACH alert. The original alert
+  is acknowledged, archived, and audit-trailed — the new
+  `clarification-needed` alert is a fresh actionable item for
+  the next operator. Mirrors how the gate-orchestrator and
+  intent-agent currently produce clarification alerts when
+  cycles pause for unrelated reasons; keeps the
+  alerts-life-cycle invariant ("an open alert means an
+  operator decision is pending")
+- **The dashboard ships three of the four actions; the fourth
+  (request-clarification) is CLI-only.** Operators using the
+  dashboard who want to ask for clarification typically just
+  submit a fresh intent or use the existing clarification flow
+  via the `clarification-needed` alert; wedging a fourth button
+  into the GP_BREACH card crowds the UI and the use case is
+  rare. CLI-only is documented; if a real demand surfaces, add
+  a fourth button (the handler is already wired)
+- **Audit metadata for `acknowledge-breach` carries `signalId`
+  and `notesLength`, NOT the notes content.** Same shape as the
+  clarification audit row (notesLength only). The full notes
+  text lives on `interventions.notes` where it can be queried
+  by a forensics operator, never in `audit_log` where it would
+  be replicated into every backup pull. GP-006 compliance
+  verified by direct SQL inspection
+- **`resume` rebuilds the artifact payload from
+  `artifacts.findByCorrelationId`, not from a cached payload.**
+  The original `deploy:pr` task the gate dispatches carries the
+  artifact set in its payload; on a resume after escalation we
+  don't have that BullMQ message anymore. The artifacts table
+  is the source of truth — the resume re-loads them and ships
+  the same shape pr-agent expects. Verified end-to-end: the
+  synthetic single-artifact intent's deploy chain ran to
+  completion with the seeded artifact making it into the
+  payload
+- **Edge case ordering matters.** Validation runs intent-shape
+  checks before the membership lookup so a malformed body
+  doesn't accidentally cause a DB call. Membership runs AFTER
+  the intent-status check so an unauthorized user can't probe
+  the intent table by sending arbitrary IDs — they get the
+  same 409 `INVALID_INTENT_STATUS` a legitimate but late-
+  arriving operator would see (status-leak via 404 vs 409 is
+  trivial in this codebase, but kept the pattern consistent)
+- **CLI `acknowledge` requires `--notes` OR a prompt response;
+  empty notes after the prompt → exit 1.** Mirrors the server-
+  side guard. Empty `--notes ""` is treated the same as
+  "no value supplied" — falls into the prompt path
+- **Dashboard `BreachInterventionBlock` renders ABOVE the
+  generic `FixIntentBlock` and `DismissBlock` so the typed
+  ADR-021 actions are the obvious first choice for GP_BREACH
+  alerts.** The existing fix/dismiss block stays available for
+  consistency with other alert types (and for the rare "I want
+  to submit a fresh intent describing the right approach"
+  use case)
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; migration 011 applied; full four-action
+matrix verified end-to-end (3 against real pre-existing
+escalated intents, 1 against a synthetic seed for the resume
+path). CLI subcommands exercised against fresh synthetic alerts.
+The `POST /interventions still a 501 stub` Pending enhancement
+is removed from STATE.md.
+
+No new Pending enhancements introduced.

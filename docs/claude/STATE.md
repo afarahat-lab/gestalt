@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — Handler-level project membership enforcement on intent submit, clarify, maintenance trigger, alert fix-intent, project config)
+**Last updated:** 2026-06-01 (Claude Code — `POST /interventions` (ADR-021): resume, abort, acknowledge-breach, request-clarification)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -22,11 +22,11 @@ the historical record of how the state evolved._
   are summarised in the "Session log" entries dated 2026-05-29 / 30
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
-- All ten migrations apply on startup: `001_initial`, `002_local_auth`,
+- All eleven migrations apply on startup: `001_initial`, `002_local_auth`,
   `003_projects`, `004_deployments`, `005_maintenance`,
   `006_intent_clarification`, `007_execution_logs`,
   `008_finding_attempts`, `009_execution_log_model`,
-  `010_user_management`
+  `010_user_management`, `011_interventions`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
 - **Dashboard SPA reachable in the browser, deep-linkable, no path
@@ -188,6 +188,105 @@ the historical record of how the state evolved._
   - **CLI** — `gestalt run` / `gestalt maintenance trigger` /
     `gestalt projects set-adapter` as a non-member each print the
     typed friendly message instead of a raw JSON dump
+- **`POST /interventions` (ADR-021, migration 011).** Operator
+  responses to escalated intents. Four typed actions — the same
+  vocabulary ADR-021 defined — implemented end-to-end:
+  - `resume` — false positive; marks the GP_BREACH signal resolved
+    by literal `'human'` (the repo-level guard enforces that),
+    acknowledges the alert, creates the intervention row, and
+    dispatches `deploy:pr` with the artifact set rebuilt from
+    `artifacts.findByCorrelationId` (same shape the gate uses on a
+    `pass` verdict). Intent transitions `escalated → deploying`,
+    then NoOp/GitHub Actions adapter completes the cycle to
+    `deployed`
+  - `abort` — real breach; acknowledges the alert, creates the
+    intervention row, transitions intent to `failed`. No deploy
+    dispatch, no signal resolution (the breach IS the truth)
+  - `acknowledge-breach` — **notes are required** (400 if
+    omitted); marks the signal resolved (human), acknowledges the
+    alert, creates the intervention row with the notes persisted
+    to `interventions.notes`, transitions to `failed`. **GP-006:
+    the audit row carries only `notesLength` + `signalId` — the
+    note text never reaches `audit_log`**. The text is auditable
+    via direct query against `interventions`
+  - `request-clarification` — creates a `clarification-needed`
+    alert (severity `high`) carrying `triggeredBy: 'intervention'`
+    + the breach signal ids in JSONB context, transitions intent
+    to `waiting-for-clarification`. The existing
+    `POST /intents/:id/clarify` flow then resumes the cycle on
+    operator follow-up
+  - All four write an `interventions` row (migration 011 —
+    `(intent_id, correlation_id, alert_id, action, actor_id,
+    notes, created_at)`) plus an audit row
+    (`intervention.resume` / `.abort` / `.acknowledge-breach` /
+    `.request-clarification`). The `alert_id` is nullable —
+    `resume` and `abort` populate it from the open GP_BREACH
+    alert when present; `request-clarification` creates a new
+    alert so the audit metadata carries that id instead
+  - **Edge cases:**
+    - Intent not in `escalated` status → 409
+      `INVALID_INTENT_STATUS` with the current status surfaced in
+      the message. Verified live for `failed` and `deployed`
+      callers
+    - Intent not found → 404
+    - Unknown action → 400 with the four valid values listed
+    - `acknowledge-breach` with empty notes → 400
+    - Non-member tries to intervene → 403
+      `INSUFFICIENT_PROJECT_ROLE` (the helper from the prior
+      session — editor minimum)
+  - **`GET /interventions?intentId=<id>`** — viewer minimum.
+    Returns the intent's intervention history (one row per
+    operator decision; ascending by `created_at`) for the
+    dashboard's IntentDetail Interventions section
+  - **Dashboard.** Alerts view: GP_BREACH alert cards render a
+    new `BreachInterventionBlock` with three buttons — `▶ Resume
+    (false positive)`, `✗ Abort intent`, and an `⚑ Acknowledge
+    breach` button gated on a required notes textarea. Submitting
+    sends the typed `POST /interventions` call; on success the
+    card disappears, a green confirmation banner shows for 1.5 s,
+    then the list refreshes. Abort confirms via the browser
+    confirm dialog before firing. The fourth action
+    (request-clarification) is reachable only from the CLI today
+    — the dashboard rarely needs it (operator can submit a fresh
+    intent / use the existing clarification flow)
+  - **IntentDetail Interventions section.** When the intent is in
+    a status where interventions could exist (`escalated`,
+    `failed`, `deploying`, `deployed`,
+    `waiting-for-clarification`), `GET /interventions?intentId=`
+    fetches the history and renders one card per intervention
+    with a coloured action chip, the actor's id-prefix, the
+    timestamp, and the notes prose (or `(no notes)` when null)
+  - **CLI `gestalt alerts`:** three new subcommands —
+    `resume <alertId>`, `abort <alertId>` (prompts `y/N`
+    confirmation), `acknowledge <alertId>` (prompts for required
+    notes when `--notes` is omitted). Each resolves the
+    `intentId` by re-using the existing
+    `fetchAlertByIdOrPrefix(client, alertIdPrefix)` helper and
+    lifting `alert.intentId` (or
+    `alert.context.intentId`) — same 8-char prefix surface the
+    other alerts subcommands use
+  - All four `POST /interventions` actions verified live against
+    `trackeros`: `abort` and `acknowledge-breach` ran against
+    pre-existing escalated intents from prior sessions
+    (`562efa69`, `cd4c1846`); `request-clarification` against a
+    third (`b86e010f` → transitioned to
+    `waiting-for-clarification` with a fresh clarification alert
+    created); `resume` against a synthetic
+    `verify-intervention-resume` intent — full deploy chain
+    completed (5 `deployment_events` rows in order
+    `pr-opened → pipeline-triggered → pipeline-passed →
+    promoted-staging → promoted-production`; intent reached
+    `deployed`). GP_BREACH signal flipped to
+    `resolved_by = 'human'`, alert acknowledged, intervention
+    row carries `alert_id` populated. Audit for the
+    `acknowledge-breach` test: `metadata = {"notesLength": 123,
+    "signalId": "432b33d9-…", "alertId": null, "ip": "…"}` —
+    no `notes` text anywhere in the audit row.
+    `GET /interventions?intentId=<resume_id>` returned the
+    intervention record with the expected shape. CLI
+    `alerts abort` and `alerts acknowledge --notes` both
+    succeeded against synthetic GP_BREACH alerts seeded for
+    each
 - **CLI server URL is fully configurable.** `gestalt config show` /
   `gestalt config set-server <url>` / `gestalt config reset` let
   operators inspect and change `~/.gestalt/config.json` without going
@@ -821,6 +920,13 @@ the historical record of how the state evolved._
   matches the BullMQ removeOnComplete contract. The
   AgentExecutionRepository also gained `findById(id)` so the
   `/executions/:id/log` endpoint can fetch the join row
+- `interventions` — create, findByIntentId, findByCorrelationId.
+  Migration 011 (ADR-021). One row per `POST /interventions`
+  call; `(intent_id, alert_id)` FK both to live tables (alert_id
+  nullable). `action` constrained to the four ADR-021 values via
+  CHECK; `notes` nullable and stores the operator's
+  acknowledge-breach text (audit_log carries only the length,
+  per GP-006)
 
 **CLI install:**
 - `@gestalt/cli` is private — not on npm
@@ -1299,13 +1405,6 @@ the historical record of how the state evolved._
   `alerts`) would let the API return the filtered set in one
   call and let the Layout's badge count match the visible list
   without extra plumbing
-- **POST /interventions still a 501 stub.** The
-  clarification flow uses `POST /intents/:id/clarify` (owns the
-  resume side effect) and the new "submit fix intent" path uses
-  `POST /alerts/:id/fix-intent`. Promotion approval (the
-  remaining `approve-promotion` action type) does not have a
-  shipped UI yet and will likely use this endpoint when it
-  does
 - **Return-URL preservation across login.** Pasting `/app/intents/<id>`
   in a fresh tab today bounces to `/app/login` and after sign-in
   lands on `/app/` (the intent ID is dropped). Small SPA-only change —

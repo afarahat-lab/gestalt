@@ -6094,3 +6094,330 @@ Follow-up from the prior user-management session resolved: "POST
 membership at the route level" no longer applies. The handler-
 level helper closes that gap and the role-rank check raises
 `/projects/:id/config` to project-admin in the same pass.
+
+---
+
+### Session 2026-06-01 — Claude Code (POST /interventions: resume / abort / acknowledge-breach / request-clarification — ADR-021)
+
+Closes the long-standing 501 stub at `POST /interventions`. ADR-021
+defines exactly four typed operator responses to escalated intents;
+this session implements all four end-to-end (server route + dashboard
+buttons + IntentDetail history + CLI subcommands) and bumps the
+schema to 11 migrations.
+
+Changed:
+- `packages/adapters/postgres/src/migrations/011_interventions.sql`
+  (new): single table
+  `(id, correlation_id, intent_id, alert_id, action, actor_id, notes,
+  created_at)`. `intent_id` and `actor_id` non-null FKs; `alert_id`
+  nullable (created on `resume`/`abort`/`acknowledge-breach` from the
+  open GP_BREACH alert; null on `request-clarification` which creates
+  its own new alert). `action` CHECK constraint pins the four
+  ADR-021 values. Indexes on `intent_id` and `correlation_id` for
+  the per-intent history fetch + the per-cycle audit join. No
+  schema_migrations writes
+- `packages/core/src/repository/index.ts`: new
+  `InterventionAction` union (the four ADR-021 values),
+  `InterventionRecord` shape, `InterventionRepository` interface
+  (`create`, `findByIntentId`, `findByCorrelationId`).
+  `RepositoryRegistry` gained `interventions`. Both types re-exported
+  from `@gestalt/core/index.ts`
+- `packages/adapters/postgres/src/repositories/interventions.ts`
+  (new): `PostgresInterventionRepository`. postgres.js camelCases the
+  column names at the client level so the returned rows already match
+  the `InterventionRecord` shape — no per-field mapper needed (same
+  pattern memberships + users use after the migration-010 trap)
+- `packages/adapters/postgres/src/index.ts`: instantiates +
+  registers the postgres impl
+- `packages/adapters/{oracle,mssql}/src/repositories/interventions.ts`
+  (new): throw-stub `*InterventionRepository` classes. Re-exported
+  from each adapter's `index.ts` so interface drift in core surfaces
+  as a build break here
+- `packages/server/src/routes/interventions.ts` (new): registers
+  both `POST /interventions` and `GET /interventions`.
+  - **`POST /interventions`** — `requireRole('operator')` preHandler
+    plus a handler-level
+    `requireProjectMembership(..., intent.projectId, 'editor')`
+    (the projectId lives on the intent record, not the URL —
+    matches the pattern the prior membership-enforcement session
+    introduced for body-projectId routes). Validation order:
+    intentId present → action valid → notes present for
+    `acknowledge-breach` → intent exists (404) → intent status is
+    `escalated` (else 409 `INVALID_INTENT_STATUS` with the actual
+    status in the message) → membership check. The four-way switch
+    follows, each branch:
+    - **resume:** `signals.markResolved(gpBreachSignalId, 'human')`
+      (the repo's GP guard rejects anything other than the literal
+      `'human'` string — the operator's user id goes on the
+      intervention + audit rows instead), `alerts.acknowledge(...)`
+      if a GP_BREACH alert is open, `interventions.create(...)`,
+      `audit.append({ action: 'intervention.resume', metadata:
+      { signalId, alertId, ip } })`. Then dispatches `deploy:pr`
+      with `artifacts = artifacts.findByCorrelationId(correlationId).
+      map(...)` — the same shape `dispatchDeployPR` in the gate
+      orchestrator builds on a `pass` verdict. Transitions intent
+      to `deploying`, emits `intent.status-changed` and (when
+      applicable) `alert.acknowledged` SSE events
+    - **abort:** alert ack, intervention row, audit, transition to
+      `failed`, SSE. No signal resolution (the breach IS the
+      truth); no deploy dispatch
+    - **acknowledge-breach:** signal resolved (`'human'`), alert
+      ack, intervention row with `notes: trimmedNotes`, audit row
+      carrying `notesLength` + `signalId` + `alertId` (**not the
+      notes content** — GP-006), transition to `failed`, SSE
+    - **request-clarification:** intervention row, fresh
+      `clarification-needed` alert (severity `high`,
+      `requiredAction: 'provide-clarification'`,
+      `context: { intentId, triggeredBy: 'intervention',
+      breachSignalIds: [...] }`), transition to
+      `waiting-for-clarification`, audit (`alertId` of the new
+      alert + optional `notesLength`), `alert.created` +
+      `intent.status-changed` SSE
+  - **`GET /interventions?intentId=<id>`** —
+    `requireRole('viewer')`. Returns
+    `{ data: InterventionRecord[] }` ordered ASC by `created_at`.
+    Used by the dashboard's IntentDetail Interventions section
+  - The outer `try/catch` around the action switch returns a
+    500 with the underlying error message on any thrown step so
+    operators don't lose the diagnostic when something downstream
+    (BullMQ enqueue, repo error) blows up mid-action
+- `packages/server/src/oversight/routes.ts`: the 501 stub at
+  `POST /interventions` is gone. The block is now a one-comment
+  pointer telling the next reader where the typed implementation
+  lives. Removed the now-unused `InterventionRequest` import
+- `packages/server/src/app.ts`: registers
+  `registerInterventionRoutes(app)` alongside the existing
+  routes
+- `packages/dashboard/src/types.ts`: replaced the aspirational
+  `InterventionType` / payload-discriminated union (left over
+  from the 501 era — it modelled `approve-promotion`,
+  `reject-promotion`, etc. which never shipped) with the
+  ADR-021-aligned shape: `InterventionAction`,
+  `InterventionRequest { intentId, action, notes? }`,
+  `InterventionRecord` (matches the server shape — `actorId`,
+  `notes`, etc.), `InterventionResponse`
+- `packages/dashboard/src/index.ts`: re-exports adjusted to the
+  new type names
+- `packages/dashboard/src/api/client.ts`: `submitIntervention`
+  rewrapped to the new `{ data: InterventionResponse }` envelope;
+  new `listInterventions(intentId)` calls
+  `GET /interventions?intentId=`
+- `packages/dashboard/src/views/Alerts.tsx`:
+  - New `breachNotes` state slot (keyed by alert.id) for the
+    `acknowledge-breach` required-notes textarea
+  - New `handleIntervention(alert, action)` handler — submits the
+    typed `POST /interventions` call, sets a green confirmation
+    banner on success, collapses the card after 1.5 s, refreshes
+    the list. Resume + abort use the shared handler; abort
+    confirms via `window.confirm` before firing. `acknowledge-
+    breach` requires the textarea to be non-empty (browser alert
+    otherwise)
+  - New `<BreachInterventionBlock>` component rendered only for
+    `alert.type === 'GOLDEN_PRINCIPLE_BREACH'`. Layout: top row
+    is `▶ Resume (false positive)` (primary green) + `✗ Abort
+    intent` (danger red); below them a required notes textarea
+    and the `⚑ Acknowledge breach` button (disabled until the
+    textarea has content). Sits ABOVE the existing
+    `FixIntentBlock` + `DismissBlock` so the typed intervention
+    is the obvious first action for GP_BREACH alerts
+- `packages/dashboard/src/views/IntentDetail.tsx`: new
+  `interventions` state slot + `useEffect` that fetches the
+  history when the intent's status is in the visible set
+  (`escalated`, `failed`, `deploying`, `deployed`,
+  `waiting-for-clarification`). Renders a new "Interventions
+  (N)" Card between the Signals card and Artifacts — one row per
+  intervention with a coloured action chip (resume: muted bg,
+  abort: red, acknowledge-breach: amber,
+  request-clarification: blue), the actor's id-prefix, the
+  timestamp, and the notes prose (or `(no notes)` italic
+  placeholder)
+- `packages/cli/src/api/client.ts`: new
+  `InterventionActionString`, `InterventionResponse`,
+  `InterventionRecordDto` types and `submitIntervention` /
+  `listInterventions` typed methods
+- `packages/cli/src/commands/alerts.ts`: three new exports —
+  `alertsResumeCommand`, `alertsAbortCommand` (prompts `y/N`),
+  `alertsAcknowledgeCommand` (prompts for required notes when
+  `--notes` is omitted). Each resolves the `intentId` from the
+  alert id-prefix via the existing
+  `fetchAlertByIdOrPrefix(client, prefix)` helper +
+  `alert.intentId` / `alert.context.intentId` fallback, then
+  fires the typed POST. Connection errors route through the
+  shared `printConnectionError` / `isConnectivityError` helpers
+- `packages/cli/src/index.ts`: registers `gestalt alerts resume
+  <alertId>`, `gestalt alerts abort <alertId>`, `gestalt alerts
+  acknowledge <alertId> [--notes <text>]`. All three accept the
+  standard `--server <url>` one-shot override
+
+Verified live against `trackeros`:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt; migration 011 applied on first boot
+  (`schema_migrations` now lists 11 versions). `\d interventions`
+  shows the expected shape (CHECK on action, indexes on
+  intent_id + correlation_id, all FK constraints present)
+- **abort** — `POST /interventions { action: 'abort' }` against
+  pre-existing escalated intent `562efa69` (text "make it
+  better"): returned
+  `{ data: { action: 'abort', intentId: '562efa69-…', status:
+  'failed' } }`; DB confirms intent → `failed`, intervention row
+  written with `action: 'abort'`, `actor_id: a@b.c`,
+  `notes: NULL`, `alert_id: NULL` (the existing intent had no
+  open GP_BREACH alert, only the signal — alerts table doesn't
+  have an `intent_id` column; the open-alert lookup goes via
+  correlationId)
+- **acknowledge-breach** — first call without notes returned 400
+  `"notes are required for acknowledge-breach"`. Second call
+  against `cd4c1846` with a 123-char notes payload returned
+  `{ data: { action: 'acknowledge-breach', intentId: 'cd4c1846-…',
+  status: 'failed' } }`. DB: intent → `failed`,
+  `interventions.notes` carries the 123 chars verbatim,
+  **audit_log row carries `metadata = { notesLength: 123,
+  signalId: '432b33d9-…', alertId: null, ip: '…' }`** — no
+  notes text anywhere in the audit metadata. GP-006 verified
+- **request-clarification** — against `b86e010f` (a
+  maintenance-sourced escalated intent): returned `{ data:
+  { action: 'request-clarification', intentId: '…', status:
+  'waiting-for-clarification' } }`. DB confirms intent
+  transitioned and a NEW `clarification-needed` alert with
+  severity `high` and title "Clarification requested for
+  escalated intent" was created against the same correlationId
+- **resume** — couldn't reuse a pre-existing intent for this
+  (none had an unresolved alert AND artifacts to dispatch with),
+  so seeded a synthetic `verify-intervention-resume` intent +
+  GP_BREACH signal + alert + a single code artifact directly via
+  SQL. `POST /interventions { action: 'resume' }` returned
+  `{ data: { action: 'resume', intentId: '4768a6b4-…', status:
+  'deploying' } }`. Within ~6 s the deploy chain ran end-to-end
+  through the NoOp adapter: `deployment_events` shows
+  `pr-opened → pipeline-triggered → pipeline-passed →
+  promoted-staging → promoted-production` in order; intent
+  reached `deployed`. GP_BREACH signal flipped to
+  `resolved_by = 'human'`; alert acknowledged; intervention row
+  carries `action: 'resume'` and a populated `alert_id`. The
+  signal-resolution guard fired correctly — passing the user
+  UUID instead of `'human'` would have thrown, but the route
+  passes the literal as required
+- **`GET /interventions?intentId=<resume_id>`** returned the
+  intervention record with the expected shape — `id`,
+  `correlationId`, `intentId`, `alertId`, `action: 'resume'`,
+  `actorId`, `notes: null`, `createdAt`. Confirms the read path
+  for the dashboard's IntentDetail section
+- **Edge cases:**
+  - non-existent intent id → 404 `"Intent not found"` ✓
+  - already-`failed` intent → 409 `INVALID_INTENT_STATUS`
+    `"Intent is not in escalated status (current: 'failed')"` ✓
+  - already-`deployed` intent (the resume target after the chain
+    completed) → 409 same ✓
+  - bad action string → 400 `"action must be one of: resume,
+    abort, acknowledge-breach, request-clarification"` ✓
+- **Membership guard:** created `reader2@example.com` (`user`,
+  membership `reader` on trackeros), seeded a fresh escalated
+  intent + signal, then POSTed `{ action: 'abort' }` as the
+  reader → 403 `INSUFFICIENT_PROJECT_ROLE` `"Minimum project
+  role required: editor"`. Intent status stayed `escalated` —
+  the helper short-circuits before any state mutation
+- **CLI:**
+  - `gestalt alerts abort <prefix>` (with `y` confirmation
+    response) — seeded a fresh GP_BREACH alert + intent,
+    grabbed its 8-char id-prefix, piped `y` to the prompt →
+    `✓ Intent aborted` + intent transitions to `failed`
+  - `gestalt alerts acknowledge <prefix> --notes "Documented
+    exception for migration script - cleared with tech lead"` —
+    seeded another fresh GP_BREACH escalation, ran the command
+    with `--notes` → `✓ Breach acknowledged` + intent → `failed`,
+    notes persisted on the intervention row
+  - Both commands successfully resolved the 8-char prefix to the
+    full alert + lifted the intentId from `alert.intentId`
+
+Decisions made:
+- **The repo's GP-resolution guard is honoured, not worked
+  around.** `signals.markResolved` rejects anything other than
+  literal `'human'` for GP_BREACH signals. The brief's
+  pseudocode passed `request.user.id`, which would have thrown
+  in the postgres impl. The route passes `'human'` to the repo
+  and writes the actor's uuid on the intervention + audit rows
+  — the operator identity is auditable via
+  `interventions.actor_id` and `audit_log.actor` for the same
+  cycle
+- **The route handles "multiple open GP_BREACH signals"
+  conservatively.** Some review-agent runs emit more than one
+  GP_BREACH signal per cycle. The route resolves the FIRST
+  unresolved one (the repo's per-id `markResolved` call) and
+  attaches the open GP_BREACH ALERT id to the intervention row.
+  Future intervention rows on the same correlationId would mark
+  the next signal resolved, but since the intent transitions out
+  of `escalated` on the first intervention, the 409 status guard
+  prevents that path. Acceptable trade-off — operators rarely
+  see N>1 GP_BREACH signals per cycle, and the audit chain
+  preserves the full signal list via `signals.findByCorrelationId`
+- **alerts table doesn't carry `intent_id` as a column** — the
+  schema-001 design stores it in JSONB context, and the
+  alerts-repo `create()` writes `intentId` there. The route's
+  alert-lookup uses
+  `alerts.findByCorrelationId(intent.correlationId)` instead
+  (one correlationId per cycle, so this finds the right alert
+  unambiguously). My synthetic seeds had to mirror this — the
+  intent-id goes into `context` JSONB, not a table column
+- **request-clarification creates a new alert directly** rather
+  than reusing the original GP_BREACH alert. The original alert
+  is acknowledged, archived, and audit-trailed — the new
+  `clarification-needed` alert is a fresh actionable item for
+  the next operator. Mirrors how the gate-orchestrator and
+  intent-agent currently produce clarification alerts when
+  cycles pause for unrelated reasons; keeps the
+  alerts-life-cycle invariant ("an open alert means an
+  operator decision is pending")
+- **The dashboard ships three of the four actions; the fourth
+  (request-clarification) is CLI-only.** Operators using the
+  dashboard who want to ask for clarification typically just
+  submit a fresh intent or use the existing clarification flow
+  via the `clarification-needed` alert; wedging a fourth button
+  into the GP_BREACH card crowds the UI and the use case is
+  rare. CLI-only is documented; if a real demand surfaces, add
+  a fourth button (the handler is already wired)
+- **Audit metadata for `acknowledge-breach` carries `signalId`
+  and `notesLength`, NOT the notes content.** Same shape as the
+  clarification audit row (notesLength only). The full notes
+  text lives on `interventions.notes` where it can be queried
+  by a forensics operator, never in `audit_log` where it would
+  be replicated into every backup pull. GP-006 compliance
+  verified by direct SQL inspection
+- **`resume` rebuilds the artifact payload from
+  `artifacts.findByCorrelationId`, not from a cached payload.**
+  The original `deploy:pr` task the gate dispatches carries the
+  artifact set in its payload; on a resume after escalation we
+  don't have that BullMQ message anymore. The artifacts table
+  is the source of truth — the resume re-loads them and ships
+  the same shape pr-agent expects. Verified end-to-end: the
+  synthetic single-artifact intent's deploy chain ran to
+  completion with the seeded artifact making it into the
+  payload
+- **Edge case ordering matters.** Validation runs intent-shape
+  checks before the membership lookup so a malformed body
+  doesn't accidentally cause a DB call. Membership runs AFTER
+  the intent-status check so an unauthorized user can't probe
+  the intent table by sending arbitrary IDs — they get the
+  same 409 `INVALID_INTENT_STATUS` a legitimate but late-
+  arriving operator would see (status-leak via 404 vs 409 is
+  trivial in this codebase, but kept the pattern consistent)
+- **CLI `acknowledge` requires `--notes` OR a prompt response;
+  empty notes after the prompt → exit 1.** Mirrors the server-
+  side guard. Empty `--notes ""` is treated the same as
+  "no value supplied" — falls into the prompt path
+- **Dashboard `BreachInterventionBlock` renders ABOVE the
+  generic `FixIntentBlock` and `DismissBlock` so the typed
+  ADR-021 actions are the obvious first choice for GP_BREACH
+  alerts.** The existing fix/dismiss block stays available for
+  consistency with other alert types (and for the rare "I want
+  to submit a fresh intent describing the right approach"
+  use case)
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; migration 011 applied; full four-action
+matrix verified end-to-end (3 against real pre-existing
+escalated intents, 1 against a synthetic seed for the resume
+path). CLI subcommands exercised against fresh synthetic alerts.
+The `POST /interventions still a 501 stub` Pending enhancement
+is removed from STATE.md.
+
+No new Pending enhancements introduced.

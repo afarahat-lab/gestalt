@@ -129,6 +129,28 @@ export interface AgentsValidateResponse {
 export type UserRoleString = 'platform-admin' | 'user';
 export type ProjectRoleString = 'project-admin' | 'editor' | 'reader';
 
+// ─── Interventions (ADR-021, migration 011) ──────────────────────────────────
+
+export type InterventionActionString =
+  | 'resume' | 'abort' | 'acknowledge-breach' | 'request-clarification';
+
+export interface InterventionResponse {
+  action: InterventionActionString;
+  intentId: string;
+  status: string;
+}
+
+export interface InterventionRecordDto {
+  id: string;
+  correlationId: string;
+  intentId: string;
+  alertId: string | null;
+  action: InterventionActionString;
+  actorId: string;
+  notes: string | null;
+  createdAt: string;
+}
+
 export interface UserSummary {
   id: string;
   email: string;
@@ -327,6 +349,20 @@ export class GestaltApiClient {
     notes?: string,
   ): Promise<{ data: AlertDetail }> {
     return this.post(`/alerts/${id}/acknowledge`, { notes: notes ?? '' });
+  }
+
+  // ─── Interventions (ADR-021) ──────────────────────────────────────────────
+
+  async submitIntervention(params: {
+    intentId: string;
+    action: InterventionActionString;
+    notes?: string;
+  }): Promise<{ data: InterventionResponse }> {
+    return this.post('/interventions', params);
+  }
+
+  async listInterventions(intentId: string): Promise<{ data: InterventionRecordDto[] }> {
+    return this.get('/interventions', { intentId });
   }
 
   // ─── Users + memberships (migration 010) ──────────────────────────────────

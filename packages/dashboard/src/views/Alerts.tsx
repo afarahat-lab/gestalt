@@ -50,6 +50,9 @@ export function Alerts() {
   const [dismissNotes, setDismissNotes] = useState<Record<string, string>>({});
   const [submitting, setSubmitting] = useState<Record<string, string | null>>({});
   const [confirmation, setConfirmation] = useState<Record<string, string>>({});
+  // GP_BREACH-only: required notes for `acknowledge-breach`. Keyed by
+  // alert id so opening multiple cards at once doesn't share input.
+  const [breachNotes, setBreachNotes] = useState<Record<string, string>>({});
 
   const load = useCallback(async () => {
     if (!currentProjectId) {
@@ -122,6 +125,53 @@ export function Alerts() {
       }, 1800);
     } catch (err) {
       browserAlert(`Failed to submit fix intent: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setSubmitting((s) => ({ ...s, [alert.id]: null }));
+    }
+  };
+
+  // ADR-021 — GP_BREACH alert interventions. Three of the four ADR
+  // actions are exposed on the alert card; `request-clarification`
+  // ships as a CLI affordance today (the dashboard rarely needs it
+  // because the operator can just open a new clarification flow).
+  const handleIntervention = async (
+    alert: Alert,
+    action: 'resume' | 'abort' | 'acknowledge-breach',
+  ): Promise<void> => {
+    const intentId = alert.intentId
+      ?? (typeof alert.context['intentId'] === 'string' ? (alert.context['intentId'] as string) : null);
+    if (!intentId) {
+      browserAlert('This alert has no intent id — cannot intervene from the dashboard.');
+      return;
+    }
+    let notes: string | undefined;
+    if (action === 'acknowledge-breach') {
+      notes = (breachNotes[alert.id] ?? '').trim();
+      if (!notes) {
+        browserAlert('Describe why this breach occurred before acknowledging.');
+        return;
+      }
+    } else if (action === 'abort') {
+      const ok = window.confirm('Abort this intent? This cannot be undone.');
+      if (!ok) return;
+    }
+    setSubmitting((s) => ({ ...s, [alert.id]: action }));
+    try {
+      const res = await api.submitIntervention({ intentId, action, notes });
+      const message =
+        action === 'resume'                ? '✓ Intent resumed — deploy chain started' :
+        action === 'abort'                 ? '✓ Intent aborted' :
+        /* acknowledge-breach */             '✓ Breach acknowledged';
+      setConfirmation((c) => ({ ...c, [alert.id]: message }));
+      setBreachNotes((s) => ({ ...s, [alert.id]: '' }));
+      setTimeout(() => {
+        setConfirmation((c) => { const n = { ...c }; delete n[alert.id]; return n; });
+        setExpanded(null);
+        void load();
+      }, 1500);
+      void res;
+    } catch (err) {
+      browserAlert(`Intervention failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       setSubmitting((s) => ({ ...s, [alert.id]: null }));
     }
@@ -230,6 +280,18 @@ export function Alerts() {
                           value={clarification[alert.id] ?? ''}
                           onChange={(v) => setClarification((s) => ({ ...s, [alert.id]: v }))}
                           onResume={() => void handleResumeClarification(alert)}
+                          submittingMode={submitting[alert.id] ?? null}
+                          busy={busy}
+                        />
+                      )}
+                      {alert.type === 'GOLDEN_PRINCIPLE_BREACH' && (
+                        <BreachInterventionBlock
+                          alert={alert}
+                          notes={breachNotes[alert.id] ?? ''}
+                          onNotesChange={(v) => setBreachNotes((s) => ({ ...s, [alert.id]: v }))}
+                          onResume={() => void handleIntervention(alert, 'resume')}
+                          onAbort={() => void handleIntervention(alert, 'abort')}
+                          onAcknowledge={() => void handleIntervention(alert, 'acknowledge-breach')}
                           submittingMode={submitting[alert.id] ?? null}
                           busy={busy}
                         />
@@ -429,6 +491,62 @@ function BreachBody({ alert }: { alert: Alert }) {
 }
 
 // ─── Action blocks ────────────────────────────────────────────────────────────
+
+/**
+ * GP_BREACH-specific intervention block (ADR-021).
+ *
+ * Three of the four typed actions render here:
+ *   - **Resume** — operator says "false positive, proceed". POST
+ *     `/interventions` with `action: 'resume'` dispatches the deploy
+ *     chain and transitions intent to `deploying`
+ *   - **Abort** — operator says "real breach, give up". Confirm
+ *     dialogue first, then POST with `action: 'abort'` → `failed`
+ *   - **Acknowledge** — operator says "real breach, here's what
+ *     happened". Notes are required (textarea; GP-006 — content
+ *     persisted to interventions.notes; only length lands in audit)
+ *
+ * `request-clarification` is reachable via the CLI today; the
+ * dashboard rarely needs it because the operator can submit a fresh
+ * intent or open a new clarification flow inline.
+ */
+function BreachInterventionBlock(props: {
+  alert: Alert;
+  notes: string;
+  onNotesChange: (v: string) => void;
+  onResume: () => void;
+  onAbort: () => void;
+  onAcknowledge: () => void;
+  submittingMode: string | null;
+  busy: boolean;
+}) {
+  const { alert, notes, onNotesChange, onResume, onAbort, onAcknowledge, submittingMode, busy } = props;
+  return (
+    <ActionBlock title="Intervene (ADR-021)" alert={alert}>
+      <div style={{ display: 'flex', gap: '8px', marginBottom: '12px', flexWrap: 'wrap' }}>
+        <Button variant="primary" onClick={onResume} disabled={busy}>
+          {submittingMode === 'resume' ? 'resuming...' : '▶ Resume (false positive)'}
+        </Button>
+        <Button variant="danger" onClick={onAbort} disabled={busy}>
+          {submittingMode === 'abort' ? 'aborting...' : '✗ Abort intent'}
+        </Button>
+      </div>
+      <div style={{ fontSize: '11px', color: 'var(--text-dim)', fontFamily: 'var(--font-mono)', marginBottom: '6px' }}>
+        Or acknowledge with notes (transitions to failed, records why the breach happened):
+      </div>
+      <textarea
+        value={notes}
+        onChange={(e) => onNotesChange(e.target.value)}
+        placeholder="Required — describe why this breach occurred..."
+        style={textareaStyle}
+      />
+      <div style={{ marginTop: '8px' }}>
+        <Button onClick={onAcknowledge} disabled={busy || !notes.trim()}>
+          {submittingMode === 'acknowledge-breach' ? 'acknowledging...' : '⚑ Acknowledge breach'}
+        </Button>
+      </div>
+    </ActionBlock>
+  );
+}
 
 function ClarificationActions({ alert, value, onChange, onResume, submittingMode, busy }: {
   alert: Alert; value: string;
