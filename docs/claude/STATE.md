@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — Agent tool use: built-in file tools + agents.yaml configuration + dashboard tool-call audit (ADR-038, migration 012))
+**Last updated:** 2026-06-01 (Claude Code — Gate orchestrator creates GP_BREACH alert on escalate verdict + backfill for prior escalations)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -644,6 +644,57 @@ the historical record of how the state evolved._
     side, the API response, and the dashboard all get the
     correct array. Direct `jsonb_array_length` SQL probes
     fail; that's a quirk of the storage path, not a bug
+- **Gate orchestrator creates a `GOLDEN_PRINCIPLE_BREACH`
+  alert on every `escalate` verdict.** Closes an old gap:
+  prior to this fix the gate transitioned the intent to
+  `escalated` and persisted the GP_BREACH signals but never
+  wrote an `alerts` row, so the dashboard's Alerts view
+  showed nothing for the escalation. Operators had to
+  discover the escalation by polling the intent list.
+  - `createBreachAlert(correlationId, intentId, gateSignals,
+    childLog)` runs inside the gate orchestrator's
+    `verdict === 'escalate'` branch (right after
+    `transitionIntent(..., 'escalated')`). Loads the
+    `GOLDEN_PRINCIPLE_BREACH` signals out of the gate
+    result, builds an alert with `type:
+    'GOLDEN_PRINCIPLE_BREACH'`, `severity: 'critical'`,
+    `requiredAction: 'acknowledge-breach'`, the first
+    breach's message as the description (or "N breach(es)
+    require review. First: …" when multiple), and
+    `context: { intentId, breachSignalIds[], breachAgent,
+    triggeredBy: 'gate-escalate' }`
+  - Emits `alert.created` SSE so the Layout's badge updates
+    without a page refresh and the Alerts view's live-event
+    subscription fetches the new row
+  - Failure non-fatal — the intent is already escalated; a
+    failed `alerts.create` writes a warning log and the
+    cycle proceeds. Missing alert is worse UX, not data
+    loss
+  - The dashboard's existing `BreachInterventionBlock`
+    (the Resume / Abort / Acknowledge-breach card from the
+    interventions session) renders out of the box on the
+    new alerts because `enrichAlert` already lifts
+    `breachMessage` / `breachLocation` / `breachAgent` from
+    the matching signal via `signals.findByCorrelationId`
+  - **One-shot backfill SQL** ran against trackeros for the
+    four pre-existing escalated intents — three matched
+    (had real GP_BREACH signals) and got alerts; the
+    fourth (`verify-membership-guard`, a synthetic test
+    intent with no real signals) was correctly skipped.
+    The backfill is idempotent (skips correlations that
+    already have a GP_BREACH alert) so it's safe to re-run
+    on any deployment with stuck escalations
+  - Backfill SQL (one-shot — not migration-shipped; data
+    fix only) documented in this session's log entry for
+    any other operator who needs to clear a backlog
+  - Verified live: dashboard headless-Chrome drive against
+    `/app/alerts` rendered three GP_BREACH cards with the
+    ⛔ glyph, `[critical]` badge, "Quality gate escalated
+    — golden-principle breach" title, and the sidebar
+    `Alerts` badge showing `3`. `GET /alerts?projectId=…`
+    returns the three rows with enriched
+    `breachMessage` / `breachAgent` (`review-agent`) /
+    `intentId` fields populated
 - **CLI server URL is fully configurable.** `gestalt config show` /
   `gestalt config set-server <url>` / `gestalt config reset` let
   operators inspect and change `~/.gestalt/config.json` without going

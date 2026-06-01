@@ -7578,3 +7578,150 @@ consumer of these columns reads through the application
 which handles it.
 
 No new Pending enhancements introduced.
+
+---
+
+### Session 2026-06-01 — Claude Code (gate orchestrator creates GP_BREACH alert on escalate + one-shot backfill)
+
+Operator-reported bug: "I see an escalated intent but no alerts —
+why are they hidden?" Investigation: dashboard Alerts view + the
+`/alerts` API are correct; the alerts table is empty for the
+escalated correlations. The gate orchestrator's `verdict ===
+'escalate'` branch was transitioning the intent to `escalated` and
+persisting the GP_BREACH signals but **never calling
+`alerts.create`**. Operators had to discover the escalation by
+polling the intent list.
+
+Changed:
+- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
+  - new `createBreachAlert(args)` helper. Filters the gate result
+    for `GOLDEN_PRINCIPLE_BREACH` signals (defensive — bails with a
+    warning if none, since a future verdict reshape shouldn't crash
+    the gate), then calls `alerts.create({ type:
+    'GOLDEN_PRINCIPLE_BREACH', severity: 'critical', title:
+    'Quality gate escalated — golden-principle breach',
+    description: <first breach msg> | "N breach(es) require review.
+    First: ...", requiredAction: 'acknowledge-breach', context: {
+    intentId, breachSignalIds[], breachAgent,
+    triggeredBy: 'gate-escalate' } })`. Emits `alert.created` SSE
+    so the dashboard's Layout sidebar badge updates without a page
+    refresh
+  - wired into the `verdict === 'escalate'` branch right after
+    `transitionIntent(..., 'escalated')`. Failure non-fatal: a
+    failed `alerts.create` writes a warning log and the cycle
+    proceeds (the intent is already escalated; a missing alert is
+    worse UX, not data loss)
+
+Verified live against `trackeros`:
+- Direct DB before the fix: 4 escalated intents, 0 alerts of type
+  GP_BREACH for any of them. Signals correctly present
+  (review-agent emitted them).
+- One-shot backfill SQL applied to clear the existing backlog
+  (idempotent — skips correlations that already have a GP_BREACH
+  alert):
+
+  ```sql
+  WITH candidates AS (
+    SELECT
+      i.id AS intent_id,
+      i.correlation_id,
+      s.source_agent AS breach_agent,
+      s.message AS breach_message,
+      (SELECT array_agg(s2.id::text) FROM signals s2
+        WHERE s2.correlation_id = i.correlation_id
+          AND s2.type = 'GOLDEN_PRINCIPLE_BREACH') AS breach_signal_ids,
+      (SELECT count(*)::int FROM signals s3
+        WHERE s3.correlation_id = i.correlation_id
+          AND s3.type = 'GOLDEN_PRINCIPLE_BREACH') AS breach_count
+    FROM intents i
+    JOIN LATERAL (
+      SELECT s.source_agent, s.message
+      FROM signals s
+      WHERE s.correlation_id = i.correlation_id
+        AND s.type = 'GOLDEN_PRINCIPLE_BREACH'
+      ORDER BY s.created_at ASC
+      LIMIT 1
+    ) s ON TRUE
+    WHERE i.status = 'escalated'
+      AND NOT EXISTS (
+        SELECT 1 FROM alerts a
+        WHERE a.correlation_id = i.correlation_id
+          AND a.type = 'GOLDEN_PRINCIPLE_BREACH'
+      )
+  )
+  INSERT INTO alerts (correlation_id, type, severity, title, description, required_action, context)
+  SELECT
+    c.correlation_id,
+    'GOLDEN_PRINCIPLE_BREACH',
+    'critical',
+    'Quality gate escalated — golden-principle breach',
+    CASE WHEN c.breach_count = 1 THEN c.breach_message
+         ELSE format('%s golden-principle breach(es) require review. First: %s',
+                     c.breach_count, c.breach_message) END,
+    'acknowledge-breach',
+    jsonb_build_object(
+      'intentId',        c.intent_id::text,
+      'breachSignalIds', to_jsonb(c.breach_signal_ids),
+      'breachAgent',     c.breach_agent,
+      'triggeredBy',     'backfill-2026-06-01'
+    )
+  FROM candidates c;
+  ```
+
+  Result: 3 of 4 escalated intents matched (the fourth,
+  `verify-membership-guard`, was a synthetic test intent with no
+  real signals — correctly skipped by the LATERAL join).
+- After backfill + gate code rebuild:
+  - `GET /alerts?projectId=trackeros` returns the 3 GP_BREACH
+    alerts with `enrichAlert` correctly populating
+    `breachMessage` / `breachAgent` (`review-agent`) /
+    `intentId` from the matched signal rows
+  - Dashboard `/app/alerts` (headless Chrome drive) renders
+    three ⛔ red GP_BREACH cards with `[critical]` badge,
+    "Quality gate escalated — golden-principle breach" title,
+    timestamp `11:18:58 PM`. Layout sidebar `Alerts` link shows
+    the red `3` badge. Screenshot saved at
+    `/tmp/dashboard-alerts.png` during verification
+  - The existing `BreachInterventionBlock` (Resume / Abort /
+    Acknowledge-breach card from the interventions session)
+    renders out of the box for these alerts — no UI changes
+    needed because the enrichment + intervention flow already
+    work against any GP_BREACH alert, regardless of whether it
+    came from the gate or the backfill
+
+Decisions made:
+- **The backfill is a one-shot SQL, not a migration.**
+  Schema-only migrations are the platform's contract; data
+  fixes go through operator-applied SQL so fresh installs
+  don't carry historical noise. The backfill is idempotent
+  (the `NOT EXISTS` guard) so re-running it on any deployment
+  is safe
+- **Failure of `alerts.create` is non-fatal in the gate path.**
+  Wrapped in try/catch with a `childLog.warn` — the intent is
+  already escalated and the operator can still see it via the
+  intent list. Letting an alert-creation failure abort the gate
+  cycle would replace a UX gap with a data-integrity gap (the
+  intent transition + signal persistence would succeed but
+  the orchestrator's error path would surface differently).
+  The trade-off favours liveness
+- **One alert per escalation, not per signal.** The dashboard's
+  enrichment pass joins back to all GP_BREACH signals via
+  `correlationId`, so a single alert can surface multiple
+  breaches via the description ("3 golden-principle breach(es)
+  require review. First: …"). Cuts dashboard noise (one card
+  per escalation instead of one per signal) and matches the
+  operator's mental model — they intervene on the intent, not
+  the individual signal
+- **`triggeredBy` in context distinguishes gate-created from
+  backfilled.** `'gate-escalate'` vs `'backfill-2026-06-01'`.
+  Lets future analytics distinguish "alerts created in the
+  natural flow" from "operator-applied backfill data". No
+  functional difference today; the dashboard renders both
+  identically
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt. Three pre-existing escalations now visible
+in the dashboard Alerts view as actionable GP_BREACH cards;
+future escalations will create their own alert automatically.
+
+No new Pending enhancements introduced.

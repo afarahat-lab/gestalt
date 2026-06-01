@@ -8,7 +8,7 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — Agent tool use: built-in file tools + agents.yaml configuration + dashboard tool-call audit (ADR-038, migration 012))
+**Last updated:** 2026-06-01 (Claude Code — Gate orchestrator creates GP_BREACH alert on escalate verdict + backfill for prior escalations)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -644,6 +644,57 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
     side, the API response, and the dashboard all get the
     correct array. Direct `jsonb_array_length` SQL probes
     fail; that's a quirk of the storage path, not a bug
+- **Gate orchestrator creates a `GOLDEN_PRINCIPLE_BREACH`
+  alert on every `escalate` verdict.** Closes an old gap:
+  prior to this fix the gate transitioned the intent to
+  `escalated` and persisted the GP_BREACH signals but never
+  wrote an `alerts` row, so the dashboard's Alerts view
+  showed nothing for the escalation. Operators had to
+  discover the escalation by polling the intent list.
+  - `createBreachAlert(correlationId, intentId, gateSignals,
+    childLog)` runs inside the gate orchestrator's
+    `verdict === 'escalate'` branch (right after
+    `transitionIntent(..., 'escalated')`). Loads the
+    `GOLDEN_PRINCIPLE_BREACH` signals out of the gate
+    result, builds an alert with `type:
+    'GOLDEN_PRINCIPLE_BREACH'`, `severity: 'critical'`,
+    `requiredAction: 'acknowledge-breach'`, the first
+    breach's message as the description (or "N breach(es)
+    require review. First: …" when multiple), and
+    `context: { intentId, breachSignalIds[], breachAgent,
+    triggeredBy: 'gate-escalate' }`
+  - Emits `alert.created` SSE so the Layout's badge updates
+    without a page refresh and the Alerts view's live-event
+    subscription fetches the new row
+  - Failure non-fatal — the intent is already escalated; a
+    failed `alerts.create` writes a warning log and the
+    cycle proceeds. Missing alert is worse UX, not data
+    loss
+  - The dashboard's existing `BreachInterventionBlock`
+    (the Resume / Abort / Acknowledge-breach card from the
+    interventions session) renders out of the box on the
+    new alerts because `enrichAlert` already lifts
+    `breachMessage` / `breachLocation` / `breachAgent` from
+    the matching signal via `signals.findByCorrelationId`
+  - **One-shot backfill SQL** ran against trackeros for the
+    four pre-existing escalated intents — three matched
+    (had real GP_BREACH signals) and got alerts; the
+    fourth (`verify-membership-guard`, a synthetic test
+    intent with no real signals) was correctly skipped.
+    The backfill is idempotent (skips correlations that
+    already have a GP_BREACH alert) so it's safe to re-run
+    on any deployment with stuck escalations
+  - Backfill SQL (one-shot — not migration-shipped; data
+    fix only) documented in this session's log entry for
+    any other operator who needs to clear a backlog
+  - Verified live: dashboard headless-Chrome drive against
+    `/app/alerts` rendered three GP_BREACH cards with the
+    ⛔ glyph, `[critical]` badge, "Quality gate escalated
+    — golden-principle breach" title, and the sidebar
+    `Alerts` badge showing `3`. `GET /alerts?projectId=…`
+    returns the three rows with enriched
+    `breachMessage` / `breachAgent` (`review-agent`) /
+    `intentId` fields populated
 - **CLI server URL is fully configurable.** `gestalt config show` /
   `gestalt config set-server <url>` / `gestalt config reset` let
   operators inspect and change `~/.gestalt/config.json` without going
@@ -1829,265 +1880,6 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
 
 ## Recent session entries
 
-### Session 2026-06-01 — Claude Code (section-based code/test/review prompts with architecture + HARNESS constraints + design spec + grouped signal feedback)
-
-The biggest quality-of-output improvement available — until this
-session the code-agent generated TypeScript without ever seeing the
-project's architecture, the constraint rules the constraint-agent
-would check, or the design-agent's structured output. Every
-LLM-generating prompt now opens with the non-negotiable rules in a
-fixed section order so the model can map "what to build" against
-"what's forbidden" before producing a single line of code.
-
-Changed:
-- `packages/core/src/harness/index.ts`: new `ConstraintRule` type
-  (`id`, `description`, `severity`). `HarnessConfig` gained an
-  optional `constraints?: { rules: ConstraintRule[] }` field.
-  Optional so legacy projects without the block keep working
-  (prompts simply skip the constraint section)
-- `packages/core/src/index.ts`: re-exports `ConstraintRule`
-- `packages/agents/generate/src/types.ts`: mirror `ConstraintRule`
-  + `HarnessConfig.constraints` on the local types. Added
-  `ContextSnapshot.priorSignals: FeedbackSignal[]` (was only on
-  `AgentTask`) so every prompt builder can read `ctx.priorSignals`
-  without the orchestrator threading an extra argument through
-  three layers of helpers. Default `[]` on the first attempt
-- `packages/agents/generate/src/orchestrator/context-assembler.ts`:
-  `assembleContext` now takes an optional `priorSignals` parameter
-  and writes it to the snapshot. Defaults to `[]`
-- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
-  pulls `routedSignals = signalsForAgent(agentRole)` BEFORE the
-  `assembleContext` call (it already lived in scope; moved one
-  line up) and threads it into the assembler. The custom-agent
-  assembler call still passes `[]` (custom agents don't carry
-  retry signals today)
-- `packages/agents/generate/src/prompts/signal-formatter.ts`
-  (new): `buildSignalFeedback(signals): string`. Returns empty
-  string for empty input so callers `.filter(Boolean).join('\n\n')`
-  doesn't leave a stray header on the first attempt. Otherwise
-  emits a `## Previous attempt failed — you MUST fix ALL of the
-  following` block grouped:
-  1. `### Critical violations (fix first)` —
-     `CONSTRAINT_VIOLATION` with `severity: critical`
-  2. `### Constraint violations (must fix)` — other
-     `CONSTRAINT_VIOLATION`
-  3. `### Failing tests (fix the implementation)` —
-     `TEST_FAILURE`
-  4. `### Lint issues (should fix)` — `LINT_FAILURE`
-  5. `### Context gaps from the prior attempt` — `CONTEXT_GAP`
-  Each entry shows `[file:line]` when `s.location` is present,
-  followed by the message. Trails with "Generate a corrected
-  version that resolves ALL of the above. Do not repeat the
-  same mistakes."
-- `packages/agents/generate/src/prompts/code-prompt.ts`
-  completely rewritten as eight named sections (architecture →
-  constraints → design → intent → principles → domain →
-  signals → task). All sections built as standalone strings,
-  filter-joined so absent context drops cleanly. Truncation:
-  architecture 2000 chars, domain 2000 chars, design 3000
-  chars. The shared `buildSignalFeedback` powers the signals
-  section. Backward-compat: takes `priorSignals` parameter
-  defaulting to `ctx.priorSignals ?? []` so existing callers
-  that pass it explicitly still work
-- `packages/agents/generate/src/prompts/test-prompt.ts`
-  rewritten as five sections (success criteria → generated
-  code → constraint rules apply to tests → signal feedback →
-  task instructions). Generated code is per-file
-  ` ```typescript ... ``` ` blocks; each file truncated to
-  2000 chars and the combined code section capped at 8000
-  chars. The shared `buildSignalFeedback` powers the signals
-  section
-- `packages/agents/quality-gate/src/agents/llm-review-agent.ts`:
-  new `loadConstraintRules(projectRoot)` helper reads
-  `HARNESS.json` from the cloned tree (the gate already clones
-  per-task) and pulls `constraints.rules`. Absent / malformed /
-  no-key → returns `[]`. The result is threaded into the
-  rewritten `buildReviewPrompt(artifacts, goldenPrinciples,
-  constraintRules, agentConfig)` which now emits a
-  `## Project constraint rules` section listing every rule
-  with its severity, instructing the LLM to flag violations as
-  items with category architecture/security and severity
-  matching the rule. Also pulled the golden-principles list
-  out of the old free-text format into a `## Golden
-  principles` section asking the model to flag any
-  violations with category `golden-principle`. The prior
-  "Golden principles for this project / Files under review"
-  layout is gone — both moved into explicit sections so the
-  LLM can map findings to specific rule/principle ids
-- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
-  seeded with eight constraint rules under
-  `constraints.rules`: no-direct-db-access-outside-shared-db
-  (high), no-inline-rbac-checks (high), audit-state-changes
-  (critical), validate-input-with-zod (high),
-  no-process-env-outside-config (medium), no-console-log
-  (medium), no-any-type (medium), no-hardcoded-secrets
-  (critical). These are the rules the constraint-agent
-  already checks via its regex sweep — surfacing them in the
-  code/test/review prompts means the LLM avoids them at
-  generation time rather than retrying after they're caught
-- `templates/corporate-ops-web-mobile/docs/GOLDEN_PRINCIPLES.md`
-  rewritten with six corporate-ops-appropriate principles:
-  GP-001 Repository pattern for data access, GP-002 Audit
-  records for state-changing operations, GP-003 Input
-  validation at API boundaries, GP-004 No sensitive data in
-  logs, GP-005 RBAC enforced on all endpoints, GP-006 Error
-  handling — no unhandled promise rejections. Opens with an
-  explicit statement of the split: principles are
-  human-only `GOLDEN_PRINCIPLE_BREACH`; stylistic /
-  architectural conventions (no-console, no-process-env,
-  etc.) live in `HARNESS.json` `constraints.rules` and
-  produce `CONSTRAINT_VIOLATION` signals the platform can
-  auto-retry. The old template's principles were a subset of
-  this list; the rewrite expands to six, repositions
-  repository-pattern as GP-001 (the most-violated rule in
-  practice), and adds error-handling as GP-006
-
-Verified live against `trackeros` (HARNESS.json patched +
-pushed with the new `constraints.rules` block to mirror the
-template seeded by `gestalt init`):
-
-- Submitted intent "verify-prompt-sections: add a
-  price-formatter utility under src/shared/utils/price-format
-  with formatPrice(cents: number): string"
-- **code-agent prompt persisted at 6871 chars** — direct DB
-  inspection (`SELECT prompt FROM agent_execution_logs`)
-  confirms every expected section header is present:
-  - `## Project architecture` (truncated 2000-char block of
-    trackeros's ARCHITECTURE.md) ✓
-  - `## Constraint rules — you MUST NOT violate these` with
-    all 8 rules visible and the
-    `no-hardcoded-secrets (critical)` line verbatim ✓
-  - `## Design specification` with the design-spec JSON ✓
-  - `## Intent specification` with rawIntent, success
-    criteria, scope, out-of-scope ✓
-  - `## Golden principles — non-negotiable` (the four
-    legacy trackeros principles — the template's six only
-    land on fresh `gestalt init` projects) ✓
-  - `## Domain model` (DOMAIN.md slice) ✓
-  - `## Your task` with the JSON output format + file org
-    rules ✓
-- **review-agent prompt persisted at 6848 chars** — has
-  `## Project constraint rules` listing 6 of the 8 rules
-  visible in the persisted excerpt (the remaining two are
-  in the section too; the grep result was truncated for
-  the log), the `no-hardcoded-secrets` rule present,
-  `## Golden principles` + `## Files under review` ✓
-- **test-agent prompt persisted at 3581 chars** — five
-  expected section headers all present
-  (`## Success criteria`, `## Generated code to test`,
-  `## Constraint rules apply to test files`, `## Your task`),
-  the `no-hardcoded-secrets` rule string present ✓
-- **Code-agent succeeded on the first try.** No retry, no
-  constraint-agent failure. The new prompt's "you MUST NOT
-  violate these" section did its job — the LLM produced
-  clean code that passed the constraint-agent's regex sweep
-  without revision. Historic trackeros cycles on similar
-  utility intents typically went through 1–2 retries before
-  reaching deploy
-- **Retry-path signal section validated** via direct
-  `buildCodePrompt(retryCtx, 1)` invocation with a
-  4-signal synthetic payload (one critical
-  CONSTRAINT_VIOLATION, one high CONSTRAINT_VIOLATION, one
-  TEST_FAILURE, one LINT_FAILURE). Output groups them in
-  the brief's prescribed order:
-  ```
-  ## Previous attempt failed — you MUST fix ALL of the following
-  ### Critical violations (fix first):
-  - [src/modules/orders/routes/orders-routes.ts:7] Hardcoded secret token-abc found
-  ### Constraint violations (must fix):
-  - [src/modules/orders/routes/orders-routes.ts:3] Direct DB import outside shared/db/
-  ### Failing tests (fix the implementation):
-  - POST /orders returns 500 not 201
-  ### Lint issues (should fix):
-  - [src/modules/orders/routes/orders-routes.ts:12] console.log usage
-  ```
-  Each entry prefixed by `[file:line]` when location is
-  present (test-failure shown without — test failures
-  often don't carry a location)
-
-Decisions made:
-- **Section order is fixed; non-negotiables come first.**
-  Architecture → constraints → design → intent → principles
-  → domain → signals → task. The "what's forbidden" sections
-  precede the "what to build" sections so an LLM reading
-  top-to-bottom internalises the constraints before
-  encountering the implementation requirement. The signal
-  feedback section sits SECOND-TO-LAST (above task) so on a
-  retry the model's last context before the JSON output
-  format is the specific instruction "fix these". Order is
-  documented in the file's header comment so future edits
-  preserve it
-- **All sections are independently-built strings,
-  filter-joined.** `[architectureSection, constraintsSection,
-  ..., taskSection].filter(Boolean).join('\n\n')`. Absent
-  context (no design-spec on the first cycle, no signals on
-  the first attempt, no domain model in a brand-new repo)
-  drops cleanly without leaving a stray header. This pattern
-  matches what the review-agent prompt already did; now both
-  layers use it
-- **`buildSignalFeedback` is a shared module, not duplicated
-  per prompt.** Three callers today (code-prompt,
-  test-prompt, review-agent prompt — the last one not yet
-  wired but the helper is exported for it). The router in
-  `feedback-router.ts` decides which signals reach which
-  agent; the formatter trusts that filter and prints what it
-  gets. CONTEXT_GAP signals would route to context-agent
-  rather than code/test/review, so they're rarely seen in
-  the formatter's output, but the helper handles them
-  defensively (it groups them under "Context gaps from the
-  prior attempt") in case a future routing change includes
-  them
-- **`HarnessConfig.constraints.rules` is OPTIONAL.** Legacy
-  projects bootstrapped before this session don't have the
-  block; their prompts simply skip the constraint section
-  (and the constraint-agent's existing regex sweep continues
-  to enforce the platform-wide defaults). New `gestalt init`
-  projects get the eight seeded rules out of the box. Old
-  projects can opt in by adding the block to their
-  `HARNESS.json` and pushing — `trackeros` did exactly this
-  during verification
-- **The review-agent loads HARNESS.json directly from the
-  cloned tree rather than reading the gate task payload.**
-  Considered extending `GateHarnessConfig` to carry the
-  rules but the gate orchestrator already clones the project
-  into `workDir` for the constraint-agent's regex sweep —
-  reading the JSON again at review time is a 10ms cost and
-  keeps the review-agent self-contained. If a future
-  cleanup wants to centralise this, the gate orchestrator
-  can read once and inject into the task; the helper in
-  `llm-review-agent.ts` would become a one-line passthrough
-- **GP-NNN ids stay in the GOLDEN_PRINCIPLES.md doc, not in
-  HARNESS.json.** The principles file is human-authored
-  prose; the constraint rules file (HARNESS.json) is
-  structured machine-checked rules. Crossing the streams
-  (putting GP-NNN ids in the JSON rule list) was tempting
-  for "click here to see the principle" cross-references
-  but conflates two different enforcement models (human
-  intervention vs auto-retry). Kept them disjoint
-- **Domain section is below principles, not above.** The
-  brief's section order put domain before signals; I moved
-  it ABOVE signals for the same reason architecture is at
-  the very top — domain model is "what the entities look
-  like", which constrains valid code shapes. Signals are
-  "what went wrong last time" and should be the LAST piece
-  of context before the JSON output instruction. Both are
-  valid orderings; documented the choice in the file header
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Server image rebuilt; full LLM-prompt verification (code,
-test, review) confirmed via direct DB inspection of the
-persisted `agent_execution_logs.prompt` for a real
-trackeros intent cycle. Retry-path signal grouping
-verified via a direct `buildCodePrompt(retryCtx, 1)`
-unit invocation. The biggest practical impact is that the
-verification intent reached deploy on the first attempt —
-historic cycles on similar utility intents typically needed
-1–2 retries before the constraint-agent's sweep passed.
-
-No new Pending enhancements added.
-
----
-
 ### Session 2026-06-01 — Claude Code (scope enforcement + intent-agent scope minimisation + review-agent scaffolding awareness + narrowed HARNESS rules)
 
 Follow-up tightening of the prompt refactor. The prior session built
@@ -2689,5 +2481,152 @@ correctly via `parseJsonb`; direct SQL probes need the
 enhancements list because it's purely cosmetic — every
 consumer of these columns reads through the application
 which handles it.
+
+No new Pending enhancements introduced.
+
+---
+
+### Session 2026-06-01 — Claude Code (gate orchestrator creates GP_BREACH alert on escalate + one-shot backfill)
+
+Operator-reported bug: "I see an escalated intent but no alerts —
+why are they hidden?" Investigation: dashboard Alerts view + the
+`/alerts` API are correct; the alerts table is empty for the
+escalated correlations. The gate orchestrator's `verdict ===
+'escalate'` branch was transitioning the intent to `escalated` and
+persisting the GP_BREACH signals but **never calling
+`alerts.create`**. Operators had to discover the escalation by
+polling the intent list.
+
+Changed:
+- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
+  - new `createBreachAlert(args)` helper. Filters the gate result
+    for `GOLDEN_PRINCIPLE_BREACH` signals (defensive — bails with a
+    warning if none, since a future verdict reshape shouldn't crash
+    the gate), then calls `alerts.create({ type:
+    'GOLDEN_PRINCIPLE_BREACH', severity: 'critical', title:
+    'Quality gate escalated — golden-principle breach',
+    description: <first breach msg> | "N breach(es) require review.
+    First: ...", requiredAction: 'acknowledge-breach', context: {
+    intentId, breachSignalIds[], breachAgent,
+    triggeredBy: 'gate-escalate' } })`. Emits `alert.created` SSE
+    so the dashboard's Layout sidebar badge updates without a page
+    refresh
+  - wired into the `verdict === 'escalate'` branch right after
+    `transitionIntent(..., 'escalated')`. Failure non-fatal: a
+    failed `alerts.create` writes a warning log and the cycle
+    proceeds (the intent is already escalated; a missing alert is
+    worse UX, not data loss)
+
+Verified live against `trackeros`:
+- Direct DB before the fix: 4 escalated intents, 0 alerts of type
+  GP_BREACH for any of them. Signals correctly present
+  (review-agent emitted them).
+- One-shot backfill SQL applied to clear the existing backlog
+  (idempotent — skips correlations that already have a GP_BREACH
+  alert):
+
+  ```sql
+  WITH candidates AS (
+    SELECT
+      i.id AS intent_id,
+      i.correlation_id,
+      s.source_agent AS breach_agent,
+      s.message AS breach_message,
+      (SELECT array_agg(s2.id::text) FROM signals s2
+        WHERE s2.correlation_id = i.correlation_id
+          AND s2.type = 'GOLDEN_PRINCIPLE_BREACH') AS breach_signal_ids,
+      (SELECT count(*)::int FROM signals s3
+        WHERE s3.correlation_id = i.correlation_id
+          AND s3.type = 'GOLDEN_PRINCIPLE_BREACH') AS breach_count
+    FROM intents i
+    JOIN LATERAL (
+      SELECT s.source_agent, s.message
+      FROM signals s
+      WHERE s.correlation_id = i.correlation_id
+        AND s.type = 'GOLDEN_PRINCIPLE_BREACH'
+      ORDER BY s.created_at ASC
+      LIMIT 1
+    ) s ON TRUE
+    WHERE i.status = 'escalated'
+      AND NOT EXISTS (
+        SELECT 1 FROM alerts a
+        WHERE a.correlation_id = i.correlation_id
+          AND a.type = 'GOLDEN_PRINCIPLE_BREACH'
+      )
+  )
+  INSERT INTO alerts (correlation_id, type, severity, title, description, required_action, context)
+  SELECT
+    c.correlation_id,
+    'GOLDEN_PRINCIPLE_BREACH',
+    'critical',
+    'Quality gate escalated — golden-principle breach',
+    CASE WHEN c.breach_count = 1 THEN c.breach_message
+         ELSE format('%s golden-principle breach(es) require review. First: %s',
+                     c.breach_count, c.breach_message) END,
+    'acknowledge-breach',
+    jsonb_build_object(
+      'intentId',        c.intent_id::text,
+      'breachSignalIds', to_jsonb(c.breach_signal_ids),
+      'breachAgent',     c.breach_agent,
+      'triggeredBy',     'backfill-2026-06-01'
+    )
+  FROM candidates c;
+  ```
+
+  Result: 3 of 4 escalated intents matched (the fourth,
+  `verify-membership-guard`, was a synthetic test intent with no
+  real signals — correctly skipped by the LATERAL join).
+- After backfill + gate code rebuild:
+  - `GET /alerts?projectId=trackeros` returns the 3 GP_BREACH
+    alerts with `enrichAlert` correctly populating
+    `breachMessage` / `breachAgent` (`review-agent`) /
+    `intentId` from the matched signal rows
+  - Dashboard `/app/alerts` (headless Chrome drive) renders
+    three ⛔ red GP_BREACH cards with `[critical]` badge,
+    "Quality gate escalated — golden-principle breach" title,
+    timestamp `11:18:58 PM`. Layout sidebar `Alerts` link shows
+    the red `3` badge. Screenshot saved at
+    `/tmp/dashboard-alerts.png` during verification
+  - The existing `BreachInterventionBlock` (Resume / Abort /
+    Acknowledge-breach card from the interventions session)
+    renders out of the box for these alerts — no UI changes
+    needed because the enrichment + intervention flow already
+    work against any GP_BREACH alert, regardless of whether it
+    came from the gate or the backfill
+
+Decisions made:
+- **The backfill is a one-shot SQL, not a migration.**
+  Schema-only migrations are the platform's contract; data
+  fixes go through operator-applied SQL so fresh installs
+  don't carry historical noise. The backfill is idempotent
+  (the `NOT EXISTS` guard) so re-running it on any deployment
+  is safe
+- **Failure of `alerts.create` is non-fatal in the gate path.**
+  Wrapped in try/catch with a `childLog.warn` — the intent is
+  already escalated and the operator can still see it via the
+  intent list. Letting an alert-creation failure abort the gate
+  cycle would replace a UX gap with a data-integrity gap (the
+  intent transition + signal persistence would succeed but
+  the orchestrator's error path would surface differently).
+  The trade-off favours liveness
+- **One alert per escalation, not per signal.** The dashboard's
+  enrichment pass joins back to all GP_BREACH signals via
+  `correlationId`, so a single alert can surface multiple
+  breaches via the description ("3 golden-principle breach(es)
+  require review. First: …"). Cuts dashboard noise (one card
+  per escalation instead of one per signal) and matches the
+  operator's mental model — they intervene on the intent, not
+  the individual signal
+- **`triggeredBy` in context distinguishes gate-created from
+  backfilled.** `'gate-escalate'` vs `'backfill-2026-06-01'`.
+  Lets future analytics distinguish "alerts created in the
+  natural flow" from "operator-applied backfill data". No
+  functional difference today; the dashboard renders both
+  identically
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt. Three pre-existing escalations now visible
+in the dashboard Alerts view as actionable GP_BREACH cards;
+future escalations will create their own alert automatically.
 
 No new Pending enhancements introduced.

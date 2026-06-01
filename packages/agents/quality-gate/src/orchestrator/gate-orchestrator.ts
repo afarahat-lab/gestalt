@@ -309,6 +309,19 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
       });
     } else if (result.verdict === 'escalate') {
       await transitionIntent(payload.intentId, correlationId, 'escalated');
+      // Surface the breach to the dashboard's Alerts view. Without
+      // this the intent transitions to `escalated` but the operator
+      // sees no actionable item — they have to discover the
+      // escalation by polling the intent list. The
+      // `POST /interventions` route's open-alert lookup degrades
+      // gracefully when the alert is missing, but the dashboard's
+      // Alerts page only renders rows from the `alerts` table.
+      await createBreachAlert({
+        correlationId,
+        intentId: payload.intentId,
+        gateSignals: result.signals,
+        childLog,
+      });
     } else {
       const retried = await maybeDispatchRetry({
         message,
@@ -578,6 +591,76 @@ async function dispatchDeployPR(args: {
  *   3. We cannot resolve enough payload context (intent text / projectId)
  *      to build a valid generate task
  */
+/**
+ * Creates a `GOLDEN_PRINCIPLE_BREACH` alert when the gate escalates.
+ *
+ * Without this row, the intent transitions to `escalated` but the
+ * dashboard's Alerts view shows nothing — operators have to discover
+ * the escalation by polling the intent list. The alert ties the
+ * breach to its source signals via `context.breachSignalIds` so the
+ * dashboard's `enrichAlert` pass can resurface
+ * `breachMessage` / `breachLocation` / `breachAgent` without
+ * additional plumbing (it already looks up signals by correlation).
+ *
+ * Failure is non-fatal — the intent is already escalated, so a
+ * missed alert is worse UX but not data loss. We log + continue.
+ */
+async function createBreachAlert(args: {
+  correlationId: string;
+  intentId: string;
+  gateSignals: GateSignal[];
+  childLog: ReturnType<typeof createContextLogger>;
+}): Promise<void> {
+  const { correlationId, intentId, gateSignals, childLog } = args;
+  const breachSignals = gateSignals.filter(
+    (s) => s.type === 'GOLDEN_PRINCIPLE_BREACH',
+  );
+  // Defensive — the caller only invokes us on `verdict === 'escalate'`
+  // which by construction includes at least one GP_BREACH, but a
+  // future verdict reshape shouldn't crash the gate.
+  if (breachSignals.length === 0) {
+    childLog.warn('createBreachAlert called without any GP_BREACH signals — skipping');
+    return;
+  }
+  const primary = breachSignals[0]!;
+  const description = breachSignals.length === 1
+    ? primary.message
+    : `${breachSignals.length} golden-principle breach(es) require review. First: ${primary.message}`;
+  try {
+    const { alerts } = getRepositories();
+    const alert = await alerts.create({
+      correlationId,
+      intentId,
+      type: 'GOLDEN_PRINCIPLE_BREACH',
+      severity: 'critical',
+      title: 'Quality gate escalated — golden-principle breach',
+      description,
+      requiredAction: 'acknowledge-breach',
+      context: {
+        intentId,
+        breachSignalIds: breachSignals.map((s) => s.id),
+        breachAgent: primary.agentRole,
+        triggeredBy: 'gate-escalate',
+      },
+    });
+    emitLiveEvent('alert.created', correlationId, {
+      alertId: alert.id,
+      type: 'GOLDEN_PRINCIPLE_BREACH',
+      intentId,
+      severity: 'critical',
+    });
+    childLog.info(
+      { alertId: alert.id, breachCount: breachSignals.length },
+      'GP_BREACH alert created for escalated intent',
+    );
+  } catch (err) {
+    childLog.warn(
+      { err, intentId, breachCount: breachSignals.length },
+      'createBreachAlert failed — intent stays escalated but alert is missing',
+    );
+  }
+}
+
 async function maybeDispatchRetry(args: {
   message: TaskMessage<GateTaskPayload>;
   payload: GateTaskPayload;
