@@ -88,6 +88,42 @@ export interface ProjectRecord {
   createdAt: string;
 }
 
+// ─── Agents (Step 2 — ADR-037) ───────────────────────────────────────────────
+
+export interface AgentSummary {
+  name: string;
+  role: string;
+  goal: string;
+  modelOverride: string | null;
+  temperature: number | null;
+  maxTokens: number | null;
+  promptExtensionCount: number;
+}
+
+export interface CustomAgentDefinition {
+  name: string;
+  role: string;
+  goal: string;
+  runsAfter?: string;
+  llm: {
+    model?: string;
+    temperature?: number;
+    maxTokens?: number;
+  };
+  prompt: string;
+}
+
+export interface AgentsListResponse {
+  frameworkAgents: AgentSummary[];
+  customAgents: CustomAgentDefinition[];
+}
+
+export interface AgentsValidateResponse {
+  valid: boolean;
+  warnings: string[];
+  customAgents: number;
+}
+
 export class GestaltApiClient {
   private readonly baseUrl: string;
   private token: string | null;
@@ -214,6 +250,16 @@ export class GestaltApiClient {
 
   async resetMaintenanceFindings(projectId: string): Promise<{ data: { deleted: number } }> {
     return this.delete(`/maintenance/findings/${projectId}`);
+  }
+
+  // ─── Agents (agents.yaml inspection — ADR-037) ────────────────────────────
+
+  async listAgents(projectId: string): Promise<{ data: AgentsListResponse }> {
+    return this.get(`/projects/${projectId}/agents`);
+  }
+
+  async validateAgents(projectId: string): Promise<{ data: AgentsValidateResponse }> {
+    return this.get(`/projects/${projectId}/agents/validate`);
   }
 
   // ─── Alerts ────────────────────────────────────────────────────────────────

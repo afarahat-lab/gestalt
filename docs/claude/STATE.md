@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — harness templates moved out of projects.ts into templates/ — ADR-036)
+**Last updated:** 2026-06-01 (Claude Code — Step 2: custom agents in agents.yaml — ADR-037)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -741,6 +741,106 @@ the historical record of how the state evolved._
   `DECISIONS.md` includes `Date: 2026-06-01`. Local-dev
   resolution from `packages/server` cwd also resolves correctly
   (walks up to repo root)
+
+**Step 2: custom agents in agents.yaml — implemented (ADR-037).**
+- Projects declare LLM agents under a top-level `custom_agents:` key
+  in `agents.yaml`. They run AFTER all six framework generate agents
+  (intent / design / context / lint-config / code / test) complete
+  and BEFORE the orchestrator dispatches to the quality gate
+- Each definition: `name`, `role`, `goal`, optional `runs_after`
+  (parsed but not enforced yet — captured for forward
+  compatibility), `llm.{model,temperature,max_tokens}` overrides,
+  and a `prompt` template
+- Prompt placeholders the runner substitutes:
+  `{{role}}` · `{{goal}}` · `{{artifacts}}` (code-type artifacts
+  only, truncated to 2000 chars each, formatted as
+  ```` ### path\n```typescript\n<content>\n``` ````) ·
+  `{{goldenPrinciples}}` · `{{intentText}}` · `{{projectName}}`.
+  Unknown placeholders survive into the prompt as literal
+  `{{key}}` so typos are debuggable
+- Expected JSON response:
+  `{ passed: bool, findings: [{ severity, file, description }],
+  summary: string }`. Parse failures fall through to a
+  passed-with-prose-summary fallback so a misbehaved LLM never
+  crashes the cycle
+- **Signal routing** (the verdict mechanism — ADR-013 stays
+  centralised in review-agent + gate):
+  - `high`   severity finding → `CONSTRAINT_VIOLATION`
+  - `medium` / `low`          → `LINT_FAILURE`
+  - LLM error / parse failure → single `CONTEXT_GAP`
+  Custom agents NEVER emit `GOLDEN_PRINCIPLE_BREACH`
+- **Observability** mirrors framework agents: one
+  `agent_executions` row per custom run (`taskType:
+  'generate:custom'`, `agentRole = definition.name`); per-run
+  `agent_execution_logs` row carrying the LLM response + the
+  captured `model_used`; `agent.started` / `agent.completed`
+  SSE; `signal.emitted` SSE per signal
+- **Failure handling** — a failed custom agent (LLM error, parse
+  error, thrown) logs the error and continues. The cycle is
+  never blocked by a custom agent directly; the gate makes the
+  final verdict from the union of framework + custom signals
+- **CLI** — new `gestalt agents` parent with two subcommands:
+  - `gestalt agents list <projectName>` — shallow-clones the
+    repo, reads `agents.yaml`, prints two sections: "Framework
+    agents" (each row shows model override / temperature /
+    prompt-extension count) and "Custom agents" (or "None
+    defined")
+  - `gestalt agents validate <projectName>` — parses
+    `agents.yaml`, surfaces warnings, prints
+    `✓ agents.yaml valid (N custom agents defined)` or
+    `✗ agents.yaml invalid` + warnings. Drops definitions
+    missing required fields (`name`, `role`, `prompt`) and
+    surfaces the count as a warning if any were skipped
+- **Server endpoints** (both `requireRole('viewer')`):
+  - `GET /projects/:id/agents` returns
+    `{ frameworkAgents: AgentSummary[], customAgents:
+    CustomAgentDefinition[] }`. Framework-agent summaries
+    always present (per-role baseline from the loader merged
+    with operator overrides); custom agents only present when
+    declared
+  - `GET /projects/:id/agents/validate` returns
+    `{ valid, warnings, customAgents: number }`. Both endpoints
+    do a shallow clone (`--depth 1`) for the YAML read; temp
+    dir cleaned in `finally`
+- **Dashboard.** `IntentDetail` accordion renders custom-agent
+  rows with `var(--purple)` role colour + a small `custom`
+  uppercase badge to the right of the role name. Anything not
+  in the `FRAMEWORK_AGENTS` set (the 19 framework roles
+  including infrastructure agents and `context-fixer`) gets the
+  custom treatment. The badge is `#a855f7` on white text,
+  font-mono, all-caps — matches the [severity] badge style on
+  Alerts
+- Live verified end-to-end against `trackeros` (commits
+  `d0a6927` + `3c6f3c5`):
+  - Two custom agents pushed: `docs-check-agent` (checks for
+    JSDoc — trackeros already has the JSDoc prompt extension
+    on code-agent, so this agent passes with no findings) and
+    `usage-example-agent` (guaranteed to flag one `low`-severity
+    finding per file, to exercise `LINT_FAILURE` routing)
+  - `gestalt agents validate` → `✓ agents.yaml valid (2 custom
+    agents defined)`
+  - `gestalt agents list` rendered the framework block (9 rows,
+    each with its current override / extensions count) +
+    custom block (2 rows, both showing platform-default model)
+  - Submitted a padEnd intent (correlationId `fbcc2a99`).
+    `agent_executions` shows 4 `generate:custom` rows across 2
+    gate-retry cycles — `docs-check-agent` completed, passed
+    each time; `usage-example-agent` completed with status
+    `failed` (passed: false) each time
+  - **`signals` table for the cycle has one
+    `LINT_FAILURE` per usage-example-agent run** (severity:
+    `low`, sourceAgent: `usage-example-agent`, message
+    `[usage-example-agent] Missing @example block (verification
+    path) (src/shared/utils/pad-end/...)`) — confirms the
+    severity-to-signal mapping. The intent reached `deployed`,
+    so the gate evaluated the signals + retry budget and let
+    the cycle through after the second attempt
+  - **Dashboard at `/app/intents/<id>`**: headless Chrome
+    confirmed 4 purple `CUSTOM` badges, one per custom-agent
+    row, with computed background `rgb(168, 85, 247)` (=
+    `#a855f7`, the platform's `--purple`). Custom rows
+    interspersed with framework rows in the chronological
+    execution list
 
 **Step 1: externalise agent prompts to agents.yaml — implemented.**
 - Every LLM-reasoning agent reads its persona (`role`, `goal`), LLM

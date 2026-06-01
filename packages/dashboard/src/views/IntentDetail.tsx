@@ -29,6 +29,19 @@ interface ExecutionLogResponse {
 
 const PREVIEW_CHARS = 400;
 
+/**
+ * Known framework agents. Anything outside this set is treated as a
+ * project-defined custom agent (ADR-037) and rendered in purple with
+ * a `custom` badge.
+ */
+const FRAMEWORK_AGENTS = new Set<string>([
+  'intent-agent', 'design-agent', 'context-agent', 'lint-config-agent',
+  'code-agent', 'test-agent', 'review-agent', 'constraint-agent',
+  'lint-agent', 'security-agent', 'test-runner-agent', 'pr-agent',
+  'pipeline-agent', 'promotion-agent', 'drift-agent', 'alignment-agent',
+  'gc-agent', 'evaluation-agent', 'context-fixer',
+]);
+
 export function IntentDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -166,6 +179,7 @@ export function IntentDetail() {
               {intent.agentExecutions.map((exec) => {
                 const isExpanded = expanded.has(exec.id);
                 const logState = logs[exec.id];
+                const isCustom = !FRAMEWORK_AGENTS.has(exec.agentRole);
                 return (
                   <div key={exec.id} style={{ borderBottom: '1px solid var(--border)' }}>
                     {/* Header row — always visible */}
@@ -174,7 +188,15 @@ export function IntentDetail() {
                       onClick={() => { void toggleExecution(exec.id); }}
                     >
                       <StatusBadge status={exec.status} size="sm" />
-                      <span style={monoText}>{exec.agentRole}</span>
+                      <span style={{
+                        ...monoText,
+                        color: isCustom ? 'var(--purple)' : 'var(--text-secondary)',
+                      }}>
+                        {exec.agentRole}
+                      </span>
+                      {isCustom && (
+                        <span style={customBadge}>custom</span>
+                      )}
                       {exec.durationMs !== null && (
                         <span style={{ ...monoText, marginLeft: 'auto', color: 'var(--text-dim)' }}>
                           {exec.durationMs}ms
@@ -458,6 +480,17 @@ const metaVal: React.CSSProperties = {
 const sectionTitle: React.CSSProperties = {
   fontSize: '11px', fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)',
   textTransform: 'uppercase', letterSpacing: '0.06em',
+};
+const customBadge: React.CSSProperties = {
+  background: 'var(--purple)',
+  color: '#fff',
+  fontSize: '10px',
+  fontWeight: 700,
+  padding: '1px 6px',
+  borderRadius: '3px',
+  fontFamily: 'var(--font-mono)',
+  letterSpacing: '0.04em',
+  textTransform: 'uppercase',
 };
 const execRow: React.CSSProperties = {
   display: 'flex', alignItems: 'center', gap: '10px',

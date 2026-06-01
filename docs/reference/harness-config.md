@@ -303,3 +303,106 @@ Each entry under `agents:` is keyed by `AgentRole` (`intent-agent`,
 - The model the orchestrator routed to is persisted into
   `agent_execution_logs.model_used` and shown in the dashboard's IntentDetail
   panel as `Model: gpt-4o-mini` / etc.
+
+---
+
+## `custom_agents` — project-defined LLM agents (ADR-037)
+
+Add `custom_agents:` at the top level of `agents.yaml` to declare
+project-specific LLM agents that run after the framework generate agents
+and before dispatch to the quality gate. They receive the generated
+artifacts as part of their prompt and return structured findings:
+
+```yaml
+custom_agents:
+  - name: security-review-agent
+    role: "Application security reviewer"
+    goal: "Identify OWASP Top 10 vulnerabilities in generated code"
+    runs_after: code-agent       # OPTIONAL — parsed but not enforced yet
+    llm:
+      model: ~                   # null = platform default
+      temperature: 0.1
+      max_tokens: 4000
+    prompt: |
+      You are {{role}}. Goal: {{goal}}.
+      Review: {{artifacts}}
+      Return JSON: { "passed": true|false, "findings": [...], "summary": "..." }
+```
+
+### Schema
+
+| Field | Required | Type | Purpose |
+|---|---|---|---|
+| `name` | yes | string | Unique agent name; becomes `agent_executions.agent_role`. Surfaces as the row label in the dashboard's IntentDetail accordion. |
+| `role` | yes | string | LLM persona (`You are <role>...`) |
+| `goal` | yes | string | One-line statement of intent |
+| `runs_after` | no | string | Framework agent name (e.g. `code-agent`). Parsed but not enforced in Step 2 — all custom agents run after all framework agents regardless. Captured for forward compatibility |
+| `llm.model` | no | string \| null | Override the platform default model. `~` (null) means "use default" |
+| `llm.temperature` | no | number | LLM temperature override |
+| `llm.max_tokens` | no | number | LLM max-tokens override (camelCase `maxTokens` also accepted) |
+| `prompt` | yes | string | Prompt template with `{{placeholders}}` — see below |
+
+### Prompt placeholders
+
+The runner substitutes the following before sending the prompt to the LLM:
+
+- `{{role}}`, `{{goal}}` — fields on the definition
+- `{{artifacts}}` — generated code files (`code` type only),
+  truncated to 2000 characters per file, formatted as
+  ```` ### path\n```typescript\n<content>\n``` ```` blocks
+- `{{goldenPrinciples}}` — bullet list of `GP-NNN: title` lines
+- `{{intentText}}` — operator's original intent string
+- `{{projectName}}` — `HARNESS.json` `name` field
+
+Unknown placeholders are left in place (`{{somethingElse}}` survives into
+the prompt) so a typo is debuggable in the dashboard's execution log.
+
+### Expected JSON response
+
+```json
+{
+  "passed": true,
+  "findings": [
+    {
+      "severity": "high|medium|low",
+      "file": "src/path.ts",
+      "description": "what's wrong"
+    }
+  ],
+  "summary": "one-line overall verdict"
+}
+```
+
+### Signal routing
+
+The orchestrator maps each finding's severity to a typed signal that the
+gate orchestrator evaluates:
+
+| Finding severity | Signal type |
+|---|---|
+| `high` | `CONSTRAINT_VIOLATION` |
+| `medium` | `LINT_FAILURE` |
+| `low` | `LINT_FAILURE` |
+
+If the LLM call fails or the response can't be parsed, the runner returns
+`status: 'error'` and the orchestrator emits a single `CONTEXT_GAP` signal
+carrying the error message. Custom agents never emit
+`GOLDEN_PRINCIPLE_BREACH` — that signal type is reserved for framework
+infrastructure agents and the review-agent (ADR-013).
+
+### Behaviour
+
+- Absent `custom_agents` key → no custom agents run; cycle proceeds
+  directly to the gate
+- Malformed YAML → no custom agents loaded, debug-logged (the loader
+  never throws)
+- Entry missing `name`, `role`, or `prompt` → silently dropped, debug-logged
+- A failed custom agent (LLM error, parse error) does NOT block the cycle —
+  the cycle continues and the resulting `CONTEXT_GAP` signal flows to the
+  gate
+- High-severity findings + the resulting `CONSTRAINT_VIOLATION` signals
+  are auto-resolvable: the gate-↔-generate feedback loop can retry with
+  the signals as priorSignals to the code-agent
+- The dashboard's IntentDetail accordion renders custom-agent rows with a
+  purple agent-role colour and a `custom` badge so operators can
+  distinguish them at a glance

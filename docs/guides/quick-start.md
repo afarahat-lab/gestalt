@@ -276,6 +276,94 @@ send it to a teammate and the dashboard loads that exact view.
 
 ---
 
+## Customising agents
+
+### Tune framework agents
+
+Edit `agents.yaml` in your project repo (seeded by `gestalt init` alongside
+`HARNESS.json`) to change model, temperature, or prompt extensions for any
+framework agent. The file is read fresh from each per-cycle clone (ADR-032),
+so an edit + push takes effect on the next intent without a server restart:
+
+```yaml
+agents:
+  code-agent:
+    llm:
+      model: gpt-4o          # null = platform default
+      temperature: 0.1
+    prompt_extensions:
+      - "Always use the Result<T,E> pattern for error handling"
+      - "Add a JSDoc comment to every exported function"
+```
+
+`prompt_extensions` are appended verbatim to the agent's prompt under a
+`## Project-specific instructions` heading. They give the project team a
+way to add standing rules that apply to every call without modifying
+framework code.
+
+### Add custom agents
+
+Define project-specific LLM agents under `custom_agents` in `agents.yaml`.
+They run after the framework generate agents (intent / design / context /
+lint-config / code / test) and BEFORE dispatch to the quality gate, so
+their findings reach the gate as signals:
+
+```yaml
+custom_agents:
+  - name: security-review-agent
+    role: "Application security reviewer"
+    goal: "Identify OWASP Top 10 vulnerabilities in generated code"
+    llm:
+      model: ~              # platform default
+      temperature: 0.1
+      max_tokens: 4000
+    prompt: |
+      You are {{role}}. Goal: {{goal}}.
+
+      Review the following generated code for OWASP Top 10 issues:
+      {{artifacts}}
+
+      Project golden principles:
+      {{goldenPrinciples}}
+
+      Return JSON only:
+      {
+        "passed": true|false,
+        "findings": [
+          { "severity": "high|medium|low", "file": "path", "description": "..." }
+        ],
+        "summary": "..."
+      }
+```
+
+Prompt placeholders the runner provides:
+
+- `{{role}}`, `{{goal}}` — fields on the definition
+- `{{artifacts}}` — generated code files (`code` type only), truncated to
+  2000 chars each
+- `{{goldenPrinciples}}` — bullet list of GP-NNN titles + descriptions
+- `{{intentText}}` — operator's original intent string
+- `{{projectName}}` — `HARNESS.json` `name` field
+
+The orchestrator routes the agent's findings to typed signals:
+
+- `high` → `CONSTRAINT_VIOLATION`
+- `medium` / `low` → `LINT_FAILURE`
+- LLM error or parse failure → `CONTEXT_GAP`
+
+Custom agents **never** emit `GOLDEN_PRINCIPLE_BREACH`. They do not block
+the cycle directly — the gate orchestrator evaluates all signals and makes
+the final pass / fail / escalate verdict.
+
+### Verify your configuration
+
+```bash
+gestalt agents list <projectName>      # show framework + custom agents
+gestalt agents validate <projectName>  # check agents.yaml parses + valid
+```
+
+---
+
 ## Summary — command reference
 
 | Command | When | Purpose |
@@ -294,6 +382,8 @@ send it to a teammate and the dashboard loads that exact view.
 | `gestalt status` | Daily | Check platform and intent status |
 | `gestalt logs` | Daily | Stream live agent activity |
 | `gestalt dashboard` | Daily | Open oversight dashboard |
+| `gestalt agents list <name>` | As needed | Show framework + custom agents for a project |
+| `gestalt agents validate <name>` | As needed | Validate `agents.yaml` and report warnings |
 
 ---
 

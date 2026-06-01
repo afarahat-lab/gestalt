@@ -55,6 +55,70 @@ export interface AgentConfig {
  */
 export interface AgentsYaml {
   agents: Record<string, AgentConfig>;
+  /** Project-defined LLM agents that run after framework generate agents
+   *  and before dispatch to the quality gate (ADR-037). Loaded via
+   *  `loadCustomAgents(projectRoot)` and executed by
+   *  `runCustomAgent(definition, ctx, correlationId)`. */
+  customAgents?: CustomAgentDefinition[];
+}
+
+// ─── Custom agents (Step 2 — ADR-037) ────────────────────────────────────────
+
+/**
+ * Project-defined LLM agent declared in `agents.yaml` under
+ * `custom_agents:`. Generic shape — no deterministic execution path.
+ * The runner substitutes `{{role}} / {{goal}} / {{artifacts}} /
+ * {{goldenPrinciples}} / {{intentText}} / {{projectName}}` placeholders
+ * in `prompt` and sends the result to the configured LLM.
+ *
+ * Findings come back as a structured JSON response:
+ *   { passed, findings: [{ severity, file, description }], summary }
+ *
+ * Severity routes to a signal type the gate evaluates:
+ *   - high   → CONSTRAINT_VIOLATION
+ *   - low/medium → LINT_FAILURE
+ *   - error  → CONTEXT_GAP (so the gate sees the agent broke)
+ *
+ * Custom agents NEVER emit GOLDEN_PRINCIPLE_BREACH — that signal type
+ * is reserved for framework infrastructure agents and the review-agent.
+ */
+export interface CustomAgentDefinition {
+  name: string;
+  role: string;
+  goal: string;
+  /** Framework agent name (e.g. `code-agent`) the custom agent should
+   *  run after. Parsed but NOT enforced in Step 2 — all custom agents
+   *  run after all framework agents regardless. Captured for forward
+   *  compatibility. */
+  runsAfter?: string;
+  llm: AgentLlmConfig;
+  /** Template with `{{role}}`, `{{goal}}`, `{{artifacts}}`,
+   *  `{{goldenPrinciples}}`, `{{intentText}}`, `{{projectName}}`
+   *  placeholders. Unknown placeholders are left in place
+   *  (debuggable, matches the template-engine convention). */
+  prompt: string;
+}
+
+export interface CustomAgentFinding {
+  severity: 'high' | 'medium' | 'low';
+  file: string;
+  description: string;
+}
+
+export interface CustomAgentResult {
+  agentName: string;
+  status: 'passed' | 'failed' | 'skipped' | 'error';
+  passed: boolean;
+  findings: CustomAgentFinding[];
+  summary: string;
+  rawResponse: string;
+  tokensUsed: number;
+  durationMs: number;
+  /** Captured by the runner after `getLLMClient(def.llm.model)` so the
+   *  orchestrator can persist it into `agent_execution_logs.model_used`. */
+  modelUsed: string | null;
+  /** Error message when `status === 'error'`. */
+  errorMessage?: string;
 }
 
 // ─── Execution graph ─────────────────────────────────────────────────────────

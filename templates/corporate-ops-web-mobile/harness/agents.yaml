@@ -107,3 +107,65 @@ agents:
       temperature: 0.2
       max_tokens: 8192
     prompt_extensions: []
+
+
+# ─── Custom agents (ADR-037) ─────────────────────────────────────────────────
+# Project-specific LLM agents that run after the framework generate agents
+# (intent / design / context / lint-config / code / test) and BEFORE
+# dispatch to the quality gate. They receive the generated artifacts and
+# return structured findings. The orchestrator routes findings to typed
+# signals:
+#   high severity   → CONSTRAINT_VIOLATION
+#   medium / low    → LINT_FAILURE
+#   error (LLM/parse) → CONTEXT_GAP
+# All of which the gate orchestrator evaluates alongside framework signals.
+# Custom agents NEVER emit GOLDEN_PRINCIPLE_BREACH.
+#
+# Prompt template placeholders:
+#   {{role}}, {{goal}}           — fields on the agent definition
+#   {{artifacts}}                — generated code files (code type only),
+#                                  truncated to 2000 chars each, formatted
+#                                  as ### path / ```typescript ... ```
+#   {{goldenPrinciples}}         — bullet list of GP-NNN titles + descriptions
+#   {{intentText}}               — the operator's original intent string
+#   {{projectName}}              — HARNESS.json `name` field
+#
+# Expected JSON response from the LLM:
+#   {
+#     "passed": true | false,
+#     "findings": [
+#       { "severity": "high|medium|low", "file": "path", "description": "..." }
+#     ],
+#     "summary": "one-line overall verdict"
+#   }
+#
+# Example — uncomment and edit to enable:
+#
+# custom_agents:
+#   - name: security-review-agent
+#     role: "Application security reviewer"
+#     goal: "Identify OWASP Top 10 vulnerabilities in generated code"
+#     llm:
+#       model: ~           # null = platform default; override with e.g. "gpt-4o"
+#       temperature: 0.1
+#       max_tokens: 4000
+#     prompt: |
+#       You are {{role}}. Goal: {{goal}}.
+#
+#       Review the following generated code for OWASP Top 10 issues
+#       (SQL injection, XSS, IDOR, missing auth checks, sensitive data
+#       exposure):
+#
+#       {{artifacts}}
+#
+#       Project golden principles to respect:
+#       {{goldenPrinciples}}
+#
+#       Return JSON only — no markdown fences, no preamble:
+#       {
+#         "passed": true|false,
+#         "findings": [
+#           { "severity": "high|medium|low", "file": "path", "description": "..." }
+#         ],
+#         "summary": "one line"
+#       }

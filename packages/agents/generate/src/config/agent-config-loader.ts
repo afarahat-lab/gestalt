@@ -19,7 +19,7 @@ import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { parse } from 'yaml';
 import { createContextLogger } from '@gestalt/core';
-import type { AgentConfig, AgentsYaml } from '../types';
+import type { AgentConfig, AgentsYaml, CustomAgentDefinition, AgentLlmConfig } from '../types';
 
 const log = createContextLogger({ module: 'agent-config-loader' });
 
@@ -186,3 +186,91 @@ function extractPromptExtensions(entry: AgentConfig): string[] {
  */
 export const defaultAgentConfig = (agentRole?: string): AgentConfig =>
   agentRole ? fallbackFor(agentRole) : { ...GENERIC_FALLBACK, llm: { ...GENERIC_FALLBACK.llm }, promptExtensions: [] };
+
+// ─── Custom agents (Step 2 — ADR-037) ────────────────────────────────────────
+
+/**
+ * Loads project-defined custom agent definitions from
+ * `<projectRoot>/agents.yaml` under the `custom_agents:` (or
+ * `customAgents:`) key. Same non-fatal contract as `loadAgentConfig`
+ * — missing / malformed file / missing key all return an empty list.
+ *
+ * Each entry is normalised (snake_case → camelCase, llm tuning merged
+ * with sensible defaults) and validated (`name`, `role`, `prompt`
+ * required). Invalid entries are dropped with a debug log.
+ */
+export async function loadCustomAgents(
+  projectRoot: string,
+): Promise<CustomAgentDefinition[]> {
+  let raw: string;
+  try {
+    raw = await readFile(join(projectRoot, 'agents.yaml'), 'utf8');
+  } catch {
+    return [];
+  }
+  let parsed: AgentsYaml | undefined;
+  try {
+    parsed = parse(raw) as AgentsYaml;
+  } catch (err) {
+    log.debug(
+      { err: err instanceof Error ? err.message : String(err) },
+      'agents.yaml present but failed to parse — no custom agents loaded',
+    );
+    return [];
+  }
+
+  // Accept both `custom_agents` (snake_case, brief's YAML examples)
+  // and `customAgents` (camelCase). The runtime type uses camelCase.
+  const raw_defs =
+    (parsed as unknown as Record<string, unknown>)['custom_agents']
+    ?? (parsed as unknown as Record<string, unknown>)['customAgents']
+    ?? [];
+  if (!Array.isArray(raw_defs)) {
+    log.debug('agents.yaml custom_agents key is not an array — ignoring');
+    return [];
+  }
+
+  const normalised: CustomAgentDefinition[] = [];
+  for (const entry of raw_defs) {
+    const def = normaliseCustomAgent(entry);
+    if (!def) continue;
+    if (!isValidCustomAgent(def)) {
+      log.debug({ name: def.name }, 'custom agent definition invalid — skipping');
+      continue;
+    }
+    normalised.push(def);
+  }
+  return normalised;
+}
+
+function normaliseCustomAgent(input: unknown): CustomAgentDefinition | null {
+  if (!input || typeof input !== 'object') return null;
+  const e = input as Record<string, unknown>;
+  const name = typeof e['name'] === 'string' ? (e['name'] as string).trim() : '';
+  const role = typeof e['role'] === 'string' ? (e['role'] as string).trim() : '';
+  const goal = typeof e['goal'] === 'string' ? (e['goal'] as string).trim() : '';
+  const prompt = typeof e['prompt'] === 'string' ? (e['prompt'] as string) : '';
+  const runsAfter =
+    typeof e['runsAfter'] === 'string' ? (e['runsAfter'] as string)
+    : typeof e['runs_after'] === 'string' ? (e['runs_after'] as string)
+    : undefined;
+  const llmIn = (e['llm'] ?? {}) as Record<string, unknown>;
+  const llm: AgentLlmConfig = {
+    ...(typeof llmIn['temperature'] === 'number' ? { temperature: llmIn['temperature'] as number } : {}),
+    ...(typeof llmIn['maxTokens'] === 'number' ? { maxTokens: llmIn['maxTokens'] as number } : {}),
+    ...(typeof llmIn['max_tokens'] === 'number' ? { maxTokens: llmIn['max_tokens'] as number } : {}),
+    ...(typeof llmIn['model'] === 'string' ? { model: llmIn['model'] as string } : {}),
+  };
+  return {
+    name,
+    role,
+    goal,
+    ...(runsAfter ? { runsAfter } : {}),
+    llm,
+    prompt,
+  };
+}
+
+function isValidCustomAgent(def: CustomAgentDefinition): boolean {
+  return Boolean(def.name?.trim() && def.role?.trim() && def.prompt?.trim());
+}

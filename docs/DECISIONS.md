@@ -568,3 +568,97 @@ to files:
   difference. Live verification confirmed: a freshly initialised
   test project receives the same eight files at the same paths
   with the same content modulo `{{variable}}` substitution.
+
+
+---
+
+## ADR-037 — Custom agents are prompt-only, verdict via signals
+
+**Date:** 2026-06-01
+**Status:** Accepted
+
+**Decision:** Project-defined custom agents declared in `agents.yaml`
+under `custom_agents:` are generic LLM runners. They receive the
+generated artifacts as part of their prompt and return structured
+findings (`{ passed, findings: [...], summary }`). The orchestrator
+maps each finding to a typed signal that the gate orchestrator
+evaluates alongside framework signals:
+
+- `high` severity → `CONSTRAINT_VIOLATION`
+- `medium` / `low` → `LINT_FAILURE`
+- LLM error / parse failure → `CONTEXT_GAP` (one signal for the run)
+
+Custom agents have no deterministic execution paths — they are
+prompt-only. They never emit `GOLDEN_PRINCIPLE_BREACH` (reserved for
+framework infrastructure agents and the review-agent). They do not
+stop the cycle directly — they contribute signals; the gate
+orchestrator owns the final pass / fail / escalate verdict (ADR-013).
+
+**Rationale:** Deterministic enforcement (ESLint, AST-based constraint
+checks, real test runners) belongs in framework agents — that code
+already exists and is shared across projects. Project-specific
+reasoning that varies by domain (security policy, performance
+budgets, internal style rules, accessibility checks) is naturally
+LLM-driven; the value comes from per-project prompt customisation,
+not per-project agent code.
+
+The signal mechanism ensures custom agents participate in the same
+quality gate loop as framework agents without bypassing it. Two
+properties follow:
+
+1. **Verdict centralisation** — the gate orchestrator + review-agent
+   are the only places that produce pass / fail / escalate. Custom
+   agents can flag issues but cannot abort the cycle independently.
+   Operators can reason about verdict logic by reading review-agent
+   code and the signal-routing table alone.
+2. **Feedback-loop reuse** — `CONSTRAINT_VIOLATION` and
+   `LINT_FAILURE` are auto-resolvable signal types in the gate-↔-
+   generate retry router (ADR-013). A custom-agent finding that
+   triggers a `CONSTRAINT_VIOLATION` automatically rolls into the
+   code-agent's `priorSignals` on the retry leg — same as if the
+   constraint-agent had flagged it. No new plumbing needed.
+
+**Consequences:**
+
+- New types in `@gestalt/agents-generate`:
+  `CustomAgentDefinition`, `CustomAgentResult`, `CustomAgentFinding`.
+  `AgentsYaml.customAgents?: CustomAgentDefinition[]` added.
+- `loadCustomAgents(projectRoot)` in the agent config loader. Same
+  non-fatal contract as `loadAgentConfig` — missing file / malformed
+  YAML / missing required field on an entry all return an empty list
+  with a debug log.
+- `runCustomAgent(definition, ctx, correlationId)` in
+  `packages/agents/generate/src/agents/custom-agent-runner.ts`. Uses
+  `getLLMClient(definition.llm.model)` so per-agent model overrides
+  from Step 1 / multi-client registry apply automatically.
+  `responseFormat: 'json'` requested; parse failures fall through
+  to a safe default that captures the LLM's raw text as `summary`.
+- Generate orchestrator runs custom agents AFTER `drivePlan` succeeds
+  and BEFORE dispatch to the gate. Each run creates an
+  `agent_executions` row (`taskType: 'generate:custom'`,
+  `agentRole: <definition.name>`), emits `agent.started` /
+  `agent.completed` SSE, persists an `agent_execution_logs` row
+  carrying the LLM response + the captured `modelUsed`, and saves
+  typed signals for each finding (with `signal.emitted` SSE per
+  signal). The same observability surface every framework agent
+  has.
+- `runs_after` is parsed but not enforced — all custom agents run
+  after all framework agents regardless of the field value. Future
+  work could make this a topological constraint.
+- `{{artifacts}}` truncates to 2000 chars per file to keep the
+  prompt budget reasonable. Custom agents that need full files can
+  request them via a future enhancement (e.g. a `full_artifacts`
+  flag that skips the truncation).
+- Dashboard `IntentDetail` shows custom-agent execution rows with
+  `var(--purple)` colour + a `custom` badge so operators can
+  distinguish them from framework agents at a glance.
+- New endpoints `GET /projects/:id/agents` and `GET
+  /projects/:id/agents/validate` (both `requireRole('viewer')`,
+  shallow-clone the repo to read `agents.yaml`).
+- New CLI subcommands `gestalt agents list <name>` and
+  `gestalt agents validate <name>`. Both accept the standard
+  `--server` one-shot override.
+- No new migrations — custom agents reuse the existing
+  `agent_executions` and `agent_execution_logs` tables with
+  `agentRole` widened informally to accept any string (TypeScript
+  cast `as AgentRole` at insert time).

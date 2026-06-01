@@ -44,6 +44,9 @@ import {
 import {
   alertsListCommand, alertsShowCommand, alertsFixCommand, alertsDismissCommand,
 } from './commands/alerts';
+import {
+  agentsListCommand, agentsValidateCommand,
+} from './commands/agents';
 
 const pkg = { version: '0.1.0' };  // replaced by package.json at build time
 
@@ -193,6 +196,27 @@ alerts
   .option('--notes <text>', 'Free-form notes')
   .action(async (alertId: string, opts: { server?: string; notes?: string }) => {
     await alertsDismissCommand(alertId, { server: opts.server, notes: opts.notes }).catch(fatalError);
+  });
+
+// gestalt agents — read + validate agents.yaml from the project repo (ADR-037)
+const agents = program
+  .command('agents')
+  .description('Read + validate agents.yaml for a project (framework + custom agents)');
+
+agents
+  .command('list <projectName>')
+  .description('List framework + custom agents configured for a project. Reads agents.yaml from the repo (shallow clone).')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (projectName: string, opts: { server?: string }) => {
+    await agentsListCommand(projectName, { server: opts.server }).catch(fatalError);
+  });
+
+agents
+  .command('validate <projectName>')
+  .description('Validate agents.yaml — checks YAML parse + per-custom-agent required fields. Surfaces warnings.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (projectName: string, opts: { server?: string }) => {
+    await agentsValidateCommand(projectName, { server: opts.server }).catch(fatalError);
   });
 
 // gestalt run

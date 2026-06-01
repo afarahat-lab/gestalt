@@ -18,8 +18,9 @@ import {
 } from '@gestalt/core';
 import type {
   TaskMessage, TaskResult, QueueConfig,
-  Artifact, PlatformSignal, ExecutionStatus,
+  Artifact, PlatformSignal, ExecutionStatus, AgentRole, SignalType, SignalSeverity,
 } from '@gestalt/core';
+import type { GeneratedArtifact } from '../types';
 import { buildExecutionPlan, getReadySteps, isPlanComplete, hasPlanFailed } from './plan-builder';
 import { assembleContext } from './context-assembler';
 import { routeFeedback, requiresEscalation } from './feedback-router';
@@ -27,11 +28,12 @@ import { transition } from './state-machine';
 import { runIntentAgent } from '../agents/intent-agent';
 import { runDesignAgent } from '../agents/design-agent';
 import { runContextAgent } from '../agents/context-agent';
+import { runCustomAgent } from '../agents/custom-agent-runner';
+import { loadCustomAgents } from '../config/agent-config-loader';
 import { runLintConfigAgent } from '../agents/lint-config-agent';
 import { runCodeAgent } from '../agents/code-agent';
 import { runTestAgent } from '../agents/test-agent';
 import type { ExecutionPlan, AgentResult, GateFeedback, FeedbackSignal, LlmCallFn } from '../types';
-import type { AgentRole } from '@gestalt/core';
 
 /**
  * Embeds a Git personal access token into an HTTPS clone URL.
@@ -252,6 +254,26 @@ async function handleIntentTask(
     // PR branch, not defaultBranch). The generate orchestrator therefore
     // never mutates the project's Git tree.
     const allArtifacts = plan.steps.flatMap((s) => s.result?.artifacts ?? []);
+
+    // ─── Custom agents (Step 2 — ADR-037) ─────────────────────────────────
+    // Project-defined LLM agents declared in agents.yaml run AFTER all
+    // framework generate agents complete, BEFORE dispatch to the gate.
+    // They receive the assembled context (same snapshot the code-agent
+    // saw) and emit findings → signals. High-severity findings become
+    // CONSTRAINT_VIOLATION signals; low/medium → LINT_FAILURE; error
+    // (LLM failure or response parse failure) → CONTEXT_GAP. They NEVER
+    // emit GOLDEN_PRINCIPLE_BREACH (reserved for framework infra +
+    // review-agent). A failed custom agent does NOT block the cycle —
+    // its signals flow to the gate which makes the final verdict.
+    await runCustomAgentsForCycle({
+      projectRoot,
+      plan,
+      intentId: payload.intentId,
+      intentText,
+      correlationId,
+      allArtifacts,
+      childLog,
+    });
 
     childLog.info(
       { artifactCount: allArtifacts.length, retryCount },
@@ -626,4 +648,198 @@ function buildResult(
 
 function queueConfigFromEnv(): QueueConfig {
   return { redisUrl: process.env['REDIS_URL'] ?? 'redis://localhost:6379' };
+}
+
+// ─── Custom agents (Step 2 — ADR-037) ────────────────────────────────────────
+
+/**
+ * Loads every project-defined custom agent from `agents.yaml` and runs
+ * them sequentially against the post-generate artifact set. Each run:
+ *   1. creates an `agent_executions` row with `agentRole = def.name`
+ *      and `taskType = 'generate:custom'`
+ *   2. emits `agent.started` SSE
+ *   3. invokes `runCustomAgent(definition, ctx, correlationId)`
+ *   4. persists an `agent_execution_logs` row carrying the LLM
+ *      response + the captured `modelUsed`
+ *   5. saves typed signals for each finding (severity → SignalType)
+ *      and emits `signal.emitted` SSE per signal
+ *   6. updates the execution row to completed/failed + emits
+ *      `agent.completed` SSE
+ *
+ * Failures (LLM error, parse error) are non-fatal — the runner returns
+ * `status: 'error'` and the orchestrator emits a single `CONTEXT_GAP`
+ * signal so the gate can see the agent broke. The cycle continues.
+ */
+async function runCustomAgentsForCycle(args: {
+  projectRoot: string;
+  plan: ExecutionPlan;
+  intentId: string;
+  intentText: string;
+  correlationId: string;
+  allArtifacts: GeneratedArtifact[];
+  childLog: ReturnType<typeof createContextLogger>;
+}): Promise<void> {
+  const { projectRoot, plan, intentId, intentText, correlationId, allArtifacts, childLog } = args;
+  const customs = await loadCustomAgents(projectRoot);
+  if (customs.length === 0) return;
+
+  childLog.info({ count: customs.length }, 'Running custom agents');
+
+  // Build a context snapshot once — the same one every custom agent
+  // receives. Built via `assembleContext` for a synthetic terminal
+  // role so we get the harness + golden principles + intentSpec
+  // shape, then override `priorArtifacts` with the FULL post-generate
+  // artifact set (code + test). This matches operator expectation
+  // that custom agents see everything the framework produced.
+  const baseCtx = await assembleContext(projectRoot, plan, 'code-agent' as AgentRole, intentText);
+  const ctx = { ...baseCtx, priorArtifacts: allArtifacts };
+
+  const { executions, signals, executionLogs } = getRepositories();
+
+  for (const def of customs) {
+    const executionId = crypto.randomUUID();
+    const startedAt = new Date();
+    const customAgentRole = def.name as AgentRole;
+
+    await executions.create({
+      id: executionId,
+      correlationId,
+      intentId,
+      agentRole: customAgentRole,
+      taskType: 'generate:custom',
+      status: 'running',
+      tokensUsed: 0,
+      durationMs: null,
+      startedAt,
+      completedAt: null,
+    });
+    emitLiveEvent('agent.started', correlationId, {
+      executionId,
+      agentRole: customAgentRole,
+      taskType: 'generate:custom',
+      startedAt: startedAt.toISOString(),
+    });
+
+    const result = await runCustomAgent(def, ctx, correlationId);
+
+    // ── Persist the execution log. The full built prompt isn't stored
+    // (it embeds artifact content) — the operator can reconstruct it
+    // from the agents.yaml definition + the artifacts on the cycle.
+    await executionLogs.save({
+      executionId,
+      correlationId,
+      agentRole: def.name,
+      prompt: null,
+      llmResponse: result.rawResponse || null,
+      resultStatus: result.status,
+      artifactPaths: [],
+      signalTypes: signalTypesForResult(result),
+      errorMessage: result.status === 'error' ? (result.errorMessage ?? result.summary) : null,
+      modelUsed: result.modelUsed,
+    }).catch((err) => {
+      childLog.warn({ err, executionId, agentRole: def.name }, 'executionLogs.save failed (custom)');
+    });
+
+    // ── Map findings → typed signals. Routing per ADR-037:
+    //   high   → CONSTRAINT_VIOLATION
+    //   medium → LINT_FAILURE
+    //   low    → LINT_FAILURE
+    //   error  → CONTEXT_GAP (one signal for the whole agent run)
+    const emittedSignals: PlatformSignal[] = [];
+    if (result.status === 'error') {
+      emittedSignals.push(buildSignal({
+        correlationId,
+        type: 'CONTEXT_GAP',
+        severity: 'high',
+        sourceAgent: customAgentRole,
+        message: `[${def.name}] ${result.errorMessage ?? result.summary}`,
+      }));
+    } else {
+      for (const finding of result.findings) {
+        const type: SignalType =
+          finding.severity === 'high' ? 'CONSTRAINT_VIOLATION' : 'LINT_FAILURE';
+        const severity: SignalSeverity =
+          finding.severity === 'high' ? 'high'
+          : finding.severity === 'medium' ? 'medium'
+          : 'low';
+        emittedSignals.push(buildSignal({
+          correlationId,
+          type,
+          severity,
+          sourceAgent: customAgentRole,
+          message: `[${def.name}] ${finding.description} (${finding.file})`,
+          location: finding.file ? { file: finding.file } : undefined,
+        }));
+      }
+    }
+    for (const sig of emittedSignals) {
+      await signals.save(sig);
+      emitLiveEvent('signal.emitted', correlationId, {
+        executionId,
+        agentRole: customAgentRole,
+        type: sig.type,
+        severity: sig.severity,
+        sourceAgent: sig.sourceAgent,
+        message: sig.message,
+      });
+    }
+
+    const completedAt = new Date();
+    const stepStatus: ExecutionStatus =
+      result.status === 'error' ? 'failed'
+      : result.passed ? 'completed' : 'failed';
+    await executions.updateStatus(executionId, stepStatus, {
+      tokensUsed: result.tokensUsed,
+      durationMs: result.durationMs,
+      startedAt,
+      completedAt,
+    });
+    emitLiveEvent('agent.completed', correlationId, {
+      executionId,
+      agentRole: customAgentRole,
+      status: stepStatus,
+      tokensUsed: result.tokensUsed,
+      durationMs: result.durationMs,
+      artifactCount: 0,
+      signalCount: emittedSignals.length,
+    });
+
+    childLog.info({
+      agentName: def.name,
+      status: result.status,
+      passed: result.passed,
+      findingCount: result.findings.length,
+      signalCount: emittedSignals.length,
+      durationMs: result.durationMs,
+      modelUsed: result.modelUsed,
+    }, 'Custom agent completed');
+  }
+}
+
+function signalTypesForResult(result: { status: string; findings: Array<{ severity: string }> }): SignalType[] {
+  if (result.status === 'error') return ['CONTEXT_GAP'];
+  return result.findings.map((f) =>
+    f.severity === 'high' ? 'CONSTRAINT_VIOLATION' : 'LINT_FAILURE',
+  );
+}
+
+function buildSignal(args: {
+  correlationId: string;
+  type: SignalType;
+  severity: SignalSeverity;
+  sourceAgent: AgentRole;
+  message: string;
+  location?: { file: string; line?: number };
+}): PlatformSignal {
+  return {
+    id: crypto.randomUUID(),
+    correlationId: args.correlationId,
+    type: args.type,
+    severity: args.severity,
+    sourceAgent: args.sourceAgent,
+    message: args.message,
+    ...(args.location ? { location: args.location } : {}),
+    autoResolvable: args.type !== 'GOLDEN_PRINCIPLE_BREACH',
+    createdAt: new Date(),
+  };
 }

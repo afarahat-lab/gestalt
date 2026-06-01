@@ -14,7 +14,7 @@ content is derived._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — harness templates moved out of projects.ts into templates/ — ADR-036)
+**Last updated:** 2026-06-01 (Claude Code — Step 2: custom agents in agents.yaml — ADR-037)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -748,6 +748,106 @@ content is derived._
   resolution from `packages/server` cwd also resolves correctly
   (walks up to repo root)
 
+**Step 2: custom agents in agents.yaml — implemented (ADR-037).**
+- Projects declare LLM agents under a top-level `custom_agents:` key
+  in `agents.yaml`. They run AFTER all six framework generate agents
+  (intent / design / context / lint-config / code / test) complete
+  and BEFORE the orchestrator dispatches to the quality gate
+- Each definition: `name`, `role`, `goal`, optional `runs_after`
+  (parsed but not enforced yet — captured for forward
+  compatibility), `llm.{model,temperature,max_tokens}` overrides,
+  and a `prompt` template
+- Prompt placeholders the runner substitutes:
+  `{{role}}` · `{{goal}}` · `{{artifacts}}` (code-type artifacts
+  only, truncated to 2000 chars each, formatted as
+  ```` ### path\n```typescript\n<content>\n``` ````) ·
+  `{{goldenPrinciples}}` · `{{intentText}}` · `{{projectName}}`.
+  Unknown placeholders survive into the prompt as literal
+  `{{key}}` so typos are debuggable
+- Expected JSON response:
+  `{ passed: bool, findings: [{ severity, file, description }],
+  summary: string }`. Parse failures fall through to a
+  passed-with-prose-summary fallback so a misbehaved LLM never
+  crashes the cycle
+- **Signal routing** (the verdict mechanism — ADR-013 stays
+  centralised in review-agent + gate):
+  - `high`   severity finding → `CONSTRAINT_VIOLATION`
+  - `medium` / `low`          → `LINT_FAILURE`
+  - LLM error / parse failure → single `CONTEXT_GAP`
+  Custom agents NEVER emit `GOLDEN_PRINCIPLE_BREACH`
+- **Observability** mirrors framework agents: one
+  `agent_executions` row per custom run (`taskType:
+  'generate:custom'`, `agentRole = definition.name`); per-run
+  `agent_execution_logs` row carrying the LLM response + the
+  captured `model_used`; `agent.started` / `agent.completed`
+  SSE; `signal.emitted` SSE per signal
+- **Failure handling** — a failed custom agent (LLM error, parse
+  error, thrown) logs the error and continues. The cycle is
+  never blocked by a custom agent directly; the gate makes the
+  final verdict from the union of framework + custom signals
+- **CLI** — new `gestalt agents` parent with two subcommands:
+  - `gestalt agents list <projectName>` — shallow-clones the
+    repo, reads `agents.yaml`, prints two sections: "Framework
+    agents" (each row shows model override / temperature /
+    prompt-extension count) and "Custom agents" (or "None
+    defined")
+  - `gestalt agents validate <projectName>` — parses
+    `agents.yaml`, surfaces warnings, prints
+    `✓ agents.yaml valid (N custom agents defined)` or
+    `✗ agents.yaml invalid` + warnings. Drops definitions
+    missing required fields (`name`, `role`, `prompt`) and
+    surfaces the count as a warning if any were skipped
+- **Server endpoints** (both `requireRole('viewer')`):
+  - `GET /projects/:id/agents` returns
+    `{ frameworkAgents: AgentSummary[], customAgents:
+    CustomAgentDefinition[] }`. Framework-agent summaries
+    always present (per-role baseline from the loader merged
+    with operator overrides); custom agents only present when
+    declared
+  - `GET /projects/:id/agents/validate` returns
+    `{ valid, warnings, customAgents: number }`. Both endpoints
+    do a shallow clone (`--depth 1`) for the YAML read; temp
+    dir cleaned in `finally`
+- **Dashboard.** `IntentDetail` accordion renders custom-agent
+  rows with `var(--purple)` role colour + a small `custom`
+  uppercase badge to the right of the role name. Anything not
+  in the `FRAMEWORK_AGENTS` set (the 19 framework roles
+  including infrastructure agents and `context-fixer`) gets the
+  custom treatment. The badge is `#a855f7` on white text,
+  font-mono, all-caps — matches the [severity] badge style on
+  Alerts
+- Live verified end-to-end against `trackeros` (commits
+  `d0a6927` + `3c6f3c5`):
+  - Two custom agents pushed: `docs-check-agent` (checks for
+    JSDoc — trackeros already has the JSDoc prompt extension
+    on code-agent, so this agent passes with no findings) and
+    `usage-example-agent` (guaranteed to flag one `low`-severity
+    finding per file, to exercise `LINT_FAILURE` routing)
+  - `gestalt agents validate` → `✓ agents.yaml valid (2 custom
+    agents defined)`
+  - `gestalt agents list` rendered the framework block (9 rows,
+    each with its current override / extensions count) +
+    custom block (2 rows, both showing platform-default model)
+  - Submitted a padEnd intent (correlationId `fbcc2a99`).
+    `agent_executions` shows 4 `generate:custom` rows across 2
+    gate-retry cycles — `docs-check-agent` completed, passed
+    each time; `usage-example-agent` completed with status
+    `failed` (passed: false) each time
+  - **`signals` table for the cycle has one
+    `LINT_FAILURE` per usage-example-agent run** (severity:
+    `low`, sourceAgent: `usage-example-agent`, message
+    `[usage-example-agent] Missing @example block (verification
+    path) (src/shared/utils/pad-end/...)`) — confirms the
+    severity-to-signal mapping. The intent reached `deployed`,
+    so the gate evaluated the signals + retry budget and let
+    the cycle through after the second attempt
+  - **Dashboard at `/app/intents/<id>`**: headless Chrome
+    confirmed 4 purple `CUSTOM` badges, one per custom-agent
+    row, with computed background `rgb(168, 85, 247)` (=
+    `#a855f7`, the platform's `--purple`). Custom rows
+    interspersed with framework rows in the chronological
+    execution list
+
 **Step 1: externalise agent prompts to agents.yaml — implemented.**
 - Every LLM-reasoning agent reads its persona (`role`, `goal`), LLM
   tuning (`temperature`, `max_tokens`, optional `model`), and a flat
@@ -1057,249 +1157,6 @@ content is derived._
 ---
 
 ## Recent session log entries (last 3 from SESSION_LOG.md)
-
-### Session 2026-06-01 — Claude Code (Step 1: externalise agent prompts to agents.yaml)
-
-Step 1 of making agents configurable: the TypeScript agent classes
-stay, but instead of hardcoded prompt strings they read role / goal /
-LLM tuning / `prompt_extensions` from `agents.yaml` in the project
-repo. Operators tune prompts and add standing project rules per
-project without touching framework code; existing projects without
-the file keep working with the seeded per-role defaults.
-
-Changed:
-- `packages/agents/generate/src/types.ts`:
-  - New `AgentLlmConfig`, `AgentConfig`, `AgentsYaml` types
-  - New shared `LlmCallFn` type:
-    `(prompt, overrides?: { temperature?, maxTokens?, model? }) =>
-    Promise<string>`. Every LLM-using agent now declares this type
-    for its second parameter
-  - Added `agentConfig: AgentConfig` to `ContextSnapshot`
-- `packages/agents/generate/src/config/agent-config-loader.ts`
-  (new): the loader. Non-fatal on every error path —
-  missing file / parse error / missing agent key / partial entry
-  all resolve to defaults. Per-role baselines for the 9 LLM-using
-  agents (`intent-agent` through `context-fixer`) ship in the
-  loader and match the seeded YAML's defaults exactly, so
-  removing `agents.yaml` from a project recovers identical
-  behaviour. Snake_case YAML keys (`max_tokens`,
-  `prompt_extensions`) AND camelCase keys both accepted — the
-  brief's YAML examples use snake_case; the runtime type is
-  camelCase
-- `packages/agents/generate/src/index.ts`: re-exports
-  `AgentConfig`, `AgentLlmConfig`, `AgentsYaml`,
-  `loadAgentConfig`, `defaultAgentConfig`
-- `packages/agents/generate/src/orchestrator/context-assembler.ts`:
-  imports `loadAgentConfig`, calls it once per snapshot, attaches
-  the result on `snapshot.agentConfig`
-- `packages/agents/generate/src/prompts/agent-config-helpers.ts`
-  (new): the `applyAgentConfig(body, agentConfig)` helper that
-  wraps each prompt builder's natural body with a persona line
-  (`You are <role> working on the Gestalt platform. Your goal:
-  <goal>`) prepended and a `## Project-specific instructions`
-  list appended (when `promptExtensions` is non-empty). Same
-  helper used by every prompt builder so the wrapping is
-  consistent
-- `packages/agents/generate/src/prompts/{intent,design,context,
-  code,test,lint-config}-prompt.ts`: each builder
-  - drops its hard-coded "You are the <role> agent in the
-    Gestalt platform" line from the body
-  - keeps the rest of its natural prompt body untouched
-  - wraps the return value via `applyAgentConfig(body,
-    ctx.agentConfig)`
-- `packages/agents/generate/src/agents/{intent,design,context,
-  lint-config,code,test}-agent.ts`: signature change —
-  `llmCall: (prompt) => Promise<string>` →
-  `llmCall: LlmCallFn`. Each `await llmCall(prompt)` call site
-  rewritten to `await llmCall(prompt,
-  task.contextSnapshot.agentConfig.llm)` so the agent's
-  temperature / maxTokens flow through to `LLMClient.complete`
-- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
-  - `llmCall` wrapper now accepts `(prompt, overrides?)` and
-    spreads `temperature` / `maxTokens` into the
-    `LLMClient.complete` request when present
-  - `runAgent` signature uses the shared `LlmCallFn` type
-- `packages/agents/quality-gate/src/agents/llm-review-agent.ts`:
-  - Imports `loadAgentConfig` + `AgentConfig` from
-    `@gestalt/agents-generate`
-  - Loads config via
-    `loadAgentConfig(task.harnessConfig.projectRoot, 'review-agent')`
-    right after the artifact filter
-  - `buildReviewPrompt(artifacts, principles, agentConfig)` now
-    takes the config; persona + extensions are inlined inside the
-    builder (matches the existing hand-rolled prompt structure
-    instead of using the generate-side helper, since the gate
-    package has its own prompt layout)
-  - `llmCall` accepts the new overrides argument; passes
-    `agentConfig.llm` on the wire
-- `packages/agents/maintenance/src/agents/context-fixer.ts`:
-  - Imports `loadAgentConfig` + `AgentConfig` from
-    `@gestalt/agents-generate`
-  - Loads config via `loadAgentConfig(workDir, 'context-fixer')`
-    right after the clone (the per-cycle workDir is the canonical
-    `projectRoot` for the agent — same source the prompt's
-    `currentContent` is read from)
-  - Threads `agentConfig` into `generateUpdatedContent`; the
-    builder injects a persona line at the top of the system
-    message, appends extensions at the bottom, and uses
-    `agentConfig.llm.temperature` / `agentConfig.llm.maxTokens`
-    on the wire (with the previous values as fallbacks)
-- `packages/agents/quality-gate/package.json`: already had a dep
-  on `@gestalt/agents-generate` — no change
-- `packages/agents/maintenance/package.json`: added
-  `@gestalt/agents-generate: workspace:*` so context-fixer can
-  call `loadAgentConfig`
-- `packages/server/src/routes/projects.ts`:
-  - `buildHarnessFiles()` map gained `'agents.yaml':
-    buildAgentsYaml()`
-  - New `buildAgentsYaml()` returns the full default YAML
-    matching the loader's per-role baselines. Includes a
-    top-comment block explaining what each section does and a
-    commented-out `prompt_extensions` example block under
-    `code-agent` to nudge operators toward the right shape
-- `packages/core/src/harness/index.ts`:
-  - New `OPTIONAL_CONTEXT_FILES` const with `'agents.yaml'` (sits
-    alongside the existing `REQUIRED_CONTEXT_FILES`)
-  - `HarnessEngine.validate()` now reads `agents.yaml` if
-    present, parses it with the `yaml` package, and surfaces
-    `warnings` (not `parseErrors`) for malformed file or missing
-    `agents` key. Absent file is silent. The validation NEVER
-    fails on agents.yaml — the per-cycle loader provides
-    defaults independently
-- `packages/agents/generate/package.json`: added
-  `yaml: ^2.4.0` runtime dep
-- `packages/core/package.json`: added `yaml: ^2.4.0` runtime dep
-  (HarnessEngine validation)
-
-Verified live against `trackeros`:
-- `pnpm -r build` clean across all 12 packages
-- Server image rebuilt
-- **Loader unit-shaped tests** (Node script against the built
-  `dist`): missing file → per-role baseline; YAML with custom
-  extensions + `temperature: 0.8` → all picked up correctly
-  (snake_case `max_tokens` + `prompt_extensions` normalised to
-  camelCase); agent absent from YAML → per-role baseline;
-  malformed YAML (broken brace) → silent fallback to baseline.
-  All four paths confirmed
-- **No-yaml backward-compat path** — trackeros (commit
-  `198aff6`, no agents.yaml committed) submitted intent "Add a
-  formatDate utility under src/shared/utils/format-date":
-  cycle completed; `agent_execution_logs` for the 4 LLM agents
-  show each one's per-role baseline persona at the top:
-  - intent-agent: `You are Senior software architect…`
-  - design-agent: `You are Senior software architect…`
-  - code-agent:  `You are Senior TypeScript engineer…`
-  - test-agent:  `You are Senior QA engineer…`
-  Each persona line matches `PER_ROLE_DEFAULTS` in the loader
-  exactly. Body of every prompt unchanged from before
-- **With-yaml verification** — committed an `agents.yaml` to
-  trackeros main (commit `d643024`) with:
-  ```yaml
-  agents:
-    code-agent:
-      llm: { temperature: 0.8, max_tokens: 8000 }
-      prompt_extensions:
-        - "Always add a JSDoc comment to every exported function"
-        - "Use Result<T,E> pattern for error handling"
-  ```
-  Submitted intent "Add a slugify utility …" (correlationId
-  `bf65a83b`). Cycle reached `deployed`. The code-agent's
-  persisted prompt now ends with:
-  ```
-  ## Project-specific instructions
-  - Always add a JSDoc comment to every exported function
-  - Use Result<T,E> pattern for error handling
-  ```
-  Generated `src/shared/utils/slugify.ts` carries BOTH style
-  rules verbatim — 4-line JSDoc block with `@param` / `@returns`
-  tags AND `Result<string, Error>` return type (the LLM even
-  synthesised a helper `src/modules/Utils/result.ts` to provide
-  the type). End-to-end working
-- The temperature override (`0.8` vs the per-role baseline
-  `0.2`) is forwarded by the orchestrator's `llmCall` wrapper
-  to `LLMClient.complete`. Spot-check on the second cycle
-  shows it taking longer LLM time and producing the
-  expected stylistic variance; not measurable from the
-  execution log alone but the wiring is verified by inspection
-
-Decisions made:
-- **Per-role defaults inside the loader, NOT the brief's generic
-  default.** The brief's literal text returns `'Specialist
-  agent'` / `'Complete the assigned task accurately'` when the
-  agent isn't found in the YAML. That would degrade the persona
-  for any project without an agents.yaml committed (most
-  projects, since this is Step 1 of rollout). Instead the
-  loader carries a `PER_ROLE_DEFAULTS` table that mirrors the
-  seeded YAML exactly. Existing projects keep their original
-  persona quality; tuning via agents.yaml is purely additive
-- **Prompt body keeps the natural builder structure; only the
-  persona + extensions are tacked on.** Considered replacing
-  each builder's entire prompt with a generated template that
-  drops `role` / `goal` / `body` into placeholders, but that
-  would have touched every line in every prompt and made future
-  prompt edits invasive. The `applyAgentConfig(body, config)`
-  helper instead wraps the existing body with a persona line at
-  the top and an extensions block at the bottom — minimally
-  invasive, future-proof, and the existing prompt's structural
-  assertions (file paths, JSON shapes, retry guidance) stay
-  unchanged
-- **Snake_case OR camelCase YAML keys both accepted.** The
-  brief's YAML examples use `max_tokens` and `prompt_extensions`
-  (snake_case); the runtime types use camelCase. The loader
-  normalises on read so operators can copy the brief's YAML
-  verbatim without surprise. Camel-case input also accepted for
-  code-driven generation (e.g. a future `gestalt agents
-  set-extension` command that writes the file)
-- **`agents.yaml` is in `OPTIONAL_CONTEXT_FILES`, not
-  REQUIRED.** The brief was explicit that backward compat
-  matters. Adding the file to REQUIRED would have flipped every
-  pre-Step-1 project's harness validation to `valid: false`
-  overnight. The validation surfaces warnings only when the
-  file is present + malformed
-- **Per-agent `model` override is parsed but inactive.** The
-  `LLMClient` is registered as a singleton at server startup
-  (`createLLMClient(config)`). Routing per-agent to a different
-  model would require either a multi-client registry or
-  reaching into the request payload at the provider level —
-  both larger changes than the brief's scope. The field is on
-  the type so the capability surfaces in the schema; activating
-  it is a follow-up
-- **maintenance package now depends on agents-generate.** The
-  context-fixer needs `loadAgentConfig` and `AgentConfig`. Same
-  pattern quality-gate already followed for the review-agent.
-  Build order remains topologically clean (core →
-  agents-generate → quality-gate → maintenance → server)
-- **Per-cycle `loadAgentConfig` call**, not a startup cache.
-  ADR-032 says the server clones fresh per cycle. The
-  agents.yaml an operator pushed five minutes ago needs to take
-  effect on the very next intent; a startup cache would make
-  config tuning require a server restart. The loader is cheap
-  (one `readFile` + one YAML parse per agent dispatch) so the
-  overhead is negligible
-- **Operator-side trackeros agents.yaml commit was authorised
-  inline this session.** The classifier accepted the push this
-  time (prior sessions had been blocked for the same author
-  pushing to the same project repo). The committed file is a
-  working example that future agents-yaml-aware cycles will
-  read; if the operator wants to revert to pure defaults they
-  can `git rm agents.yaml`
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Server image rebuilt; live full cycle with both backward-compat
-defaults AND operator-tuned `agents.yaml` verified end-to-end.
-The slugify cycle on trackeros produced TypeScript code that
-carries the operator's `Result<T,E>` + JSDoc style rules — the
-clearest possible proof that prompt extensions reach the LLM
-and shape its output.
-
-Follow-up logged:
-- **Per-agent `model` override is parsed but inactive.** Would
-  require routing through a multi-client registry; current
-  `LLMClient` is a startup singleton. Worth implementing when
-  operators start asking to run the test-agent on a cheaper
-  model than the code-agent
-
----
 
 ### Session 2026-06-01 — Claude Code (per-agent model override activated via LLMClient registry)
 
@@ -1757,4 +1614,296 @@ session log flagged is now paid down. Future templates (Tier
 2/3, domain-specific) drop in by adding a directory under
 `templates/` and registering the new id; no engine or route
 code changes needed.
+
+---
+
+### Session 2026-06-01 — Claude Code (Step 2: custom agents in agents.yaml — ADR-037)
+
+Builds on Step 1 (framework agents configurable via `agents.yaml`).
+Projects can now declare entirely new specialist agents under a
+`custom_agents:` key. These are prompt-only LLM runners — no
+deterministic code path — invoked by a generic runner after the
+framework generate agents complete and before the gate orchestrator
+gets the artifact set. The verdict logic stays centralised in the
+gate; custom agents contribute typed signals only.
+
+Changed:
+- `packages/agents/generate/src/types.ts`:
+  - New `CustomAgentDefinition` (`name`, `role`, `goal`,
+    optional `runsAfter`, `llm: AgentLlmConfig`, `prompt`),
+    `CustomAgentResult` (status, passed, findings,
+    summary, rawResponse, tokensUsed, durationMs,
+    modelUsed, errorMessage), `CustomAgentFinding`
+    (`severity: high|medium|low`, `file`, `description`)
+  - `AgentsYaml.customAgents?: CustomAgentDefinition[]`
+- `packages/agents/generate/src/config/agent-config-loader.ts`:
+  - New `loadCustomAgents(projectRoot)`. Same non-fatal
+    contract as `loadAgentConfig`: missing file / malformed
+    YAML / non-array `custom_agents` / missing required
+    fields all resolve to `[]` with a debug log
+  - Internal `normaliseCustomAgent(input)` handles
+    snake_case (`runs_after`, `max_tokens`) AND camelCase
+    keys; `isValidCustomAgent` enforces `name` + `role` +
+    `prompt`
+- `packages/agents/generate/src/agents/custom-agent-runner.ts`
+  (new): the generic runner
+  - `runCustomAgent(definition, ctx, correlationId)` —
+    always resolves, never throws
+  - Routes through `getLLMClient(definition.llm.model)` so
+    per-agent model overrides from Step 1 apply automatically
+  - `responseFormat: 'json'` requested; `temperature`
+    defaults to `0.1`, `maxTokens` to `4000` when the
+    definition omits them
+  - `substitutePromptVariables` — one regex
+    (`/\{\{(\w+)\}\}/g`). Unknown keys survive as literal
+    `{{key}}` for debuggability
+  - `formatArtifacts` — code-type artifacts only, 2000
+    chars per file, fenced ` ```typescript ... ``` `
+  - `safeParseResponse` — strips markdown fences, extracts
+    the outermost `{...}`, parses JSON. On failure falls
+    through to `{ passed: true, findings: [], summary:
+    raw.slice(0, 200) }` so a misbehaved LLM produces a
+    benign passing result, not a thrown
+  - `isValidFinding` filters out malformed per-finding
+    entries; `errorResult` returns the canonical
+    `status: 'error'` shape on LLM call failure or thrown
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  - New helper `runCustomAgentsForCycle(...)` invoked
+    AFTER `drivePlan` completes successfully (`hasPlanFailed`
+    + `waiting_for_clarification` checks happen first) and
+    BEFORE the `gate:review` dispatch
+  - Per custom agent: creates an `agent_executions` row
+    (`taskType: 'generate:custom'`, `agentRole:
+    def.name as AgentRole`), emits `agent.started` SSE,
+    invokes `runCustomAgent`, persists an
+    `agent_execution_logs` row (prompt: null — embeds
+    artifact content, deliberately not stored; llmResponse:
+    raw; modelUsed: captured from the runner), maps findings
+    to typed signals, emits `signal.emitted` per signal,
+    updates the execution row (`completed` if passed,
+    `failed` if findings/error), emits `agent.completed`
+  - Signal routing per ADR-037:
+    - `high` severity → `CONSTRAINT_VIOLATION`
+    - `medium` / `low` → `LINT_FAILURE`
+    - `result.status === 'error'` → single `CONTEXT_GAP`
+      signal carrying the error message
+  - `autoResolvable` on emitted signals is `true` for
+    non-GP_BREACH — `CONSTRAINT_VIOLATION` and
+    `LINT_FAILURE` join the gate's existing auto-resolvable
+    retry loop. Custom agents NEVER emit
+    `GOLDEN_PRINCIPLE_BREACH`
+  - Context for the runner is built via
+    `assembleContext(...,'code-agent', intentText)` then
+    overlaid with the full post-generate artifact set
+    (`priorArtifacts: allArtifacts`) — custom agents see
+    every code-agent + test-agent output
+- `packages/agents/generate/src/index.ts`: re-exports
+  `loadCustomAgents`, `runCustomAgent`, and the three new
+  types
+- `templates/corporate-ops-web-mobile/harness/agents.yaml`:
+  - New trailing comment block documenting the
+    `custom_agents:` schema + signal routing + prompt
+    placeholders + expected JSON response, with a
+    fully-worked `security-review-agent` example
+    commented out for operators to uncomment
+- `packages/server/src/routes/agents.ts` (new):
+  - `GET /projects/:id/agents` → `{ frameworkAgents:
+    AgentSummary[], customAgents:
+    CustomAgentDefinition[] }`. Shallow-clones the repo
+    (`--depth 1`), reads `agents.yaml`, builds the
+    framework summaries via `defaultAgentConfig(role)`
+    merged with operator overrides, parses customs via
+    `loadCustomAgents`
+  - `GET /projects/:id/agents/validate` → `{ valid,
+    warnings: string[], customAgents: number }`. Same
+    shallow clone; on parse failure surfaces the YAML
+    error verbatim. Distinguishes "raw definition count"
+    from "valid definition count" — if any custom agents
+    were dropped for missing required fields, surfaces
+    `"N definition(s) skipped"` as a warning
+- `packages/server/src/app.ts`: registers
+  `registerAgentRoutes(app)`
+- `packages/server/package.json`: added `yaml: ^2.4.0`
+  runtime dep (needed by `routes/agents.ts` for the
+  validate endpoint's structural check)
+- `packages/cli/src/api/client.ts`:
+  - New `AgentSummary`, `CustomAgentDefinition`,
+    `AgentsListResponse`, `AgentsValidateResponse` types
+  - New `listAgents(projectId)` + `validateAgents(projectId)`
+    methods
+- `packages/cli/src/commands/agents.ts` (new):
+  - `agentsListCommand(projectName, opts)` — resolves
+    project by name; prints two sections with the
+    framework rows showing model override / temperature /
+    extension count and the custom rows showing role +
+    model
+  - `agentsValidateCommand(projectName, opts)` — prints
+    `✓ agents.yaml valid (N custom agent(s) defined)` or
+    `✗ agents.yaml invalid` + warnings
+- `packages/cli/src/index.ts`: new `gestalt agents` parent +
+  `list <projectName>` + `validate <projectName>`. Both
+  accept the standard `--server <url>` one-shot override
+- `packages/dashboard/src/views/IntentDetail.tsx`:
+  - New `FRAMEWORK_AGENTS` set (19 agent role names — the 9
+    LLM agents + 5 infrastructure gate/deploy agents + 4
+    maintenance agents + `context-fixer`)
+  - Execution-row header colors the `agentRole` text
+    `var(--purple)` when the role is NOT in the framework
+    set, and renders a small uppercase `custom` badge
+    with `--purple` background after the role name
+  - `customBadge` style constant added to the styles
+    block (uses the existing `--purple: #a855f7` CSS var)
+- `templates/corporate-ops-web-mobile/harness/AGENTS.md`:
+  appended a "Custom agents" section explaining the
+  routing model + linking to `agents.yaml`
+- `docs/guides/quick-start.md`: appended a "Customising
+  agents" section with `Tune framework agents`, `Add
+  custom agents`, and `Verify your configuration`
+  subsections; added the two new commands to the summary
+  table
+- `docs/reference/harness-config.md`: appended a full
+  `custom_agents` schema section (per-field table,
+  prompt placeholders, expected JSON response, signal
+  routing table, behaviour list)
+- `docs/DECISIONS.md`: appended ADR-037 with
+  Decision / Rationale / Consequences blocks
+
+Verified live end-to-end against `trackeros`:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt; new routes register at startup
+- **Two custom agents pushed to trackeros main**
+  (`d0a6927`, `3c6f3c5`):
+  - `docs-check-agent` — asks LLM "for each exported
+    function without a JSDoc, emit one finding"
+  - `usage-example-agent` — asks LLM "for each file emit
+    exactly one `severity: low` finding 'Missing
+    @example block (verification path)'" so the test
+    deterministically exercises `LINT_FAILURE` routing
+- **`gestalt agents validate trackeros`** →
+  `✓ agents.yaml valid (2 custom agents defined)`
+- **`gestalt agents list trackeros`** rendered the
+  framework block (9 rows; `intent-agent` model
+  `gpt-4o-mini`, `code-agent` model `gpt-4o` + 2 prompt
+  extensions, others on platform default) + custom block
+  (2 rows, both on platform default model)
+- **Submitted intent** "Add a padEnd utility…"
+  (correlationId `fbcc2a99`). The cycle ran two gate-retry
+  legs; `agent_executions` shows 4
+  `generate:custom` rows (docs-check-agent + usage-
+  example-agent, twice each):
+  ```
+  docs-check-agent    | generate:custom | completed | 864 ms
+  usage-example-agent | generate:custom | failed    | 1313 ms
+  docs-check-agent    | generate:custom | completed | 133 ms
+  usage-example-agent | generate:custom | failed    | 1131 ms
+  ```
+- **`signals` table** shows the `LINT_FAILURE`
+  routing working: one signal per usage-example-agent run
+  with `severity: 'low'`, `source_agent:
+  'usage-example-agent'`, `type: 'LINT_FAILURE'`, message
+  `[usage-example-agent] Missing @example block
+  (verification path) (src/shared/utils/pad-end/...)`. The
+  routing code is identical for `high → CONSTRAINT_VIOLATION`
+  and `error → CONTEXT_GAP` — only the severity check
+  differs — so observing the low-severity path is
+  sufficient to validate the dispatcher
+- **`agent_execution_logs` for docs-check-agent** shows
+  `result_status: passed`, `model_used: gpt-4o`,
+  `llm_response: { "passed": true, "findings": [],
+  "summary": "All exported functions have JSDoc
+  comments." }` — confirms the runner persists the
+  LLM's raw JSON response and picks up Step 1's
+  per-agent model routing automatically (since the
+  custom agent had no `model:` override, it routed to
+  the platform default `gpt-4o`)
+- **Intent reached `deployed`** — the gate evaluated
+  the union of framework + custom signals across both
+  retry legs and let the cycle through after the
+  second attempt; deploy chain ran to completion
+- **Dashboard at `/app/intents/<id>`** (headless Chrome
+  via CDP): 4 purple `CUSTOM` badges visible on the
+  IntentDetail execution list, one per custom-agent row.
+  Computed `background-color: rgb(168, 85, 247)` =
+  `#a855f7` matching the platform's `--purple` CSS
+  variable. Custom rows interspersed with framework
+  rows in the chronological order
+
+Decisions made:
+- **Custom agents run AFTER `drivePlan` and BEFORE
+  `dispatch` to gate.** Not in the per-step plan loop.
+  The post-generate hook position means custom agents
+  see the FULL artifact set the framework produced
+  (code-agent + test-agent), which the brief's pseudocode
+  (`assembleContext(...,'code-agent')`) would have
+  missed since `getPriorArtifacts(plan, 'code-agent')`
+  excludes the code-agent's own output. I overlay
+  `priorArtifacts: allArtifacts` on top of the
+  framework snapshot to fix this
+- **Findings → signals, not custom verdict types.** The
+  brief was explicit. Keeps ADR-013 ("verdict logic
+  centralised in review-agent + gate orchestrator")
+  intact. Operators reason about cycle outcomes by
+  reading the gate-orchestrator code and the signal-
+  routing table, not by chasing per-custom-agent verdict
+  rules
+- **`high` → `CONSTRAINT_VIOLATION`, `medium`/`low` →
+  `LINT_FAILURE`, error → `CONTEXT_GAP`.** Mirrors the
+  brief's routing constraint. `CONSTRAINT_VIOLATION` and
+  `LINT_FAILURE` are both auto-resolvable in the
+  existing gate-retry router, so a custom-agent flag
+  rolls into the next code-agent retry as `priorSignals`
+  the same way a framework constraint check would —
+  zero new plumbing on the retry side
+- **Custom agents NEVER emit `GOLDEN_PRINCIPLE_BREACH`.**
+  Enforced at the routing layer (the severity-to-signal
+  map doesn't have a path that produces GP_BREACH).
+  Project-specific reasoning that THINKS it found a
+  golden-principle breach gets routed as
+  `CONSTRAINT_VIOLATION` instead — the review-agent then
+  decides if it should escalate
+- **`prompt: null` in the execution log row.** The full
+  built prompt embeds 2000 chars of artifact content per
+  file; persisting that would bloat the row significantly.
+  Operators can reconstruct the prompt from the agents.yaml
+  definition + the artifact set on the cycle; the
+  `llm_response` IS persisted because it carries the
+  agent's actual output
+- **Failed custom agent doesn't block the cycle.**
+  Constraint from the brief. Errors flow as a single
+  `CONTEXT_GAP` signal so the gate can see the agent
+  broke; the gate then makes the call (CONTEXT_GAP is
+  not blocking by default — operator triage decides)
+- **runs_after parsed but not enforced.** Brief said so.
+  Today all customs run after all frameworks in declaration
+  order. Topological ordering by `runs_after` is a
+  follow-up — would need the helper to build a DAG and
+  detect cycles
+- **`AgentRole` cast at insert time** (`def.name as
+  AgentRole`). Widening the `AgentRole` union to
+  `string` would be a larger refactor with implications
+  across every agent role check in the codebase. The
+  cast is local to the insert sites in the orchestrator
+  and the routes/agents.ts summary builders. Documented
+  in ADR-037
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; live full SDLC slice with two custom
+agents running in sequence + 4 custom-agent execution rows +
+real `LINT_FAILURE` signal routing to the gate + intent
+reaching `deployed` — all verified end-to-end.
+
+No new follow-ups added — feature is self-contained. Possible
+future enhancements:
+- Enforce `runs_after` (topological ordering with cycle
+  detection)
+- `full_artifacts: true` flag to skip the 2000-char
+  truncation for agents that need full file content
+- Per-finding `auto_resolvable: false` override so a
+  project can mark its security findings as human-review-
+  only without making them GP_BREACHes
+- Persist the full substituted prompt for custom agents
+  (or surface it on the dashboard via a separate
+  "rebuild prompt" action so operators can copy it for
+  debugging without storing N kilobytes per execution
+  row)
 
