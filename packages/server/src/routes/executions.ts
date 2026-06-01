@@ -17,7 +17,7 @@
 
 import type { FastifyInstance } from 'fastify';
 import { getRepositories } from '@gestalt/core';
-import { requireRole } from '../auth/middleware';
+import { requireRole, checkProjectMembership } from '../auth/middleware';
 
 export async function registerExecutionRoutes(app: FastifyInstance): Promise<void> {
 
@@ -25,11 +25,20 @@ export async function registerExecutionRoutes(app: FastifyInstance): Promise<voi
     '/executions/:id/log',
     { preHandler: requireRole('viewer') },
     async (request, reply) => {
-      const { executions, executionLogs, artifacts, signals } = getRepositories();
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+      const { executions, executionLogs, artifacts, signals, intents } = getRepositories();
 
       const execution = await executions.findById(request.params.id);
       if (!execution) {
         return reply.code(404).send({ error: 'Execution not found' });
+      }
+
+      // Resolve membership through correlationId → intent → projectId.
+      // A user who can't see the project can't read its execution logs
+      // (the prompts + LLM responses are not for cross-project eyes).
+      const intent = await intents.findByCorrelationId(execution.correlationId);
+      if (intent) {
+        if (!await checkProjectMembership(reply, request.user.id, request.user.role, intent.projectId)) return;
       }
 
       const log = await executionLogs.findByExecutionId(execution.id);

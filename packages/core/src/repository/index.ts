@@ -66,6 +66,12 @@ export interface IntentRepository extends BaseRepository {
    */
   saveClarification(id: string, clarification: string): Promise<IntentRecord>;
   list(params: { projectId: string; status?: IntentStatus; limit: number; offset: number }): Promise<{ records: IntentRecord[]; total: number }>;
+  /**
+   * Server-wide intent list (no project filter). Used by the
+   * platform-admin view of `GET /intents`. Regular users never reach
+   * this path — they get a per-project list scoped by membership.
+   */
+  listAll(params: { status?: IntentStatus; limit: number; offset: number }): Promise<{ records: IntentRecord[]; total: number }>;
 }
 
 // ─── Agent execution repository ───────────────────────────────────────────────

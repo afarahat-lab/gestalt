@@ -19,7 +19,7 @@ import {
   getRepositories,
   type IntentRecord, type DeploymentEventRecord,
 } from '@gestalt/core';
-import { requireRole } from '../auth/middleware';
+import { checkProjectMembership } from '../auth/middleware';
 
 interface ListQuery {
   projectId?: string;
@@ -45,14 +45,21 @@ const DEPLOY_STATUSES = ['deploying', 'deployed', 'failed'] as const;
 
 export async function registerDeploymentRoutes(app: FastifyInstance): Promise<void> {
 
+  // Handler-level membership check covers authorization; the
+  // `requireRole('viewer')` preHandler is intentionally dropped here
+  // because it would run a redundant membership lookup with the
+  // older error shape (`{ error: 'Not a member of this project' }`)
+  // and short-circuit before our typed
+  // `INSUFFICIENT_PROJECT_ROLE / NOT_PROJECT_MEMBER` reply.
   app.get<{ Querystring: ListQuery }>(
     '/deployments',
-    { preHandler: requireRole('viewer') },
     async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
       const projectId = request.query.projectId;
       if (!projectId?.trim()) {
         return reply.code(400).send({ error: 'projectId is required' });
       }
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, projectId)) return;
       const limit = Math.min(Math.max(parseInt(request.query.limit ?? '20', 10) || 20, 1), 100);
 
       const { intents, deploymentEvents } = getRepositories();

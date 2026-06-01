@@ -12,8 +12,7 @@ import { getRepositories, dispatch, createContextLogger } from '@gestalt/core';
 import type { TaskMessage, TaskPriority } from '@gestalt/core';
 import { emitLiveEvent } from '../events';
 import {
-  requireRole, requireProjectMembership, sendProjectMembershipError,
-  ProjectMembershipError,
+  requireRole, checkProjectMembership,
 } from '../auth/middleware';
 
 const log = createContextLogger({ module: 'routes:intents' });
@@ -69,12 +68,7 @@ export async function registerIntentRoutes(app: FastifyInstance): Promise<void> 
       // resolves projectId from URL params/query, never from the body,
       // so a regular user could otherwise submit intents against any
       // project they knew the ID of.
-      try {
-        await requireProjectMembership(request.user.id, request.user.role, projectId, 'editor');
-      } catch (err) {
-        if (err instanceof ProjectMembershipError) return sendProjectMembershipError(reply, err);
-        throw err;
-      }
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, projectId, 'editor')) return;
 
       const { intents } = getRepositories();
       const correlationId = crypto.randomUUID();
@@ -118,43 +112,68 @@ export async function registerIntentRoutes(app: FastifyInstance): Promise<void> 
   );
 
   // GET /intents — list intents
+  //
+  // Membership rules:
+  //   - With ?projectId=…  → require reader+ on that project (403 if
+  //     not a member); platform-admin bypasses the check
+  //   - Without projectId  → platform-admin sees the server-wide list
+  //     (via intents.listAll); regular users get an empty array
+  //     instead of a 403 so the response shape never leaks "this
+  //     project exists" by erroring instead of returning empty
   app.get<{ Querystring: ListIntentsQuery }>(
     '/intents',
     async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
       const { status, limit = '20', offset = '0' } = request.query;
       const projectId = (request.query as Record<string, string>)['projectId'] ?? '';
-
-      if (!projectId) {
-        return reply.code(400).send({ error: 'projectId is required' });
-      }
+      const parsedLimit = Math.min(parseInt(limit, 10), 100);
+      const parsedOffset = parseInt(offset, 10);
 
       const { intents } = getRepositories();
+
+      if (!projectId) {
+        if (request.user.role !== 'platform-admin') {
+          return reply.send({ data: [], total: 0, limit: parsedLimit, offset: parsedOffset });
+        }
+        const { records, total } = await intents.listAll({
+          status: status as never,
+          limit: parsedLimit,
+          offset: parsedOffset,
+        });
+        return reply.send({ data: records, total, limit: parsedLimit, offset: parsedOffset });
+      }
+
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, projectId)) return;
+
       const { records, total } = await intents.list({
         projectId,
         status: status as never,
-        limit: Math.min(parseInt(limit, 10), 100),
-        offset: parseInt(offset, 10),
+        limit: parsedLimit,
+        offset: parsedOffset,
       });
 
-      return reply.send({
-        data: records,
-        total,
-        limit: parseInt(limit, 10),
-        offset: parseInt(offset, 10),
-      });
+      return reply.send({ data: records, total, limit: parsedLimit, offset: parsedOffset });
     },
   );
 
-  // GET /intents/:id — intent detail
+  // GET /intents/:id — intent detail.
+  //
+  // Membership is checked against the intent's projectId. A user who
+  // is NOT a member of the project gets a 403 — NOT a 404. Returning
+  // 404 would leak existence by letting non-members enumerate intent
+  // IDs to detect which ones map to projects they can't see.
   app.get<{ Params: { id: string } }>(
     '/intents/:id',
     async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
       const { intents, executions, signals, artifacts } = getRepositories();
       const intent = await intents.findById(request.params.id);
 
       if (!intent) {
         return reply.code(404).send({ error: 'Intent not found' });
       }
+
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, intent.projectId)) return;
 
       const [agentExecutions, intentSignals, intentArtifacts] = await Promise.all([
         executions.findByCorrelationId(intent.correlationId),
@@ -209,14 +228,7 @@ export async function registerIntentRoutes(app: FastifyInstance): Promise<void> 
       // Membership guard — `params.id` is the intent UUID, not a project
       // UUID, so `requireRole('operator')` cannot enforce membership
       // here. Resolved manually from the intent record's projectId.
-      try {
-        await requireProjectMembership(
-          request.user.id, request.user.role, intent.projectId, 'editor',
-        );
-      } catch (err) {
-        if (err instanceof ProjectMembershipError) return sendProjectMembershipError(reply, err);
-        throw err;
-      }
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, intent.projectId, 'editor')) return;
 
       if (intent.status !== 'waiting-for-clarification') {
         return reply.code(400).send({

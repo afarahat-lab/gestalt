@@ -29,4 +29,9 @@ export class MssqlIntentRepository implements IntentRepository {
     limit: number;
     offset: number;
   }): Promise<{ records: IntentRecord[]; total: number }> { return notImplemented(); }
+  async listAll(_params: {
+    status?: IntentStatus;
+    limit: number;
+    offset: number;
+  }): Promise<{ records: IntentRecord[]; total: number }> { return notImplemented(); }
 }

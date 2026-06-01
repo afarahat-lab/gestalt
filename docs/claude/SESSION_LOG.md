@@ -6421,3 +6421,295 @@ The `POST /interventions still a 501 stub` Pending enhancement
 is removed from STATE.md.
 
 No new Pending enhancements introduced.
+
+---
+
+### Session 2026-06-01 — Claude Code (server-side membership filtering on read endpoints + checkProjectMembership helper)
+
+Closes the read-side counterpart of the prior membership-enforcement
+session. Until now `GET /intents?projectId=…` and most other read
+endpoints accepted any authenticated user — a reader on project A
+who knew (or guessed) the projectId of project B could query its
+intents, alerts, deployments, maintenance runs, executions, and
+interventions. This session shuts that down at the handler level
+for every read endpoint, prevents intent-id enumeration via the
+403-not-404 rule, and introduces a one-line membership-check
+helper that consolidates the fifteen call sites now in the
+codebase.
+
+Changed:
+- `packages/server/src/auth/middleware.ts`: new
+  `checkProjectMembership(reply, userId, platformRole, projectId,
+  minRole = 'reader'): Promise<boolean>`. Internally calls
+  `requireProjectMembership` (kept exported for any caller that
+  needs the raw throw-based form) and on a thrown
+  `ProjectMembershipError` calls `sendProjectMembershipError` to
+  emit the typed `{ error: 'FORBIDDEN', code: NOT_PROJECT_MEMBER |
+  INSUFFICIENT_PROJECT_ROLE, message }` reply, returning `false`
+  so the caller does `return;`. Returns `true` on pass.
+  Non-membership errors are rethrown so the route's normal error
+  path catches them. Reduces every check site to one line
+- `packages/core/src/repository/index.ts`: new
+  `IntentRepository.listAll({ status?, limit, offset })` for the
+  server-wide platform-admin view of `GET /intents`. Returns the
+  same shape as `list(...)`. Per-project queries continue to use
+  `list(...)`
+- `packages/adapters/postgres/src/repositories/intents.ts`:
+  `PostgresIntentRepository.listAll` impl — same query shape as
+  `list` without the `WHERE project_id` filter
+- `packages/adapters/{oracle,mssql}/src/repositories/intents.ts`:
+  throw-stub `listAll` methods added for interface parity
+- `packages/server/src/routes/intents.ts`:
+  - **`GET /intents`** rewrite. With `?projectId=…` →
+    `checkProjectMembership(reader)` then per-project list.
+    Without projectId → platform-admin gets `intents.listAll`,
+    every other user gets `{ data: [], total: 0 }` (200 with
+    empty array, NOT 403 — the "never leak project IDs via
+    error-vs-empty" rule). The old 400 "projectId is required"
+    is gone; the empty-array path covers the new case
+  - **`GET /intents/:id`** — after `intents.findById`, run
+    `checkProjectMembership(intent.projectId, 'reader')`. A
+    non-member gets 403, NOT 404, so they can't enumerate
+    intent UUIDs to detect which ones map to projects they
+    can't see
+  - Both write-path try/catches (POST /intents, POST
+    /intents/:id/clarify) refactored to use
+    `checkProjectMembership` — same semantics, one line each
+- `packages/server/src/routes/executions.ts`:
+  `GET /executions/:id/log` — after `executions.findById`,
+  load `intents.findByCorrelationId(execution.correlationId)`
+  and check membership on `intent.projectId`. The prompts + LLM
+  responses are not for cross-project eyes
+- `packages/server/src/routes/deployments.ts`:
+  - **Dropped the `requireRole('viewer')` preHandler** because
+    when the user passed `?projectId=…` the preHandler ran the
+    old membership check first and returned the legacy `{ error:
+    'Not a member of this project', code: 'FORBIDDEN' }` shape,
+    short-circuiting before the typed
+    `INSUFFICIENT_PROJECT_ROLE` / `NOT_PROJECT_MEMBER` reply.
+    The handler-level `checkProjectMembership` is sufficient
+    (the global auth preHandler already establishes
+    `request.user`)
+  - Handler now runs `checkProjectMembership(reader)` when
+    projectId is present
+- `packages/server/src/routes/maintenance.ts`:
+  - `GET /maintenance/runs` — `checkProjectMembership(reader)`
+    when projectId is provided. No preHandler conflict here —
+    the route never had one
+  - Both write-path try/catches (POST /maintenance/trigger and
+    DELETE /maintenance/findings/:projectId) refactored to use
+    the helper
+- `packages/server/src/oversight/routes.ts`:
+  - **`GET /alerts`** — new optional `?projectId=` query param.
+    With it, runs `checkProjectMembership(reader)` and
+    intersects the result set by looking up each alert's
+    `intents.findByCorrelationId(alert.correlationId)?.projectId
+    === projectId`. The intersection is small in practice (one
+    project's open alerts) so per-alert intent lookup is fine.
+    Without projectId, platform-admin sees every unack alert;
+    regular users get 200 with empty array (same
+    no-enumeration-leak rule). The dashboard's prior
+    client-side intent-id-join filter is now superseded by the
+    server-side filter — pending enhancement closed
+  - **`GET /alerts/:id`** — after `findById`, resolve
+    `intents.findByCorrelationId(alert.correlationId)` and run
+    membership check on the intent's projectId. 403-not-404
+    rule (when an intent exists for the alert; alerts with no
+    resolvable intent — none today — pass through with the
+    alert-not-found 404)
+  - `POST /alerts/:id/fix-intent` try/catch refactored to use
+    the helper
+- `packages/server/src/routes/interventions.ts`:
+  - **`GET /interventions?intentId=…`** — load the intent
+    first; unknown intent → `{ data: [] }`. Then
+    `checkProjectMembership(intent.projectId, 'reader')`. The
+    intervention history is a record of operator decisions on a
+    project's intents — non-members shouldn't see it
+  - POST /interventions try/catch refactored to use the helper
+- `packages/server/src/routes/projects.ts`:
+  - POST /projects/:id/config try/catch refactored to use the
+    helper
+
+Verified live against `trackeros` + a synthetic `outsider` project
+(admin pre-created, no membership for reader/editor), with two test
+users `reader3@example.com` (`reader` on trackeros) and
+`editor3@example.com` (`editor` on trackeros):
+
+**Reader on trackeros** (17 probes, all expected outcomes):
+- `GET /intents?projectId=trackeros&limit=2` → 200, 2 items ✓
+- `GET /intents/<trackeros-intent>` → 200 ✓
+- `GET /intents?projectId=outsider` → 403 `NOT_PROJECT_MEMBER` ✓
+- `GET /intents/<outsider-intent>` → 403 `NOT_PROJECT_MEMBER`
+  (NOT 404 — enumeration prevented) ✓
+- `GET /deployments?projectId=trackeros` → 200 ✓
+- `GET /deployments?projectId=outsider` → 403
+  `NOT_PROJECT_MEMBER` ✓ (preHandler drop confirmed — typed
+  error shape, not the legacy one)
+- `GET /maintenance/runs?projectId=trackeros&limit=2` → 200,
+  2 items ✓
+- `GET /maintenance/runs?projectId=outsider` → 403 ✓
+- `GET /alerts?projectId=trackeros` → 200, 1 alert (the
+  intersection of trackeros' intents and the open alert set) ✓
+- `GET /alerts?projectId=outsider` → 403 ✓
+- `GET /interventions?intentId=<outsider-intent>` → 403 ✓
+- `GET /executions/<trackeros-exec>/log` → 200 ✓
+- `GET /executions/<synthetic-outsider-exec>/log` → 403
+  `NOT_PROJECT_MEMBER` ✓ (the synthetic exec was seeded with a
+  matching outsider intent so the correlationId → intent
+  lookup could find the right project)
+
+**Editor on trackeros:**
+- `GET /intents?projectId=trackeros` → 200 ✓
+- `GET /intents?projectId=outsider` → 403 ✓
+- **Write check** — `POST /intents { projectId: trackeros }` →
+  201 ✓ (the refactor preserved write semantics)
+
+**Platform-admin:**
+- `GET /intents` (no projectId) → 200, server-wide list via
+  `intents.listAll` ✓
+- `GET /intents?projectId=outsider` → 200 (membership bypass) ✓
+- `GET /intents/<outsider-intent>` → 200, full detail incl. 14
+  artifacts ✓
+- `GET /alerts` (no projectId) → 200, server-wide unack list ✓
+
+**Regular user no projectId** (the enumeration-leak guard):
+- `GET /intents` → 200, `data: []` (not 403) ✓
+- `GET /alerts` → 200, `data: []` (not 403) ✓
+
+Decisions made:
+- **`GET /intents` without `projectId` returns empty for non-
+  admin, 200 not 403.** Returning 403 would let an attacker
+  probe "does this project exist" by alternating with-projectId
+  and without-projectId requests and watching the status code.
+  Returning empty makes the absence indistinguishable from
+  membership-not-found. Same rule applied to
+  `GET /alerts` without projectId
+- **`GET /intents/:id` for non-member returns 403, not 404.**
+  Returning 404 for "intent doesn't exist" AND "intent exists
+  but you can't see it" would let an attacker enumerate intent
+  UUIDs (or check a leaked one) to find ones they can't see.
+  Returning 403 only on existence-and-no-membership gives the
+  same response shape regardless of which side of the
+  membership check failed. Same rule for `GET /alerts/:id`
+- **`IntentRepository.listAll` added as a sibling of `list`.**
+  Required because `intents.list(...)` mandates a projectId,
+  and the platform-admin server-wide view of `GET /intents`
+  needs an unfiltered query. Oracle + MSSQL stubs added for
+  interface parity. Same pattern as `ProjectRepository.listAll`
+  which the maintenance scheduler uses
+- **Dropped the `requireRole('viewer')` preHandler from
+  `GET /deployments`** because the old preHandler's
+  membership-check leg returned the legacy `{ error: 'Not a
+  member of this project', code: 'FORBIDDEN' }` shape and
+  short-circuited before the typed
+  `INSUFFICIENT_PROJECT_ROLE` / `NOT_PROJECT_MEMBER` reply
+  could fire. Other read endpoints that retain
+  `requireRole('viewer')` (executions, interventions) are
+  unaffected because their URL params/query don't carry a
+  projectId for the preHandler to find — the preHandler falls
+  through to "authenticated user is enough" and my handler
+  check runs cleanly afterward
+- **`GET /alerts` projectId filter uses per-alert intent
+  lookup, not a SQL join.** The schema-001 alerts table has
+  `correlation_id` but not `project_id`; adding the latter
+  would require a migration + backfill + extra read-path
+  defensive coercion. The dashboard's `?acknowledged=false`
+  result set is small (single-digit alerts per project at
+  steady state), so the in-handler per-alert
+  `findByCorrelationId` lookup is fine. If alert volume grows
+  significantly, the right next step is `project_id` on alerts
+  (with a backfill from `correlation_id` → intent at migration
+  time), but YAGNI today
+- **`GET /interventions` with an unknown intentId returns
+  `{ data: [] }`, not 404.** Same enumeration-prevention rule
+  as the alerts endpoint. Operators querying a real intent
+  they're a member of will get the real history; cross-project
+  probes return empty
+- **The helper supersedes the seven-line try/catch pattern
+  the previous session shipped.** All eight write-path sites
+  (POST /intents, POST /intents/:id/clarify, POST
+  /maintenance/trigger, DELETE
+  /maintenance/findings/:projectId, POST
+  /alerts/:id/fix-intent, POST /projects/:id/config, POST
+  /interventions) refactored to the one-line form along with
+  the seven new read-path sites. Fifteen consumers, one
+  helper, consistent error shape
+- **`requireProjectMembership` and `sendProjectMembershipError`
+  remain exported** — they're the building blocks of the new
+  helper and any future caller that needs the raw throw-based
+  form (e.g., a route that runs more than one membership check
+  before deciding what to do) can still use them
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; full 17-probe matrix verified live; CLI
+and dashboard surfaces unchanged (the existing 403 handlers
+already render the typed friendly message). No new migrations,
+no new tables — pure auth tightening + one repo-interface
+addition.
+
+Follow-ups resolved:
+- The `GET /alerts has no projectId filter` Pending
+  enhancement is closed — the new query parameter + handler
+  intersection ships in this session. Removed from STATE.md
+
+---
+
+### Session 2026-06-01 — Claude Code (two small fixes: gestalt.yml package.json guard + quick-start first-intent clarification)
+
+Two follow-ups to the harness-template work. Both small, both
+docs/template only — no source changes, no schema impact.
+
+Changed:
+- `templates/corporate-ops-web-mobile/ci/gestalt.yml`: the seeded
+  GitHub Actions workflow now guards `pnpm install --frozen-lockfile`
+  and `pnpm test` behind `if [ -f package.json ]` checks. The else
+  branch prints a "skipping install — run gestalt run to scaffold"
+  notice instead of failing the step. Without this, a freshly
+  initialised project (one `gestalt init` push, no `gestalt run` yet)
+  had a CI workflow that failed immediately on its first dispatch
+  because there was no `package.json` to install from. The deploy
+  chain treats `pipeline-passed` as a precondition for promotion, so
+  the failure blocked the whole loop. The guard lets the first
+  `gestalt run` (which scaffolds the foundation) reach `deployed`
+- `docs/guides/quick-start.md` Step 9: prefaces the "submit your
+  first intent" example with an explicit note that `gestalt init`
+  seeds the harness only — application code comes from `gestalt
+  run`. Replaces the older generic "Set up the initial project
+  scaffold" prompt with a concrete "Scaffold the project foundation"
+  intent that names the runtime (TypeScript), package manager
+  (pnpm), test runner (Vitest), and entry point (`src/index.ts`).
+  Adds a follow-up example showing the natural next intent ("Add a
+  hello-world REST endpoint")
+
+Decisions:
+- **No new template variable for "scaffolding prompt".** The
+  recommended first intent is documented in the quick-start, not
+  baked into `agents.yaml` or `AGENTS.md` — different projects
+  will want different runtimes (Node vs Deno vs Bun, TS vs JS,
+  Vitest vs Jest, etc.), and pinning a single prompt in the
+  template would lock that decision before the operator can make
+  it. Keeping the recommendation in prose lets the operator
+  adapt
+- **The `if [ -f package.json ]` guard is in the seeded workflow,
+  not in pipeline-agent.** The platform doesn't try to know
+  whether a project has scaffolded itself yet — it dispatches the
+  workflow, the workflow decides what's runnable. Same separation
+  the rest of the deploy chain follows (pipeline-agent triggers
+  + polls; the workflow owns the per-project steps)
+- **Existing projects don't get the new guard automatically.**
+  The workflow is template-seeded at `gestalt init` time; an
+  already-registered project has its older `gestalt.yml`
+  committed and the template change only affects NEW projects.
+  Operators who hit the missing-package.json failure on an
+  existing project can copy the new block in from this template
+  via a manual PR (or run `gestalt init` against a fresh repo).
+  Documenting this as a "no auto-migration of the workflow file"
+  contract — the harness is operator-owned after the initial
+  seed (matches ADR-018 — drift-agent's additive-only rule for
+  context files; same principle applies to the workflow)
+
+Build status: no source files changed; `pnpm -r build` unaffected.
+No verification cycle needed for the template change — the workflow
+will be visible in the next project that runs `gestalt init`.
+
+No new Pending enhancements.

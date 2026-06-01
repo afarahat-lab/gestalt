@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — `POST /interventions` (ADR-021): resume, abort, acknowledge-breach, request-clarification)
+**Last updated:** 2026-06-01 (Claude Code — gestalt.yml CI handles missing package.json + quick-start clarifies first-intent scaffolding)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -287,6 +287,74 @@ the historical record of how the state evolved._
     `alerts abort` and `alerts acknowledge --notes` both
     succeeded against synthetic GP_BREACH alerts seeded for
     each
+- **Server-side membership filtering on every read endpoint.**
+  Closes the prior gap where a non-member could query
+  `GET /intents?projectId=<any>` (and equivalents) and see another
+  project's data. Six GET endpoints now enforce reader+ at the
+  handler level:
+  - **`GET /intents`** — with `?projectId=` requires reader+
+    membership; without projectId, platform-admin sees the
+    server-wide list (new `IntentRepository.listAll` —
+    interface + postgres impl + oracle/mssql stubs), regular
+    users get a 200 with empty array (NOT a 403 — never leak
+    "project X exists" via error-vs-empty)
+  - **`GET /intents/:id`** — membership checked against the
+    intent's `projectId`. A non-member gets 403 with code
+    `NOT_PROJECT_MEMBER`, NOT 404. Returning 404 would let a
+    non-member enumerate intent UUIDs and infer which ones map
+    to projects they can't see
+  - **`GET /executions/:id/log`** — resolves the intent via
+    `correlationId` and runs the same reader-minimum check; the
+    prompts + LLM responses are not for cross-project eyes
+  - **`GET /deployments?projectId=`** — handler-level reader
+    check (the prior `requireRole('viewer')` preHandler is
+    dropped on this route because it would otherwise short-
+    circuit with the old `{ error: 'Not a member ...', code:
+    'FORBIDDEN' }` shape before the typed
+    `NOT_PROJECT_MEMBER` reply could fire)
+  - **`GET /maintenance/runs?projectId=`** — reader check when
+    projectId is provided
+  - **`GET /alerts?projectId=`** — new optional projectId query
+    param. With it, runs reader check and intersects alerts to
+    those whose intent (via `correlationId`) belongs to the
+    project. Without it, platform-admin sees every unack alert
+    server-wide; regular users get 200 with empty array (same
+    no-enumeration-leak rule as `/intents`)
+  - **`GET /alerts/:id`** — membership checked through the
+    alert's `correlationId → intent → projectId` chain (same
+    403-not-404 rule)
+  - **`GET /interventions?intentId=`** — loads the intent first
+    to get its projectId, then runs the reader check; unknown
+    intentId returns `{ data: [] }` rather than 404 (same
+    rule)
+- **New `checkProjectMembership(reply, userId, role, projectId,
+  minRole)` helper in `auth/middleware.ts`** — boolean-returning
+  wrapper around `requireProjectMembership` that sends the typed
+  403 internally and returns `false` for the caller to bail.
+  Reduces every check site to one line:
+  `if (!await checkProjectMembership(reply, request.user.id,
+  request.user.role, projectId)) return;`. Replaced the 7-line
+  try/catch pattern in all eight write-path sites from the
+  prior membership-enforcement session AND the seven new read-
+  path sites — one helper, fifteen consumers, consistent error
+  shape across the whole auth surface. `requireProjectMembership`
+  and `sendProjectMembershipError` remain exported for any
+  future caller that needs the raw throw-based form
+- **Verified live across the full read matrix** against
+  `trackeros` + a freshly-created `outsider` project:
+  - **reader on trackeros:** intent list/detail, deployments,
+    maintenance/runs, alerts, executions/log → 200 for
+    trackeros, 403 `NOT_PROJECT_MEMBER` for outsider on every
+    endpoint
+  - **editor on trackeros:** all reads for trackeros 200,
+    outsider 403; write path (POST /intents) still 201 — the
+    refactor preserved write semantics
+  - **platform-admin:** GET /intents without projectId returned
+    server-wide list via the new `listAll`; cross-project
+    GET /intents/:id and GET /alerts both 200 (bypass)
+  - **regular user no projectId:** GET /intents → 200 with
+    empty array; GET /alerts → 200 with empty array (the
+    no-enumeration-leak rule)
 - **CLI server URL is fully configurable.** `gestalt config show` /
   `gestalt config set-server <url>` / `gestalt config reset` let
   operators inspect and change `~/.gestalt/config.json` without going
@@ -961,6 +1029,15 @@ the historical record of how the state evolved._
   root; `docs/*` keeps its prefix; `ci/gestalt.yml` →
   `.github/workflows/gestalt.yml`; any future top-level template
   files pass through unchanged
+- The seeded `gestalt.yml` workflow guards both its `pnpm install
+  --frozen-lockfile` and `pnpm test` steps with
+  `if [ -f package.json ]` — the freshly-initialised repo has no
+  `package.json` until the first `gestalt run` scaffolds one, so the
+  first cycle's CI step prints a "skipping install — run gestalt run
+  to scaffold" notice instead of failing on missing pnpm metadata.
+  Subsequent cycles (after a `package.json` lands) install + test
+  normally. Aligned with the Quick Start's recommended first-intent
+  prompt ("Scaffold the project foundation: create package.json …")
 - Skip list: `constraints/`, `principles/`, `template.json`, and
   top-level `README.md` are platform-internal — the engine walks
   them but does not emit them to the project repo
@@ -1396,15 +1473,6 @@ the historical record of how the state evolved._
     stacked action blocks (Resume / Submit-as-new / Dismiss)
 
 **Pending enhancements (design in chat first):**
-- **`GET /alerts` has no `projectId` filter.** The dashboard's
-  Alerts view filters client-side by joining each alert's
-  `context.intentId` against the current project's intent list,
-  which costs an extra `/intents?projectId=…` call per refresh.
-  A server-side query parameter that joins the alerts table to
-  intents (or to a `project_id` column added directly on
-  `alerts`) would let the API return the filtered set in one
-  call and let the Layout's badge count match the visible list
-  without extra plumbing
 - **Return-URL preservation across login.** Pasting `/app/intents/<id>`
   in a fresh tab today bounces to `/app/login` and after sign-in
   lands on `/app/` (the intent ID is dropped). Small SPA-only change —

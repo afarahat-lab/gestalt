@@ -45,7 +45,17 @@ jobs:
           version: 9
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: |
+          if [ -f package.json ]; then
+            pnpm install --frozen-lockfile
+          else
+            echo "No package.json found — skipping install (run gestalt run to scaffold the project)"
+          fi
 
       - name: Run tests
-        run: pnpm test
+        run: |
+          if [ -f package.json ]; then
+            pnpm test
+          else
+            echo "No test script found — skipping tests"
+          fi

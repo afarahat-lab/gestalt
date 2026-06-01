@@ -26,10 +26,7 @@ import {
   getRepositories, createContextLogger,
   type ProjectRecord,
 } from '@gestalt/core';
-import {
-  requireRole, requireProjectMembership, sendProjectMembershipError,
-  ProjectMembershipError,
-} from '../auth/middleware';
+import { requireRole, checkProjectMembership } from '../auth/middleware';
 import { loadTemplate, resolveTemplatesDir } from '../templates/engine';
 
 /** ADR-036 — every project today gets the Tier 1 template. Future
@@ -334,14 +331,7 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
       // Editing HARNESS.json shapes how the deploy chain runs for every
       // operator on this project. Editor isn't enough — must be a
       // project-admin (or platform-admin via the helper's bypass).
-      try {
-        await requireProjectMembership(
-          request.user.id, request.user.role, request.params.id, 'project-admin',
-        );
-      } catch (err) {
-        if (err instanceof ProjectMembershipError) return sendProjectMembershipError(reply, err);
-        throw err;
-      }
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, request.params.id, 'project-admin')) return;
 
       const body = request.body ?? ({} as UpdateConfigBody);
       const requestedAdapter = body.pipeline?.adapter;

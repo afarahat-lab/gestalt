@@ -256,3 +256,36 @@ export function sendProjectMembershipError(
     message: err.message,
   });
 }
+
+/**
+ * One-line helper that wraps `requireProjectMembership` + the
+ * `sendProjectMembershipError` reply path. Returns `true` when the
+ * check passed (caller proceeds normally) and `false` when a 403
+ * was sent (caller should `return;`). Non-membership errors are
+ * rethrown so the route handler's normal error path catches them.
+ *
+ * Replaces the 7-line try/catch boilerplate that grew around every
+ * handler-level membership check in the membership-enforcement
+ * session.
+ *
+ * @example
+ * if (!await checkProjectMembership(reply, request.user.id, request.user.role, projectId)) return;
+ */
+export async function checkProjectMembership(
+  reply: FastifyReply,
+  userId: string,
+  platformRole: string,
+  projectId: string,
+  minRole: ProjectRole = 'reader',
+): Promise<boolean> {
+  try {
+    await requireProjectMembership(userId, platformRole, projectId, minRole);
+    return true;
+  } catch (err) {
+    if (err instanceof ProjectMembershipError) {
+      sendProjectMembershipError(reply, err);
+      return false;
+    }
+    throw err;
+  }
+}

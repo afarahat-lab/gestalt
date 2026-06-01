@@ -113,4 +113,27 @@ export class PostgresIntentRepository implements IntentRepository {
 
     return { records, total: parseInt(count, 10) };
   }
+
+  async listAll(params: {
+    status?: IntentStatus;
+    limit: number;
+    offset: number;
+  }): Promise<{ records: IntentRecord[]; total: number }> {
+    const db = getDb();
+
+    const records = await db<IntentRecord[]>`
+      SELECT * FROM intents
+      ${params.status ? db`WHERE status = ${params.status}` : db``}
+      ORDER BY created_at DESC
+      LIMIT ${params.limit}
+      OFFSET ${params.offset}
+    `;
+
+    const [{ count }] = await db<[{ count: string }]>`
+      SELECT COUNT(*)::text AS count FROM intents
+      ${params.status ? db`WHERE status = ${params.status}` : db``}
+    `;
+
+    return { records, total: parseInt(count, 10) };
+  }
 }

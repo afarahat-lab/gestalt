@@ -32,10 +32,7 @@ import {
   type TaskMessage, type TaskPriority, type InterventionAction,
 } from '@gestalt/core';
 import { emitLiveEvent } from '../events';
-import {
-  requireRole, requireProjectMembership, sendProjectMembershipError,
-  ProjectMembershipError,
-} from '../auth/middleware';
+import { requireRole, checkProjectMembership } from '../auth/middleware';
 
 const log = createContextLogger({ module: 'routes:interventions' });
 
@@ -59,11 +56,19 @@ export async function registerInterventionRoutes(app: FastifyInstance): Promise<
     '/interventions',
     { preHandler: requireRole('viewer') },
     async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
       const intentId = request.query.intentId?.trim();
       if (!intentId) {
         return reply.code(400).send({ error: 'intentId is required' });
       }
-      const { interventions } = getRepositories();
+      const { interventions, intents } = getRepositories();
+      // Resolve the intent so we can enforce project membership. An
+      // unknown intentId returns an empty array (consistent with the
+      // "never leak via 404 vs empty" rule used elsewhere in the
+      // read layer).
+      const intent = await intents.findById(intentId);
+      if (!intent) return reply.send({ data: [] });
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, intent.projectId)) return;
       const rows = await interventions.findByIntentId(intentId);
       return reply.send({ data: rows });
     },
@@ -105,14 +110,7 @@ export async function registerInterventionRoutes(app: FastifyInstance): Promise<
       }
 
       // Membership check — the projectId is on the intent, not in the URL.
-      try {
-        await requireProjectMembership(
-          request.user.id, request.user.role, intent.projectId, 'editor',
-        );
-      } catch (err) {
-        if (err instanceof ProjectMembershipError) return sendProjectMembershipError(reply, err);
-        throw err;
-      }
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, intent.projectId, 'editor')) return;
 
       // Resolve the GP_BREACH signal + alert for this cycle. There can
       // be more than one breach signal — operators address them as a

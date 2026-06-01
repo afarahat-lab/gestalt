@@ -247,10 +247,30 @@ on the next intent cycle.
 
 ### Step 9 — Submit your first intent
 
-From inside your project folder:
+`gestalt init` only seeds the harness files (`AGENTS.md`,
+`HARNESS.json`, `agents.yaml`, `docs/*`, `.github/workflows/gestalt.yml`)
+— it does NOT create application code. The repo has no `package.json`
+yet, no `src/`, nothing to run. Application code comes from
+`gestalt run`.
+
+The first intent should scaffold the project foundation:
 
 ```bash
-gestalt run "Set up the initial project scaffold with folder structure"
+gestalt run "Scaffold the project foundation: create package.json for a
+TypeScript application with pnpm as package manager, Vitest for testing,
+and a src/ directory with src/index.ts as the entry point"
+```
+
+The pipeline workflow (`.github/workflows/gestalt.yml`) skips
+`pnpm install` and `pnpm test` until a `package.json` exists, so the
+first cycle won't fail on a missing scaffold — the CI step prints a
+"skipping install — run `gestalt run` to scaffold" notice and the
+deploy chain proceeds.
+
+After the foundation lands, you can submit feature intents normally:
+
+```bash
+gestalt run "Add a hello-world REST endpoint at GET /hello"
 ```
 
 Watch live agent activity:

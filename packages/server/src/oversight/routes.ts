@@ -32,16 +32,14 @@ import type {
   AlertRecord, TaskMessage, TaskPriority, CodeLocation,
 } from '@gestalt/core';
 import { emitLiveEvent } from '../events';
-import {
-  requireRole, requireProjectMembership, sendProjectMembershipError,
-  ProjectMembershipError,
-} from '../auth/middleware';
+import { requireRole, checkProjectMembership } from '../auth/middleware';
 
 const log = createContextLogger({ module: 'routes:oversight' });
 
 interface ListAlertsQuery {
   acknowledged?: string;  // 'true' | 'false' — defaults to unacknowledged-only
   severity?: string;
+  projectId?: string;
 }
 
 interface AcknowledgeBody {
@@ -79,8 +77,29 @@ export async function registerOversightRoutes(app: FastifyInstance): Promise<voi
   // GET /alerts — defaults to acknowledged=false so the dashboard's
   // "Alerts" tab shows the actionable ones. Response shape:
   //   { data: EnrichedAlert[] }
+  //
+  // Membership rules (matches the read-side pattern of /intents):
+  //   - With ?projectId=…  → reader+ on that project; the result set
+  //     is then filtered to alerts whose intent belongs to the
+  //     project (alerts with no resolvable intent — none today —
+  //     would be dropped). Closes the dashboard's prior
+  //     client-side-only filter, which let any authenticated user
+  //     query /alerts and see every project's alerts
+  //   - Without projectId  → platform-admin sees every unack alert;
+  //     regular users get an empty array (same shape as /intents
+  //     without projectId — never leak project ids via error vs
+  //     empty)
   app.get<{ Querystring: ListAlertsQuery }>('/alerts', async (request, reply) => {
-    const { alerts } = getRepositories();
+    if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+    const { alerts, intents } = getRepositories();
+    const projectId = request.query.projectId?.trim();
+
+    if (projectId) {
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, projectId)) return;
+    } else if (request.user.role !== 'platform-admin') {
+      return reply.send({ data: [], total: 0 });
+    }
+
     const showAcknowledged = request.query.acknowledged === 'true';
     const all = showAcknowledged
       ? []  // intentional: today the dashboard only consumes unacknowledged;
@@ -88,18 +107,39 @@ export async function registerOversightRoutes(app: FastifyInstance): Promise<voi
             // breaking change
       : await alerts.findUnacknowledged();
     const severityFilter = request.query.severity;
-    const filtered = severityFilter
+    const bySeverity = severityFilter
       ? all.filter((a) => a.severity === severityFilter)
       : all;
+
+    // When projectId is provided, intersect alerts with the project's
+    // intents via correlationId. The set is small in practice (one
+    // project's open alerts), so a per-alert intent lookup is fine.
+    let filtered = bySeverity;
+    if (projectId) {
+      const matched: typeof bySeverity = [];
+      for (const a of bySeverity) {
+        const intent = await intents.findByCorrelationId(a.correlationId);
+        if (intent?.projectId === projectId) matched.push(a);
+      }
+      filtered = matched;
+    }
+
     const enriched = await Promise.all(filtered.map(enrichAlert));
     return reply.send({ data: enriched, total: enriched.length });
   });
 
-  // GET /alerts/:id
+  // GET /alerts/:id — single alert. Membership check via correlationId
+  // → intent → projectId (same prevention-of-enumeration rule as
+  // /intents/:id: a non-member gets 403, not 404).
   app.get<{ Params: { id: string } }>('/alerts/:id', async (request, reply) => {
-    const { alerts } = getRepositories();
+    if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+    const { alerts, intents } = getRepositories();
     const alert = await alerts.findById(request.params.id);
     if (!alert) return reply.code(404).send({ error: 'Alert not found' });
+    const intent = await intents.findByCorrelationId(alert.correlationId);
+    if (intent) {
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, intent.projectId)) return;
+    }
     const enriched = await enrichAlert(alert);
     return reply.send({ data: enriched });
   });
@@ -182,14 +222,7 @@ export async function registerOversightRoutes(app: FastifyInstance): Promise<voi
 
       // Editor or above required — the fix intent will commit code on
       // the resolved project's repo.
-      try {
-        await requireProjectMembership(
-          request.user.id, request.user.role, projectId, 'editor',
-        );
-      } catch (err) {
-        if (err instanceof ProjectMembershipError) return sendProjectMembershipError(reply, err);
-        throw err;
-      }
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, projectId, 'editor')) return;
 
       const correlationId = crypto.randomUUID();
       const intent = await intents.create({

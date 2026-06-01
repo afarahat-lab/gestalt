@@ -16,10 +16,7 @@ import {
 } from '@gestalt/core';
 import { triggerMaintenanceRun } from '@gestalt/agents-maintenance';
 import type { MaintenanceAgentName } from '@gestalt/agents-maintenance';
-import {
-  requireRole, requireProjectMembership, sendProjectMembershipError,
-  ProjectMembershipError,
-} from '../auth/middleware';
+import { requireRole, checkProjectMembership } from '../auth/middleware';
 
 const log = createContextLogger({ module: 'routes:maintenance' });
 
@@ -43,7 +40,11 @@ export async function registerMaintenanceRoutes(app: FastifyInstance): Promise<v
   app.get<{ Querystring: ListQuery }>(
     '/maintenance/runs',
     async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
       const { maintenanceRuns } = getRepositories();
+      if (request.query.projectId) {
+        if (!await checkProjectMembership(reply, request.user.id, request.user.role, request.query.projectId)) return;
+      }
       const limit = Math.min(
         Math.max(1, parseInt(request.query.limit ?? '20', 10) || 20),
         200,
@@ -80,14 +81,7 @@ export async function registerMaintenanceRoutes(app: FastifyInstance): Promise<v
       // check membership for us — do it here. Editor is the minimum:
       // readers shouldn't be triggering maintenance work that could
       // queue an intent against the project.
-      try {
-        await requireProjectMembership(
-          request.user.id, request.user.role, projectId, 'editor',
-        );
-      } catch (err) {
-        if (err instanceof ProjectMembershipError) return sendProjectMembershipError(reply, err);
-        throw err;
-      }
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, projectId, 'editor')) return;
 
       const { projects } = getRepositories();
       const project = await projects.findById(projectId);
@@ -132,14 +126,7 @@ export async function registerMaintenanceRoutes(app: FastifyInstance): Promise<v
       // doesn't resolve membership for us. Same editor-minimum as the
       // trigger above — resetting another project's finding budget is
       // not something a reader of THIS project should be able to do.
-      try {
-        await requireProjectMembership(
-          request.user.id, request.user.role, projectId, 'editor',
-        );
-      } catch (err) {
-        if (err instanceof ProjectMembershipError) return sendProjectMembershipError(reply, err);
-        throw err;
-      }
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, projectId, 'editor')) return;
 
       const { projects, findingAttempts, audit } = getRepositories();
       const project = await projects.findById(projectId);
