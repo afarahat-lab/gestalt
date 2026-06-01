@@ -39,6 +39,11 @@ COPY packages/agents/quality-gate  ./packages/agents/quality-gate
 COPY packages/agents/deploy        ./packages/agents/deploy
 COPY packages/agents/maintenance   ./packages/agents/maintenance
 
+# Harness templates (ADR-036). The engine reads + substitutes these
+# at init-harness time; they ship as part of the image so the server
+# doesn't need outbound network access to fetch them.
+COPY templates                     ./templates
+
 # Build in dependency order
 RUN pnpm --filter @gestalt/core build
 RUN pnpm --filter @gestalt/adapter-postgres build
@@ -85,6 +90,11 @@ COPY --from=builder /app/packages/dashboard/dist                ./packages/dashb
 # SQL migrations run at startup
 COPY --from=builder /app/packages/adapters/postgres/src/migrations \
                     ./packages/adapters/postgres/src/migrations
+
+# Harness templates — copied verbatim from the builder image. The
+# template engine (packages/server/src/templates/engine.ts) walks
+# /app/templates/<id>/ on every init-harness call.
+COPY --from=builder /app/templates ./templates
 
 # Production-only dependencies
 RUN pnpm install --prod --no-frozen-lockfile

@@ -1,0 +1,29 @@
+{
+  "id": "corporate-ops-web-mobile",
+  "name": "Corporate Operations Web & Mobile",
+  "version": "0.1.0",
+  "tier": "tier1",
+  "description": "Harness for corporate operations web and mobile applications",
+  "variables": {
+    "projectName": {
+      "required": true,
+      "description": "Short project identifier"
+    },
+    "projectDescription": {
+      "required": true,
+      "description": "Natural language project description"
+    },
+    "defaultBranch": {
+      "required": false,
+      "default": "main"
+    },
+    "today": {
+      "required": false,
+      "description": "ISO date at init time (auto-supplied by the engine)"
+    },
+    "projectSlug": {
+      "required": false,
+      "description": "kebab-cased projectName (auto-derived by the engine)"
+    }
+  }
+}

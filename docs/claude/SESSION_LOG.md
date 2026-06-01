@@ -4794,3 +4794,237 @@ Follow-up logged:
   + `llm.apiKey` fields and the loader + registry extended to
   honour them. Reasonable next step for multi-provider shops
 
+---
+
+### Session 2026-06-01 — Claude Code (harness templates moved out of projects.ts into templates/ — ADR-036)
+
+Pays down the technical debt the ADR-032 session log flagged:
+*"Inlined harness file content in routes/projects.ts (Dockerfile
+does not copy templates/; revisit when template story matures)."*
+The eight `build*()` functions inside `projects.ts` (815 lines)
+that returned harness file content as TypeScript string literals
+are now actual files under `templates/corporate-ops-web-mobile/`
+with `{{variable}}` placeholders. The server reads + substitutes
+them via a lightweight engine; the Dockerfile ships the directory
+in the image.
+
+Changed:
+- `templates/corporate-ops-web-mobile/` — new template files
+  extracted verbatim from the existing `build*()` content with
+  hardcoded values replaced by `{{placeholders}}`:
+  - `template.json` — template metadata (`id`, `name`, `version`,
+    `tier`, `description`, `variables` map documenting what
+    operators should supply)
+  - `harness/AGENTS.md` — `{{projectName}}` +
+    `{{projectDescription}}` substituted; rest verbatim
+    including the Operator notes — Git credential scopes block
+  - `harness/HARNESS.json` — `{{projectSlug}}` (auto-derived
+    kebab-case from projectName), `{{projectDescription}}`
+    substituted; includes the new
+    `"templateId": "corporate-ops-web-mobile"` field
+  - `harness/agents.yaml` — verbatim from `buildAgentsYaml()`,
+    no substitution needed (this file is project-agnostic)
+  - `docs/ARCHITECTURE.md` — `{{projectName}}` substituted
+  - `docs/DOMAIN.md` — `{{projectName}}` substituted
+  - `docs/GOLDEN_PRINCIPLES.md` — verbatim, no substitution
+  - `docs/DECISIONS.md` — `{{projectName}}`,
+    `{{projectDescription}}`, `{{today}}` substituted
+  - `ci/gestalt.yml` — verbatim, no substitution
+- `packages/server/src/templates/engine.ts` (new): the engine
+  - `loadTemplate(templatesDir, templateId, vars)` walks the
+    template directory, runs `substitute()` on each file body,
+    and returns the list of `{ repoPath, content }` pairs
+  - `substitute(content, vars)` is one regex
+    (`/\{\{(\w+)\}\}/g`). Unknown keys log a `debug` line and
+    leave `{{key}}` in place — debuggable rather than silently
+    empty
+  - Auto-supplies `today` (ISO date at load time) and
+    `projectSlug` (kebab-cased + lowercased `projectName`)
+    when the caller omits them; supplies `defaultBranch:
+    'main'` as a fallback default
+  - Skip lists: `constraints/` + `principles/` directories +
+    the brace-expansion artifact directory
+    `{harness,principles,constraints}/` skipped recursively;
+    top-level `template.json` + `README.md` skipped (template
+    descriptors, not project content)
+  - `resolveRepoPath()` maps `harness/X` → `X`,
+    `ci/gestalt.yml` → `.github/workflows/gestalt.yml`,
+    everything else (including `docs/*`) passes through
+  - `resolveTemplatesDir()` is sync — runs once at module load,
+    caches the result. Walks four candidate paths:
+    `cwd/templates` (Docker `/app/templates`), `cwd/../../templates`
+    (`pnpm dev` from `packages/server`), and two `__dirname`
+    based paths for compiled JS variants. Throws with a helpful
+    message at module load if no candidate resolves (server
+    fails to start rather than 500ing the first registration)
+- `packages/server/src/routes/projects.ts`:
+  - New imports for `loadTemplate` / `resolveTemplatesDir`
+    from `../templates/engine`
+  - Module-scope const `TEMPLATES_DIR = resolveTemplatesDir()`
+    pins the resolution cache at import time
+  - Module-scope const `DEFAULT_TEMPLATE_ID =
+    'corporate-ops-web-mobile'` documents the implicit choice
+    (future templates would be selected via an `init-harness`
+    body field once the registry can list them)
+  - The init-harness handler's file-writing block now reads:
+    ```ts
+    const harnessFiles = await loadTemplate(TEMPLATES_DIR,
+      DEFAULT_TEMPLATE_ID, { projectName, projectDescription,
+      defaultBranch });
+    for (const file of harnessFiles) {
+      const fullPath = join(workDir, file.repoPath);
+      await mkdir(dirname(fullPath), { recursive: true });
+      await writeFile(fullPath, file.content, 'utf8');
+    }
+    ```
+    Slightly cleaner than the old `Object.entries(...)` form;
+    `dirname(fullPath)` replaces the old `join(fullPath, '..')`
+    pattern
+  - **Deleted lines 423–831**: the 8 `build*()` functions
+    (`buildHarnessFiles`, `buildAgentsYaml`, `buildAgentsMd`,
+    `buildHarnessJson`, `buildArchitectureMd`, `buildDomainMd`,
+    `buildGoldenPrinciplesMd`, `buildDecisionsMd`,
+    `buildGestaltWorkflowYml`), the `HarnessInputs` interface,
+    and the closing comment block. File shrank from 815 to
+    422 lines (48% reduction)
+- `packages/server/Dockerfile`:
+  - Builder stage gained `COPY templates ./templates` so
+    `templates/` is available during the build
+  - Production stage gained `COPY --from=builder
+    /app/templates ./templates` so it lands in the final image
+  - Both COPY directives are paired with comment blocks
+    pointing at ADR-036
+- `.dockerignore`:
+  - Previously excluded `templates` (correct under the inline
+    scheme — the directory wasn't needed in the build context)
+  - Now excludes `docs` only; the comment block flags
+    `templates/` as deliberately included per ADR-036
+- `docs/DECISIONS.md`: appended ADR-036 with full Decision /
+  Rationale / Engine contract / Consequences blocks
+
+Verified live:
+- `pnpm -r build` clean across all 12 packages
+- `docker-compose up -d --build server` rebuilt successfully
+  with the new COPY directives. Server reaches `Up (healthy)`;
+  `/health` returns 200
+- **`/app/templates` exists inside the container.** `docker
+  exec gestalt-server-1 ls /app/templates` shows
+  `corporate-ops-web-mobile`; recursive listing shows all 8
+  expected files at the expected paths plus `README.md` +
+  `template.json` + `constraints/` + `principles/` (the latter
+  three skipped by the engine but visible on disk)
+- **Server startup log emits the resolution.** The
+  `template-engine` logger writes `"Templates directory
+  resolved" templatesDir: "/app/templates"` once at module
+  import (driven by the module-scope `resolveTemplatesDir()`
+  call in `projects.ts`)
+- **Engine end-to-end** — `docker exec gestalt-server-1 node
+  -e "..."` running `loadTemplate('/app/templates',
+  'corporate-ops-web-mobile', { projectName: 'Test Project',
+  projectDescription: 'A test project description' })`
+  returned exactly 8 files at the expected repo paths:
+  ```
+  .github/workflows/gestalt.yml  (1418 bytes)
+  docs/ARCHITECTURE.md           (574  bytes)
+  docs/DECISIONS.md              (330  bytes)
+  docs/DOMAIN.md                 (103  bytes)
+  docs/GOLDEN_PRINCIPLES.md      (694  bytes)
+  AGENTS.md                      (1390 bytes)
+  HARNESS.json                   (1656 bytes)
+  agents.yaml                    (3519 bytes)
+  ```
+  Spot checks confirmed every substitution:
+  - `AGENTS.md` starts `# AGENTS.md — Test Project`
+  - `HARNESS.json` has `"name": "test-project"` (slug
+    auto-derived from `Test Project`) + `"templateId":
+    "corporate-ops-web-mobile"` + `"description": "A test
+    project description"`
+  - `docs/DECISIONS.md` has `Date: 2026-06-01` (today
+    auto-supplied) + `Description: A test project
+    description`
+- **Local-dev resolution path also works.** Ran `node -e
+  "..."` from `packages/server` against the compiled
+  `dist/templates/engine.js` — `resolveTemplatesDir()`
+  returned `/Users/amrmohamed/Work/gestalt/templates` (the
+  `process.cwd() + '../../templates'` candidate matched),
+  loaded all 8 files cleanly
+- **`projects.ts` is free of inline build functions.** `grep
+  "^function build\|^interface HarnessInputs\b"` returns
+  zero matches; the only references to the template surface
+  are the import, the `TEMPLATES_DIR` module-load
+  resolution, and the single `loadTemplate(...)` call inside
+  the handler
+
+Decisions made:
+- **`projectSlug` auto-derived from `projectName`, not a
+  separate variable the caller supplies.** The old
+  `buildHarnessJson()` did the same kebab-case derivation
+  inline. Centralising it in the engine (and exposing it as
+  `{{projectSlug}}` so any template file can reference it)
+  removes the need for every template author to repeat the
+  regex. Caller can still override via
+  `variables.projectSlug` if they want a custom shape
+- **Unknown variables leave `{{key}}` in place, not empty
+  string.** Empty-string substitution would silently mask
+  configuration bugs; leaving the literal makes the missing
+  value visible in the committed file (operator sees
+  `{{somethingNew}}` in `HARNESS.json` and knows to ask).
+  Debug-logged so the server-side trace is captured
+- **`resolveTemplatesDir()` is sync, runs at module load.**
+  Async resolution would mean every init-harness call pays
+  the FS walk cost. Cached + sync means: one walk per server
+  process, plus a startup-time failure if the directory is
+  missing (better than a 500 on the first project
+  registration with no diagnostic context)
+- **`HARNESS.json` template carries `templateId`** at the
+  top level. Lets a future drift-agent or registry tool
+  distinguish "project X was bootstrapped from
+  corporate-ops-web-mobile@0.1.0" from "project X was
+  hand-rolled". No code depends on this yet, but exposing
+  it costs nothing
+- **Skip list includes the `{harness,principles,constraints}/`
+  artifact directory.** A previous shell command in this
+  repo's history created an empty directory with that
+  literal name (a brace-expansion failure mode). The engine
+  needs to walk past it without falling over; explicit
+  inclusion in `SKIP_DIRS` is documentation as much as
+  defensive code
+- **`docs/*` keeps its prefix** in the repo-path mapping
+  while `harness/*` strips it. Reflects how project repos
+  actually organise context files: `AGENTS.md` / `HARNESS.json`
+  / `agents.yaml` at the root, `docs/*` in a subdirectory.
+  No special case for `ci/gestalt.yml` would have been
+  ergonomic — the explicit `.github/workflows/gestalt.yml`
+  remap keeps GitHub Actions happy without renaming the
+  source file to something with `.github` in its path
+- **All 8 template files extracted verbatim from `build*()`
+  content** (not from the pre-existing `templates/`
+  directory's stub content). The existing `harness/AGENTS.md`
+  and `principles/GOLDEN_PRINCIPLES.md` had different
+  content from what the server was actually committing today;
+  using the `build*()` source preserved byte-equivalence with
+  the pre-refactor behaviour. New projects get the same
+  files they would have got before this change
+- **Dockerfile: builder + production both COPY templates.**
+  Builder needs them to be part of the build context (so the
+  test-runner / lint stages could exercise them in the
+  future); production needs them at runtime so the engine can
+  read them. Two COPY directives, both pointing to the same
+  source, is the cleanest expression of intent. Could have
+  skipped the builder copy and only put it in production, but
+  that would make the builder image diverge from what the
+  source tree contains in a non-obvious way
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; full template engine verified end-to-end
+inside the container and against the local-dev path. The
+`projects.ts` file is now a thin routing + Git layer; harness
+content is reviewable as markdown / JSON / YAML diffs in any
+editor.
+
+No new follow-ups added — the technical debt the ADR-032
+session log flagged is now paid down. Future templates (Tier
+2/3, domain-specific) drop in by adding a directory under
+`templates/` and registering the new id; no engine or route
+code changes needed.
+

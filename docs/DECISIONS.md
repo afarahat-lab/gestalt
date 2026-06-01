@@ -485,3 +485,86 @@ costs multiple agent cycles.
 - `IntentRecord.source = 'maintenance-agent'` distinguishes maintenance-queued intents from human ones in `gestalt status` and dashboards.
 - The duplicate-intent guard in evaluation-agent inspects the intent text for the `[gestalt-maintenance/<TYPE>]` prefix that every maintenance dispatch carries — prevents piling on duplicate `PERFORMANCE_DEGRADATION` intents while a previous one is still in-flight.
 - `node-cron` runs in the server process; maintenance is **not** a BullMQ worker. Scheduled agents execute inline in their cron callbacks. Manual operator triggers (`POST /maintenance/trigger`) share the same runner code path.
+
+
+---
+
+## ADR-036 — Harness templates are files, not inline code
+
+**Date:** 2026-06-01
+**Status:** Accepted
+
+**Decision:** All harness file content (`HARNESS.json`, `AGENTS.md`,
+`agents.yaml`, the `docs/*.md` set, `.github/workflows/gestalt.yml`)
+lives in `templates/<templateId>/` as actual files with `{{variable}}`
+placeholders. The server reads, substitutes, and commits them via the
+lightweight engine in `packages/server/src/templates/engine.ts`. The
+Dockerfile copies `templates/` into both the builder and production
+stages of the server image. No harness content is hardcoded in route
+handlers.
+
+**Rationale:** Template content was previously inlined in
+`packages/server/src/routes/projects.ts` as eight hand-written
+`build*()` functions (`buildAgentsMd`, `buildHarnessJson`,
+`buildAgentsYaml`, `buildArchitectureMd`, `buildDomainMd`,
+`buildGoldenPrinciplesMd`, `buildDecisionsMd`, `buildGestaltWorkflowYml`).
+The ADR-032 session log documented this as technical debt:
+*"Inlined harness file content in routes/projects.ts (Dockerfile does
+not copy templates/; revisit when template story matures)."* Moving
+to files:
+
+- Templates become version-controllable as content, not as
+  string-concatenated TypeScript. Diffs on `templates/<id>/AGENTS.md`
+  are real markdown diffs reviewable in any editor / git log.
+- A new template (Tier 2/3, or domain-specific) lands by dropping a
+  directory under `templates/`. No server code changes; no
+  redeploy beyond the next image build.
+- Substitution is one regex (`/\{\{(\w+)\}\}/g`) with no
+  conditionals or loops. Unknown variables are left in place
+  (e.g. `{{somethingNew}}` survives as the literal string) so a
+  forgotten value is debuggable in the committed file rather than
+  silently empty.
+
+**Engine contract (`packages/server/src/templates/engine.ts`):**
+
+- `loadTemplate(templatesDir, templateId, variables)` returns the
+  list of `{ repoPath, content }` pairs ready to write into the
+  cloned project tree.
+- `today` and `projectSlug` are auto-supplied (ISO date, kebab-cased
+  projectName) when the caller omits them. Other unknown placeholders
+  log a debug message and stay in the file.
+- Files under `harness/` are committed at the project root
+  (`harness/AGENTS.md` → `AGENTS.md`). `docs/*` keeps its prefix.
+  `ci/gestalt.yml` maps to `.github/workflows/gestalt.yml`.
+- `constraints/` + `principles/` directories and the top-level
+  `template.json` + `README.md` are platform-internal and skipped —
+  they describe the template but don't belong in project repos.
+- `resolveTemplatesDir()` walks a candidate list at module load
+  time, caches the result, and supports three deployment modes:
+  Docker production (`/app/templates`), `pnpm dev` from
+  `packages/server` (walks up to repo root), and `node dist/...`
+  from `packages/server` (walks up from the compiled JS location).
+
+**Consequences:**
+
+- New `template.json` per template documents `id`, `name`,
+  `version`, `tier`, `description`, and the `variables` operators are
+  expected to supply.
+- `.dockerignore` no longer excludes `templates/`. The Dockerfile
+  adds `COPY templates ./templates` to the builder stage AND
+  `COPY --from=builder /app/templates ./templates` to the
+  production stage.
+- `projects.ts` shrinks from 815 lines to 422 lines — the eight
+  `build*()` functions and the `HarnessInputs` interface are deleted.
+  The init-harness handler is the only caller of the engine; the
+  rest of the route file deals with project CRUD + Git wrangling.
+- `HARNESS.json` template includes `templateId:
+  "corporate-ops-web-mobile"` so future tooling (registry, audit,
+  drift-agent's template-aware checks) can identify which template
+  seeded the project without re-parsing the harness.
+- Project-side behaviour is byte-for-byte unchanged from before the
+  refactor — the template content is the same strings the
+  `build*()` functions produced. Existing projects don't see any
+  difference. Live verification confirmed: a freshly initialised
+  test project receives the same eight files at the same paths
+  with the same content modulo `{{variable}}` substitution.

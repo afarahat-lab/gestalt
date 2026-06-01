@@ -14,7 +14,7 @@ content is derived._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — per-agent model override activated via LLMClient registry)
+**Last updated:** 2026-06-01 (Claude Code — harness templates moved out of projects.ts into templates/ — ADR-036)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -693,6 +693,61 @@ content is derived._
 7. `git pull` — receive harness files locally
 8. `gestalt run "<intent>"` — submit work to agents
 
+**Harness templates live in `templates/`, not inline in routes (ADR-036).**
+- All 8 harness files (`AGENTS.md`, `HARNESS.json`, `agents.yaml`,
+  the 4 `docs/*.md`, `.github/workflows/gestalt.yml`) ship as
+  files under `templates/corporate-ops-web-mobile/{harness,docs,ci}/`
+  with `{{variable}}` placeholders
+- `packages/server/src/templates/engine.ts` provides
+  `loadTemplate(templatesDir, templateId, vars)`, a one-regex
+  substitution engine (`/\{\{(\w+)\}\}/g`) with no conditionals or
+  loops. Unknown variables are left in place (the literal
+  `{{foo}}` survives into the committed file) so missing values
+  are debuggable rather than silently empty
+- Auto-supplied variables: `today` (ISO date at load time) and
+  `projectSlug` (kebab-cased `projectName`). Caller supplies
+  `projectName`, `projectDescription`, and optionally
+  `defaultBranch`
+- Repo-path mapping is contract: `harness/X` → `X` at the repo
+  root; `docs/*` keeps its prefix; `ci/gestalt.yml` →
+  `.github/workflows/gestalt.yml`; any future top-level template
+  files pass through unchanged
+- Skip list: `constraints/`, `principles/`, `template.json`, and
+  top-level `README.md` are platform-internal — the engine walks
+  them but does not emit them to the project repo
+- `resolveTemplatesDir()` is sync, walks 4 candidate paths
+  (Docker `/app/templates`, `pnpm dev` from `packages/server`,
+  `node dist/...` from compiled paths), caches the result at
+  module load. Throws at module-load time if no candidate
+  resolves, so the server fails fast rather than 500ing on the
+  first registration
+- `init-harness` route became a thin orchestrator: clone repo,
+  call `loadTemplate(...)`, write each file via `mkdir` +
+  `writeFile`, commit + push. The 8 inline `build*()` functions
+  + the `HarnessInputs` interface are deleted —
+  `packages/server/src/routes/projects.ts` shrank from 815 to
+  422 lines (48% reduction)
+- The seeded `HARNESS.json` carries
+  `"templateId": "corporate-ops-web-mobile"` so future tooling
+  (registry, drift-agent template-aware checks) can identify
+  which template seeded the project
+- **Dockerfile + `.dockerignore` updated.** The Dockerfile copies
+  `templates/` into the builder stage AND the production stage;
+  `.dockerignore` no longer excludes the directory. The
+  template engine reads from `/app/templates/<id>/` at runtime
+- Verified live: docker rebuild → `/app/templates/corporate-ops-web-mobile/`
+  visible inside the container with all 8 expected files;
+  server startup log emits `"Templates directory resolved"
+  templatesDir: "/app/templates"`. Direct engine invocation
+  produces 8 substituted files for `projectName: "Test Project"`
+  / `projectDescription: "A test project description"` —
+  `AGENTS.md` starts with `# AGENTS.md — Test Project`,
+  `HARNESS.json` has `"name": "test-project"` (slug-derived) +
+  `"description": "A test project description"`,
+  `DECISIONS.md` includes `Date: 2026-06-01`. Local-dev
+  resolution from `packages/server` cwd also resolves correctly
+  (walks up to repo root)
+
 **Step 1: externalise agent prompts to agents.yaml — implemented.**
 - Every LLM-reasoning agent reads its persona (`role`, `goal`), LLM
   tuning (`temperature`, `max_tokens`, optional `model`), and a flat
@@ -1002,292 +1057,6 @@ content is derived._
 ---
 
 ## Recent session log entries (last 3 from SESSION_LOG.md)
-
-### Session 2026-06-01 — Claude Code (richer alerts: enriched payload + fix-intent flow + CLI alerts commands)
-
-Closes the operator workflow gap on the alert surface. Before this
-session every alert rendered roughly the same (a title + description
-+ a couple of action buttons), and the only way to act on a stuck
-maintenance finding or a GP breach was through the dashboard. The
-brief asked for three things:
-- Each alert type should surface its own structural context (intent
-  text for clarification, suggestedAction + attempts + files for
-  maintenance-stuck, breach location + message for GP_BREACH)
-- Every alert type should let the operator submit a fix intent with
-  the alert's context pre-populated
-- A `gestalt alerts` CLI so operators can read + act on alerts
-  without opening the dashboard
-
-Changed:
-- `packages/server/src/oversight/routes.ts` — rewrote the oversight
-  routes:
-  - Response shape on `GET /alerts` and `GET /alerts/:id` is now
-    `{ data: EnrichedAlert[] }` / `{ data: EnrichedAlert }` (the
-    standard envelope). `EnrichedAlert` extends the base
-    `AlertRecord` with optional per-type enrichment fields:
-    `intentText` + `intentStatus` for clarification-needed (looked
-    up via `intents.findById(context.intentId)`);
-    `findingType` + `affectedFiles` + `evidence` + `attemptCount` +
-    `suggestedAction` lifted out of the `context` JSONB for
-    maintenance-stuck; `breachMessage` + `breachLocation` +
-    `breachAgent` for GP_BREACH (resolved via
-    `signals.findByCorrelationId(alert.correlationId)` → pick the
-    `GOLDEN_PRINCIPLE_BREACH` row). Helper functions `enrichAlert` +
-    `stringOrNull` keep the rendering branchless on the wire side
-  - New `POST /alerts/:id/fix-intent { additionalContext? }`
-    (`requireRole('operator')`). Builds an intent text from the
-    enriched alert via the `buildFixIntentText` helper (three
-    templates: clarification / maintenance-stuck / GP_BREACH plus
-    a fallback that uses the alert description). Resolves the
-    projectId via the new `resolveProjectIdForAlert` (direct
-    `context.projectId` for maintenance-stuck; intent walk for
-    clarification-needed; correlationId → intent for GP_BREACH).
-    Writes an `intents` row (`source: 'human'` — the operator
-    pressed the button), dispatches the BullMQ task, transitions
-    intent to `generating`, acknowledges the original alert
-    (same call — the card disappears atomically with submission),
-    writes `alert.fix-intent-submitted` audit row, returns
-    `{ intentId, correlationId, intentText }`.
-    **`additionalContext` is APPENDED to the auto-built intent
-    text, never replaces it** — the alert's structural context
-    always leads. **Audit metadata captures `fixIntentId` +
-    `additionalContextLength` + `intentTextLength` only — the
-    operator's free-form text stays out of the audit row per
-    GP-006**
-  - `POST /alerts/:id/acknowledge` accepts an optional `{ notes }`
-    body. Audit metadata records `notesLength` only (GP-006).
-    The dismiss path on the dashboard / CLI uses this endpoint
-- `packages/dashboard/src/types.ts`:
-  - Extended `Alert` with the per-type enrichment fields (all
-    optional). Added a `CodeLocation` interface for the breach
-    location shape
-- `packages/dashboard/src/api/client.ts`:
-  - `listAlerts()` typed as `{ data: Alert[]; total }` (was
-    `{ alerts, total }` — the server changed envelope, this
-    keeps the dashboard in sync)
-  - `getAlert()` now `{ data: Alert }`
-  - `acknowledgeAlert(id, notes?)` sends `{ notes }`
-  - New `submitAlertFixIntent(alertId, additionalContext?)`
-    returning `{ data: { intentId, correlationId, intentText } }`
-  - New `dismissAlert(id, notes?)` as a semantic alias for the
-    acknowledge call (the dashboard's "Dismiss" button is
-    semantically distinct from the auto-ack that happens during
-    a fix or clarification submission, so a separate method
-    name makes the UI code easier to read)
-- `packages/dashboard/src/views/Alerts.tsx` (rewritten):
-  - Per-type body components: `ClarificationBody`,
-    `MaintenanceStuckBody`, `BreachBody`. Each renders the
-    fields relevant to its alert type using a shared
-    `KV` helper + a `mutedLabel` style for the small uppercase
-    section headings. Unknown types fall through to plain
-    `description` rendering
-  - Per-type action blocks: `ClarificationActions` (textarea +
-    "resume intent ▶" button — wraps the existing
-    `POST /intents/:id/clarify` flow), `FixIntentBlock`
-    (textarea + "submit fix intent ▶" — the new
-    `POST /alerts/:id/fix-intent`), `DismissBlock` (textarea +
-    red `dismiss` button — wraps `POST /alerts/:id/acknowledge`).
-    `FIX_TYPES` const gates which alert types render the fix
-    block (currently all four documented alert types — the
-    fallback is to NOT show it for unrecognised types)
-  - Per-alert UI state is keyed by `alert.id` so opening
-    multiple cards at once doesn't share input. Confirmation
-    banners (`✓ Fix intent submitted — "..."`) appear inside
-    the expanded panel and auto-clear after 1–2 s
-  - Project scoping unchanged from the prior session: client-side
-    join on `context.intentId` against the current project's
-    intents, plus the direct `context.projectId` short-circuit
-    for `maintenance-stuck`. Pending enhancement to add a
-    server-side filter still applies
-  - Header bar redesigned to show a per-type glyph (`?` amber
-    for clarification, `⚙` amber for maintenance-stuck, `⛔` red
-    for GP_BREACH, `✗` red for `gate-failed-max-retries`), the
-    uppercase type label, a colour-coded `[severity]` badge,
-    the title, the timestamp, and a chevron
-- `packages/cli/src/api/client.ts`:
-  - New `AlertSummary` + `AlertDetail` types mirroring the
-    dashboard's enriched shape
-  - New `listAlerts`, `getAlert`, `submitAlertFixIntent`,
-    `acknowledgeAlert` methods
-- `packages/cli/src/commands/alerts.ts` (new): four subcommands
-  per the brief — `alertsListCommand`, `alertsShowCommand`,
-  `alertsFixCommand`, `alertsDismissCommand`. Project resolution
-  prefers the stored `currentProjectId` (set by
-  `gestalt projects use`) with a fallback to `projects[0]`.
-  Alert lookup accepts either the full UUID or an 8-char prefix
-  (same shape the list table prints); ambiguous prefixes error
-  with the match count. `--context` / `--notes` flags can be
-  omitted — the commands fall through to `prompt()` for the
-  optional input (consistent with `gestalt init-admin`'s pattern)
-- `packages/cli/src/index.ts`: registered the new
-  `gestalt alerts` parent + four subcommands. Each accepts the
-  standard `--server <url>` one-shot override
-
-Verified live against `trackeros`:
-- `pnpm -r build` clean across all 12 packages
-- Server image rebuilt; dashboard bundle is the new
-  `index-CymrQ0Rf.js` (225 KB, +6 KB for the alerts rewrite)
-- **`GET /alerts` enrichment via curl** — 2 pre-existing
-  maintenance-stuck alerts from the prior session each came back
-  with `findingType: 'CONTEXT_ALIGNMENT'`, `attemptCount: 3`,
-  `affectedFiles: ['docs/ARCHITECTURE.md', 'docs/DOMAIN.md']`,
-  `suggestedAction` (the literal-path nudge text), and
-  `evidence: "entity 'StartButton' in DOMAIN.md has no matching
-  architecture module"` — all five fields lifted from JSONB on
-  the wire side
-- **`gestalt alerts list`** — printed both rows with `[medium]`
-  badges, `maintenance-stuck` type column, 8-char ids
-  (`b2260ec2`, `bf44dc0a`), and `45m` ages
-- **`gestalt alerts show b2260ec2`** — full detail panel rendered:
-  Title, Description, Finding, Attempts (3), Affected files
-  comma-joined, Suggested action prose, Evidence prose, and the
-  "Available actions" footer with the `gestalt alerts fix` /
-  `dismiss` hints using the 8-char prefix
-- **`gestalt alerts fix b2260ec2 --context "(operator note: use
-  the new literal-path format)"`** — submitted a fix intent:
-  - Server built intent text from the alert's
-    `suggestedAction` + appended the operator's note
-  - Created `intents` row `fd0ac307` with `source: 'human'`,
-    status `generating`
-  - Acknowledged alert `b2260ec2` in the same call —
-    `acknowledged_at` populated
-  - Audit row written with `action:
-    'alert.fix-intent-submitted'`, metadata
-    `{type: 'maintenance-stuck', fixIntentId:
-    'fd0ac307...', additionalContextLength: 48,
-    intentTextLength: 291, ip}` — no `additionalContext` text
-    or `intentText` content in the audit metadata
-- **`gestalt alerts dismiss bf44dc0a --notes "Will be
-  addressed when we redo the module structure"`** —
-  acknowledged the second alert with notes;
-  `alert.acknowledged` audit row metadata records
-  `{type, notesLength: 51, ip}` only
-- **`gestalt alerts list` (post)** — `✓ No unacknowledged
-  alerts` printed
-- **Fresh `clarification-needed` alert** — submitted "make it
-  better" via `POST /intents` to drive a paused cycle;
-  intent-agent created the alert with `context.intentId` +
-  `context.suggestions` (3 entries). `gestalt alerts show`
-  enriched the display with `intentText: "make it better"`,
-  `intentStatus: waiting-for-clarification`, and the 3
-  bullet-listed suggestions
-- **Browser drive (headless Chrome via CDP) at `/app/alerts`**:
-  - Layout rendered with the 1-alert badge in the sidebar
-  - Card collapsed shows: `?` amber glyph,
-    `CLARIFICATION NEEDED` uppercase label, `[high]` amber
-    badge, title `Intent needs clarification`, timestamp,
-    chevron
-  - Card expanded shows: `Intent: "make it better"` and
-    `Status: waiting-for-clarification` KV header, "Why
-    paused" prose, "Suggestions" bullet list with 3 entries,
-    and **three** stacked action blocks:
-    1. "Provide clarification (resumes the existing intent)"
-       — textarea + green `resume intent ▶` button
-    2. "Or submit as a new intent (does not resume the
-       existing one)" — textarea + neutral `submit fix
-       intent ▶` button
-    3. "Dismiss (acknowledge without action)" — optional
-       notes textarea + red `dismiss` button
-  - Screenshot captured; layout matches the brief's ASCII
-    mockup including the relative button positioning and
-    block ordering
-
-Decisions made:
-- **Enrichment is server-side, eager, single round trip.** Could
-  have shipped per-type fetch endpoints (`GET
-  /alerts/:id/clarification-detail`) but that would have
-  required N+1 calls from the list view (`/alerts` returns N
-  rows, each needing one detail fetch). The enrichment per row
-  is cheap — `intents.findById` is a PK lookup;
-  `signals.findByCorrelationId` is a single indexed query.
-  Done eagerly in `enrichAlert(alert)` on each row in the list
-  handler, parallel via `Promise.all`
-- **`enrichAlert` returns `EnrichedAlert` not raw `AlertRecord`.**
-  The wire shape is `EnrichedAlert extends AlertRecord` with
-  optional fields — every existing client that read `id`, `type`,
-  `title`, `description`, `context`, etc. continues to read them
-  unchanged. The enrichment fields are additive
-- **`additionalContext` is APPENDED, never replaces.** Brief was
-  explicit: "the alert's structural context always comes first".
-  `buildFixIntentText` constructs the typed template
-  (`suggestedAction. Context: evidence`) THEN appends the
-  operator's free text with a leading space. If the operator
-  leaves the field empty (or the CLI's `prompt` defaults to
-  empty), the trailing space is trimmed by `.trim()`
-- **The fix-intent path acknowledges the alert in the SAME
-  call.** Atomic from the operator's perspective. Means the
-  card disappears the moment a fix is submitted, no
-  refresh-then-still-here state. If the dispatch fails after the
-  intent row is written, the alert is already acked and the
-  operator has to re-trigger via the new intent. Acceptable
-  trade-off — the alternative (write intent → ack alert → only
-  ack on success of the upstream dispatch) introduces a window
-  where two operators could both fix the same alert
-- **`source: 'human'` on fix-intent-created intents.** The
-  operator chose to press the button (or run `gestalt alerts
-  fix`); semantically this is human-driven work, not a
-  maintenance auto-run. Same source the regular
-  `POST /intents` uses. Easy to distinguish in the audit trail
-  via the `alert.fix-intent-submitted` action + the
-  `fixIntentId` field
-- **GP-006 compliance for both new audit paths.** Audit row
-  records lengths only — `additionalContextLength` /
-  `intentTextLength` / `notesLength`. The text content lives on
-  the alert / intent records and can be queried by an audit
-  forensics operator via direct DB. Same pattern the
-  clarification flow established
-- **Per-alert UI state in `Alerts.tsx` is keyed by `alert.id`.**
-  The previous implementation kept a single `clarification` /
-  `notes` string at the component level, so opening two alerts
-  would either share the textarea contents (confusing) or one
-  card's submit would wipe the other's input. The new
-  `Record<alertId, string>` state model lets the operator scroll
-  through multiple expanded cards without interaction
-- **Per-type glyphs use `?` / `⚙` / `⛔` / `✗`.** Distinguish at
-  a glance in the collapsed header without needing to read the
-  type label. `⚙` for maintenance-stuck (settings cog =
-  "maintenance"), `⛔` for GP_BREACH (no-entry =
-  "non-negotiable"), `?` for clarification (already used by the
-  prior implementation's badge), `✗` for retry-budget exhausted
-- **`FIX_TYPES` allowlist gates the fix block.** Defensive — if a
-  future alert type lands without an associated `buildFixIntentText`
-  template, the fix block won't render. The fallback template in
-  `buildFixIntentText` uses the alert description, so even a new
-  type renders something sensible if added to the list
-- **`gestalt alerts show <prefix>` accepts an 8-char id prefix.**
-  The list table prints 8 chars; making `show` accept the same
-  shape (with full UUID also supported) is the obvious UX. The
-  prefix lookup goes through `client.listAlerts({ acknowledged:
-  false })` and `startsWith` matches; ambiguous matches error
-  with the count instead of silently picking the first
-- **CLI prompts on missing `--context` / `--notes`.** Brief
-  specified consistency with `gestalt init-admin`. The `prompt`
-  helper in `ui/prompts.ts` already does the readline interaction;
-  empty Enter passes through as an empty string (so the operator
-  can skip without typing). Both flags + prompt entries can be
-  empty; that's a valid "no additional context / no notes"
-  submission
-- **No new migrations.** All enrichment is computed from existing
-  data (alerts.context JSONB + intents/signals lookups). No new
-  columns, no new tables
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Server image rebuilt; dashboard bundle live under `/app/`. Full
-operator workflow verified end-to-end:
-- Server side: 4 endpoints exercised (GET /alerts, GET
-  /alerts/:id, POST /alerts/:id/fix-intent, POST
-  /alerts/:id/acknowledge), audit captures all 3 actions with
-  GP-006-compliant metadata
-- CLI side: all 4 subcommands exercised against real alerts
-  (list, show, fix with --context, dismiss with --notes); empty
-  list state confirmed
-- Dashboard side: clarification-needed card rendered with the
-  brief-specified layout (intent quote, suggestions, 3 action
-  blocks)
-
-No new follow-ups added — feature is self-contained.
-
----
 
 ### Session 2026-06-01 — Claude Code (Step 1: externalise agent prompts to agents.yaml)
 
@@ -1754,4 +1523,238 @@ Follow-up logged:
   intent) would need `agents.yaml` extended with `llm.baseUrl`
   + `llm.apiKey` fields and the loader + registry extended to
   honour them. Reasonable next step for multi-provider shops
+
+---
+
+### Session 2026-06-01 — Claude Code (harness templates moved out of projects.ts into templates/ — ADR-036)
+
+Pays down the technical debt the ADR-032 session log flagged:
+*"Inlined harness file content in routes/projects.ts (Dockerfile
+does not copy templates/; revisit when template story matures)."*
+The eight `build*()` functions inside `projects.ts` (815 lines)
+that returned harness file content as TypeScript string literals
+are now actual files under `templates/corporate-ops-web-mobile/`
+with `{{variable}}` placeholders. The server reads + substitutes
+them via a lightweight engine; the Dockerfile ships the directory
+in the image.
+
+Changed:
+- `templates/corporate-ops-web-mobile/` — new template files
+  extracted verbatim from the existing `build*()` content with
+  hardcoded values replaced by `{{placeholders}}`:
+  - `template.json` — template metadata (`id`, `name`, `version`,
+    `tier`, `description`, `variables` map documenting what
+    operators should supply)
+  - `harness/AGENTS.md` — `{{projectName}}` +
+    `{{projectDescription}}` substituted; rest verbatim
+    including the Operator notes — Git credential scopes block
+  - `harness/HARNESS.json` — `{{projectSlug}}` (auto-derived
+    kebab-case from projectName), `{{projectDescription}}`
+    substituted; includes the new
+    `"templateId": "corporate-ops-web-mobile"` field
+  - `harness/agents.yaml` — verbatim from `buildAgentsYaml()`,
+    no substitution needed (this file is project-agnostic)
+  - `docs/ARCHITECTURE.md` — `{{projectName}}` substituted
+  - `docs/DOMAIN.md` — `{{projectName}}` substituted
+  - `docs/GOLDEN_PRINCIPLES.md` — verbatim, no substitution
+  - `docs/DECISIONS.md` — `{{projectName}}`,
+    `{{projectDescription}}`, `{{today}}` substituted
+  - `ci/gestalt.yml` — verbatim, no substitution
+- `packages/server/src/templates/engine.ts` (new): the engine
+  - `loadTemplate(templatesDir, templateId, vars)` walks the
+    template directory, runs `substitute()` on each file body,
+    and returns the list of `{ repoPath, content }` pairs
+  - `substitute(content, vars)` is one regex
+    (`/\{\{(\w+)\}\}/g`). Unknown keys log a `debug` line and
+    leave `{{key}}` in place — debuggable rather than silently
+    empty
+  - Auto-supplies `today` (ISO date at load time) and
+    `projectSlug` (kebab-cased + lowercased `projectName`)
+    when the caller omits them; supplies `defaultBranch:
+    'main'` as a fallback default
+  - Skip lists: `constraints/` + `principles/` directories +
+    the brace-expansion artifact directory
+    `{harness,principles,constraints}/` skipped recursively;
+    top-level `template.json` + `README.md` skipped (template
+    descriptors, not project content)
+  - `resolveRepoPath()` maps `harness/X` → `X`,
+    `ci/gestalt.yml` → `.github/workflows/gestalt.yml`,
+    everything else (including `docs/*`) passes through
+  - `resolveTemplatesDir()` is sync — runs once at module load,
+    caches the result. Walks four candidate paths:
+    `cwd/templates` (Docker `/app/templates`), `cwd/../../templates`
+    (`pnpm dev` from `packages/server`), and two `__dirname`
+    based paths for compiled JS variants. Throws with a helpful
+    message at module load if no candidate resolves (server
+    fails to start rather than 500ing the first registration)
+- `packages/server/src/routes/projects.ts`:
+  - New imports for `loadTemplate` / `resolveTemplatesDir`
+    from `../templates/engine`
+  - Module-scope const `TEMPLATES_DIR = resolveTemplatesDir()`
+    pins the resolution cache at import time
+  - Module-scope const `DEFAULT_TEMPLATE_ID =
+    'corporate-ops-web-mobile'` documents the implicit choice
+    (future templates would be selected via an `init-harness`
+    body field once the registry can list them)
+  - The init-harness handler's file-writing block now reads:
+    ```ts
+    const harnessFiles = await loadTemplate(TEMPLATES_DIR,
+      DEFAULT_TEMPLATE_ID, { projectName, projectDescription,
+      defaultBranch });
+    for (const file of harnessFiles) {
+      const fullPath = join(workDir, file.repoPath);
+      await mkdir(dirname(fullPath), { recursive: true });
+      await writeFile(fullPath, file.content, 'utf8');
+    }
+    ```
+    Slightly cleaner than the old `Object.entries(...)` form;
+    `dirname(fullPath)` replaces the old `join(fullPath, '..')`
+    pattern
+  - **Deleted lines 423–831**: the 8 `build*()` functions
+    (`buildHarnessFiles`, `buildAgentsYaml`, `buildAgentsMd`,
+    `buildHarnessJson`, `buildArchitectureMd`, `buildDomainMd`,
+    `buildGoldenPrinciplesMd`, `buildDecisionsMd`,
+    `buildGestaltWorkflowYml`), the `HarnessInputs` interface,
+    and the closing comment block. File shrank from 815 to
+    422 lines (48% reduction)
+- `packages/server/Dockerfile`:
+  - Builder stage gained `COPY templates ./templates` so
+    `templates/` is available during the build
+  - Production stage gained `COPY --from=builder
+    /app/templates ./templates` so it lands in the final image
+  - Both COPY directives are paired with comment blocks
+    pointing at ADR-036
+- `.dockerignore`:
+  - Previously excluded `templates` (correct under the inline
+    scheme — the directory wasn't needed in the build context)
+  - Now excludes `docs` only; the comment block flags
+    `templates/` as deliberately included per ADR-036
+- `docs/DECISIONS.md`: appended ADR-036 with full Decision /
+  Rationale / Engine contract / Consequences blocks
+
+Verified live:
+- `pnpm -r build` clean across all 12 packages
+- `docker-compose up -d --build server` rebuilt successfully
+  with the new COPY directives. Server reaches `Up (healthy)`;
+  `/health` returns 200
+- **`/app/templates` exists inside the container.** `docker
+  exec gestalt-server-1 ls /app/templates` shows
+  `corporate-ops-web-mobile`; recursive listing shows all 8
+  expected files at the expected paths plus `README.md` +
+  `template.json` + `constraints/` + `principles/` (the latter
+  three skipped by the engine but visible on disk)
+- **Server startup log emits the resolution.** The
+  `template-engine` logger writes `"Templates directory
+  resolved" templatesDir: "/app/templates"` once at module
+  import (driven by the module-scope `resolveTemplatesDir()`
+  call in `projects.ts`)
+- **Engine end-to-end** — `docker exec gestalt-server-1 node
+  -e "..."` running `loadTemplate('/app/templates',
+  'corporate-ops-web-mobile', { projectName: 'Test Project',
+  projectDescription: 'A test project description' })`
+  returned exactly 8 files at the expected repo paths:
+  ```
+  .github/workflows/gestalt.yml  (1418 bytes)
+  docs/ARCHITECTURE.md           (574  bytes)
+  docs/DECISIONS.md              (330  bytes)
+  docs/DOMAIN.md                 (103  bytes)
+  docs/GOLDEN_PRINCIPLES.md      (694  bytes)
+  AGENTS.md                      (1390 bytes)
+  HARNESS.json                   (1656 bytes)
+  agents.yaml                    (3519 bytes)
+  ```
+  Spot checks confirmed every substitution:
+  - `AGENTS.md` starts `# AGENTS.md — Test Project`
+  - `HARNESS.json` has `"name": "test-project"` (slug
+    auto-derived from `Test Project`) + `"templateId":
+    "corporate-ops-web-mobile"` + `"description": "A test
+    project description"`
+  - `docs/DECISIONS.md` has `Date: 2026-06-01` (today
+    auto-supplied) + `Description: A test project
+    description`
+- **Local-dev resolution path also works.** Ran `node -e
+  "..."` from `packages/server` against the compiled
+  `dist/templates/engine.js` — `resolveTemplatesDir()`
+  returned `/Users/amrmohamed/Work/gestalt/templates` (the
+  `process.cwd() + '../../templates'` candidate matched),
+  loaded all 8 files cleanly
+- **`projects.ts` is free of inline build functions.** `grep
+  "^function build\|^interface HarnessInputs\b"` returns
+  zero matches; the only references to the template surface
+  are the import, the `TEMPLATES_DIR` module-load
+  resolution, and the single `loadTemplate(...)` call inside
+  the handler
+
+Decisions made:
+- **`projectSlug` auto-derived from `projectName`, not a
+  separate variable the caller supplies.** The old
+  `buildHarnessJson()` did the same kebab-case derivation
+  inline. Centralising it in the engine (and exposing it as
+  `{{projectSlug}}` so any template file can reference it)
+  removes the need for every template author to repeat the
+  regex. Caller can still override via
+  `variables.projectSlug` if they want a custom shape
+- **Unknown variables leave `{{key}}` in place, not empty
+  string.** Empty-string substitution would silently mask
+  configuration bugs; leaving the literal makes the missing
+  value visible in the committed file (operator sees
+  `{{somethingNew}}` in `HARNESS.json` and knows to ask).
+  Debug-logged so the server-side trace is captured
+- **`resolveTemplatesDir()` is sync, runs at module load.**
+  Async resolution would mean every init-harness call pays
+  the FS walk cost. Cached + sync means: one walk per server
+  process, plus a startup-time failure if the directory is
+  missing (better than a 500 on the first project
+  registration with no diagnostic context)
+- **`HARNESS.json` template carries `templateId`** at the
+  top level. Lets a future drift-agent or registry tool
+  distinguish "project X was bootstrapped from
+  corporate-ops-web-mobile@0.1.0" from "project X was
+  hand-rolled". No code depends on this yet, but exposing
+  it costs nothing
+- **Skip list includes the `{harness,principles,constraints}/`
+  artifact directory.** A previous shell command in this
+  repo's history created an empty directory with that
+  literal name (a brace-expansion failure mode). The engine
+  needs to walk past it without falling over; explicit
+  inclusion in `SKIP_DIRS` is documentation as much as
+  defensive code
+- **`docs/*` keeps its prefix** in the repo-path mapping
+  while `harness/*` strips it. Reflects how project repos
+  actually organise context files: `AGENTS.md` / `HARNESS.json`
+  / `agents.yaml` at the root, `docs/*` in a subdirectory.
+  No special case for `ci/gestalt.yml` would have been
+  ergonomic — the explicit `.github/workflows/gestalt.yml`
+  remap keeps GitHub Actions happy without renaming the
+  source file to something with `.github` in its path
+- **All 8 template files extracted verbatim from `build*()`
+  content** (not from the pre-existing `templates/`
+  directory's stub content). The existing `harness/AGENTS.md`
+  and `principles/GOLDEN_PRINCIPLES.md` had different
+  content from what the server was actually committing today;
+  using the `build*()` source preserved byte-equivalence with
+  the pre-refactor behaviour. New projects get the same
+  files they would have got before this change
+- **Dockerfile: builder + production both COPY templates.**
+  Builder needs them to be part of the build context (so the
+  test-runner / lint stages could exercise them in the
+  future); production needs them at runtime so the engine can
+  read them. Two COPY directives, both pointing to the same
+  source, is the cleanest expression of intent. Could have
+  skipped the builder copy and only put it in production, but
+  that would make the builder image diverge from what the
+  source tree contains in a non-obvious way
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; full template engine verified end-to-end
+inside the container and against the local-dev path. The
+`projects.ts` file is now a thin routing + Git layer; harness
+content is reviewable as markdown / JSON / YAML diffs in any
+editor.
+
+No new follow-ups added — the technical debt the ADR-032
+session log flagged is now paid down. Future templates (Tier
+2/3, domain-specific) drop in by adding a directory under
+`templates/` and registering the new id; no engine or route
+code changes needed.
 

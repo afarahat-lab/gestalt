@@ -1,0 +1,54 @@
+{
+  "name": "{{projectSlug}}",
+  "version": "0.1.0",
+  "tier": "tier1",
+  "templateId": "corporate-ops-web-mobile",
+  "description": "{{projectDescription}}",
+  "stack": {
+    "language": "typescript",
+    "runtime": "node20",
+    "packageManager": "pnpm",
+    "frontend": "react",
+    "backend": "node-fastify",
+    "database": "postgres",
+    "architectureStyle": "modular-monolith"
+  },
+  "adapters": {
+    "database": { "type": "postgres", "configKey": "DATABASE_URL" },
+    "queue":    { "type": "bullmq", "configKey": "REDIS_URL" },
+    "llm":      { "type": "azure-openai", "configKey": "LLM_BASE_URL" }
+  },
+  "qualityGate": {
+    "required": ["lint", "typecheck", "unit-tests", "constraint-check", "security-scan"],
+    "blockingSignals": ["GOLDEN_PRINCIPLE_BREACH", "CONSTRAINT_VIOLATION"],
+    "autoResolvableSignals": ["LINT_FAILURE", "TEST_FAILURE"],
+    "maxRetries": 3
+  },
+  "pipeline": {
+    "adapter": "noop"
+  },
+  "maintenance": {
+    "driftCheck":     { "enabled": true, "scheduleUtc": "0 2 * * *" },
+    "alignmentCheck": { "enabled": true, "scheduleUtc": "0 3 * * *" },
+    "gcCheck":        { "enabled": true, "scheduleUtc": "0 4 * * 5" },
+    "monitoring": {
+      "adapter": "noop",
+      "enabled": true,
+      "connectionConfig": {},
+      "thresholds": {
+        "errorRatePercent": 5.0,
+        "latencyP99Ms": 2000,
+        "alertCountWindow": "1h",
+        "alertCountThreshold": 10
+      }
+    }
+  },
+  "identity": {
+    "providers": [
+      { "type": "local", "enabled": true, "warningBanner": true, "allowedInProduction": false }
+    ],
+    "roleMapping": [],
+    "defaultRole": null,
+    "sessionTtlMinutes": 480
+  }
+}

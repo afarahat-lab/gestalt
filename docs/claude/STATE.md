@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — per-agent model override activated via LLMClient registry)
+**Last updated:** 2026-06-01 (Claude Code — harness templates moved out of projects.ts into templates/ — ADR-036)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -686,6 +686,61 @@ the historical record of how the state evolved._
 6. `gestalt init` — register project + server pushes harness to Git
 7. `git pull` — receive harness files locally
 8. `gestalt run "<intent>"` — submit work to agents
+
+**Harness templates live in `templates/`, not inline in routes (ADR-036).**
+- All 8 harness files (`AGENTS.md`, `HARNESS.json`, `agents.yaml`,
+  the 4 `docs/*.md`, `.github/workflows/gestalt.yml`) ship as
+  files under `templates/corporate-ops-web-mobile/{harness,docs,ci}/`
+  with `{{variable}}` placeholders
+- `packages/server/src/templates/engine.ts` provides
+  `loadTemplate(templatesDir, templateId, vars)`, a one-regex
+  substitution engine (`/\{\{(\w+)\}\}/g`) with no conditionals or
+  loops. Unknown variables are left in place (the literal
+  `{{foo}}` survives into the committed file) so missing values
+  are debuggable rather than silently empty
+- Auto-supplied variables: `today` (ISO date at load time) and
+  `projectSlug` (kebab-cased `projectName`). Caller supplies
+  `projectName`, `projectDescription`, and optionally
+  `defaultBranch`
+- Repo-path mapping is contract: `harness/X` → `X` at the repo
+  root; `docs/*` keeps its prefix; `ci/gestalt.yml` →
+  `.github/workflows/gestalt.yml`; any future top-level template
+  files pass through unchanged
+- Skip list: `constraints/`, `principles/`, `template.json`, and
+  top-level `README.md` are platform-internal — the engine walks
+  them but does not emit them to the project repo
+- `resolveTemplatesDir()` is sync, walks 4 candidate paths
+  (Docker `/app/templates`, `pnpm dev` from `packages/server`,
+  `node dist/...` from compiled paths), caches the result at
+  module load. Throws at module-load time if no candidate
+  resolves, so the server fails fast rather than 500ing on the
+  first registration
+- `init-harness` route became a thin orchestrator: clone repo,
+  call `loadTemplate(...)`, write each file via `mkdir` +
+  `writeFile`, commit + push. The 8 inline `build*()` functions
+  + the `HarnessInputs` interface are deleted —
+  `packages/server/src/routes/projects.ts` shrank from 815 to
+  422 lines (48% reduction)
+- The seeded `HARNESS.json` carries
+  `"templateId": "corporate-ops-web-mobile"` so future tooling
+  (registry, drift-agent template-aware checks) can identify
+  which template seeded the project
+- **Dockerfile + `.dockerignore` updated.** The Dockerfile copies
+  `templates/` into the builder stage AND the production stage;
+  `.dockerignore` no longer excludes the directory. The
+  template engine reads from `/app/templates/<id>/` at runtime
+- Verified live: docker rebuild → `/app/templates/corporate-ops-web-mobile/`
+  visible inside the container with all 8 expected files;
+  server startup log emits `"Templates directory resolved"
+  templatesDir: "/app/templates"`. Direct engine invocation
+  produces 8 substituted files for `projectName: "Test Project"`
+  / `projectDescription: "A test project description"` —
+  `AGENTS.md` starts with `# AGENTS.md — Test Project`,
+  `HARNESS.json` has `"name": "test-project"` (slug-derived) +
+  `"description": "A test project description"`,
+  `DECISIONS.md` includes `Date: 2026-06-01`. Local-dev
+  resolution from `packages/server` cwd also resolves correctly
+  (walks up to repo root)
 
 **Step 1: externalise agent prompts to agents.yaml — implemented.**
 - Every LLM-reasoning agent reads its persona (`role`, `goal`), LLM

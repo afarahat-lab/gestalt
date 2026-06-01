@@ -8,9 +8,13 @@ node_modules
 **/*.log
 npm-debug.log*
 
-# Don't copy docs or templates — not needed for the server build
+# Don't copy docs — not needed for the server build
 docs
-templates
+
+# templates/ IS copied (ADR-036): the template engine reads
+# templates/<id>/ on every init-harness call. The Dockerfile COPYs
+# it into the builder + production stages; leaving it out of
+# .dockerignore so the build context includes it.
 
 # Don't copy test files into image
 **/*.test.ts
