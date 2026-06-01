@@ -4569,3 +4569,228 @@ Follow-up logged:
   operators start asking to run the test-agent on a cheaper
   model than the code-agent
 
+---
+
+### Session 2026-06-01 — Claude Code (per-agent model override activated via LLMClient registry)
+
+Activates the per-agent `model` override that Step 1 had parsed but
+left inactive. The previous session's follow-up said:
+*"Would require routing through a multi-client registry; current
+LLMClient is a startup singleton."* This session implements that
+registry and threads the routing through every LLM-using agent. The
+dashboard's IntentDetail accordion now shows which model handled each
+agent step.
+
+Changed:
+- `packages/core/src/llm/index.ts`:
+  - Replaced the `_client: LLMClient | null` singleton with a
+    `_clients: Map<string, LLMClient>` keyed by model name plus a
+    `_defaultConfig: LLMConfig | null` slot
+  - `createLLMClient(config)` seeds `_defaultConfig`, instantiates
+    the default client, and stores it in the Map under
+    `config.model`. Re-calling clears the Map (handy for test setup)
+  - `getLLMClient(model?: string)` resolves to the cached client
+    for the requested model name. If the model is `undefined` or
+    matches the default, returns the default client. Otherwise
+    creates a derived `LLMConfig` (default + `model: targetModel`),
+    instantiates a new `LLMClient`, stores it in the Map, and
+    logs `"LLM client created for model override"`. Per-process
+    cache — one entry per unique model, created on first use,
+    reused for the lifetime of the server
+  - New `LLMClient.getModel(): string` — exposes the bound model
+    name so orchestrators can capture the actual model that ran
+    after every `complete()` call
+- `packages/adapters/postgres/src/migrations/009_execution_log_model.sql`
+  (new): `ALTER TABLE agent_execution_logs ADD COLUMN model_used
+  TEXT;`. Pure schema; no `schema_migrations` writes
+- `packages/core/src/repository/index.ts`:
+  - `AgentExecutionLogRecord` extended with
+    `modelUsed: string | null`. The Omit<> in
+    `AgentExecutionLogRepository.save()` automatically includes
+    the new field, so every save call site has to populate it —
+    TypeScript caught the missing fields in the generate / gate /
+    deploy orchestrators on the first build attempt
+- `packages/adapters/postgres/src/repositories/execution-logs.ts`:
+  - `LogRow.modelUsed: string | null`
+  - `rowToRecord` passes `modelUsed` through (postgres.js returns
+    a plain string or NULL — no JSONB-style parsing needed)
+  - `save()` includes `model_used` in the INSERT
+- Oracle/MSSQL stubs untouched — they throw on every call so the
+  new column requires no code change there
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  - Hoisted `let lastModelUsed: string | null = null` above the
+    per-agent try block so both the success and the catch paths
+    can read it
+  - Rewrote the `llmCall` factory: now calls
+    `getLLMClient(overrides?.model)` per invocation (per-agent
+    routing!), captures `client.getModel()` into `lastModelUsed`,
+    and forwards `temperature` / `maxTokens` to the chosen
+    client. Drops the previous "model override is parsed but
+    inactive" comment
+  - Both `executionLogs.save` call sites (success path + catch
+    path) include `modelUsed: lastModelUsed`
+- `packages/agents/quality-gate/src/types.ts`:
+  - `GateAgentResult.modelUsed?: string` so the LLM-backed
+    review-agent can return the routed model
+- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
+  - Same routing pattern: `llmCall` accepts overrides,
+    `getLLMClient(overrides?.model)` per call, captures
+    `reviewModelUsed`
+  - After `runLlmReviewAgent` returns, the orchestrator attaches
+    `r.modelUsed = reviewModelUsed` so it lands on the wire
+  - `runWithObservability`'s `executionLogs.save` reads
+    `resultWithPrompt.modelUsed ?? null`; the thrown-error path
+    persists `modelUsed: null`
+- `packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`:
+  - Both `executionLogs.save` sites set `modelUsed: null` (deploy
+    agents are deterministic — pr-agent / pipeline-agent /
+    promotion-agent never call the LLM)
+- `packages/agents/maintenance/src/agents/context-fixer.ts`:
+  - `getLLMClient(agentConfig.llm.model)` — context-fixer's LLM
+    call now routes via the registry like the generate-side
+    agents
+  - context-fixer doesn't have an `agent_executions` row of its
+    own (it runs inside the maintenance runner), so no
+    `executionLogs.save` change needed
+- `packages/server/src/routes/projects.ts` `buildAgentsYaml()`:
+  - Each agent's `llm:` block now lists `model: ~` (YAML null
+    = "use platform default") above the existing `temperature`
+    + `max_tokens` lines
+  - Top-comment block documents the `llm.model` semantics and
+    flags `code-agent` with an example comment
+    (`# Example: set to "gpt-4o" to use a specific model`)
+- `packages/dashboard/src/views/IntentDetail.tsx`:
+  - `ExecutionLogResponse.log.modelUsed: string | null` added
+  - Expanded execution panel renders a new `Model` KV row in the
+    Agent section showing `gpt-4o-mini` / `gpt-4o` / `—` for
+    non-LLM agents
+- `packages/dashboard/src/api/client.ts`:
+  - `getExecutionLog()` return type widened with `modelUsed:
+    string | null` so the dashboard typing matches the wire
+- `docs/reference/harness-config.md`:
+  - New `agents.yaml — per-agent configuration` section
+    documenting the full schema (`role`, `goal`, `llm.model`,
+    `llm.temperature`, `llm.max_tokens`, `prompt_extensions`)
+    + the loader's behaviour on missing / partial / malformed
+    files
+
+Verified live against `trackeros`:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt; migration 009 applied
+  (`schema_migrations` now lists 9 entries through
+  `009_execution_log_model`). `model_used TEXT` column visible
+  on `\d agent_execution_logs`
+- **Committed `agents.yaml` to trackeros main** (commit
+  `498eb0f`) with:
+  ```yaml
+  agents:
+    intent-agent: { llm: { model: gpt-4o-mini } }   # cheaper for parsing
+    code-agent:   { llm: { model: gpt-4o } }        # best for code
+  ```
+- **Submitted intent** "Add a trimEnd utility under
+  src/shared/utils/trim-end" (correlationId `1581ab36`).
+  Server ran two gate-retry cycles (review-agent flagged
+  concerns); both cycles surfaced the per-agent routing
+- **`agent_execution_logs.model_used` per agent:**
+  ```
+  intent-agent      | gpt-4o-mini | completed   ← override
+  design-agent      | gpt-4o      | completed   ← platform default
+  context-agent     | gpt-4o      | completed   ← platform default
+  lint-config-agent | (null)      | skipped     ← non-LLM
+  code-agent        | gpt-4o      | completed   ← override matches default
+  test-agent        | gpt-4o      | completed   ← platform default
+  constraint-agent  | (null)      | passed      ← deterministic
+  review-agent      | gpt-4o      | failed      ← platform default
+  ```
+  Same shape repeats on the gate-retry leg
+- **Cache verified.** Server log shows
+  `"LLM client created for model override"` exactly ONCE
+  during the cycle (when `gpt-4o-mini` was first requested);
+  the second intent-agent run on the retry leg used the cached
+  client (no second log line)
+- **API surface confirmed.** `GET /executions/<intent-agent-id>/log`
+  returns `data.log.modelUsed: "gpt-4o-mini"` — the new field
+  flows through the route handler unchanged because the
+  AgentExecutionLogRecord shape propagates automatically
+- **Health endpoint still 200.** `gestalt status` works
+  unchanged; default client unaffected
+
+Decisions made:
+- **Per-process cache, not per-correlationId.** A model name is
+  a global routing key — `gpt-4o-mini` always means the same
+  thing for the lifetime of the server, so the cached client is
+  safe to share across cycles + projects. Memory cost is one
+  `LLMClient` instance per unique model name (typically 1–3)
+- **`getLLMClient(undefined)` returns the default client.**
+  Every existing call site (`getLLMClient()` with no args) keeps
+  working without modification. Backward compatible
+- **Override clients reuse `baseUrl` + `apiKey` from the default
+  config.** Matches the brief; matches how Azure deployments
+  work (deployment-name path component IS the model on the
+  wire). Operators who need a different endpoint per model
+  would need a richer `agents.yaml` schema — captured as a
+  follow-up enhancement
+- **`createLLMClient` clears the registry before re-seeding.**
+  Production calls this once at startup, so the clear is a
+  no-op. But this makes test setup deterministic — a test that
+  calls `createLLMClient(testConfig)` after a previous test
+  used a different default doesn't carry forward stale entries
+- **Captured `lastModelUsed` in the closure variable per agent
+  step, NOT on the result returned by the agent.** The agents
+  themselves don't need to know which model handled their LLM
+  call — that's an observability concern owned by the
+  orchestrator. The closure-captured variable means the
+  orchestrator doesn't have to ferry a "current model" pointer
+  through every agent function signature
+- **Gate orchestrator's `modelUsed` flows on `GateAgentResult`.**
+  Different surface from the generate orchestrator (the agent
+  returns a typed result that the orchestrator's
+  `runWithObservability` consumes). Adding an optional
+  `modelUsed` to the result type, populated by the orchestrator
+  after the agent runs, kept the agent signature unchanged and
+  let `runWithObservability` stay generic over the per-agent
+  result shape
+- **context-fixer routes via the registry but doesn't persist
+  modelUsed.** It has no `agent_executions` row of its own —
+  it runs inside the maintenance runner's per-finding loop,
+  and the maintenance run record captures aggregate counts not
+  per-call model. If operators ever want per-finding model
+  tracking, the maintenance_runs table would need a new column;
+  out of scope for this session
+- **`model: ~` (YAML null) is "use platform default", same as
+  the field being absent.** The loader's existing snake_case +
+  camelCase normalisation already drops null model values from
+  the merged config — `typeof null === 'object'` so the
+  `typeof llmIn['model'] === 'string'` guard skips null. No
+  loader change needed. Tested implicitly by the verification
+  cycle (review-agent / design-agent / etc. have no `model`
+  override and route to the default `gpt-4o`)
+- **Dashboard shows `—` (em-dash) for null `modelUsed`.**
+  Consistent with the rest of the IntentDetail panel's
+  placeholder (which uses em-dashes for "not applicable"
+  fields). Non-LLM agents and pre-migration-009 rows both
+  render the same way; the operator can tell from the rest of
+  the row whether it's "no LLM call" vs "old run"
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; migration 009 applied; full per-agent
+model routing verified end-to-end. The brief's verification
+matrix (intent-agent on gpt-4o-mini, code-agent on gpt-4o,
+other agents on platform default, single
+`"LLM client created for model override"` log line) hits all
+four checkpoints.
+
+The "Per-agent model override is parsed but inactive"
+follow-up from the previous session is now resolved. New
+follow-up logged below — separate endpoints / credentials per
+model is a richer schema change.
+
+Follow-up logged:
+- **Per-model endpoint + API key overrides.** Today's registry
+  reuses the default `baseUrl` + `apiKey` for every override.
+  An operator who wants to run `gpt-4o-mini` on OpenAI's
+  endpoint but `gpt-4o` on Azure (or vLLM for code, OpenAI for
+  intent) would need `agents.yaml` extended with `llm.baseUrl`
+  + `llm.apiKey` fields and the loader + registry extended to
+  honour them. Reasonable next step for multi-provider shops
+

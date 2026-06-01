@@ -212,11 +212,22 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
       harnessConfig: defaultGateHarnessConfig(workDir),
     };
 
-    const llmClient = getLLMClient();
-    const llmCall = async (prompt: string): Promise<string> => {
-      const result = await llmClient.complete({
+    // Captures the model the review-agent's LLM call actually routed
+    // to — see the runLlmReviewAgent callback below where this is
+    // attached to the result before runWithObservability persists it
+    // into agent_execution_logs.model_used.
+    let reviewModelUsed: string | null = null;
+    const llmCall = async (
+      prompt: string,
+      overrides?: { temperature?: number; maxTokens?: number; model?: string },
+    ): Promise<string> => {
+      const client = getLLMClient(overrides?.model);
+      reviewModelUsed = client.getModel();
+      const result = await client.complete({
         messages: [{ role: 'user', content: prompt }],
         correlationId,
+        ...(overrides?.temperature !== undefined ? { temperature: overrides.temperature } : {}),
+        ...(overrides?.maxTokens !== undefined ? { maxTokens: overrides.maxTokens } : {}),
       });
       if (!result.ok) throw new Error(result.error.message);
       return result.value.content;
@@ -247,6 +258,9 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
             const { artifacts } = getRepositories();
             await artifacts.save(r.reviewArtifact as unknown as Artifact);
           }
+          // Forward the routed model to the observability wrapper so it
+          // lands on agent_execution_logs.model_used.
+          if (reviewModelUsed) r.modelUsed = reviewModelUsed;
           return r;
         },
         childLog,
@@ -391,6 +405,7 @@ async function runWithObservability<T extends GateAgentResult>(
       artifactPaths: [],
       signalTypes: [],
       errorMessage: err instanceof Error ? err.message : String(err),
+      modelUsed: null,
     }).catch(() => undefined);
     emitLiveEvent('agent.completed', correlationId, {
       executionId,
@@ -430,12 +445,14 @@ async function runWithObservability<T extends GateAgentResult>(
   });
 
   // Persist the execution log row. The result type widens to allow the
-  // optional `lastPrompt` + `llmResponse` (added to `GateAgentResult`
-  // for LLM-backed gate agents like review-agent; non-LLM agents like
-  // constraint-agent leave them undefined and the column goes null).
+  // optional `lastPrompt` + `llmResponse` + `modelUsed` (added to
+  // `GateAgentResult` for LLM-backed gate agents like review-agent;
+  // non-LLM agents like constraint-agent leave them undefined and the
+  // columns go null).
   const resultWithPrompt = result as unknown as GateAgentResult & {
     lastPrompt?: string;
     llmResponse?: string;
+    modelUsed?: string;
   };
   await executionLogs.save({
     executionId,
@@ -446,6 +463,7 @@ async function runWithObservability<T extends GateAgentResult>(
     resultStatus: result.status,
     artifactPaths: [],   // gate agents do not produce artifacts
     signalTypes: result.signals.map((s) => s.type),
+    modelUsed: resultWithPrompt.modelUsed ?? null,
     errorMessage: result.status === 'errored'
       ? 'Gate agent threw before producing a structured response'
       : null,

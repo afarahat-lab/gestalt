@@ -15,6 +15,13 @@ interface ExecutionLogResponse {
     artifactPaths: string[];
     signalTypes: string[];
     errorMessage: string | null;
+    /**
+     * The LLM model the orchestrator routed to for this agent step
+     * (after agents.yaml override resolution). Null for non-LLM
+     * agents (constraint-agent, pr-agent, pipeline-agent,
+     * promotion-agent) and for pre-migration-009 rows.
+     */
+    modelUsed: string | null;
   } | null;
   artifacts: Array<{ id: string; type: string; path: string; content: string }>;
   signals: SignalSummary[];
@@ -289,6 +296,9 @@ function ExecutionLogPanel({ data, showFull, onToggleFull, onCopy }: ExecutionLo
       {/* Agent meta */}
       <Section title="Agent">
         <KV label="Role">{execution.agentRole}</KV>
+        <KV label="Model">
+          <span style={{ fontFamily: 'var(--font-mono)' }}>{log.modelUsed ?? '—'}</span>
+        </KV>
         <KV label="Status"><StatusBadge status={log.resultStatus} size="sm" /></KV>
         {execution.durationMs !== null && <KV label="Duration">{execution.durationMs}ms</KV>}
         {execution.startedAt && (

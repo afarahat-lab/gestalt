@@ -23,6 +23,7 @@ interface LogRow {
   artifactPaths: string[] | null;
   signalTypes: string[] | null;
   errorMessage: string | null;
+  modelUsed: string | null;
   createdAt: Date;
 }
 
@@ -40,6 +41,7 @@ function rowToRecord(row: LogRow): AgentExecutionLogRecord {
     artifactPaths: row.artifactPaths ?? [],
     signalTypes: row.signalTypes ?? [],
     errorMessage: row.errorMessage,
+    modelUsed: row.modelUsed,
     createdAt: row.createdAt,
   };
 }
@@ -60,7 +62,8 @@ export class PostgresAgentExecutionLogRepository implements AgentExecutionLogRep
       INSERT INTO agent_execution_logs (
         execution_id, correlation_id, agent_role,
         prompt, llm_response, result_status,
-        artifact_paths, signal_types, error_message
+        artifact_paths, signal_types, error_message,
+        model_used
       ) VALUES (
         ${log.executionId},
         ${log.correlationId},
@@ -70,7 +73,8 @@ export class PostgresAgentExecutionLogRepository implements AgentExecutionLogRep
         ${log.resultStatus},
         ${log.artifactPaths},
         ${log.signalTypes},
-        ${log.errorMessage}
+        ${log.errorMessage},
+        ${log.modelUsed}
       )
       RETURNING *
     `;

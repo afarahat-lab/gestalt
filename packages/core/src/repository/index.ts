@@ -121,6 +121,15 @@ export interface AgentExecutionLogRecord {
   artifactPaths: string[];
   signalTypes: string[];
   errorMessage: string | null;
+  /**
+   * The LLM model that actually ran this agent step. Populated by the
+   * orchestrator from `client.getModel()` after `LLMClient.complete()`
+   * — so it reflects the per-agent `agents.yaml` override, not the
+   * platform default. Null for non-LLM agents (constraint-agent,
+   * pr-agent, pipeline-agent, promotion-agent) and for pre-migration-009
+   * rows. Migration 009.
+   */
+  modelUsed: string | null;
   createdAt: Date;
 }
 

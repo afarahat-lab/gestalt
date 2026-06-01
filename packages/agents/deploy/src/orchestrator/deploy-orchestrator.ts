@@ -322,6 +322,7 @@ async function runWithObservability<T>(
       artifactPaths: [],
       signalTypes: [],
       errorMessage: err instanceof Error ? err.message : String(err),
+      modelUsed: null,
     }).catch(() => undefined);
     emitLiveEvent('agent.completed', correlationId, {
       executionId,
@@ -368,6 +369,7 @@ async function runWithObservability<T>(
     errorMessage: producedSignals.length > 0
       ? (producedSignals[0]?.message ?? null)
       : null,
+    modelUsed: null,        // deploy agents never call the LLM
   }).catch((err) => {
     childLog.warn({ err, executionId, agentRole }, 'executionLogs.save failed');
   });

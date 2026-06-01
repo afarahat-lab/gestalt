@@ -245,3 +245,61 @@ Alert routing configuration.
 ```
 
 Supported channels: `dashboard` · `email` · `slack` · `webhook`
+
+---
+
+## `agents.yaml` — per-agent configuration
+
+Lives alongside `HARNESS.json` in the project repo root. Read fresh from each
+per-cycle clone (ADR-032), so edits + a push take effect on the next intent
+cycle without a server restart.
+
+```yaml
+agents:
+  intent-agent:
+    role: "Senior software architect"
+    goal: "Extract a precise, unambiguous specification from a natural language intent"
+    llm:
+      model: ~              # null = use platform default (LLM_MODEL env var)
+      temperature: 0.1
+      max_tokens: 2000
+    prompt_extensions: []
+  code-agent:
+    role: "Senior TypeScript engineer"
+    goal: "Generate production-quality TypeScript code that follows the project harness"
+    llm:
+      model: "gpt-4o"       # Override the default model for this agent
+      temperature: 0.2
+      max_tokens: 8000
+    prompt_extensions:
+      - "Always add a JSDoc comment to every exported function"
+      - "Use Result<T,E> pattern for error handling"
+```
+
+### Schema
+
+Each entry under `agents:` is keyed by `AgentRole` (`intent-agent`,
+`design-agent`, `context-agent`, `code-agent`, `test-agent`, `review-agent`,
+`drift-agent`, `alignment-agent`, `context-fixer`). Infrastructure agents
+(`constraint-agent`, `test-runner-agent`, `pipeline-agent`,
+`promotion-agent`, `gc-agent`) do deterministic work and ignore this file.
+
+| Field | Type | Purpose |
+|---|---|---|
+| `role` | string | Becomes "You are `<role>` working on the Gestalt platform." |
+| `goal` | string | One sentence appended to the persona block |
+| `llm.model` | string \| null | Override the platform default model for this agent. `~` (null) means "use the default". Reuses platform `baseUrl` + `apiKey` — only the model name changes on the wire |
+| `llm.temperature` | number | Override the LLM client's temperature for this agent |
+| `llm.max_tokens` | number | Override the LLM client's max-tokens for this agent (camelCase `maxTokens` also accepted) |
+| `prompt_extensions` | string[] | Standing project rules appended to every prompt under "Project-specific instructions" (camelCase `promptExtensions` also accepted) |
+
+### Behaviour
+
+- Absent file → per-role defaults (seeded by `gestalt init` would match these)
+- Malformed YAML → defaults, debug-logged
+- Agent absent from `agents:` map → per-role default for that agent
+- Partial entry (only `role`, no `llm.temperature`) → merged with defaults
+- `model: ~` (YAML null) → platform default (same as omitting the field)
+- The model the orchestrator routed to is persisted into
+  `agent_execution_logs.model_used` and shown in the dashboard's IntentDetail
+  panel as `Model: gpt-4o-mini` / etc.

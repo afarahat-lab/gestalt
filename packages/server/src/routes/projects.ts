@@ -455,6 +455,11 @@ function buildAgentsYaml(): string {
 #   role  — short professional title (becomes "You are <role> working on
 #           the Gestalt platform.")
 #   goal  — one sentence stating what the agent is trying to accomplish
+#   llm.model         — '~' (YAML null) means "use the platform default
+#                       from .env LLM_MODEL". Set to a specific model
+#                       name (e.g. "gpt-4o", "gpt-4o-mini") to override.
+#                       The override reuses the platform's baseUrl +
+#                       apiKey — only the model name changes on the wire.
 #   llm.temperature, llm.max_tokens — override the platform defaults
 #   prompt_extensions — list of standing project rules appended to every
 #                       prompt under a "Project-specific instructions"
@@ -466,6 +471,7 @@ agents:
     role: "Senior software architect"
     goal: "Extract a precise, unambiguous specification from a natural language intent"
     llm:
+      model: ~          # null = use platform default. Example: gpt-4o-mini
       temperature: 0.1
       max_tokens: 2000
     prompt_extensions: []
@@ -474,6 +480,7 @@ agents:
     role: "Senior software architect"
     goal: "Produce domain model changes, API contracts, and component specs"
     llm:
+      model: ~
       temperature: 0.2
       max_tokens: 4000
     prompt_extensions: []
@@ -482,6 +489,7 @@ agents:
     role: "Technical writer"
     goal: "Keep project context files accurate and up to date"
     llm:
+      model: ~
       temperature: 0.1
       max_tokens: 8000
     prompt_extensions: []
@@ -490,6 +498,7 @@ agents:
     role: "Senior TypeScript engineer"
     goal: "Generate production-quality TypeScript code that follows the project harness"
     llm:
+      model: ~          # Example: set to "gpt-4o" to use a specific model
       temperature: 0.2
       max_tokens: 8000
     prompt_extensions: []
@@ -501,6 +510,7 @@ agents:
     role: "Senior QA engineer"
     goal: "Generate comprehensive Vitest tests mapped to success criteria"
     llm:
+      model: ~
       temperature: 0.1
       max_tokens: 6000
     prompt_extensions: []
@@ -509,6 +519,7 @@ agents:
     role: "Senior engineer and code reviewer"
     goal: "Assess generated code quality and architectural correctness"
     llm:
+      model: ~
       temperature: 0.1
       max_tokens: 4000
     prompt_extensions: []
@@ -517,6 +528,7 @@ agents:
     role: "Technical documentation specialist"
     goal: "Detect when project documentation has fallen behind the codebase"
     llm:
+      model: ~
       temperature: 0.1
       max_tokens: 2000
     prompt_extensions: []
@@ -525,6 +537,7 @@ agents:
     role: "Technical documentation specialist"
     goal: "Ensure project context files are internally consistent"
     llm:
+      model: ~
       temperature: 0.1
       max_tokens: 2000
     prompt_extensions: []
@@ -533,6 +546,7 @@ agents:
     role: "Technical writer"
     goal: "Apply additive context-file edits that resolve maintenance findings"
     llm:
+      model: ~
       temperature: 0.2
       max_tokens: 8192
     prompt_extensions: []

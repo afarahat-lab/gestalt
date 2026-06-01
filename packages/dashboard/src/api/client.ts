@@ -74,6 +74,7 @@ export class DashboardApiClient {
         artifactPaths: string[];
         signalTypes: string[];
         errorMessage: string | null;
+        modelUsed: string | null;
       } | null;
       artifacts: Array<{ id: string; type: string; path: string; content: string }>;
       signals: SignalSummary[];

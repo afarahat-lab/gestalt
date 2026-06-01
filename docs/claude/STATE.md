@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — Step 1: externalise agent prompts to agents.yaml)
+**Last updated:** 2026-06-01 (Claude Code — per-agent model override activated via LLMClient registry)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -22,10 +22,10 @@ the historical record of how the state evolved._
   are summarised in the "Session log" entries dated 2026-05-29 / 30
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
-- All eight migrations apply on startup: `001_initial`, `002_local_auth`,
+- All nine migrations apply on startup: `001_initial`, `002_local_auth`,
   `003_projects`, `004_deployments`, `005_maintenance`,
   `006_intent_clarification`, `007_execution_logs`,
-  `008_finding_attempts`
+  `008_finding_attempts`, `009_execution_log_model`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
 - **Dashboard SPA reachable in the browser, deep-linkable, no path
@@ -739,15 +739,37 @@ the historical record of how the state evolved._
   intact. `llm-review-agent.ts` and `context-fixer.ts` follow the
   same pattern inline (different surrounding architecture; same
   effect)
-- **LLM tuning** flows through a shared `LlmCallFn` type:
+- **LLM tuning + per-agent model routing** flow through a shared
+  `LlmCallFn` type:
   `(prompt, overrides?: { temperature?, maxTokens?, model? }) =>
-  Promise<string>`. The orchestrator's `llmCall` wrapper forwards
-  the overrides to `LLMClient.complete`. Each agent passes
-  `task.contextSnapshot.agentConfig.llm` as the second argument,
-  so per-agent `temperature` + `max_tokens` land on the wire.
-  Per-agent `model` override is parsed and surfaced on the type
-  but is a no-op today (the LLMClient is wired as a singleton at
-  startup; per-agent model routing is captured as a follow-up)
+  Promise<string>`. The orchestrator's `llmCall` wrapper calls
+  `getLLMClient(overrides.model)` per invocation — the registry
+  returns the cached default client when `model` is undefined
+  or matches the platform default, and creates + caches a new
+  client (sharing the default's `baseUrl` + `apiKey`) on first
+  use of any other model name. Each agent passes
+  `task.contextSnapshot.agentConfig.llm` so per-agent
+  `temperature`, `max_tokens`, AND `model` land on the wire
+- **Multi-client LLM registry (`@gestalt/core/src/llm/index.ts`).**
+  The startup singleton is now a `Map<string, LLMClient>` keyed
+  by model name. `createLLMClient(config)` seeds the default;
+  `getLLMClient(model?)` returns the cached client for the
+  requested model name or builds a new one on demand. Override
+  clients reuse the default's endpoint + API key — only the
+  model name changes on the wire (matches Azure deployment +
+  every OpenAI-compatible provider's contract). `LLMClient.getModel()`
+  exposes the bound model name so the orchestrators can capture
+  it after each call. Per-process cache — one entry per unique
+  model, created on first use, reused forever after
+- **`agent_execution_logs.model_used` column (migration 009).**
+  Captures which model actually ran each agent step (after the
+  per-agent override resolution). The orchestrators read
+  `client.getModel()` after every `complete()` call and persist
+  it. Null for non-LLM agents (constraint-agent / pr-agent /
+  pipeline-agent / promotion-agent / skipped lint-config) and
+  for pre-migration-009 rows. Dashboard's IntentDetail panel
+  shows `Model: gpt-4o-mini` / `gpt-4o` / `—` in the agent
+  meta section
 - **`gestalt init` seeds `agents.yaml`** in the harness file map
   (alongside `HARNESS.json` / `AGENTS.md` / context files). The
   seeded content matches the loader's per-role defaults exactly,

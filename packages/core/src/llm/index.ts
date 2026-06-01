@@ -63,6 +63,15 @@ export class LLMClient {
   }
 
   /**
+   * The model name this client is bound to. Useful for the orchestrator
+   * when it persists `agent_execution_logs.model_used` — the value here
+   * is exactly what gets sent on the wire.
+   */
+  getModel(): string {
+    return this.config.model;
+  }
+
+  /**
    * Sends a request to the LLM provider.
    * Retries on transient errors (rate limits, timeouts).
    * Returns a typed Result — never throws.
@@ -172,25 +181,54 @@ export class LLMClient {
 
 // ─── Factory ──────────────────────────────────────────────────────────────────
 
-let _client: LLMClient | null = null;
+/**
+ * One LLMClient instance per model name. The default model (set at
+ * server startup via createLLMClient) is the first entry; per-agent
+ * overrides land additional entries on first use and stay cached for
+ * the lifetime of the process. Override clients reuse the default
+ * config's baseUrl + apiKey and differ only in `model` — this matches
+ * how Azure OpenAI deployments + every OpenAI-compatible provider
+ * actually work today.
+ */
+const _clients = new Map<string, LLMClient>();
+let _defaultConfig: LLMConfig | null = null;
 
 /**
- * Returns the singleton LLM client.
- * Call createLLMClient(config) once at startup.
+ * Returns an LLMClient for the given model name.
+ *
+ *   - `undefined` or the default model → the default client.
+ *   - Any other model name → a cached override client (created on
+ *     first use, reused thereafter).
+ *
+ * Throws if `createLLMClient(config)` has not yet been called.
  */
-export function getLLMClient(): LLMClient {
-  if (!_client) throw new Error('LLM client not initialised. Call createLLMClient(config) first.');
-  return _client;
+export function getLLMClient(model?: string): LLMClient {
+  if (!_defaultConfig) {
+    throw new Error('LLM client not initialised. Call createLLMClient(config) first.');
+  }
+  const targetModel = model ?? _defaultConfig.model;
+  const cached = _clients.get(targetModel);
+  if (cached) return cached;
+  // First use of this model — create a derived client.
+  const overrideConfig: LLMConfig = { ..._defaultConfig, model: targetModel };
+  const client = new LLMClient(overrideConfig);
+  _clients.set(targetModel, client);
+  log.info({ model: targetModel }, 'LLM client created for model override');
+  return client;
 }
 
 /**
- * Initialises the singleton LLM client.
- * Called once at server startup with the loaded config.
+ * Initialises the default LLM client at server startup with the
+ * loaded platform config. Re-calling resets the registry (intended
+ * for test setup; production calls once).
  */
 export function createLLMClient(config: LLMConfig): LLMClient {
-  _client = new LLMClient(config);
+  _defaultConfig = config;
+  _clients.clear();
+  const client = new LLMClient(config);
+  _clients.set(config.model, client);
   log.info({ model: config.model, baseUrl: config.baseUrl }, 'LLM client initialised');
-  return _client;
+  return client;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

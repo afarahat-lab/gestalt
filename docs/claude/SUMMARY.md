@@ -14,7 +14,7 @@ content is derived._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — Step 1: externalise agent prompts to agents.yaml)
+**Last updated:** 2026-06-01 (Claude Code — per-agent model override activated via LLMClient registry)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -28,10 +28,10 @@ content is derived._
   are summarised in the "Session log" entries dated 2026-05-29 / 30
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
-- All eight migrations apply on startup: `001_initial`, `002_local_auth`,
+- All nine migrations apply on startup: `001_initial`, `002_local_auth`,
   `003_projects`, `004_deployments`, `005_maintenance`,
   `006_intent_clarification`, `007_execution_logs`,
-  `008_finding_attempts`
+  `008_finding_attempts`, `009_execution_log_model`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
 - **Dashboard SPA reachable in the browser, deep-linkable, no path
@@ -745,15 +745,37 @@ content is derived._
   intact. `llm-review-agent.ts` and `context-fixer.ts` follow the
   same pattern inline (different surrounding architecture; same
   effect)
-- **LLM tuning** flows through a shared `LlmCallFn` type:
+- **LLM tuning + per-agent model routing** flow through a shared
+  `LlmCallFn` type:
   `(prompt, overrides?: { temperature?, maxTokens?, model? }) =>
-  Promise<string>`. The orchestrator's `llmCall` wrapper forwards
-  the overrides to `LLMClient.complete`. Each agent passes
-  `task.contextSnapshot.agentConfig.llm` as the second argument,
-  so per-agent `temperature` + `max_tokens` land on the wire.
-  Per-agent `model` override is parsed and surfaced on the type
-  but is a no-op today (the LLMClient is wired as a singleton at
-  startup; per-agent model routing is captured as a follow-up)
+  Promise<string>`. The orchestrator's `llmCall` wrapper calls
+  `getLLMClient(overrides.model)` per invocation — the registry
+  returns the cached default client when `model` is undefined
+  or matches the platform default, and creates + caches a new
+  client (sharing the default's `baseUrl` + `apiKey`) on first
+  use of any other model name. Each agent passes
+  `task.contextSnapshot.agentConfig.llm` so per-agent
+  `temperature`, `max_tokens`, AND `model` land on the wire
+- **Multi-client LLM registry (`@gestalt/core/src/llm/index.ts`).**
+  The startup singleton is now a `Map<string, LLMClient>` keyed
+  by model name. `createLLMClient(config)` seeds the default;
+  `getLLMClient(model?)` returns the cached client for the
+  requested model name or builds a new one on demand. Override
+  clients reuse the default's endpoint + API key — only the
+  model name changes on the wire (matches Azure deployment +
+  every OpenAI-compatible provider's contract). `LLMClient.getModel()`
+  exposes the bound model name so the orchestrators can capture
+  it after each call. Per-process cache — one entry per unique
+  model, created on first use, reused forever after
+- **`agent_execution_logs.model_used` column (migration 009).**
+  Captures which model actually ran each agent step (after the
+  per-agent override resolution). The orchestrators read
+  `client.getModel()` after every `complete()` call and persist
+  it. Null for non-LLM agents (constraint-agent / pr-agent /
+  pipeline-agent / promotion-agent / skipped lint-config) and
+  for pre-migration-009 rows. Dashboard's IntentDetail panel
+  shows `Model: gpt-4o-mini` / `gpt-4o` / `—` in the agent
+  meta section
 - **`gestalt init` seeds `agents.yaml`** in the harness file map
   (alongside `HARNESS.json` / `AGENTS.md` / context files). The
   seeded content matches the loader's per-role defaults exactly,
@@ -980,284 +1002,6 @@ content is derived._
 ---
 
 ## Recent session log entries (last 3 from SESSION_LOG.md)
-
-### Session 2026-06-01 — Claude Code (alignment-agent module extractor — tree-block scan + literal-path suggestedAction + CLI maintenance commands)
-
-Closes the architect's "module extractor literal-substring gap"
-follow-up flagged at the end of the previous session. The
-alignment-agent's `extractModules()` had only ever recognised a
-contiguous `src/modules/<name>` substring; ARCHITECTURE.md as
-authored by humans (and as written by the harness template)
-typically uses a markdown directory tree (`├── modules/` /
-`│   └── X/`) where the parent path is implied by indentation.
-The LLM's idiomatic additive edits never produced the contiguous
-form, so the alignment loop didn't converge — the idempotency
-budget caught the runaway but the underlying reconciliation never
-succeeded.
-
-This session implements the brief's Fix 1 + Fix 2 + Fix 3 in
-order, plus a structural depth check discovered during live
-verification.
-
-Changed:
-- `packages/agents/maintenance/src/agents/alignment-agent.ts`:
-  - **Fix 1 — `extractModules()` now runs two patterns.**
-    Pattern 1 is the previous literal `src/modules/<name>`
-    substring match. Pattern 2 walks the file looking for lines
-    that introduce a `modules/` container (the test handles the
-    trackeros-style `├── modules/   # business domain modules`
-    by stripping the trailing `# …` comment before regex-matching;
-    same pattern applied to child lines), and for each one
-    scans up to 10 following lines for tree-child entries
-    (`│   ├── X/`). The brief's 10-line cap is preserved; the
-    child match uses the brief's `[├└│─\s]+([a-zA-Z]…)\/?(?:\s*[—–-].*)?$`
-    regex after the comment strip
-  - **Structural depth check (added during live verification).**
-    The brief's break condition `if (/^[a-zA-Z#]/.test(trim))
-    break` doesn't catch sibling tree entries like
-    `├── shared/` that follow the modules/ subtree at the SAME
-    indent depth — the first run after Fix 1 + Fix 2 reported
-    `directFixes: 5` for 5 false-positive
-    `architecture-module-without-entity` findings (`shared`,
-    `db`, `auth`, `utils`, `api` — all of which are visible
-    siblings of `modules/` in the trackeros tree). Added
-    `countLeadingPipes(line)` and require child tree entries to
-    have STRICTLY more `│` characters in their leading prefix
-    than the parent. This eliminates the sibling false positives
-    cleanly: parent `├── modules/` has 0 leading `│`, real child
-    `│   ├── WelcomeScreen/` has 1, sibling `├── shared/` has 0
-    and breaks the scan
-  - Helper functions broken out (`isModulesContainerLine`,
-    `stripLineComment`, `countLeadingPipes`) so the patterns
-    stay readable
-  - **Fix 2 — sharpened `suggestedAction` for
-    `domain-entity-without-module`.** Old text:
-    `Add a src/modules/${entity}/ entry to docs/ARCHITECTURE.md
-    to match …`. New text:
-    `Add the line "  src/modules/${entity}/    — ${entity}
-    module" to the module listing in docs/ARCHITECTURE.md. Use
-    the literal path format, not a tree diagram child entry`.
-    Single instruction shared by both the
-    `MaintenanceFinding.suggestedAction` and the
-    `MaintenanceIntent.suggestedAction` (DRY). The "literal path
-    format, not a tree diagram" wording is load-bearing — without
-    it the LLM tends to add an indented child like `│   └── X/`
-    which Pattern 2 catches but Pattern 1 (the simpler, more
-    authoritative path) does not. The literal format guarantees
-    Pattern 1 matches on the NEXT run
-- `packages/core/src/repository/index.ts`:
-  - `FindingAttemptRepository.resetAll(projectId): Promise<number>`
-    — operator-triggered full reset for a project. Deletes every
-    attempt row (escalated or not). Returns the count
-- `packages/adapters/postgres/src/repositories/finding-attempts.ts`:
-  - Implemented `resetAll` using the `WITH deleted AS (… RETURNING
-    1) SELECT COUNT(*)::text FROM deleted` trick — postgres.js
-    doesn't surface affected-row counts on naked `DELETE`
-    statements. Same pattern as `gcOlderThan` on the
-    deployment-events repo
-- `packages/adapters/{oracle,mssql}/src/repositories/finding-attempts.ts`:
-  - Throw-stub `resetAll(projectId)` added to each adapter's
-    `*FindingAttemptRepository` class for interface parity
-- `packages/server/src/routes/maintenance.ts`:
-  - `DELETE /maintenance/findings/:projectId`
-    (`requireRole('operator')`). Validates `projectId`,
-    `projects.findById` to 404 if missing, calls
-    `findingAttempts.resetAll(projectId)`, writes audit, returns
-    `{ data: { deleted: N } }`. **Audit record carries only
-    `projectName` + `deletedCount` + `ip` — finding hashes are
-    derived from finding content (file paths, evidence text)
-    and so are excluded per GP-006**. Verified live:
-    `SELECT count(*) FROM audit_log WHERE action='maintenance.findings-reset'
-    AND metadata::text LIKE '%findingHash%'` returns 0
-- `packages/cli/src/api/client.ts`:
-  - New `triggerMaintenance(agentRole, projectId)` method
-    wrapping `POST /maintenance/trigger`
-  - New `resetMaintenanceFindings(projectId)` method wrapping
-    `DELETE /maintenance/findings/:projectId`
-  - New private `delete<T>(path)` helper (the existing client
-    only had get/post — DELETE was missing)
-- `packages/cli/src/commands/maintenance.ts` (new):
-  - `maintenanceTriggerCommand(agentRole, projectName, opts)` —
-    resolves the project ID by name (same convention as
-    `gestalt projects use` and `gestalt projects set-adapter`),
-    calls the API, prints `runId` + `intentsQueued` +
-    `directFixes` + `durationMs`. Validates the agentRole
-    client-side against `{drift-agent, alignment-agent,
-    gc-agent, evaluation-agent}` so typos fail fast before the
-    network round-trip
-  - `maintenanceResetFindingsCommand(projectName, opts)` —
-    resolves project, calls DELETE endpoint, prints the
-    deleted count + a hint to run alignment-agent. Connection
-    errors route through the shared `printConnectionError` /
-    `isConnectivityError` helpers used by every other command
-- `packages/cli/src/index.ts`:
-  - New `gestalt maintenance` parent command grouping
-    `trigger <agentRole> <projectName>` and
-    `reset-findings <projectName>`. Both subcommands accept
-    the standard `--server <url>` one-shot override
-
-Verified live against `trackeros` (4 maintenance triggers + 2
-reset calls + DB inspection):
-
-1. **CLI reset** — `gestalt maintenance reset-findings trackeros`
-   deleted the 2 escalated rows left over from the previous
-   session (`SELECT count(*) FROM maintenance_finding_attempts`
-   went 2 → 0). Audit row recorded with
-   `metadata = {"projectName":"trackeros","deletedCount":2,
-   "ip":"192.168.65.1"}` and no finding hash anywhere in it
-2. **First alignment-agent trigger (post-reset).** Pre-existing
-   DOMAIN.md state still had the 12+ spurious `> Note:`
-   blockquotes from earlier sessions (operator-side cleanup not
-   automated per the brief), and ARCHITECTURE.md still held the
-   tree-format module subtree the LLM had written in the prior
-   session's run. With the dual-pattern extractor BUT
-   pre-depth-check, the tree-block scan over-reached and
-   surfaced 5 false-positive
-   `architecture-module-without-entity` findings for
-   `shared/db/auth/utils/api` (the siblings of `modules/`).
-   The LLM happily added 5 garbage entities to DOMAIN.md to
-   "reconcile". Recognised this as a true bug in the scan —
-   not a known limitation — and added the
-   `countLeadingPipes`-based structural depth check
-3. **Server rebuilt, finding attempts reset again
-   (`deleted: 0`), and triggered alignment-agent a second
-   time.** With the depth check in place, the scan now
-   correctly stopped at `├── shared/` — only `WelcomeScreen`
-   and `StartButton` were extracted as modules. The lingering
-   5 LLM-added entities in DOMAIN.md (`Shared`, `DB`, `Auth`,
-   `Utils`, `API` — left over from the previous run's
-   pollution) re-surfaced as 5
-   `domain-entity-without-module` findings. The runner
-   targeted each at `docs/ARCHITECTURE.md` (Fix B from the
-   prior session), and the LLM — driven by the sharpened
-   `suggestedAction` text from Fix 2 — added EXACTLY the
-   literal-path format below the existing tree block:
-   ```
-   src/modules/Shared/    — Shared module
-   src/modules/DB/        — DB module
-   src/modules/Auth/      — Auth module
-   src/modules/Utils/     — Utils module
-   src/modules/API/       — API module
-   ```
-   5 commits to ARCHITECTURE.md, each authored by
-   `Gestalt Maintenance Agent`. `directFixes: 5`,
-   `intentsQueued: 0`
-4. **Third trigger — convergence.** Re-scanned: Pattern 1
-   picked up all 5 new literal-path entries, Pattern 2
-   picked up `WelcomeScreen` / `StartButton` (and
-   correctly stopped at `├── shared/`); module set was
-   `{WelcomeScreen, StartButton, Shared, DB, Auth, Utils,
-   API}`. DOMAIN.md entity set was identical. **Run result:
-   `intentsQueued: 0, directFixes: 0, findings: 0,
-   durationMs: 1591 ms`** (no LLM calls, just the clone +
-   scan + cleanup). HEAD did NOT advance —
-   `git ls-remote` shows the same `62bbeabf` SHA before
-   and after the trigger. The alignment loop has fully
-   converged
-5. **`finding_attempts` table stays empty** through all 3
-   triggers because every fix succeeded (each success calls
-   `resetAttempts(hash)` to delete the row). No idempotency
-   budget tripped; no `maintenance-stuck` alerts created
-
-Decisions made:
-- **Structural depth check is not in the brief but is required
-  for correctness.** The brief's break condition catches
-  alphabetic / `#` line starts but not tree decorations at the
-  parent's depth. Discovered the bug live (5 spurious
-  commits on the first trigger after Fix 1+2), traced through
-  the LLM's prompt input vs the agent's regex output, and
-  added the depth check. This is the only deviation from the
-  brief's literal spec, motivated by an actual failed
-  verification cycle and the brief's invariant ("the second
-  alignment-agent run produces findings: 0")
-- **Comment-stripping (`# …` → strip-and-trim-end) applied to
-  BOTH the modules-container-line detection AND the child
-  regex match.** The harness template's `├── modules/   #
-  business domain modules — own their data and routes` puts a
-  long comment after `modules/`; without stripping it neither
-  brief regex (`/\bmodules\/?\s*$/` or
-  `/\bmodules\/\s*[─│├└]/`) would match. The same line in
-  child position (`│   ├── WelcomeScreen/ # module for
-  WelcomeScreen entity`) wouldn't pattern-match the brief's
-  trailing `$`. One helper, applied both places — cleanest
-  approach and doesn't change the visible brief regexes
-- **`maintenanceTriggerCommand` validates agentRole
-  client-side.** The server validates too (whitelist check in
-  `routes/maintenance.ts`) but a CLI-side check produces a
-  better error message for typos like `gestalt maintenance
-  trigger alignement-agent ...` (missing the network round
-  trip). Both lists are the same hardcoded
-  `{drift-agent, alignment-agent, gc-agent,
-  evaluation-agent}` for now; the next adapter would need
-  edits to both
-- **CLI command structure: `gestalt maintenance trigger / reset-findings`
-  follows the existing `gestalt projects list / use / set-adapter`
-  pattern**: a parent command grouping subcommands. Kept all
-  the existing project-management conventions
-  (`resolveProjectByName` reuses the same name-lookup pattern;
-  errors route through the shared `printConnectionError`;
-  `--server` one-shot override on every subcommand). Auth
-  check is the same `if (!config.token) ... process.exit(1)`
-  used everywhere else
-- **`resetAll` is `DELETE FROM ... RETURNING 1` + `SELECT
-  COUNT(*)`, not the simpler `DELETE` with no return.**
-  postgres.js doesn't expose affected-row count on naked
-  DELETE statements (returns 0 every time). The CTE trick is
-  the established platform pattern (mirrors `gcOlderThan` in
-  `deployment-events.ts`) and gives the caller a real
-  `deleted: N` count for the CLI to print
-- **DELETE endpoint requires `requireRole('operator')`.**
-  Same level as `POST /maintenance/trigger` — both are
-  operator-grade operations that touch project state.
-  Viewer role gets none of the maintenance write APIs.
-  Audit row captures the operator's `request.user.id` as the
-  `actor` field so accountability is preserved
-- **Operator-side DOMAIN.md cleanup (the previous session's
-  spurious `> Note:` blockquotes) NOT done by Claude Code.**
-  The brief explicitly carved this out ("The manual
-  DOMAIN.md cleanup in trackeros is done by the operator
-  after verification — Claude Code documents it in the
-  session log but does not attempt to automate it"). An
-  attempt to push the cleanup commit was correctly denied by
-  the auto-mode classifier (pushing to a project's main
-  branch on the operator's behalf is out of scope). The
-  convergence verification still succeeded — DOMAIN.md's
-  unrelated `> Note:` content doesn't influence the entity
-  extractor (H3-only regex doesn't match blockquote lines).
-  Recommended operator action is still in last session's log
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Server image rebuilt (twice — once for the initial Fix 1+2+3
-ship, once after the depth-check correction). CLI rebuilt and
-the linked `gestalt` command surfaces the new subcommands
-(`gestalt maintenance --help` lists `trigger` and
-`reset-findings`). Migration 008 still applied from the prior
-session — no new migration this round.
-
-Operator follow-up: the trackeros `docs/DOMAIN.md` still
-carries the spurious `> Note:` blockquotes accumulated by
-the original buggy runs (~12 lines). They no longer
-influence the alignment-agent (the H3-only entity extractor
-ignores blockquote lines), but they're visual clutter the
-operator can remove in a single commit. Same recommended
-commit as the prior session's log:
-
-```
-cd <trackeros working tree>
-git pull
-# edit docs/DOMAIN.md, remove every `> Note: …` line
-git add docs/DOMAIN.md
-git commit -m "docs: remove spurious Note blockquotes from alignment-agent bug [manual cleanup]"
-git push
-```
-
-Pending enhancement closed in this session: "alignment-agent
-module extractor assumes literal `src/modules/<name>`
-references in ARCHITECTURE.md". The dual-pattern extractor +
-sharpened suggestedAction + depth-check together resolve the
-underlying reconciliation gap. No new follow-ups added.
-
----
 
 ### Session 2026-06-01 — Claude Code (richer alerts: enriched payload + fix-intent flow + CLI alerts commands)
 
@@ -1785,4 +1529,229 @@ Follow-up logged:
   `LLMClient` is a startup singleton. Worth implementing when
   operators start asking to run the test-agent on a cheaper
   model than the code-agent
+
+---
+
+### Session 2026-06-01 — Claude Code (per-agent model override activated via LLMClient registry)
+
+Activates the per-agent `model` override that Step 1 had parsed but
+left inactive. The previous session's follow-up said:
+*"Would require routing through a multi-client registry; current
+LLMClient is a startup singleton."* This session implements that
+registry and threads the routing through every LLM-using agent. The
+dashboard's IntentDetail accordion now shows which model handled each
+agent step.
+
+Changed:
+- `packages/core/src/llm/index.ts`:
+  - Replaced the `_client: LLMClient | null` singleton with a
+    `_clients: Map<string, LLMClient>` keyed by model name plus a
+    `_defaultConfig: LLMConfig | null` slot
+  - `createLLMClient(config)` seeds `_defaultConfig`, instantiates
+    the default client, and stores it in the Map under
+    `config.model`. Re-calling clears the Map (handy for test setup)
+  - `getLLMClient(model?: string)` resolves to the cached client
+    for the requested model name. If the model is `undefined` or
+    matches the default, returns the default client. Otherwise
+    creates a derived `LLMConfig` (default + `model: targetModel`),
+    instantiates a new `LLMClient`, stores it in the Map, and
+    logs `"LLM client created for model override"`. Per-process
+    cache — one entry per unique model, created on first use,
+    reused for the lifetime of the server
+  - New `LLMClient.getModel(): string` — exposes the bound model
+    name so orchestrators can capture the actual model that ran
+    after every `complete()` call
+- `packages/adapters/postgres/src/migrations/009_execution_log_model.sql`
+  (new): `ALTER TABLE agent_execution_logs ADD COLUMN model_used
+  TEXT;`. Pure schema; no `schema_migrations` writes
+- `packages/core/src/repository/index.ts`:
+  - `AgentExecutionLogRecord` extended with
+    `modelUsed: string | null`. The Omit<> in
+    `AgentExecutionLogRepository.save()` automatically includes
+    the new field, so every save call site has to populate it —
+    TypeScript caught the missing fields in the generate / gate /
+    deploy orchestrators on the first build attempt
+- `packages/adapters/postgres/src/repositories/execution-logs.ts`:
+  - `LogRow.modelUsed: string | null`
+  - `rowToRecord` passes `modelUsed` through (postgres.js returns
+    a plain string or NULL — no JSONB-style parsing needed)
+  - `save()` includes `model_used` in the INSERT
+- Oracle/MSSQL stubs untouched — they throw on every call so the
+  new column requires no code change there
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  - Hoisted `let lastModelUsed: string | null = null` above the
+    per-agent try block so both the success and the catch paths
+    can read it
+  - Rewrote the `llmCall` factory: now calls
+    `getLLMClient(overrides?.model)` per invocation (per-agent
+    routing!), captures `client.getModel()` into `lastModelUsed`,
+    and forwards `temperature` / `maxTokens` to the chosen
+    client. Drops the previous "model override is parsed but
+    inactive" comment
+  - Both `executionLogs.save` call sites (success path + catch
+    path) include `modelUsed: lastModelUsed`
+- `packages/agents/quality-gate/src/types.ts`:
+  - `GateAgentResult.modelUsed?: string` so the LLM-backed
+    review-agent can return the routed model
+- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
+  - Same routing pattern: `llmCall` accepts overrides,
+    `getLLMClient(overrides?.model)` per call, captures
+    `reviewModelUsed`
+  - After `runLlmReviewAgent` returns, the orchestrator attaches
+    `r.modelUsed = reviewModelUsed` so it lands on the wire
+  - `runWithObservability`'s `executionLogs.save` reads
+    `resultWithPrompt.modelUsed ?? null`; the thrown-error path
+    persists `modelUsed: null`
+- `packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`:
+  - Both `executionLogs.save` sites set `modelUsed: null` (deploy
+    agents are deterministic — pr-agent / pipeline-agent /
+    promotion-agent never call the LLM)
+- `packages/agents/maintenance/src/agents/context-fixer.ts`:
+  - `getLLMClient(agentConfig.llm.model)` — context-fixer's LLM
+    call now routes via the registry like the generate-side
+    agents
+  - context-fixer doesn't have an `agent_executions` row of its
+    own (it runs inside the maintenance runner), so no
+    `executionLogs.save` change needed
+- `packages/server/src/routes/projects.ts` `buildAgentsYaml()`:
+  - Each agent's `llm:` block now lists `model: ~` (YAML null
+    = "use platform default") above the existing `temperature`
+    + `max_tokens` lines
+  - Top-comment block documents the `llm.model` semantics and
+    flags `code-agent` with an example comment
+    (`# Example: set to "gpt-4o" to use a specific model`)
+- `packages/dashboard/src/views/IntentDetail.tsx`:
+  - `ExecutionLogResponse.log.modelUsed: string | null` added
+  - Expanded execution panel renders a new `Model` KV row in the
+    Agent section showing `gpt-4o-mini` / `gpt-4o` / `—` for
+    non-LLM agents
+- `packages/dashboard/src/api/client.ts`:
+  - `getExecutionLog()` return type widened with `modelUsed:
+    string | null` so the dashboard typing matches the wire
+- `docs/reference/harness-config.md`:
+  - New `agents.yaml — per-agent configuration` section
+    documenting the full schema (`role`, `goal`, `llm.model`,
+    `llm.temperature`, `llm.max_tokens`, `prompt_extensions`)
+    + the loader's behaviour on missing / partial / malformed
+    files
+
+Verified live against `trackeros`:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt; migration 009 applied
+  (`schema_migrations` now lists 9 entries through
+  `009_execution_log_model`). `model_used TEXT` column visible
+  on `\d agent_execution_logs`
+- **Committed `agents.yaml` to trackeros main** (commit
+  `498eb0f`) with:
+  ```yaml
+  agents:
+    intent-agent: { llm: { model: gpt-4o-mini } }   # cheaper for parsing
+    code-agent:   { llm: { model: gpt-4o } }        # best for code
+  ```
+- **Submitted intent** "Add a trimEnd utility under
+  src/shared/utils/trim-end" (correlationId `1581ab36`).
+  Server ran two gate-retry cycles (review-agent flagged
+  concerns); both cycles surfaced the per-agent routing
+- **`agent_execution_logs.model_used` per agent:**
+  ```
+  intent-agent      | gpt-4o-mini | completed   ← override
+  design-agent      | gpt-4o      | completed   ← platform default
+  context-agent     | gpt-4o      | completed   ← platform default
+  lint-config-agent | (null)      | skipped     ← non-LLM
+  code-agent        | gpt-4o      | completed   ← override matches default
+  test-agent        | gpt-4o      | completed   ← platform default
+  constraint-agent  | (null)      | passed      ← deterministic
+  review-agent      | gpt-4o      | failed      ← platform default
+  ```
+  Same shape repeats on the gate-retry leg
+- **Cache verified.** Server log shows
+  `"LLM client created for model override"` exactly ONCE
+  during the cycle (when `gpt-4o-mini` was first requested);
+  the second intent-agent run on the retry leg used the cached
+  client (no second log line)
+- **API surface confirmed.** `GET /executions/<intent-agent-id>/log`
+  returns `data.log.modelUsed: "gpt-4o-mini"` — the new field
+  flows through the route handler unchanged because the
+  AgentExecutionLogRecord shape propagates automatically
+- **Health endpoint still 200.** `gestalt status` works
+  unchanged; default client unaffected
+
+Decisions made:
+- **Per-process cache, not per-correlationId.** A model name is
+  a global routing key — `gpt-4o-mini` always means the same
+  thing for the lifetime of the server, so the cached client is
+  safe to share across cycles + projects. Memory cost is one
+  `LLMClient` instance per unique model name (typically 1–3)
+- **`getLLMClient(undefined)` returns the default client.**
+  Every existing call site (`getLLMClient()` with no args) keeps
+  working without modification. Backward compatible
+- **Override clients reuse `baseUrl` + `apiKey` from the default
+  config.** Matches the brief; matches how Azure deployments
+  work (deployment-name path component IS the model on the
+  wire). Operators who need a different endpoint per model
+  would need a richer `agents.yaml` schema — captured as a
+  follow-up enhancement
+- **`createLLMClient` clears the registry before re-seeding.**
+  Production calls this once at startup, so the clear is a
+  no-op. But this makes test setup deterministic — a test that
+  calls `createLLMClient(testConfig)` after a previous test
+  used a different default doesn't carry forward stale entries
+- **Captured `lastModelUsed` in the closure variable per agent
+  step, NOT on the result returned by the agent.** The agents
+  themselves don't need to know which model handled their LLM
+  call — that's an observability concern owned by the
+  orchestrator. The closure-captured variable means the
+  orchestrator doesn't have to ferry a "current model" pointer
+  through every agent function signature
+- **Gate orchestrator's `modelUsed` flows on `GateAgentResult`.**
+  Different surface from the generate orchestrator (the agent
+  returns a typed result that the orchestrator's
+  `runWithObservability` consumes). Adding an optional
+  `modelUsed` to the result type, populated by the orchestrator
+  after the agent runs, kept the agent signature unchanged and
+  let `runWithObservability` stay generic over the per-agent
+  result shape
+- **context-fixer routes via the registry but doesn't persist
+  modelUsed.** It has no `agent_executions` row of its own —
+  it runs inside the maintenance runner's per-finding loop,
+  and the maintenance run record captures aggregate counts not
+  per-call model. If operators ever want per-finding model
+  tracking, the maintenance_runs table would need a new column;
+  out of scope for this session
+- **`model: ~` (YAML null) is "use platform default", same as
+  the field being absent.** The loader's existing snake_case +
+  camelCase normalisation already drops null model values from
+  the merged config — `typeof null === 'object'` so the
+  `typeof llmIn['model'] === 'string'` guard skips null. No
+  loader change needed. Tested implicitly by the verification
+  cycle (review-agent / design-agent / etc. have no `model`
+  override and route to the default `gpt-4o`)
+- **Dashboard shows `—` (em-dash) for null `modelUsed`.**
+  Consistent with the rest of the IntentDetail panel's
+  placeholder (which uses em-dashes for "not applicable"
+  fields). Non-LLM agents and pre-migration-009 rows both
+  render the same way; the operator can tell from the rest of
+  the row whether it's "no LLM call" vs "old run"
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; migration 009 applied; full per-agent
+model routing verified end-to-end. The brief's verification
+matrix (intent-agent on gpt-4o-mini, code-agent on gpt-4o,
+other agents on platform default, single
+`"LLM client created for model override"` log line) hits all
+four checkpoints.
+
+The "Per-agent model override is parsed but inactive"
+follow-up from the previous session is now resolved. New
+follow-up logged below — separate endpoints / credentials per
+model is a richer schema change.
+
+Follow-up logged:
+- **Per-model endpoint + API key overrides.** Today's registry
+  reuses the default `baseUrl` + `apiKey` for every override.
+  An operator who wants to run `gpt-4o-mini` on OpenAI's
+  endpoint but `gpt-4o` on Azure (or vLLM for code, OpenAI for
+  intent) would need `agents.yaml` extended with `llm.baseUrl`
+  + `llm.apiKey` fields and the loader + registry extended to
+  honour them. Reasonable next step for multi-provider shops
 

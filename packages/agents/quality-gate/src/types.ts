@@ -55,6 +55,15 @@ export interface GateAgentResult {
    */
   lastPrompt?: string;
   llmResponse?: string;
+  /**
+   * The model the LLM call routed to. Captured by the gate
+   * orchestrator from `client.getModel()` after the agent runs and
+   * persisted into `agent_execution_logs.model_used` so the
+   * dashboard's IntentDetail panel can show "Model: gpt-4o-mini"
+   * for an agents.yaml-overridden review-agent. Undefined for
+   * non-LLM gate agents.
+   */
+  modelUsed?: string;
 }
 
 // Retry recommendation returned to generate layer

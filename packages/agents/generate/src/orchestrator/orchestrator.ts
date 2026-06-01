@@ -379,6 +379,10 @@ async function drivePlan(
           startedAt: startedAt.toISOString(),
         });
 
+        // Captured inside `llmCall` below; declared here so the catch
+        // block can persist whatever model handled the call that
+        // triggered the throw (often the most useful diagnostic).
+        let lastModelUsed: string | null = null;
         try {
           const context = await assembleContext(projectRoot, plan, agentRole, intentText);
           const routedSignals = signalsForAgent(agentRole);
@@ -398,26 +402,24 @@ async function drivePlan(
               agentRole === 'intent-agent' ? opts.clarification : undefined,
           };
 
-          const llmClient = getLLMClient();
-          // Each agent reads its tuning from `task.contextSnapshot.agentConfig.llm`
-          // (loaded by the context-assembler from agents.yaml; falls back to the
-          // per-role baseline when the file is absent). The agents pass these
-          // overrides explicitly so a single shared `llmCall` doesn't have to
-          // know which agent is calling it.
+          // Per-agent LLM routing. agentConfig.llm.model (parsed from
+          // agents.yaml, optionally null) selects the right client from
+          // the registry; getLLMClient(undefined) returns the default
+          // client, so projects without an agents.yaml override behave
+          // identically to before. lastModelUsed is captured into the
+          // outer closure variable so the catch path below can also
+          // persist whatever model the failing call routed to.
           const llmCall = async (
             prompt: string,
             overrides?: { temperature?: number; maxTokens?: number; model?: string },
           ): Promise<string> => {
-            const result = await llmClient.complete({
+            const client = getLLMClient(overrides?.model);
+            lastModelUsed = client.getModel();
+            const result = await client.complete({
               messages: [{ role: 'user', content: prompt }],
               correlationId: plan.correlationId,
               ...(overrides?.temperature !== undefined ? { temperature: overrides.temperature } : {}),
               ...(overrides?.maxTokens !== undefined ? { maxTokens: overrides.maxTokens } : {}),
-              // model is platform-wide today (configured at startup via
-              // `createLLMClient`); per-agent model override would require
-              // routing through a different client instance — left as a
-              // follow-up. The field is parsed from agents.yaml so the
-              // capability surfaces in the type, even if it's a no-op now.
             });
             if (!result.ok) throw new Error(result.error.message);
             return result.value.content;
@@ -479,6 +481,10 @@ async function drivePlan(
             errorMessage: result.status === 'failed'
               ? (result.signals[0]?.message ?? 'Unknown error')
               : null,
+            // Captured inside llmCall — null when the agent didn't make
+            // an LLM call (skipped lint-config; clarification-needed
+            // path before any call).
+            modelUsed: lastModelUsed,
           }).catch((err) => {
             childLog.warn({ err, executionId, agentRole }, 'executionLogs.save failed');
           });
@@ -560,6 +566,10 @@ async function drivePlan(
             artifactPaths: [],
             signalTypes: [],
             errorMessage: err instanceof Error ? err.message : String(err),
+            // The agent threw before completing — lastModelUsed may
+            // hold the model from the call that triggered the throw,
+            // or null if the throw happened before any LLM call.
+            modelUsed: lastModelUsed,
           }).catch(() => undefined);
           emitLiveEvent('agent.completed', plan.correlationId, {
             executionId,

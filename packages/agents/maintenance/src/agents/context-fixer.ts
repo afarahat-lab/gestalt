@@ -202,7 +202,12 @@ async function generateUpdatedContent(args: {
   agentConfig: AgentConfig;
 }): Promise<string | null> {
   const { targetFile, currentContent, intent, agentConfig } = args;
-  const llm = getLLMClient();
+  // Per-agent model routing via the registry. agentConfig.llm.model
+  // (parsed from agents.yaml; null means platform default) selects
+  // the right client; getLLMClient(undefined) returns the default
+  // singleton so existing projects without an agents.yaml override
+  // behave identically.
+  const llm = getLLMClient(agentConfig.llm.model);
 
   // Persona built from agents.yaml — the original "technical writer" role
   // is the per-role default in agent-config-loader.ts, so removing the
