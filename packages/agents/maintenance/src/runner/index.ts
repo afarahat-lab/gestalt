@@ -30,7 +30,7 @@ import type {
   MaintenancePriority, HarnessSubset,
 } from '../types';
 import { classifyMaintenanceIntent } from '../types';
-import { applyContextFileFix } from '../agents/context-fixer';
+import { ContextFixer } from '../agents/context-fixer';
 
 /**
  * Max consecutive direct-fix attempts on the same finding before the
@@ -88,7 +88,7 @@ async function runDirectFix(args: {
   }
 
   try {
-    const outcome = await applyContextFileFix(intent, project);
+    const outcome = await new ContextFixer().applyFix(intent, project);
     if (outcome.committed) {
       // Real edit shipped — clear the attempt row so the next time the
       // SAME finding fires (if it ever does), it starts at attempt 1.

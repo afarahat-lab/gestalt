@@ -1,56 +1,73 @@
 /**
- * Design agent — produces domain model changes, API contracts, component specs.
- * Always runs. Reads IntentSpec from prior artifacts.
+ * Design agent — produces domain model changes, API contracts,
+ * component specs. Always runs; reads IntentSpec from prior
+ * artifacts. Internal retry on JSON parse failure.
  */
 
-import type { AgentTask, AgentResult, DesignArtifact, LlmCallFn } from '../types';
+import type { AgentTask, AgentResult, DesignArtifact } from '../types';
 import { buildDesignPrompt } from '../prompts/design-prompt';
+import { applyAgentConfig } from '../prompts/agent-config-helpers';
+import { BaseLLMAgent } from './base-llm-agent';
 
 const MAX_INTERNAL_RETRIES = 2;
 
-export async function runDesignAgent(
-  task: AgentTask,
-  llmCall: LlmCallFn,
-): Promise<AgentResult> {
-  const startedAt = Date.now();
-  let lastError: Error | undefined;
-  let lastPrompt: string | undefined;
-  let lastLlmResponse: string | undefined;
+export class DesignAgent extends BaseLLMAgent {
+  constructor() { super('design-agent'); }
 
-  for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
-    try {
-      const prompt = buildDesignPrompt(task.contextSnapshot, attempt);
-      lastPrompt = prompt;
-      const raw = await llmCall(prompt, task.contextSnapshot.agentConfig.llm);
-      lastLlmResponse = raw;
-      const design = parseDesignArtifact(raw, task.correlationId);
+  override async run(task: AgentTask): Promise<AgentResult> {
+    const startedAt = task.startedAt ?? Date.now();
+    const { agentConfig } = task.contextSnapshot;
+    let lastError: Error | undefined;
 
-      return {
-        agentRole: 'design-agent',
-        status: 'completed',
-        lastPrompt,
-        llmResponse: lastLlmResponse,
-        artifacts: [
-          {
-            id: crypto.randomUUID(),
-            correlationId: task.correlationId,
-            type: 'design',
-            path: '.gestalt/design-spec.json',
-            content: JSON.stringify(design, null, 2),
-            producedBy: 'design-agent',
-            createdAt: new Date(),
-          },
-        ],
-        signals: [],
-        tokensUsed: 0,
-        durationMs: Date.now() - startedAt,
-      };
-    } catch (err) {
-      lastError = err instanceof Error ? err : new Error(String(err));
+    for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
+      try {
+        const rawPrompt = buildDesignPrompt(task.contextSnapshot, attempt);
+        const prompt = applyAgentConfig(rawPrompt, agentConfig);
+        const raw = await this.callLLM(prompt, agentConfig, task.correlationId);
+        const design = parseDesignArtifact(raw, task.correlationId);
+
+        return {
+          agentRole: 'design-agent',
+          status: 'completed',
+          artifacts: [
+            {
+              id: crypto.randomUUID(),
+              correlationId: task.correlationId,
+              type: 'design',
+              path: '.gestalt/design-spec.json',
+              content: JSON.stringify(design, null, 2),
+              producedBy: 'design-agent',
+              createdAt: new Date(),
+            },
+          ],
+          signals: [],
+          tokensUsed: 0,
+          durationMs: Date.now() - startedAt,
+        };
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+      }
     }
+
+    return {
+      agentRole: 'design-agent',
+      status: 'failed',
+      artifacts: [],
+      signals: [this.makeContextGapSignal(
+        task.correlationId,
+        `design-agent failed: ${lastError?.message ?? 'unknown error'}`,
+      )],
+      tokensUsed: 0,
+      durationMs: Date.now() - startedAt,
+    };
   }
 
-  return failedResult('design-agent', task.correlationId, startedAt, lastError, lastPrompt, lastLlmResponse);
+  protected buildPrompt(): string {
+    throw new Error('DesignAgent.buildPrompt is not used — see overridden run()');
+  }
+  protected parseResponse(): AgentResult {
+    throw new Error('DesignAgent.parseResponse is not used — see overridden run()');
+  }
 }
 
 function parseDesignArtifact(raw: string, correlationId: string): DesignArtifact {
@@ -61,34 +78,5 @@ function parseDesignArtifact(raw: string, correlationId: string): DesignArtifact
     domainChanges: parsed.domainChanges ?? [],
     apiContracts: parsed.apiContracts ?? [],
     componentSpecs: parsed.componentSpecs ?? [],
-  };
-}
-
-function failedResult(
-  agentRole: AgentResult['agentRole'],
-  correlationId: string,
-  startedAt: number,
-  error?: Error,
-  lastPrompt?: string,
-  llmResponse?: string,
-): AgentResult {
-  return {
-    agentRole,
-    status: 'failed',
-    lastPrompt,
-    llmResponse,
-    artifacts: [],
-    signals: [{
-      id: crypto.randomUUID(),
-      correlationId,
-      type: 'CONTEXT_GAP',
-      severity: 'high',
-      sourceAgent: agentRole,
-      message: `${agentRole} failed: ${error?.message ?? 'unknown error'}`,
-      autoResolvable: false,
-      createdAt: new Date(),
-    }],
-    tokensUsed: 0,
-    durationMs: Date.now() - startedAt,
   };
 }

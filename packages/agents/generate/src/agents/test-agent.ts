@@ -1,20 +1,61 @@
 /**
- * Test agent — generates test suite from IntentSpec success criteria.
- * Always runs. Each success criterion maps to one or more test cases.
+ * Test agent — generates a Vitest suite from the IntentSpec's success
+ * criteria. Always runs (when criteria exist). Each criterion maps to
+ * one or more test cases. Test-generation failure surfaces as a
+ * `TEST_FAILURE` signal (auto-resolvable via the gate retry loop).
  */
 
-import type { AgentTask, AgentResult, GeneratedArtifact, LlmCallFn } from '../types';
+import type { AgentTask, AgentResult, GeneratedArtifact } from '../types';
 import { buildTestPrompt } from '../prompts/test-prompt';
+import { applyAgentConfig } from '../prompts/agent-config-helpers';
+import { BaseLLMAgent } from './base-llm-agent';
 
 const MAX_INTERNAL_RETRIES = 2;
 
-export async function runTestAgent(
-  task: AgentTask,
-  llmCall: LlmCallFn,
-): Promise<AgentResult> {
-  const startedAt = Date.now();
+export class TestAgent extends BaseLLMAgent {
+  constructor() { super('test-agent'); }
 
-  if (!task.contextSnapshot.intentSpec.successCriteria.length) {
+  override async run(task: AgentTask): Promise<AgentResult> {
+    const startedAt = task.startedAt ?? Date.now();
+    const { agentConfig } = task.contextSnapshot;
+
+    if (!task.contextSnapshot.intentSpec.successCriteria.length) {
+      return {
+        agentRole: 'test-agent',
+        status: 'failed',
+        artifacts: [],
+        signals: [this.makeContextGapSignal(
+          task.correlationId,
+          'No success criteria in IntentSpec — cannot generate tests',
+        )],
+        tokensUsed: 0,
+        durationMs: Date.now() - startedAt,
+      };
+    }
+
+    let lastError: Error | undefined;
+
+    for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
+      try {
+        const rawPrompt = buildTestPrompt(task.contextSnapshot, attempt);
+        const prompt = applyAgentConfig(rawPrompt, agentConfig);
+        const raw = await this.callLLM(prompt, agentConfig, task.correlationId);
+        const testFiles = parseTestFiles(raw, task.correlationId);
+        if (testFiles.length === 0) throw new Error('LLM returned no test files');
+
+        return {
+          agentRole: 'test-agent',
+          status: 'completed',
+          artifacts: testFiles,
+          signals: [],
+          tokensUsed: 0,
+          durationMs: Date.now() - startedAt,
+        };
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+      }
+    }
+
     return {
       agentRole: 'test-agent',
       status: 'failed',
@@ -22,11 +63,11 @@ export async function runTestAgent(
       signals: [{
         id: crypto.randomUUID(),
         correlationId: task.correlationId,
-        type: 'CONTEXT_GAP',
-        severity: 'high',
+        type: 'TEST_FAILURE',
+        severity: 'medium',
         sourceAgent: 'test-agent',
-        message: 'No success criteria in IntentSpec — cannot generate tests',
-        autoResolvable: false,
+        message: `Test generation failed: ${lastError?.message}`,
+        autoResolvable: true,
         createdAt: new Date(),
       }],
       tokensUsed: 0,
@@ -34,53 +75,12 @@ export async function runTestAgent(
     };
   }
 
-  let lastError: Error | undefined;
-  let lastPrompt: string | undefined;
-  let lastLlmResponse: string | undefined;
-
-  for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
-    try {
-      const prompt = buildTestPrompt(task.contextSnapshot, attempt);
-      lastPrompt = prompt;
-      const raw = await llmCall(prompt, task.contextSnapshot.agentConfig.llm);
-      lastLlmResponse = raw;
-      const testFiles = parseTestFiles(raw, task.correlationId);
-      if (testFiles.length === 0) throw new Error('LLM returned no test files');
-
-      return {
-        agentRole: 'test-agent',
-        status: 'completed',
-        lastPrompt,
-        llmResponse: lastLlmResponse,
-        artifacts: testFiles,
-        signals: [],
-        tokensUsed: 0,
-        durationMs: Date.now() - startedAt,
-      };
-    } catch (err) {
-      lastError = err instanceof Error ? err : new Error(String(err));
-    }
+  protected buildPrompt(): string {
+    throw new Error('TestAgent.buildPrompt is not used — see overridden run()');
   }
-
-  return {
-    agentRole: 'test-agent',
-    status: 'failed',
-    lastPrompt,
-    llmResponse: lastLlmResponse,
-    artifacts: [],
-    signals: [{
-      id: crypto.randomUUID(),
-      correlationId: task.correlationId,
-      type: 'TEST_FAILURE',
-      severity: 'medium',
-      sourceAgent: 'test-agent',
-      message: `Test generation failed: ${lastError?.message}`,
-      autoResolvable: true,
-      createdAt: new Date(),
-    }],
-    tokensUsed: 0,
-    durationMs: Date.now() - startedAt,
-  };
+  protected parseResponse(): AgentResult {
+    throw new Error('TestAgent.parseResponse is not used — see overridden run()');
+  }
 }
 
 function parseTestFiles(raw: string, correlationId: string): GeneratedArtifact[] {

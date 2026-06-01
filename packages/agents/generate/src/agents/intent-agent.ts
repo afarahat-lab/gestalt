@@ -8,74 +8,92 @@
  * - Identifies affected domains and layers from the harness context
  *
  * This agent never skips. If intent is received, this agent runs.
+ *
+ * The clarification gate runs AFTER the LLM call (trusts the LLM's
+ * structured output to drive the decision, not a pre-flight regex).
+ * Maintenance-sourced intents bypass clarification — see ADR-035.
  */
 
-import type { AgentTask, AgentResult, ClarificationNeeded, IntentSpec, Ambiguity, LlmCallFn } from '../types';
+import type {
+  AgentTask, AgentResult, ClarificationNeeded, IntentSpec, Ambiguity,
+} from '../types';
 import { buildIntentPrompt } from '../prompts/intent-prompt';
+import { applyAgentConfig } from '../prompts/agent-config-helpers';
+import { BaseLLMAgent } from './base-llm-agent';
 
 const MAX_INTERNAL_RETRIES = 2;
 
 /**
  * Intents queued by a maintenance agent carry this exact prefix on their
  * text (see ADR-035). The clarification gate must NOT fire for them —
- * `MaintenanceIntent` payloads are typed and self-contained; an empty
- * `successCriteria` array on a maintenance-sourced intent is the
- * maintenance-agent telling the generate layer "I will not synthesise
- * tests; just apply the structural change."
+ * `MaintenanceIntent` payloads are typed and self-contained.
  */
 const MAINTENANCE_PREFIX = '[gestalt-maintenance/';
 
-/**
- * Runs the intent agent for the given task.
- * Returns a completed AgentResult with the IntentSpec as an artifact,
- * or a failed result with signals if parsing could not succeed.
- */
-export async function runIntentAgent(
-  task: AgentTask,
-  llmCall: LlmCallFn,
-): Promise<AgentResult> {
-  const startedAt = Date.now();
-  let lastError: Error | undefined;
+export class IntentAgent extends BaseLLMAgent {
+  constructor() { super('intent-agent'); }
 
-  // The operator's intent text always wins — the LLM is asked to summarise
-  // and classify, not to round-trip the original string. assembleContext has
-  // already placed it on the snapshot's intentSpec.rawIntent.
-  const rawIntentText = task.contextSnapshot.intentSpec.rawIntent;
+  override async run(task: AgentTask): Promise<AgentResult> {
+    const startedAt = task.startedAt ?? Date.now();
+    const { agentConfig } = task.contextSnapshot;
+    const rawIntentText = task.contextSnapshot.intentSpec.rawIntent;
 
-  // Capture the most recent attempt's prompt + response so the
-  // orchestrator can persist them into `agent_execution_logs` even when
-  // every attempt fails. Reset each iteration; the values surviving the
-  // loop belong to the last attempt the agent made.
-  let lastPrompt: string | undefined;
-  let lastLlmResponse: string | undefined;
+    let lastError: Error | undefined;
 
-  for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
-    try {
-      const prompt = buildIntentPrompt(task.contextSnapshot, attempt, task.clarification);
-      lastPrompt = prompt;
-      const raw = await llmCall(prompt, task.contextSnapshot.agentConfig.llm);
-      lastLlmResponse = raw;
-      const spec = parseIntentSpec(raw, task.correlationId, rawIntentText);
-      validateIntentSpec(spec);
+    for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
+      try {
+        const rawPrompt = buildIntentPrompt(task.contextSnapshot, attempt, task.clarification);
+        const prompt = applyAgentConfig(rawPrompt, agentConfig);
+        const raw = await this.callLLM(prompt, agentConfig, task.correlationId);
+        const spec = parseIntentSpec(raw, task.correlationId, rawIntentText);
+        validateIntentSpec(spec);
 
-      // Clarification gate. Runs AFTER the LLM call (we trust the LLM's
-      // structured output to drive the decision, not a pre-flight regex).
-      // Skipped for maintenance-sourced intents — those are typed
-      // `MaintenanceIntent` objects, not free-form vague text, so even
-      // an empty successCriteria array is a legitimate signal that the
-      // maintenance agent didn't synthesise tests.
-      const clarificationNeeded = needsClarification(spec, rawIntentText, task.intentSource);
-      if (clarificationNeeded) {
+        const clarificationNeeded = needsClarification(spec, rawIntentText, task.intentSource);
+        if (clarificationNeeded) {
+          return {
+            agentRole: 'intent-agent',
+            status: 'clarification-needed',
+            clarificationNeeded,
+            artifacts: [
+              // Persist whatever the LLM did extract; the resume cycle
+              // will overwrite, but operators can inspect the partial
+              // spec to understand what was missing.
+              {
+                id: crypto.randomUUID(),
+                correlationId: task.correlationId,
+                type: 'design',
+                path: '.gestalt/intent-spec.json',
+                content: JSON.stringify(spec, null, 2),
+                producedBy: 'intent-agent',
+                createdAt: new Date(),
+              },
+            ],
+            signals: [
+              {
+                id: crypto.randomUUID(),
+                correlationId: task.correlationId,
+                type: 'CONTEXT_GAP',
+                severity: 'high',
+                sourceAgent: 'intent-agent',
+                message: `Intent requires clarification: ${clarificationNeeded.reason}`,
+                // Hard-coded `autoResolvable: false` (not the
+                // base-class helper) — only a human-supplied
+                // clarification (POST /clarify) can satisfy this;
+                // the gate's retry loop must not retry the cycle
+                // automatically.
+                autoResolvable: false,
+                createdAt: new Date(),
+              },
+            ],
+            tokensUsed: 0,
+            durationMs: Date.now() - startedAt,
+          };
+        }
+
         return {
           agentRole: 'intent-agent',
-          status: 'clarification-needed',
-          clarificationNeeded,
-          lastPrompt,
-          llmResponse: lastLlmResponse,
+          status: 'completed',
           artifacts: [
-            // Still persist the intent-spec — the resume cycle will
-            // overwrite it with a better one, and the operator may want
-            // to see what the LLM extracted even when it isn't enough.
             {
               id: crypto.randomUUID(),
               correlationId: task.correlationId,
@@ -86,84 +104,52 @@ export async function runIntentAgent(
               createdAt: new Date(),
             },
           ],
-          signals: [
-            {
-              id: crypto.randomUUID(),
-              correlationId: task.correlationId,
-              type: 'CONTEXT_GAP',
-              severity: 'high',
-              sourceAgent: 'intent-agent',
-              message: `Intent requires clarification: ${clarificationNeeded.reason}`,
-              // Cannot be auto-resolved by the gate's retry loop —
-              // only a human-supplied clarification (POST /clarify) can
-              // make progress. Routes through the alerts surface, not
-              // through the gate ↔ generate feedback router.
-              autoResolvable: false,
-              createdAt: new Date(),
-            },
-          ],
+          signals: buildAmbiguitySignals(spec.ambiguities, task.correlationId),
           tokensUsed: 0,
           durationMs: Date.now() - startedAt,
         };
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
       }
-
-      return {
-        agentRole: 'intent-agent',
-        status: 'completed',
-        lastPrompt,
-        llmResponse: lastLlmResponse,
-        artifacts: [
-          {
-            id: crypto.randomUUID(),
-            correlationId: task.correlationId,
-            type: 'design',
-            path: '.gestalt/intent-spec.json',
-            content: JSON.stringify(spec, null, 2),
-            producedBy: 'intent-agent',
-            createdAt: new Date(),
-          },
-        ],
-        signals: buildAmbiguitySignals(spec.ambiguities, task.correlationId),
-        tokensUsed: 0,   // populated by LLM wrapper in core
-        durationMs: Date.now() - startedAt,
-      };
-    } catch (err) {
-      lastError = err instanceof Error ? err : new Error(String(err));
     }
+
+    return {
+      agentRole: 'intent-agent',
+      status: 'failed',
+      artifacts: [],
+      signals: [
+        // Auto-resolvable: a fresh retry cycle may produce a parseable
+        // spec where the prior attempts didn't. Distinct from the
+        // clarification-needed `autoResolvable: false` path above.
+        {
+          id: crypto.randomUUID(),
+          correlationId: task.correlationId,
+          type: 'CONTEXT_GAP',
+          severity: 'high',
+          sourceAgent: 'intent-agent',
+          message: `Intent parsing failed after ${MAX_INTERNAL_RETRIES + 1} attempts: ${lastError?.message}`,
+          autoResolvable: true,
+          createdAt: new Date(),
+        },
+      ],
+      tokensUsed: 0,
+      durationMs: Date.now() - startedAt,
+    };
   }
 
-  // All retries exhausted
-  return {
-    agentRole: 'intent-agent',
-    status: 'failed',
-    lastPrompt,
-    llmResponse: lastLlmResponse,
-    artifacts: [],
-    signals: [
-      {
-        id: crypto.randomUUID(),
-        correlationId: task.correlationId,
-        type: 'CONTEXT_GAP',
-        severity: 'high',
-        sourceAgent: 'intent-agent',
-        message: `Intent parsing failed after ${MAX_INTERNAL_RETRIES + 1} attempts: ${lastError?.message}`,
-        autoResolvable: true,
-        createdAt: new Date(),
-      },
-    ],
-    tokensUsed: 0,
-    durationMs: Date.now() - startedAt,
-  };
+  protected buildPrompt(): string {
+    throw new Error('IntentAgent.buildPrompt is not used — see overridden run()');
+  }
+  protected parseResponse(): AgentResult {
+    throw new Error('IntentAgent.parseResponse is not used — see overridden run()');
+  }
 }
 
 /**
  * Parses the LLM response into a structured IntentSpec.
- * Expects the LLM to return JSON — prompt enforces this.
- *
  * `rawIntent` is always overwritten with `rawIntentText` (the operator's
- * actual intent string from the BullMQ payload). The LLM is not trusted to
- * round-trip the input verbatim and this avoids spurious "missing rawIntent"
- * validation failures when the model paraphrases or omits it.
+ * actual intent string from the BullMQ payload). The LLM is not trusted
+ * to round-trip the input verbatim.
  */
 function parseIntentSpec(
   raw: string,
@@ -190,16 +176,6 @@ function parseIntentSpec(
   };
 }
 
-/**
- * Validates that the intent spec has the minimum required fields.
- *
- * Only checks rawIntent (always populated by the orchestrator from the
- * operator's input — its absence indicates a real plumbing bug, not LLM
- * variance). Empty `affectedDomains` and `successCriteria` arrays are
- * allowed: on a greenfield project there are no existing domains for the
- * LLM to reference, and on an exploratory intent the LLM may legitimately
- * defer success-criteria definition to downstream agents.
- */
 function validateIntentSpec(spec: IntentSpec): void {
   if (!spec.rawIntent) throw new Error('IntentSpec missing rawIntent');
 }
@@ -207,9 +183,9 @@ function validateIntentSpec(spec: IntentSpec): void {
 /**
  * Returns a `ClarificationNeeded` describing why the cycle must pause,
  * or `null` if the spec is good enough to proceed. Maintenance-sourced
- * intents are exempted up front: their text always carries the
+ * intents are exempted: their text carries the
  * `[gestalt-maintenance/<type>]` prefix the maintenance runner adds,
- * and their structure is governed by ADR-035, not by operator prose.
+ * and ADR-035 governs their structure.
  */
 function needsClarification(
   spec: IntentSpec,
@@ -246,15 +222,6 @@ function needsClarification(
   return null;
 }
 
-/**
- * Converts high-impact ambiguities into CONTEXT_GAP signals.
- * Low and medium impact ambiguities are documented but do not signal.
- *
- * Note: when `needsClarification` returns non-null the clarification
- * gate fires first and we never reach this function — so the
- * "low/medium ambiguities only" framing still holds for the
- * completed-status path.
- */
 function buildAmbiguitySignals(
   ambiguities: Ambiguity[],
   correlationId: string,

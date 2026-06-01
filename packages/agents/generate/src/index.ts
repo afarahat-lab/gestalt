@@ -23,13 +23,18 @@ export { transition, isTerminalState, isWaitingState } from './orchestrator/stat
 export { assembleContext } from './orchestrator/context-assembler';
 export { startOrchestratorWorker } from './orchestrator/orchestrator';
 
-// Specialist agents
-export { runIntentAgent }      from './agents/intent-agent';
-export { runDesignAgent }      from './agents/design-agent';
-export { runContextAgent }     from './agents/context-agent';
-export { runLintConfigAgent }  from './agents/lint-config-agent';
-export { runCodeAgent }        from './agents/code-agent';
-export { runTestAgent }        from './agents/test-agent';
+// Abstract base class for every LLM-calling agent (generate / gate / maintenance)
+export { BaseLLMAgent } from './agents/base-llm-agent';
+
+// Specialist agents — instantiate and call `.run(task)` (or the
+// agent's own dedicated entry point for ones that don't follow the
+// standard task shape).
+export { IntentAgent }     from './agents/intent-agent';
+export { DesignAgent }     from './agents/design-agent';
+export { ContextAgent }    from './agents/context-agent';
+export { LintConfigAgent } from './agents/lint-config-agent';
+export { CodeAgent }       from './agents/code-agent';
+export { TestAgent }       from './agents/test-agent';
 
 // Prompts
 export { buildIntentPrompt }     from './prompts/intent-prompt';

@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — Step 2: custom agents in agents.yaml — ADR-037)
+**Last updated:** 2026-06-01 (Claude Code — BaseLLMAgent refactor: every LLM agent shares one abstract class)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -741,6 +741,78 @@ the historical record of how the state evolved._
   `DECISIONS.md` includes `Date: 2026-06-01`. Local-dev
   resolution from `packages/server` cwd also resolves correctly
   (walks up to repo root)
+
+**BaseLLMAgent — every LLM-calling agent extends one abstract class.**
+- New `BaseLLMAgent` in
+  `packages/agents/generate/src/agents/base-llm-agent.ts`. Owns the
+  shared LLM-call pattern: routing via `getLLMClient(model)` (Step 1
+  multi-client registry), per-call instance capture of `lastPrompt`
+  / `lastLlmResponse` / `lastModelUsed` (the orchestrator reads
+  these after `run()` for execution-log persistence)
+- Two protected helpers:
+  - `callLLM(prompt, agentConfig, correlationId)` — single user
+    message
+  - `callLLMWithMessages(messages, agentConfig, correlationId,
+    promptForLog)` — system + user (or richer) message arrays;
+    `promptForLog` is what gets stored in `lastPrompt` so the
+    dashboard's prompt panel shows the same text the operator
+    wrote in their agent config
+- `makeContextGapSignal(correlationId, message)` builds the canonical
+  `CONTEXT_GAP` (severity `high`, `autoResolvable: false`,
+  `sourceAgent` from the instance's role) every subclass uses on
+  retry-exhausted failure
+- Template `run(task)`: `buildPrompt` → wrap with `applyAgentConfig`
+  → `callLLM` → `parseResponse`. Agents with internal retries (intent
+  / design / context / code / test) override `run()` and call
+  `this.callLLM` inside their own loop instead — same instance-capture
+  semantics
+- Converted classes (no more `runXxxAgent` function exports):
+  - **Generate layer** — `IntentAgent`, `DesignAgent`, `ContextAgent`,
+    `LintConfigAgent` (extends for consistency; never calls
+    `callLLM` — Phase 2), `CodeAgent`, `TestAgent`
+  - **Gate layer** — `ReviewAgent` (custom entry `review(gateTask)`
+    because the gate operates on `GateTask`, not `AgentTask`)
+  - **Maintenance layer** — `ContextFixer` (custom entry
+    `applyFix(intent, project)` for the maintenance runner's
+    per-finding loop; uses `callLLMWithMessages` for system+user)
+  - drift-agent / alignment-agent / gc-agent / evaluation-agent are
+    deterministic in this codebase (regex / cron / metric checks —
+    no LLM calls), so they stay as functions per the
+    "infrastructure agents not affected" rule
+- `AgentTask.startedAt?: number` added. Set by the orchestrator
+  before `agent.run(task)`; subclasses use it to compute
+  `durationMs` without a second `Date.now()` at the top of every
+  implementation. Optional so older callers don't break
+- `AgentResult.lastPrompt` / `llmResponse` REMOVED. These now live
+  on the agent instance; the orchestrators read
+  `agent.lastPrompt` / `agent.lastLlmResponse` /
+  `agent.lastModelUsed` after `run()` returns and pass them into
+  `agent_execution_logs.save({...})`
+- Orchestrator changes — both the generate orchestrator (`runAgent`
+  switch → `newAgentForRole` factory returning a `BaseLLMAgent`
+  subclass) and the gate orchestrator (the closure-captured
+  `reviewModelUsed` is gone — `ReviewAgent.lastModelUsed` carries
+  it) shrank significantly. The inline `llmCall` wrappers that
+  routed via `getLLMClient` are deleted from both orchestrators —
+  routing is owned by the base class now
+- `AgentRole` union in `@gestalt/core/types` gained `'context-fixer'`
+  so the new `ContextFixer` class can pass `super('context-fixer')`
+  without a cast. Was previously informally cast at insert sites;
+  now first-class
+- Live verified end-to-end against `trackeros`: padLeft intent
+  ran 14 agent executions (6 generate / 2 custom / constraint /
+  review / 4 deploy) → reached `deployed`. Execution-log columns
+  populated as expected:
+  - `intent-agent`: prompt 3011 chars, response 902, model
+    `gpt-4o-mini` (agents.yaml override preserved through the
+    refactor)
+  - `code-agent`: prompt 4065, response 1435, model `gpt-4o`
+    (override preserved)
+  - `review-agent`: prompt 4498, response 234, model `gpt-4o`
+  - Skipped / non-LLM agents: prompt / response / model all NULL
+- No behaviour changes; pure refactor. No new endpoints, no new
+  migrations, no dashboard changes. Custom agents continue to use
+  the unchanged `runCustomAgent` runner
 
 **Step 2: custom agents in agents.yaml — implemented (ADR-037).**
 - Projects declare LLM agents under a top-level `custom_agents:` key

@@ -16,7 +16,7 @@ export { startGateWorker } from './orchestrator/gate-orchestrator';
 
 // Agents
 export { runConstraintAgent }   from './agents/constraint-agent';
-export { runLlmReviewAgent }    from './agents/llm-review-agent';
+export { ReviewAgent }          from './agents/llm-review-agent';
 export type { LLMReviewAgentResult, LLMReviewArtifact } from './agents/llm-review-agent';
 export { runSecurityAgent }     from './agents/security-agent';
 export { runLintAgent }         from './agents/lint-agent';

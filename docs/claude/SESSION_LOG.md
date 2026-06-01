@@ -5320,3 +5320,242 @@ future enhancements:
   debugging without storing N kilobytes per execution
   row)
 
+---
+
+### Session 2026-06-01 — Claude Code (BaseLLMAgent refactor: every LLM agent shares one abstract class)
+
+Code-quality refactor. No behaviour changes, no new endpoints, no
+migrations. Goal: eliminate the copy-pasted LLM-call pattern that had
+spread across nine agent files (intent / design / context / code /
+test / lint-config / review / context-fixer + the smaller variations).
+Centralises model routing, response capture, and the standard
+`CONTEXT_GAP` failure signal in one abstract base class. Every
+LLM-calling agent in the platform now extends `BaseLLMAgent`.
+
+Changed:
+- `packages/agents/generate/src/agents/base-llm-agent.ts` (new):
+  the abstract base class.
+  - Instance fields `lastPrompt: string | null`,
+    `lastLlmResponse: string | null`, `lastModelUsed: string | null`
+    — captured per call, read back by the orchestrator after
+    `run()` returns to persist into `agent_execution_logs.{prompt,
+    llm_response, model_used}`
+  - Template method `run(task)`: `buildPrompt(task)` → wrap with
+    `applyAgentConfig(rawPrompt, agentConfig)` → `callLLM(prompt,
+    agentConfig, correlationId)` → `parseResponse(raw, task)`.
+    Subclasses that need internal retries override `run()` and
+    call `this.callLLM` inside their own loop (covers intent /
+    design / context / code / test — the JSON-parse retry loop
+    each has)
+  - Two protected LLM helpers:
+    - `callLLM(prompt, agentConfig, correlationId)` — single user
+      message
+    - `callLLMWithMessages(messages, agentConfig, correlationId,
+      promptForLog)` — system + user (or richer) message arrays.
+      `promptForLog` is what gets stored in `lastPrompt` so the
+      dashboard shows a coherent string even when the agent
+      sends multi-message conversations (context-fixer is the
+      one caller today)
+  - Both helpers route via `getLLMClient(agentConfig.llm.model)`
+    so per-agent model overrides from Step 1 + the multi-client
+    registry continue to work unchanged
+  - Throws on LLM call failure; subclass retry loops catch
+  - `makeContextGapSignal(correlationId, message)` builds the
+    canonical `CONTEXT_GAP` (`severity: high`, `autoResolvable:
+    false`, `sourceAgent` from the instance's role) used by every
+    subclass's retry-exhausted failure path
+- `packages/agents/generate/src/types.ts`:
+  - `AgentTask.startedAt?: number` added (Date.now() before
+    `agent.run(task)`; subclasses use it for `durationMs`).
+    Optional so older callers don't break
+  - `AgentResult.lastPrompt` / `llmResponse` REMOVED — moved to
+    the agent instance
+- `packages/agents/generate/src/agents/intent-agent.ts`,
+  `design-agent.ts`, `context-agent.ts`, `code-agent.ts`,
+  `test-agent.ts`, `lint-config-agent.ts`: rewritten as classes
+  (`IntentAgent`, `DesignAgent`, `ContextAgent`, `CodeAgent`,
+  `TestAgent`, `LintConfigAgent`) extending `BaseLLMAgent`. All
+  override `run()` because they have internal retry loops OR
+  pre-flight skip checks. `buildPrompt` / `parseResponse` are
+  stubbed and throw — calling them via the base template would be
+  a misuse. The free `runXxxAgent` function exports are deleted —
+  no backward-compat wrappers per the brief
+- `packages/agents/generate/src/agents/lint-config-agent.ts`:
+  converted to `LintConfigAgent` for consistency. Doesn't call
+  the LLM (Phase 2) so `lastPrompt` / `lastLlmResponse` /
+  `lastModelUsed` stay null on the instance
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  - `runAgent(agentRole, task, llmCall)` switch replaced by
+    `newAgentForRole(agentRole): BaseLLMAgent` factory
+  - The inline `llmCall` closure that captured
+    `lastModelUsed` is gone — routing happens inside
+    `BaseLLMAgent.callLLM`. The orchestrator reads
+    `agent.lastPrompt` / `agent.lastLlmResponse` /
+    `agent.lastModelUsed` after `run()` returns and passes them
+    into `executionLogs.save(...)`
+  - `AgentTask` construction sets `startedAt: startedAt.getTime()`
+    so subclasses can compute `durationMs` from it
+- `packages/agents/quality-gate/src/agents/llm-review-agent.ts`:
+  rewritten as `ReviewAgent` class extending `BaseLLMAgent`.
+  Custom entry `review(task: GateTask)` because the gate operates
+  on `GateTask`, not `AgentTask`. Uses `this.callLLM(prompt,
+  agentConfig, correlationId)` for the model-routed call;
+  `buildPrompt` / `parseResponse` are stubbed
+- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
+  - The closure-captured `reviewModelUsed` variable and the
+    inline `llmCall` wrapper are gone — `ReviewAgent.lastModelUsed`
+    carries the model now
+  - After `reviewAgent.review(gateTask)` returns, the
+    orchestrator copies `agent.lastPrompt` / `agent.lastLlmResponse`
+    / `agent.lastModelUsed` onto the result so the existing
+    `runWithObservability` save site (which still reads them off
+    `GateAgentResult`) keeps working without further changes
+  - `getLLMClient` import removed from the gate orchestrator
+- `packages/agents/quality-gate/src/index.ts`:
+  `runLlmReviewAgent` export replaced with `ReviewAgent`
+- `packages/agents/maintenance/src/agents/context-fixer.ts`:
+  rewritten as `ContextFixer` class extending `BaseLLMAgent`.
+  Custom entry `applyFix(intent, project)` for the maintenance
+  runner's per-finding loop. The system+user message pair (the
+  ADR-018 rules live in the system role) goes through the new
+  `this.callLLMWithMessages([{role:'system',...},{role:'user',
+  ...}], cfg, ...)` helper. `buildPrompt` / `parseResponse`
+  stubbed
+- `packages/agents/maintenance/src/runner/index.ts`:
+  `applyContextFileFix(intent, project)` call → `new
+  ContextFixer().applyFix(intent, project)`
+- `packages/agents/maintenance/src/index.ts`:
+  `applyContextFileFix` export replaced with `ContextFixer`
+- `packages/core/src/types.ts`: `AgentRole` union gained
+  `'context-fixer'` so the new class's
+  `super('context-fixer')` compiles without a cast. Was
+  informally cast at insert sites before; now first-class
+- `packages/agents/generate/src/index.ts`:
+  - Exports `BaseLLMAgent` (re-used by quality-gate +
+    maintenance)
+  - Class exports `IntentAgent` / `DesignAgent` / `ContextAgent`
+    / `LintConfigAgent` / `CodeAgent` / `TestAgent` replace the
+    six `runXxxAgent` function exports
+
+Decisions made:
+- **drift-agent / alignment-agent / gc-agent / evaluation-agent
+  NOT converted.** The brief lists drift + alignment as ones to
+  convert assuming they make LLM calls. In this codebase they
+  don't — drift-agent does git-log + commit-timestamp comparison;
+  alignment-agent does regex extraction; gc-agent + evaluation-
+  agent are scheduled deterministic tasks. Converting them
+  would add no value (no LLM, no shared logic to factor) and
+  could obscure the semantics — they'd extend a class whose
+  primary method they'd never call. Same rationale the brief
+  applies to constraint-agent and the deploy agents. Documented
+  here so the next agent reviewer knows this is intentional
+- **Custom agents stay on the `runCustomAgent` functional
+  runner.** Brief constraint: "Custom agent runner is NOT
+  converted — it's a generic runner, not a class hierarchy."
+  Held to this — the runner takes a `CustomAgentDefinition`
+  data structure, not a class. Per-instance state (last prompt
+  etc.) doesn't apply the same way; the custom agent runner
+  is one function processing N data definitions
+- **`callLLMWithMessages` is a separate helper, not an overload
+  of `callLLM`.** Two reasons: (1) TypeScript overload
+  signatures get awkward when the parameters differ in count +
+  type; (2) the `promptForLog` parameter is required for
+  callers of the messages variant (so the dashboard can show
+  a single string in the prompt panel), and there's no clean
+  way to make it optional only in one overload. Two methods
+  with clear names is more obvious
+- **`AgentResult.lastPrompt` and `llmResponse` are deleted, not
+  deprecated.** Brief was explicit. Keeping them around as
+  optional would invite drift — agents could populate them or
+  not, the orchestrator wouldn't know which source to trust.
+  Now there's exactly one source: the agent instance after
+  `run()` returns
+- **Subclasses that need internal retries override `run()`
+  instead of having the base class loop.** Considered making
+  `BaseLLMAgent.run` itself loop with a configurable
+  `maxInternalRetries`. Rejected because the retry conditions
+  differ — intent-agent retries on `validateIntentSpec` throw
+  AND on parse failure; code-agent retries on "zero code
+  files"; test-agent retries on "zero test files". Wrapping
+  that in a parameter would create a leaky abstraction. The
+  cleaner pattern is to let subclasses own their retry
+  semantics and just call `this.callLLM` in a loop. Base class
+  template `run()` remains for the simple case (none of the
+  current subclasses use it because they all have retries —
+  but the template is documented for future agents)
+- **`context-fixer` extends `BaseLLMAgent` even though it
+  doesn't follow the standard `run(task)` shape.** The base
+  class is useful for ANY LLM-calling code because of the
+  instance-captured `lastModelUsed` (Step 1) — context-fixer
+  needs to persist which model it routed to. Inheritance gives
+  it `callLLMWithMessages` + `lastModelUsed` for free; the
+  stubbed `buildPrompt` / `parseResponse` are a small ergonomic
+  cost for a real structural win
+- **`AgentRole` union widened to include `'context-fixer'`.**
+  The previous behaviour was to cast `as AgentRole` at every
+  insert site (the maintenance runner's `agent_executions`
+  rows). Now the class's `super('context-fixer')` is typed
+  cleanly and the cast disappears. Made the same union part of
+  the core schema so any future agent reading the role from
+  the DB doesn't have to know about the implicit widening
+- **gate-orchestrator and maintenance-runner CHANGED but no
+  externally-observable behaviour did.** Both went from
+  closure-captured `lastModelUsed` patterns + free-function
+  agent calls to class instantiation. The execution-log
+  contents (prompt, response, model_used) are byte-identical
+  to before for every agent that was already running
+
+Verified live (no behaviour changes, but worth confirming the
+refactor is correct):
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt
+- Submitted padLeft intent against `trackeros`. Cycle ran 14
+  agent executions (6 generate / 2 custom / constraint /
+  review / 4 deploy) → reached `deployed` status
+- **Execution-log columns** populated as expected per agent:
+  - intent-agent: prompt 3011 chars, response 902, model
+    `gpt-4o-mini` (Step 1 override from trackeros agents.yaml
+    preserved through the refactor)
+  - design-agent: prompt 2162, response 83, model `gpt-4o`
+  - context-agent: prompt 2217, response 31, model `gpt-4o`
+  - code-agent: prompt 4065, response 1435, model `gpt-4o`
+    (override preserved)
+  - test-agent: prompt 2135, response 1626, model `gpt-4o`
+  - lint-config-agent: prompt NULL, response NULL, model NULL
+    (skipped — no LLM call) ✓
+  - constraint-agent: NULL everywhere (deterministic regex) ✓
+  - review-agent: prompt 4498, response 234, model `gpt-4o`
+    (ReviewAgent now via BaseLLMAgent.callLLM)
+  - custom agents: prompt NULL (custom-agent-runner doesn't
+    persist it per Step 2 design), response populated, model
+    `gpt-4o`
+  - deploy agents: NULL everywhere (non-LLM) ✓
+- `grep "^export async function run" packages/agents/` shows
+  zero matches in the converted files — only infrastructure
+  agents (deploy / gate / maintenance scheduled + the custom
+  runner + the maintenance runner itself) remain as function
+  exports, which the brief specified are NOT to be converted
+- `grep "BaseLLMAgent" packages/agents/generate/src/index.ts`
+  shows the export
+- Maintenance run also exercised — `usage-example-agent` custom
+  finding generated a `LINT_FAILURE` signal; gate retry routing
+  + intent → `deployed` continues to work unchanged
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; one full SDLC slice verified end-to-end
+with the new class-based agents + the existing custom-agent
+runner + the maintenance context-fixer all coexisting. The
+copy-pasted LLM call pattern that lived in 8+ files now lives
+in one place.
+
+No new follow-ups. Possible future tidy-ups:
+- Convert deterministic maintenance agents (drift / alignment /
+  gc / evaluation) to a `BaseMaintenanceAgent` of their own if
+  the codebase grows a second deterministic maintenance step
+  worth factoring
+- The base template `run(task)` method is currently unused —
+  every concrete subclass overrides it because each has an
+  internal retry loop or skip check. If a future agent fits
+  the simple build → call → parse shape (the brief's
+  pseudocode), the template is ready
+

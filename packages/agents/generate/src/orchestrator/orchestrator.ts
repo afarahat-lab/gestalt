@@ -25,15 +25,16 @@ import { buildExecutionPlan, getReadySteps, isPlanComplete, hasPlanFailed } from
 import { assembleContext } from './context-assembler';
 import { routeFeedback, requiresEscalation } from './feedback-router';
 import { transition } from './state-machine';
-import { runIntentAgent } from '../agents/intent-agent';
-import { runDesignAgent } from '../agents/design-agent';
-import { runContextAgent } from '../agents/context-agent';
+import { IntentAgent } from '../agents/intent-agent';
+import { DesignAgent } from '../agents/design-agent';
+import { ContextAgent } from '../agents/context-agent';
+import { LintConfigAgent } from '../agents/lint-config-agent';
+import { CodeAgent } from '../agents/code-agent';
+import { TestAgent } from '../agents/test-agent';
+import type { BaseLLMAgent } from '../agents/base-llm-agent';
 import { runCustomAgent } from '../agents/custom-agent-runner';
 import { loadCustomAgents } from '../config/agent-config-loader';
-import { runLintConfigAgent } from '../agents/lint-config-agent';
-import { runCodeAgent } from '../agents/code-agent';
-import { runTestAgent } from '../agents/test-agent';
-import type { ExecutionPlan, AgentResult, GateFeedback, FeedbackSignal, LlmCallFn } from '../types';
+import type { ExecutionPlan, AgentResult, GateFeedback, FeedbackSignal } from '../types';
 
 /**
  * Embeds a Git personal access token into an HTTPS clone URL.
@@ -401,10 +402,12 @@ async function drivePlan(
           startedAt: startedAt.toISOString(),
         });
 
-        // Captured inside `llmCall` below; declared here so the catch
-        // block can persist whatever model handled the call that
-        // triggered the throw (often the most useful diagnostic).
-        let lastModelUsed: string | null = null;
+        // The agent instance owns lastPrompt / lastLlmResponse /
+        // lastModelUsed after `run()` completes. Hoisted here so the
+        // catch block below (the agent's run() threw — rare; usually
+        // it returns a `failed` AgentResult instead) can still
+        // persist whatever model the failing call routed to.
+        let agentInstance: BaseLLMAgent | null = null;
         try {
           const context = await assembleContext(projectRoot, plan, agentRole, intentText);
           const routedSignals = signalsForAgent(agentRole);
@@ -415,6 +418,7 @@ async function drivePlan(
             contextSnapshot: context,
             maxRetries: 2,
             priorSignals: routedSignals.length ? routedSignals : undefined,
+            startedAt: startedAt.getTime(),
             // intent-agent uses these to decide whether to apply the
             // clarification gate, and to fold the operator's
             // clarification text into the prompt on resume. Other
@@ -424,30 +428,13 @@ async function drivePlan(
               agentRole === 'intent-agent' ? opts.clarification : undefined,
           };
 
-          // Per-agent LLM routing. agentConfig.llm.model (parsed from
-          // agents.yaml, optionally null) selects the right client from
-          // the registry; getLLMClient(undefined) returns the default
-          // client, so projects without an agents.yaml override behave
-          // identically to before. lastModelUsed is captured into the
-          // outer closure variable so the catch path below can also
-          // persist whatever model the failing call routed to.
-          const llmCall = async (
-            prompt: string,
-            overrides?: { temperature?: number; maxTokens?: number; model?: string },
-          ): Promise<string> => {
-            const client = getLLMClient(overrides?.model);
-            lastModelUsed = client.getModel();
-            const result = await client.complete({
-              messages: [{ role: 'user', content: prompt }],
-              correlationId: plan.correlationId,
-              ...(overrides?.temperature !== undefined ? { temperature: overrides.temperature } : {}),
-              ...(overrides?.maxTokens !== undefined ? { maxTokens: overrides.maxTokens } : {}),
-            });
-            if (!result.ok) throw new Error(result.error.message);
-            return result.value.content;
-          };
-
-          const result = await runAgent(agentRole, task, llmCall);
+          // Per-agent LLM routing happens inside BaseLLMAgent.callLLM
+          // via `getLLMClient(agentConfig.llm.model)`. The agent
+          // captures lastModelUsed on its instance after each call;
+          // we read it back after `run()` returns to persist into
+          // `agent_execution_logs.model_used`.
+          agentInstance = newAgentForRole(agentRole);
+          const result = await agentInstance.run(task);
 
           const stepStatus: ExecutionStatus =
             result.status === 'skipped' ? 'skipped'
@@ -495,18 +482,23 @@ async function drivePlan(
             executionId,
             correlationId: plan.correlationId,
             agentRole,
-            prompt: result.lastPrompt ?? null,
-            llmResponse: result.llmResponse ?? null,
+            // Now sourced from the agent instance after `run()` —
+            // BaseLLMAgent.callLLM captures these for the LAST LLM
+            // call the agent made (covers internal retry loops too).
+            // Null for skipped non-LLM agents (lint-config) or
+            // pre-LLM failures (intent-agent clarification-needed
+            // path triggers BEFORE the agent reaches the LLM is not
+            // a thing — clarification fires AFTER, so lastPrompt is
+            // populated even there).
+            prompt: agentInstance?.lastPrompt ?? null,
+            llmResponse: agentInstance?.lastLlmResponse ?? null,
             resultStatus: result.status,
             artifactPaths: (result.artifacts ?? []).map((a) => a.path),
             signalTypes: (result.signals ?? []).map((s) => s.type),
             errorMessage: result.status === 'failed'
               ? (result.signals[0]?.message ?? 'Unknown error')
               : null,
-            // Captured inside llmCall — null when the agent didn't make
-            // an LLM call (skipped lint-config; clarification-needed
-            // path before any call).
-            modelUsed: lastModelUsed,
+            modelUsed: agentInstance?.lastModelUsed ?? null,
           }).catch((err) => {
             childLog.warn({ err, executionId, agentRole }, 'executionLogs.save failed');
           });
@@ -588,10 +580,11 @@ async function drivePlan(
             artifactPaths: [],
             signalTypes: [],
             errorMessage: err instanceof Error ? err.message : String(err),
-            // The agent threw before completing — lastModelUsed may
-            // hold the model from the call that triggered the throw,
-            // or null if the throw happened before any LLM call.
-            modelUsed: lastModelUsed,
+            // The agent threw before completing — the instance's
+            // lastModelUsed holds the model from the call that
+            // triggered the throw, or null if the throw happened
+            // before any LLM call.
+            modelUsed: agentInstance?.lastModelUsed ?? null,
           }).catch(() => undefined);
           emitLiveEvent('agent.completed', plan.correlationId, {
             executionId,
@@ -609,20 +602,20 @@ async function drivePlan(
 
 
 /**
- * Routes a task to the correct specialist agent.
+ * Constructs the right `BaseLLMAgent` subclass for a given role.
+ * The orchestrator instantiates one per step (cheap — these are
+ * stateless except for `lastPrompt` / `lastLlmResponse` /
+ * `lastModelUsed` which are per-call diagnostics, not persistent
+ * agent state).
  */
-async function runAgent(
-  agentRole: AgentRole,
-  task: Parameters<typeof runIntentAgent>[0],
-  llmCall: LlmCallFn,
-): Promise<AgentResult> {
+function newAgentForRole(agentRole: AgentRole): BaseLLMAgent {
   switch (agentRole) {
-    case 'intent-agent':      return runIntentAgent(task, llmCall);
-    case 'design-agent':      return runDesignAgent(task, llmCall);
-    case 'context-agent':     return runContextAgent(task, llmCall);
-    case 'lint-config-agent': return runLintConfigAgent(task, llmCall);
-    case 'code-agent':        return runCodeAgent(task, llmCall);
-    case 'test-agent':        return runTestAgent(task, llmCall);
+    case 'intent-agent':      return new IntentAgent();
+    case 'design-agent':      return new DesignAgent();
+    case 'context-agent':     return new ContextAgent();
+    case 'lint-config-agent': return new LintConfigAgent();
+    case 'code-agent':        return new CodeAgent();
+    case 'test-agent':        return new TestAgent();
     default:
       throw new Error(`Unknown agent role in generate layer: ${agentRole}`);
   }

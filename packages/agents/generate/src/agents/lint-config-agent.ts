@@ -1,26 +1,62 @@
 /**
- * Lint config agent — updates ESLint constraint rules when new module boundaries are introduced.
- * Can skip: Yes — if no new module boundaries in the intent.
+ * Lint config agent — updates ESLint constraint rules when new module
+ * boundaries are introduced. Can skip in two ways:
+ *   1. No design artifact present
+ *   2. Design introduces no domain changes
+ *
+ * Today this agent doesn't actually call the LLM — Phase 2 will
+ * generate updated ESLint rules from the design spec. The class
+ * extends `BaseLLMAgent` for consistency with the other agents in
+ * the package (uniform instantiation + execution-log surface), but
+ * `lastPrompt` / `lastLlmResponse` / `lastModelUsed` stay null on
+ * the instance because no LLM call ever happens.
  */
 
-import type { AgentTask, AgentResult, LlmCallFn } from '../types';
+import type { AgentTask, AgentResult } from '../types';
+import { BaseLLMAgent } from './base-llm-agent';
 
-export async function runLintConfigAgent(
-  task: AgentTask,
-  _llmCall: LlmCallFn,
-): Promise<AgentResult> {
-  const startedAt = Date.now();
+export class LintConfigAgent extends BaseLLMAgent {
+  constructor() { super('lint-config-agent'); }
 
-  // Skip if design did not introduce new module boundaries
-  const designArtifact = task.contextSnapshot.priorArtifacts.find(
-    (a) => a.path === '.gestalt/design-spec.json',
-  );
+  override async run(task: AgentTask): Promise<AgentResult> {
+    const startedAt = task.startedAt ?? Date.now();
 
-  if (!designArtifact) {
+    const designArtifact = task.contextSnapshot.priorArtifacts.find(
+      (a) => a.path === '.gestalt/design-spec.json',
+    );
+
+    if (!designArtifact) {
+      return {
+        agentRole: 'lint-config-agent',
+        status: 'skipped',
+        skipReason: 'No design artifact found — no new module boundaries to configure',
+        artifacts: [],
+        signals: [],
+        tokensUsed: 0,
+        durationMs: Date.now() - startedAt,
+      };
+    }
+
+    const design = safeParseJson(designArtifact.content) as { domainChanges?: unknown[] } | null;
+    if (!design?.domainChanges?.length) {
+      return {
+        agentRole: 'lint-config-agent',
+        status: 'skipped',
+        skipReason: 'Design introduces no domain changes requiring lint config updates',
+        artifacts: [],
+        signals: [],
+        tokensUsed: 0,
+        durationMs: Date.now() - startedAt,
+      };
+    }
+
+    // Phase 2: generate updated ESLint config with new module boundary
+    // rules. For now: return completed with no artifacts (existing
+    // rules sufficient). This will be the point where the agent
+    // calls `this.callLLM(...)` once the prompt is wired.
     return {
       agentRole: 'lint-config-agent',
-      status: 'skipped',
-      skipReason: 'No design artifact found — no new module boundaries to configure',
+      status: 'completed',
       artifacts: [],
       signals: [],
       tokensUsed: 0,
@@ -28,29 +64,12 @@ export async function runLintConfigAgent(
     };
   }
 
-  const design = safeParseJson(designArtifact.content) as { domainChanges?: unknown[] } | null;
-  if (!design?.domainChanges?.length) {
-    return {
-      agentRole: 'lint-config-agent',
-      status: 'skipped',
-      skipReason: 'Design introduces no domain changes requiring lint config updates',
-      artifacts: [],
-      signals: [],
-      tokensUsed: 0,
-      durationMs: Date.now() - startedAt,
-    };
+  protected buildPrompt(): string {
+    throw new Error('LintConfigAgent.buildPrompt is not used — see overridden run()');
   }
-
-  // Phase 2: generate updated ESLint config with new module boundary rules
-  // For now: return completed with no artifacts (existing rules sufficient)
-  return {
-    agentRole: 'lint-config-agent',
-    status: 'completed',
-    artifacts: [],
-    signals: [],
-    tokensUsed: 0,
-    durationMs: Date.now() - startedAt,
-  };
+  protected parseResponse(): AgentResult {
+    throw new Error('LintConfigAgent.parseResponse is not used — see overridden run()');
+  }
 }
 
 function safeParseJson(content: string): unknown | null {

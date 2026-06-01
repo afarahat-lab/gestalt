@@ -300,22 +300,6 @@ export interface AgentResult {
    * sees the same explanation in the dashboard.
    */
   clarificationNeeded?: ClarificationNeeded;
-  /**
-   * The prompt sent to the LLM on the run that produced this result.
-   * Persisted into `agent_execution_logs.prompt` so the IntentDetail
-   * view can show it. Undefined for non-LLM agents
-   * (lint-config-agent when it skips, gate's constraint-agent,
-   * pr-agent / pipeline-agent / promotion-agent in the deploy layer).
-   */
-  lastPrompt?: string;
-  /**
-   * The raw text returned by the LLM. Persisted into
-   * `agent_execution_logs.llm_response`. Undefined for non-LLM agents.
-   * On `clarification-needed` this is the response that drove the
-   * pause decision (the LLM returned a parseable spec but with empty
-   * `successCriteria`, etc.).
-   */
-  llmResponse?: string;
   artifacts: GeneratedArtifact[];
   signals: FeedbackSignal[];
   tokensUsed: number;
@@ -328,6 +312,16 @@ export interface AgentTask {
   agentRole: AgentRole;
   contextSnapshot: ContextSnapshot;
   maxRetries: number;
+  /**
+   * `Date.now()` captured by the orchestrator BEFORE calling
+   * `agent.run(task)`. Available inside `parseResponse` so subclasses
+   * compute `durationMs` without a second `Date.now()` call at the
+   * top of every implementation. Optional so callers that build a
+   * task elsewhere (older test helpers, the gate dispatch payload)
+   * don't have to know about it; agents that need it fall back to
+   * `Date.now()`.
+   */
+  startedAt?: number;
   /**
    * Signals carried over from a prior quality-gate `fail` verdict.
    * Empty (or undefined) on the first attempt; populated when the

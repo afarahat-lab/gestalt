@@ -14,7 +14,7 @@ content is derived._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — Step 2: custom agents in agents.yaml — ADR-037)
+**Last updated:** 2026-06-01 (Claude Code — BaseLLMAgent refactor: every LLM agent shares one abstract class)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -748,6 +748,78 @@ content is derived._
   resolution from `packages/server` cwd also resolves correctly
   (walks up to repo root)
 
+**BaseLLMAgent — every LLM-calling agent extends one abstract class.**
+- New `BaseLLMAgent` in
+  `packages/agents/generate/src/agents/base-llm-agent.ts`. Owns the
+  shared LLM-call pattern: routing via `getLLMClient(model)` (Step 1
+  multi-client registry), per-call instance capture of `lastPrompt`
+  / `lastLlmResponse` / `lastModelUsed` (the orchestrator reads
+  these after `run()` for execution-log persistence)
+- Two protected helpers:
+  - `callLLM(prompt, agentConfig, correlationId)` — single user
+    message
+  - `callLLMWithMessages(messages, agentConfig, correlationId,
+    promptForLog)` — system + user (or richer) message arrays;
+    `promptForLog` is what gets stored in `lastPrompt` so the
+    dashboard's prompt panel shows the same text the operator
+    wrote in their agent config
+- `makeContextGapSignal(correlationId, message)` builds the canonical
+  `CONTEXT_GAP` (severity `high`, `autoResolvable: false`,
+  `sourceAgent` from the instance's role) every subclass uses on
+  retry-exhausted failure
+- Template `run(task)`: `buildPrompt` → wrap with `applyAgentConfig`
+  → `callLLM` → `parseResponse`. Agents with internal retries (intent
+  / design / context / code / test) override `run()` and call
+  `this.callLLM` inside their own loop instead — same instance-capture
+  semantics
+- Converted classes (no more `runXxxAgent` function exports):
+  - **Generate layer** — `IntentAgent`, `DesignAgent`, `ContextAgent`,
+    `LintConfigAgent` (extends for consistency; never calls
+    `callLLM` — Phase 2), `CodeAgent`, `TestAgent`
+  - **Gate layer** — `ReviewAgent` (custom entry `review(gateTask)`
+    because the gate operates on `GateTask`, not `AgentTask`)
+  - **Maintenance layer** — `ContextFixer` (custom entry
+    `applyFix(intent, project)` for the maintenance runner's
+    per-finding loop; uses `callLLMWithMessages` for system+user)
+  - drift-agent / alignment-agent / gc-agent / evaluation-agent are
+    deterministic in this codebase (regex / cron / metric checks —
+    no LLM calls), so they stay as functions per the
+    "infrastructure agents not affected" rule
+- `AgentTask.startedAt?: number` added. Set by the orchestrator
+  before `agent.run(task)`; subclasses use it to compute
+  `durationMs` without a second `Date.now()` at the top of every
+  implementation. Optional so older callers don't break
+- `AgentResult.lastPrompt` / `llmResponse` REMOVED. These now live
+  on the agent instance; the orchestrators read
+  `agent.lastPrompt` / `agent.lastLlmResponse` /
+  `agent.lastModelUsed` after `run()` returns and pass them into
+  `agent_execution_logs.save({...})`
+- Orchestrator changes — both the generate orchestrator (`runAgent`
+  switch → `newAgentForRole` factory returning a `BaseLLMAgent`
+  subclass) and the gate orchestrator (the closure-captured
+  `reviewModelUsed` is gone — `ReviewAgent.lastModelUsed` carries
+  it) shrank significantly. The inline `llmCall` wrappers that
+  routed via `getLLMClient` are deleted from both orchestrators —
+  routing is owned by the base class now
+- `AgentRole` union in `@gestalt/core/types` gained `'context-fixer'`
+  so the new `ContextFixer` class can pass `super('context-fixer')`
+  without a cast. Was previously informally cast at insert sites;
+  now first-class
+- Live verified end-to-end against `trackeros`: padLeft intent
+  ran 14 agent executions (6 generate / 2 custom / constraint /
+  review / 4 deploy) → reached `deployed`. Execution-log columns
+  populated as expected:
+  - `intent-agent`: prompt 3011 chars, response 902, model
+    `gpt-4o-mini` (agents.yaml override preserved through the
+    refactor)
+  - `code-agent`: prompt 4065, response 1435, model `gpt-4o`
+    (override preserved)
+  - `review-agent`: prompt 4498, response 234, model `gpt-4o`
+  - Skipped / non-LLM agents: prompt / response / model all NULL
+- No behaviour changes; pure refactor. No new endpoints, no new
+  migrations, no dashboard changes. Custom agents continue to use
+  the unchanged `runCustomAgent` runner
+
 **Step 2: custom agents in agents.yaml — implemented (ADR-037).**
 - Projects declare LLM agents under a top-level `custom_agents:` key
   in `agents.yaml`. They run AFTER all six framework generate agents
@@ -1157,231 +1229,6 @@ content is derived._
 ---
 
 ## Recent session log entries (last 3 from SESSION_LOG.md)
-
-### Session 2026-06-01 — Claude Code (per-agent model override activated via LLMClient registry)
-
-Activates the per-agent `model` override that Step 1 had parsed but
-left inactive. The previous session's follow-up said:
-*"Would require routing through a multi-client registry; current
-LLMClient is a startup singleton."* This session implements that
-registry and threads the routing through every LLM-using agent. The
-dashboard's IntentDetail accordion now shows which model handled each
-agent step.
-
-Changed:
-- `packages/core/src/llm/index.ts`:
-  - Replaced the `_client: LLMClient | null` singleton with a
-    `_clients: Map<string, LLMClient>` keyed by model name plus a
-    `_defaultConfig: LLMConfig | null` slot
-  - `createLLMClient(config)` seeds `_defaultConfig`, instantiates
-    the default client, and stores it in the Map under
-    `config.model`. Re-calling clears the Map (handy for test setup)
-  - `getLLMClient(model?: string)` resolves to the cached client
-    for the requested model name. If the model is `undefined` or
-    matches the default, returns the default client. Otherwise
-    creates a derived `LLMConfig` (default + `model: targetModel`),
-    instantiates a new `LLMClient`, stores it in the Map, and
-    logs `"LLM client created for model override"`. Per-process
-    cache — one entry per unique model, created on first use,
-    reused for the lifetime of the server
-  - New `LLMClient.getModel(): string` — exposes the bound model
-    name so orchestrators can capture the actual model that ran
-    after every `complete()` call
-- `packages/adapters/postgres/src/migrations/009_execution_log_model.sql`
-  (new): `ALTER TABLE agent_execution_logs ADD COLUMN model_used
-  TEXT;`. Pure schema; no `schema_migrations` writes
-- `packages/core/src/repository/index.ts`:
-  - `AgentExecutionLogRecord` extended with
-    `modelUsed: string | null`. The Omit<> in
-    `AgentExecutionLogRepository.save()` automatically includes
-    the new field, so every save call site has to populate it —
-    TypeScript caught the missing fields in the generate / gate /
-    deploy orchestrators on the first build attempt
-- `packages/adapters/postgres/src/repositories/execution-logs.ts`:
-  - `LogRow.modelUsed: string | null`
-  - `rowToRecord` passes `modelUsed` through (postgres.js returns
-    a plain string or NULL — no JSONB-style parsing needed)
-  - `save()` includes `model_used` in the INSERT
-- Oracle/MSSQL stubs untouched — they throw on every call so the
-  new column requires no code change there
-- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
-  - Hoisted `let lastModelUsed: string | null = null` above the
-    per-agent try block so both the success and the catch paths
-    can read it
-  - Rewrote the `llmCall` factory: now calls
-    `getLLMClient(overrides?.model)` per invocation (per-agent
-    routing!), captures `client.getModel()` into `lastModelUsed`,
-    and forwards `temperature` / `maxTokens` to the chosen
-    client. Drops the previous "model override is parsed but
-    inactive" comment
-  - Both `executionLogs.save` call sites (success path + catch
-    path) include `modelUsed: lastModelUsed`
-- `packages/agents/quality-gate/src/types.ts`:
-  - `GateAgentResult.modelUsed?: string` so the LLM-backed
-    review-agent can return the routed model
-- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
-  - Same routing pattern: `llmCall` accepts overrides,
-    `getLLMClient(overrides?.model)` per call, captures
-    `reviewModelUsed`
-  - After `runLlmReviewAgent` returns, the orchestrator attaches
-    `r.modelUsed = reviewModelUsed` so it lands on the wire
-  - `runWithObservability`'s `executionLogs.save` reads
-    `resultWithPrompt.modelUsed ?? null`; the thrown-error path
-    persists `modelUsed: null`
-- `packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`:
-  - Both `executionLogs.save` sites set `modelUsed: null` (deploy
-    agents are deterministic — pr-agent / pipeline-agent /
-    promotion-agent never call the LLM)
-- `packages/agents/maintenance/src/agents/context-fixer.ts`:
-  - `getLLMClient(agentConfig.llm.model)` — context-fixer's LLM
-    call now routes via the registry like the generate-side
-    agents
-  - context-fixer doesn't have an `agent_executions` row of its
-    own (it runs inside the maintenance runner), so no
-    `executionLogs.save` change needed
-- `packages/server/src/routes/projects.ts` `buildAgentsYaml()`:
-  - Each agent's `llm:` block now lists `model: ~` (YAML null
-    = "use platform default") above the existing `temperature`
-    + `max_tokens` lines
-  - Top-comment block documents the `llm.model` semantics and
-    flags `code-agent` with an example comment
-    (`# Example: set to "gpt-4o" to use a specific model`)
-- `packages/dashboard/src/views/IntentDetail.tsx`:
-  - `ExecutionLogResponse.log.modelUsed: string | null` added
-  - Expanded execution panel renders a new `Model` KV row in the
-    Agent section showing `gpt-4o-mini` / `gpt-4o` / `—` for
-    non-LLM agents
-- `packages/dashboard/src/api/client.ts`:
-  - `getExecutionLog()` return type widened with `modelUsed:
-    string | null` so the dashboard typing matches the wire
-- `docs/reference/harness-config.md`:
-  - New `agents.yaml — per-agent configuration` section
-    documenting the full schema (`role`, `goal`, `llm.model`,
-    `llm.temperature`, `llm.max_tokens`, `prompt_extensions`)
-    + the loader's behaviour on missing / partial / malformed
-    files
-
-Verified live against `trackeros`:
-- `pnpm -r build` clean across all 12 packages
-- Server image rebuilt; migration 009 applied
-  (`schema_migrations` now lists 9 entries through
-  `009_execution_log_model`). `model_used TEXT` column visible
-  on `\d agent_execution_logs`
-- **Committed `agents.yaml` to trackeros main** (commit
-  `498eb0f`) with:
-  ```yaml
-  agents:
-    intent-agent: { llm: { model: gpt-4o-mini } }   # cheaper for parsing
-    code-agent:   { llm: { model: gpt-4o } }        # best for code
-  ```
-- **Submitted intent** "Add a trimEnd utility under
-  src/shared/utils/trim-end" (correlationId `1581ab36`).
-  Server ran two gate-retry cycles (review-agent flagged
-  concerns); both cycles surfaced the per-agent routing
-- **`agent_execution_logs.model_used` per agent:**
-  ```
-  intent-agent      | gpt-4o-mini | completed   ← override
-  design-agent      | gpt-4o      | completed   ← platform default
-  context-agent     | gpt-4o      | completed   ← platform default
-  lint-config-agent | (null)      | skipped     ← non-LLM
-  code-agent        | gpt-4o      | completed   ← override matches default
-  test-agent        | gpt-4o      | completed   ← platform default
-  constraint-agent  | (null)      | passed      ← deterministic
-  review-agent      | gpt-4o      | failed      ← platform default
-  ```
-  Same shape repeats on the gate-retry leg
-- **Cache verified.** Server log shows
-  `"LLM client created for model override"` exactly ONCE
-  during the cycle (when `gpt-4o-mini` was first requested);
-  the second intent-agent run on the retry leg used the cached
-  client (no second log line)
-- **API surface confirmed.** `GET /executions/<intent-agent-id>/log`
-  returns `data.log.modelUsed: "gpt-4o-mini"` — the new field
-  flows through the route handler unchanged because the
-  AgentExecutionLogRecord shape propagates automatically
-- **Health endpoint still 200.** `gestalt status` works
-  unchanged; default client unaffected
-
-Decisions made:
-- **Per-process cache, not per-correlationId.** A model name is
-  a global routing key — `gpt-4o-mini` always means the same
-  thing for the lifetime of the server, so the cached client is
-  safe to share across cycles + projects. Memory cost is one
-  `LLMClient` instance per unique model name (typically 1–3)
-- **`getLLMClient(undefined)` returns the default client.**
-  Every existing call site (`getLLMClient()` with no args) keeps
-  working without modification. Backward compatible
-- **Override clients reuse `baseUrl` + `apiKey` from the default
-  config.** Matches the brief; matches how Azure deployments
-  work (deployment-name path component IS the model on the
-  wire). Operators who need a different endpoint per model
-  would need a richer `agents.yaml` schema — captured as a
-  follow-up enhancement
-- **`createLLMClient` clears the registry before re-seeding.**
-  Production calls this once at startup, so the clear is a
-  no-op. But this makes test setup deterministic — a test that
-  calls `createLLMClient(testConfig)` after a previous test
-  used a different default doesn't carry forward stale entries
-- **Captured `lastModelUsed` in the closure variable per agent
-  step, NOT on the result returned by the agent.** The agents
-  themselves don't need to know which model handled their LLM
-  call — that's an observability concern owned by the
-  orchestrator. The closure-captured variable means the
-  orchestrator doesn't have to ferry a "current model" pointer
-  through every agent function signature
-- **Gate orchestrator's `modelUsed` flows on `GateAgentResult`.**
-  Different surface from the generate orchestrator (the agent
-  returns a typed result that the orchestrator's
-  `runWithObservability` consumes). Adding an optional
-  `modelUsed` to the result type, populated by the orchestrator
-  after the agent runs, kept the agent signature unchanged and
-  let `runWithObservability` stay generic over the per-agent
-  result shape
-- **context-fixer routes via the registry but doesn't persist
-  modelUsed.** It has no `agent_executions` row of its own —
-  it runs inside the maintenance runner's per-finding loop,
-  and the maintenance run record captures aggregate counts not
-  per-call model. If operators ever want per-finding model
-  tracking, the maintenance_runs table would need a new column;
-  out of scope for this session
-- **`model: ~` (YAML null) is "use platform default", same as
-  the field being absent.** The loader's existing snake_case +
-  camelCase normalisation already drops null model values from
-  the merged config — `typeof null === 'object'` so the
-  `typeof llmIn['model'] === 'string'` guard skips null. No
-  loader change needed. Tested implicitly by the verification
-  cycle (review-agent / design-agent / etc. have no `model`
-  override and route to the default `gpt-4o`)
-- **Dashboard shows `—` (em-dash) for null `modelUsed`.**
-  Consistent with the rest of the IntentDetail panel's
-  placeholder (which uses em-dashes for "not applicable"
-  fields). Non-LLM agents and pre-migration-009 rows both
-  render the same way; the operator can tell from the rest of
-  the row whether it's "no LLM call" vs "old run"
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Server image rebuilt; migration 009 applied; full per-agent
-model routing verified end-to-end. The brief's verification
-matrix (intent-agent on gpt-4o-mini, code-agent on gpt-4o,
-other agents on platform default, single
-`"LLM client created for model override"` log line) hits all
-four checkpoints.
-
-The "Per-agent model override is parsed but inactive"
-follow-up from the previous session is now resolved. New
-follow-up logged below — separate endpoints / credentials per
-model is a richer schema change.
-
-Follow-up logged:
-- **Per-model endpoint + API key overrides.** Today's registry
-  reuses the default `baseUrl` + `apiKey` for every override.
-  An operator who wants to run `gpt-4o-mini` on OpenAI's
-  endpoint but `gpt-4o` on Azure (or vLLM for code, OpenAI for
-  intent) would need `agents.yaml` extended with `llm.baseUrl`
-  + `llm.apiKey` fields and the loader + registry extended to
-  honour them. Reasonable next step for multi-provider shops
-
----
 
 ### Session 2026-06-01 — Claude Code (harness templates moved out of projects.ts into templates/ — ADR-036)
 
@@ -1906,4 +1753,243 @@ future enhancements:
   "rebuild prompt" action so operators can copy it for
   debugging without storing N kilobytes per execution
   row)
+
+---
+
+### Session 2026-06-01 — Claude Code (BaseLLMAgent refactor: every LLM agent shares one abstract class)
+
+Code-quality refactor. No behaviour changes, no new endpoints, no
+migrations. Goal: eliminate the copy-pasted LLM-call pattern that had
+spread across nine agent files (intent / design / context / code /
+test / lint-config / review / context-fixer + the smaller variations).
+Centralises model routing, response capture, and the standard
+`CONTEXT_GAP` failure signal in one abstract base class. Every
+LLM-calling agent in the platform now extends `BaseLLMAgent`.
+
+Changed:
+- `packages/agents/generate/src/agents/base-llm-agent.ts` (new):
+  the abstract base class.
+  - Instance fields `lastPrompt: string | null`,
+    `lastLlmResponse: string | null`, `lastModelUsed: string | null`
+    — captured per call, read back by the orchestrator after
+    `run()` returns to persist into `agent_execution_logs.{prompt,
+    llm_response, model_used}`
+  - Template method `run(task)`: `buildPrompt(task)` → wrap with
+    `applyAgentConfig(rawPrompt, agentConfig)` → `callLLM(prompt,
+    agentConfig, correlationId)` → `parseResponse(raw, task)`.
+    Subclasses that need internal retries override `run()` and
+    call `this.callLLM` inside their own loop (covers intent /
+    design / context / code / test — the JSON-parse retry loop
+    each has)
+  - Two protected LLM helpers:
+    - `callLLM(prompt, agentConfig, correlationId)` — single user
+      message
+    - `callLLMWithMessages(messages, agentConfig, correlationId,
+      promptForLog)` — system + user (or richer) message arrays.
+      `promptForLog` is what gets stored in `lastPrompt` so the
+      dashboard shows a coherent string even when the agent
+      sends multi-message conversations (context-fixer is the
+      one caller today)
+  - Both helpers route via `getLLMClient(agentConfig.llm.model)`
+    so per-agent model overrides from Step 1 + the multi-client
+    registry continue to work unchanged
+  - Throws on LLM call failure; subclass retry loops catch
+  - `makeContextGapSignal(correlationId, message)` builds the
+    canonical `CONTEXT_GAP` (`severity: high`, `autoResolvable:
+    false`, `sourceAgent` from the instance's role) used by every
+    subclass's retry-exhausted failure path
+- `packages/agents/generate/src/types.ts`:
+  - `AgentTask.startedAt?: number` added (Date.now() before
+    `agent.run(task)`; subclasses use it for `durationMs`).
+    Optional so older callers don't break
+  - `AgentResult.lastPrompt` / `llmResponse` REMOVED — moved to
+    the agent instance
+- `packages/agents/generate/src/agents/intent-agent.ts`,
+  `design-agent.ts`, `context-agent.ts`, `code-agent.ts`,
+  `test-agent.ts`, `lint-config-agent.ts`: rewritten as classes
+  (`IntentAgent`, `DesignAgent`, `ContextAgent`, `CodeAgent`,
+  `TestAgent`, `LintConfigAgent`) extending `BaseLLMAgent`. All
+  override `run()` because they have internal retry loops OR
+  pre-flight skip checks. `buildPrompt` / `parseResponse` are
+  stubbed and throw — calling them via the base template would be
+  a misuse. The free `runXxxAgent` function exports are deleted —
+  no backward-compat wrappers per the brief
+- `packages/agents/generate/src/agents/lint-config-agent.ts`:
+  converted to `LintConfigAgent` for consistency. Doesn't call
+  the LLM (Phase 2) so `lastPrompt` / `lastLlmResponse` /
+  `lastModelUsed` stay null on the instance
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  - `runAgent(agentRole, task, llmCall)` switch replaced by
+    `newAgentForRole(agentRole): BaseLLMAgent` factory
+  - The inline `llmCall` closure that captured
+    `lastModelUsed` is gone — routing happens inside
+    `BaseLLMAgent.callLLM`. The orchestrator reads
+    `agent.lastPrompt` / `agent.lastLlmResponse` /
+    `agent.lastModelUsed` after `run()` returns and passes them
+    into `executionLogs.save(...)`
+  - `AgentTask` construction sets `startedAt: startedAt.getTime()`
+    so subclasses can compute `durationMs` from it
+- `packages/agents/quality-gate/src/agents/llm-review-agent.ts`:
+  rewritten as `ReviewAgent` class extending `BaseLLMAgent`.
+  Custom entry `review(task: GateTask)` because the gate operates
+  on `GateTask`, not `AgentTask`. Uses `this.callLLM(prompt,
+  agentConfig, correlationId)` for the model-routed call;
+  `buildPrompt` / `parseResponse` are stubbed
+- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
+  - The closure-captured `reviewModelUsed` variable and the
+    inline `llmCall` wrapper are gone — `ReviewAgent.lastModelUsed`
+    carries the model now
+  - After `reviewAgent.review(gateTask)` returns, the
+    orchestrator copies `agent.lastPrompt` / `agent.lastLlmResponse`
+    / `agent.lastModelUsed` onto the result so the existing
+    `runWithObservability` save site (which still reads them off
+    `GateAgentResult`) keeps working without further changes
+  - `getLLMClient` import removed from the gate orchestrator
+- `packages/agents/quality-gate/src/index.ts`:
+  `runLlmReviewAgent` export replaced with `ReviewAgent`
+- `packages/agents/maintenance/src/agents/context-fixer.ts`:
+  rewritten as `ContextFixer` class extending `BaseLLMAgent`.
+  Custom entry `applyFix(intent, project)` for the maintenance
+  runner's per-finding loop. The system+user message pair (the
+  ADR-018 rules live in the system role) goes through the new
+  `this.callLLMWithMessages([{role:'system',...},{role:'user',
+  ...}], cfg, ...)` helper. `buildPrompt` / `parseResponse`
+  stubbed
+- `packages/agents/maintenance/src/runner/index.ts`:
+  `applyContextFileFix(intent, project)` call → `new
+  ContextFixer().applyFix(intent, project)`
+- `packages/agents/maintenance/src/index.ts`:
+  `applyContextFileFix` export replaced with `ContextFixer`
+- `packages/core/src/types.ts`: `AgentRole` union gained
+  `'context-fixer'` so the new class's
+  `super('context-fixer')` compiles without a cast. Was
+  informally cast at insert sites before; now first-class
+- `packages/agents/generate/src/index.ts`:
+  - Exports `BaseLLMAgent` (re-used by quality-gate +
+    maintenance)
+  - Class exports `IntentAgent` / `DesignAgent` / `ContextAgent`
+    / `LintConfigAgent` / `CodeAgent` / `TestAgent` replace the
+    six `runXxxAgent` function exports
+
+Decisions made:
+- **drift-agent / alignment-agent / gc-agent / evaluation-agent
+  NOT converted.** The brief lists drift + alignment as ones to
+  convert assuming they make LLM calls. In this codebase they
+  don't — drift-agent does git-log + commit-timestamp comparison;
+  alignment-agent does regex extraction; gc-agent + evaluation-
+  agent are scheduled deterministic tasks. Converting them
+  would add no value (no LLM, no shared logic to factor) and
+  could obscure the semantics — they'd extend a class whose
+  primary method they'd never call. Same rationale the brief
+  applies to constraint-agent and the deploy agents. Documented
+  here so the next agent reviewer knows this is intentional
+- **Custom agents stay on the `runCustomAgent` functional
+  runner.** Brief constraint: "Custom agent runner is NOT
+  converted — it's a generic runner, not a class hierarchy."
+  Held to this — the runner takes a `CustomAgentDefinition`
+  data structure, not a class. Per-instance state (last prompt
+  etc.) doesn't apply the same way; the custom agent runner
+  is one function processing N data definitions
+- **`callLLMWithMessages` is a separate helper, not an overload
+  of `callLLM`.** Two reasons: (1) TypeScript overload
+  signatures get awkward when the parameters differ in count +
+  type; (2) the `promptForLog` parameter is required for
+  callers of the messages variant (so the dashboard can show
+  a single string in the prompt panel), and there's no clean
+  way to make it optional only in one overload. Two methods
+  with clear names is more obvious
+- **`AgentResult.lastPrompt` and `llmResponse` are deleted, not
+  deprecated.** Brief was explicit. Keeping them around as
+  optional would invite drift — agents could populate them or
+  not, the orchestrator wouldn't know which source to trust.
+  Now there's exactly one source: the agent instance after
+  `run()` returns
+- **Subclasses that need internal retries override `run()`
+  instead of having the base class loop.** Considered making
+  `BaseLLMAgent.run` itself loop with a configurable
+  `maxInternalRetries`. Rejected because the retry conditions
+  differ — intent-agent retries on `validateIntentSpec` throw
+  AND on parse failure; code-agent retries on "zero code
+  files"; test-agent retries on "zero test files". Wrapping
+  that in a parameter would create a leaky abstraction. The
+  cleaner pattern is to let subclasses own their retry
+  semantics and just call `this.callLLM` in a loop. Base class
+  template `run()` remains for the simple case (none of the
+  current subclasses use it because they all have retries —
+  but the template is documented for future agents)
+- **`context-fixer` extends `BaseLLMAgent` even though it
+  doesn't follow the standard `run(task)` shape.** The base
+  class is useful for ANY LLM-calling code because of the
+  instance-captured `lastModelUsed` (Step 1) — context-fixer
+  needs to persist which model it routed to. Inheritance gives
+  it `callLLMWithMessages` + `lastModelUsed` for free; the
+  stubbed `buildPrompt` / `parseResponse` are a small ergonomic
+  cost for a real structural win
+- **`AgentRole` union widened to include `'context-fixer'`.**
+  The previous behaviour was to cast `as AgentRole` at every
+  insert site (the maintenance runner's `agent_executions`
+  rows). Now the class's `super('context-fixer')` is typed
+  cleanly and the cast disappears. Made the same union part of
+  the core schema so any future agent reading the role from
+  the DB doesn't have to know about the implicit widening
+- **gate-orchestrator and maintenance-runner CHANGED but no
+  externally-observable behaviour did.** Both went from
+  closure-captured `lastModelUsed` patterns + free-function
+  agent calls to class instantiation. The execution-log
+  contents (prompt, response, model_used) are byte-identical
+  to before for every agent that was already running
+
+Verified live (no behaviour changes, but worth confirming the
+refactor is correct):
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt
+- Submitted padLeft intent against `trackeros`. Cycle ran 14
+  agent executions (6 generate / 2 custom / constraint /
+  review / 4 deploy) → reached `deployed` status
+- **Execution-log columns** populated as expected per agent:
+  - intent-agent: prompt 3011 chars, response 902, model
+    `gpt-4o-mini` (Step 1 override from trackeros agents.yaml
+    preserved through the refactor)
+  - design-agent: prompt 2162, response 83, model `gpt-4o`
+  - context-agent: prompt 2217, response 31, model `gpt-4o`
+  - code-agent: prompt 4065, response 1435, model `gpt-4o`
+    (override preserved)
+  - test-agent: prompt 2135, response 1626, model `gpt-4o`
+  - lint-config-agent: prompt NULL, response NULL, model NULL
+    (skipped — no LLM call) ✓
+  - constraint-agent: NULL everywhere (deterministic regex) ✓
+  - review-agent: prompt 4498, response 234, model `gpt-4o`
+    (ReviewAgent now via BaseLLMAgent.callLLM)
+  - custom agents: prompt NULL (custom-agent-runner doesn't
+    persist it per Step 2 design), response populated, model
+    `gpt-4o`
+  - deploy agents: NULL everywhere (non-LLM) ✓
+- `grep "^export async function run" packages/agents/` shows
+  zero matches in the converted files — only infrastructure
+  agents (deploy / gate / maintenance scheduled + the custom
+  runner + the maintenance runner itself) remain as function
+  exports, which the brief specified are NOT to be converted
+- `grep "BaseLLMAgent" packages/agents/generate/src/index.ts`
+  shows the export
+- Maintenance run also exercised — `usage-example-agent` custom
+  finding generated a `LINT_FAILURE` signal; gate retry routing
+  + intent → `deployed` continues to work unchanged
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; one full SDLC slice verified end-to-end
+with the new class-based agents + the existing custom-agent
+runner + the maintenance context-fixer all coexisting. The
+copy-pasted LLM call pattern that lived in 8+ files now lives
+in one place.
+
+No new follow-ups. Possible future tidy-ups:
+- Convert deterministic maintenance agents (drift / alignment /
+  gc / evaluation) to a `BaseMaintenanceAgent` of their own if
+  the codebase grows a second deterministic maintenance step
+  worth factoring
+- The base template `run(task)` method is currently unused —
+  every concrete subclass overrides it because each has an
+  internal retry loop or skip check. If a future agent fits
+  the simple build → call → parse shape (the brief's
+  pseudocode), the template is ready
 

@@ -19,7 +19,7 @@ export { runEvaluationAgent } from './agents/evaluation-agent';
 // Context-fixer (ADR-018) — direct-fix path for docs-only maintenance
 // intents. Exposed so tests / advanced wiring can call it without going
 // through the runner.
-export { applyContextFileFix } from './agents/context-fixer';
+export { ContextFixer } from './agents/context-fixer';
 export type { ContextFixProject, ContextFixOutcome } from './agents/context-fixer';
 
 // Runner — exposed for tests + advanced wiring (skip the scheduler).

@@ -31,7 +31,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { simpleGit } from 'simple-git';
 import {
-  createWorker, dispatch, getRepositories, getLLMClient,
+  createWorker, dispatch, getRepositories,
   createContextLogger, emitLiveEvent, QUEUE_NAMES,
 } from '@gestalt/core';
 import type {
@@ -39,7 +39,7 @@ import type {
   Artifact, PlatformSignal, ExecutionStatus, IntentStatus,
 } from '@gestalt/core';
 import { runConstraintAgent } from '../agents/constraint-agent';
-import { runLlmReviewAgent } from '../agents/llm-review-agent';
+import { ReviewAgent } from '../agents/llm-review-agent';
 import { synthesiseGateResult, summariseGateResult } from '../agents/review-agent';
 import type {
   GateAgentResult, GateAgentRole, GateHarnessConfig, GateResult, GateSignal, GateTask, ArtifactRef,
@@ -212,26 +212,12 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
       harnessConfig: defaultGateHarnessConfig(workDir),
     };
 
-    // Captures the model the review-agent's LLM call actually routed
-    // to — see the runLlmReviewAgent callback below where this is
-    // attached to the result before runWithObservability persists it
-    // into agent_execution_logs.model_used.
-    let reviewModelUsed: string | null = null;
-    const llmCall = async (
-      prompt: string,
-      overrides?: { temperature?: number; maxTokens?: number; model?: string },
-    ): Promise<string> => {
-      const client = getLLMClient(overrides?.model);
-      reviewModelUsed = client.getModel();
-      const result = await client.complete({
-        messages: [{ role: 'user', content: prompt }],
-        correlationId,
-        ...(overrides?.temperature !== undefined ? { temperature: overrides.temperature } : {}),
-        ...(overrides?.maxTokens !== undefined ? { maxTokens: overrides.maxTokens } : {}),
-      });
-      if (!result.ok) throw new Error(result.error.message);
-      return result.value.content;
-    };
+    // BaseLLMAgent now owns LLM-call routing + lastModelUsed capture.
+    // ReviewAgent.review(task) uses this.callLLM internally; we read
+    // back `agent.lastPrompt` / `agent.lastLlmResponse` /
+    // `agent.lastModelUsed` after the call to thread them into the
+    // observability wrapper's execution-log persistence.
+    const reviewAgent = new ReviewAgent();
 
     // Run constraint + review in parallel. Each step persists its own
     // agent_executions row and emits its own SSE events; concurrency is
@@ -251,16 +237,20 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
         correlationId,
         payload.intentId,
         async () => {
-          const r = await runLlmReviewAgent(gateTask, llmCall);
+          const r = await reviewAgent.review(gateTask);
           // Side-effect: persist the markdown review artifact so the
           // operator can read the prose feedback alongside the signals.
           if (r.reviewArtifact) {
             const { artifacts } = getRepositories();
             await artifacts.save(r.reviewArtifact as unknown as Artifact);
           }
-          // Forward the routed model to the observability wrapper so it
-          // lands on agent_execution_logs.model_used.
-          if (reviewModelUsed) r.modelUsed = reviewModelUsed;
+          // Forward the instance-captured prompt / response / model
+          // to the observability wrapper. These were on the
+          // `runLlmReviewAgent` result before the BaseLLMAgent
+          // refactor; now they're on the agent instance.
+          if (reviewAgent.lastPrompt) r.lastPrompt = reviewAgent.lastPrompt;
+          if (reviewAgent.lastLlmResponse) r.llmResponse = reviewAgent.lastLlmResponse;
+          if (reviewAgent.lastModelUsed) r.modelUsed = reviewAgent.lastModelUsed;
           return r;
         },
         childLog,

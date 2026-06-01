@@ -25,7 +25,8 @@ export type AgentRole =
   | 'drift-agent'
   | 'alignment-agent'
   | 'gc-agent'
-  | 'evaluation-agent';
+  | 'evaluation-agent'
+  | 'context-fixer';
 
 // ─── Signal types ─────────────────────────────────────────────────────────────
 

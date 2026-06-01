@@ -14,12 +14,20 @@
  * emitted as `CONSTRAINT_VIOLATION` / `GOLDEN_PRINCIPLE_BREACH` signals;
  * low/info-severity comments stay in the artifact only and do not fail
  * the gate.
+ *
+ * Inherits from `BaseLLMAgent` in `@gestalt/agents-generate` for the
+ * shared `callLLM` helper (per-agent model routing via Step 1's
+ * multi-client registry, instance-captured `lastPrompt` /
+ * `lastLlmResponse` / `lastModelUsed`). The agent has its own entry
+ * point `review(task)` because the gate operates on `GateTask`, not
+ * the generate-layer `AgentTask` shape — so `buildPrompt` /
+ * `parseResponse` from the base template are stubbed.
  */
 
 import type { ArtifactRef, GateAgentResult, GateSignal, GateTask } from '../types';
 import type { Artifact, SignalSeverity } from '@gestalt/core';
-import { loadAgentConfig } from '@gestalt/agents-generate';
-import type { AgentConfig } from '@gestalt/agents-generate';
+import { loadAgentConfig, BaseLLMAgent } from '@gestalt/agents-generate';
+import type { AgentConfig, AgentResult } from '@gestalt/agents-generate';
 
 interface LLMReviewItem {
   file?: string;
@@ -47,80 +55,86 @@ export interface LLMReviewAgentResult extends GateAgentResult {
 const MAX_ARTIFACT_BYTES = 8000;   // per file, when bundling into the prompt
 const MAX_TOTAL_BYTES = 60_000;    // prompt budget guard
 
-/**
- * Runs the LLM review agent against the artifact set in the task.
- * The caller (gate orchestrator) is expected to invoke this with an
- * `llmCall` that returns the model's raw text response.
- */
-export async function runLlmReviewAgent(
-  task: GateTask,
-  llmCall: (
-    prompt: string,
-    overrides?: { temperature?: number; maxTokens?: number; model?: string },
-  ) => Promise<string>,
-): Promise<LLMReviewAgentResult> {
-  const startedAt = Date.now();
+export class ReviewAgent extends BaseLLMAgent {
+  constructor() { super('review-agent'); }
 
-  const codeArtifacts = task.artifacts.filter(
-    (a) => a.type === 'code' || a.type === 'test' || a.type === 'context-file',
-  );
+  /**
+   * Runs the LLM review against the gate task's artifact set. The
+   * orchestrator reads `lastPrompt` / `lastLlmResponse` /
+   * `lastModelUsed` from this instance after the call returns to
+   * persist into `agent_execution_logs`.
+   */
+  async review(task: GateTask): Promise<LLMReviewAgentResult> {
+    const startedAt = Date.now();
 
-  if (codeArtifacts.length === 0) {
+    const codeArtifacts = task.artifacts.filter(
+      (a) => a.type === 'code' || a.type === 'test' || a.type === 'context-file',
+    );
+
+    if (codeArtifacts.length === 0) {
+      return {
+        agentRole: 'review-agent',
+        status: 'passed',
+        signals: [],
+        durationMs: Date.now() - startedAt,
+        reviewArtifact: null,
+      };
+    }
+
+    // Step 1 agent externalisation — role / goal / extensions /
+    // model from agents.yaml. Loader never throws.
+    const agentConfig = await loadAgentConfig(task.harnessConfig.projectRoot, 'review-agent');
+    const prompt = buildReviewPrompt(codeArtifacts, task.harnessConfig.goldenPrinciples, agentConfig);
+
+    let review: LLMReview;
+    let raw: string | undefined;
+    try {
+      raw = await this.callLLM(prompt, agentConfig, task.correlationId);
+      review = parseReview(raw);
+    } catch {
+      // LLM call or JSON parse failed. Treat as `errored` — the gate
+      // verdict treats this as an absence of signals (pass through);
+      // the operator sees the error in `agent_executions`.
+      return {
+        agentRole: 'review-agent',
+        status: 'errored',
+        signals: [],
+        durationMs: Date.now() - startedAt,
+        reviewArtifact: null,
+      };
+    }
+
+    const signals = mapItemsToSignals(task.correlationId, review.items);
+
+    const reviewArtifact: LLMReviewArtifact = {
+      id: crypto.randomUUID(),
+      correlationId: task.correlationId,
+      type: 'design',
+      path: `.gestalt/llm-review-${task.correlationId.slice(0, 8)}.md`,
+      content: renderReviewMarkdown(review),
+      producedBy: 'review-agent',
+      createdAt: new Date(),
+    };
+
     return {
       agentRole: 'review-agent',
-      status: 'passed',
-      signals: [],
+      status: signals.length === 0 ? 'passed' : 'failed',
+      signals,
       durationMs: Date.now() - startedAt,
-      reviewArtifact: null,
+      reviewArtifact,
     };
   }
 
-  // Step 1 of agent externalisation — pull role/goal/extensions out of
-  // agents.yaml in the project repo. loadAgentConfig never throws.
-  const agentConfig = await loadAgentConfig(task.harnessConfig.projectRoot, 'review-agent');
-  const prompt = buildReviewPrompt(codeArtifacts, task.harnessConfig.goldenPrinciples, agentConfig);
-
-  let review: LLMReview;
-  let raw: string | undefined;
-  try {
-    raw = await llmCall(prompt, agentConfig.llm);
-    review = parseReview(raw);
-  } catch {
-    // The LLM call or JSON parse failed. Treat as an `errored` agent run —
-    // gate verdict treats it as an absence of signals (pass through),
-    // operator sees the error in the agent_executions row.
-    return {
-      agentRole: 'review-agent',
-      status: 'errored',
-      signals: [],
-      durationMs: Date.now() - startedAt,
-      reviewArtifact: null,
-      lastPrompt: prompt,
-      llmResponse: raw,
-    };
+  // The base template (`run(AgentTask)`) doesn't apply to the gate
+  // layer — review-agent has its own `review(GateTask)` entry point.
+  // The abstract methods are stubbed for the same reason as the
+  // generate-side agents that override `run()`.
+  protected buildPrompt(): string {
+    throw new Error('ReviewAgent.buildPrompt is not used — see review(task)');
   }
-
-  const signals = mapItemsToSignals(task.correlationId, review.items);
-
-  const reviewArtifact: LLMReviewArtifact = {
-    id: crypto.randomUUID(),
-    correlationId: task.correlationId,
-    type: 'design',
-    path: `.gestalt/llm-review-${task.correlationId.slice(0, 8)}.md`,
-    content: renderReviewMarkdown(review),
-    producedBy: 'review-agent',
-    createdAt: new Date(),
-  };
-
-  return {
-    agentRole: 'review-agent',
-    status: signals.length === 0 ? 'passed' : 'failed',
-    signals,
-    durationMs: Date.now() - startedAt,
-    reviewArtifact,
-    lastPrompt: prompt,
-    llmResponse: raw,
-  };
+  protected parseResponse(): AgentResult {
+    throw new Error('ReviewAgent.parseResponse is not used — see review(task)');
+  }
 }
 
 // ─── Prompt + parsing ────────────────────────────────────────────────────────
@@ -230,11 +244,7 @@ function mapItemsToSignals(
     if (item.severity === 'low' || item.severity === 'info') continue;
 
     // GOLDEN_PRINCIPLE_BREACH triggers `escalate` (human review, never
-    // auto-resolved). Reserve it for `critical` severity only — that
-    // means actual security threats: hardcoded secrets, unguarded SQL,
-    // RBAC bypass. "Missing input validation" or "could improve audit
-    // logging" are fixable issues that should route back to the code-
-    // agent via CONSTRAINT_VIOLATION, not escalate to a human.
+    // auto-resolved). Reserve it for `critical` severity only.
     const isBreach = item.severity === 'critical';
 
     out.push({

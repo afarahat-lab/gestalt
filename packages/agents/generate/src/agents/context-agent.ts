@@ -1,101 +1,101 @@
 /**
- * Context agent — updates context files when intent changes project scope.
- * Can skip: Yes — if no context files need updating.
+ * Context agent — updates context files (DOMAIN.md, ARCHITECTURE.md)
+ * when an intent changes the project's domain model or module
+ * structure. Can skip when neither condition holds — see the
+ * `touchesDomain` / `addsNewModule` gates below.
  */
 
-import type { AgentTask, AgentResult, LlmCallFn } from '../types';
+import type { AgentTask, AgentResult } from '../types';
 import { buildContextPrompt } from '../prompts/context-prompt';
+import { applyAgentConfig } from '../prompts/agent-config-helpers';
 import { createHarnessEngine } from '@gestalt/core';
+import { BaseLLMAgent } from './base-llm-agent';
 
 const MAX_INTERNAL_RETRIES = 2;
 
-export async function runContextAgent(
-  task: AgentTask,
-  llmCall: LlmCallFn,
-): Promise<AgentResult> {
-  const startedAt = Date.now();
+export class ContextAgent extends BaseLLMAgent {
+  constructor() { super('context-agent'); }
 
-  // Skip if intent does not touch context files
-  const intentSpec = task.contextSnapshot.intentSpec;
-  const touchesDomain = intentSpec.scope.affectedLayers.includes('domain');
-  const addsNewModule = intentSpec.scope.affectedDomains.some(
-    (d) => !task.contextSnapshot.domain.entities.find((e) => e.name.toLowerCase() === d.toLowerCase()),
-  );
+  override async run(task: AgentTask): Promise<AgentResult> {
+    const startedAt = task.startedAt ?? Date.now();
+    const { agentConfig } = task.contextSnapshot;
 
-  if (!touchesDomain && !addsNewModule) {
+    // Skip when the intent doesn't change anything context files
+    // describe — no LLM call necessary.
+    const intentSpec = task.contextSnapshot.intentSpec;
+    const touchesDomain = intentSpec.scope.affectedLayers.includes('domain');
+    const addsNewModule = intentSpec.scope.affectedDomains.some(
+      (d) => !task.contextSnapshot.domain.entities.find((e) => e.name.toLowerCase() === d.toLowerCase()),
+    );
+
+    if (!touchesDomain && !addsNewModule) {
+      return {
+        agentRole: 'context-agent',
+        status: 'skipped',
+        skipReason: 'Intent does not affect domain model or module structure',
+        artifacts: [],
+        signals: [],
+        tokensUsed: 0,
+        durationMs: Date.now() - startedAt,
+      };
+    }
+
+    let lastError: Error | undefined;
+
+    for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
+      try {
+        const rawPrompt = buildContextPrompt(task.contextSnapshot, attempt);
+        const prompt = applyAgentConfig(rawPrompt, agentConfig);
+        const raw = await this.callLLM(prompt, agentConfig, task.correlationId);
+        const updates = parseContextUpdates(raw);
+
+        const artifacts: AgentResult['artifacts'] = [];
+        const engine = createHarnessEngine(task.contextSnapshot.projectRoot);
+        for (const update of updates) {
+          await engine.writeContextFile(update.path, update.content);
+          artifacts.push({
+            id: crypto.randomUUID(),
+            correlationId: task.correlationId,
+            type: 'context-file',
+            path: update.path,
+            content: update.content,
+            producedBy: 'context-agent',
+            createdAt: new Date(),
+          });
+        }
+
+        return {
+          agentRole: 'context-agent',
+          status: 'completed',
+          artifacts,
+          signals: [],
+          tokensUsed: 0,
+          durationMs: Date.now() - startedAt,
+        };
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+      }
+    }
+
     return {
       agentRole: 'context-agent',
-      status: 'skipped',
-      skipReason: 'Intent does not affect domain model or module structure',
+      status: 'failed',
       artifacts: [],
-      signals: [],
+      signals: [this.makeContextGapSignal(
+        task.correlationId,
+        `Context agent failed: ${lastError?.message ?? 'unknown error'}`,
+      )],
       tokensUsed: 0,
       durationMs: Date.now() - startedAt,
     };
   }
 
-  let lastError: Error | undefined;
-  let lastPrompt: string | undefined;
-  let lastLlmResponse: string | undefined;
-
-  for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
-    try {
-      const prompt = buildContextPrompt(task.contextSnapshot, attempt);
-      lastPrompt = prompt;
-      const raw = await llmCall(prompt, task.contextSnapshot.agentConfig.llm);
-      lastLlmResponse = raw;
-      const updates = parseContextUpdates(raw);
-
-      const artifacts: AgentResult['artifacts'] = [];
-      const engine = createHarnessEngine(task.contextSnapshot.projectRoot);
-
-      for (const update of updates) {
-        await engine.writeContextFile(update.path, update.content);
-        artifacts.push({
-          id: crypto.randomUUID(),
-          correlationId: task.correlationId,
-          type: 'context-file',
-          path: update.path,
-          content: update.content,
-          producedBy: 'context-agent',
-          createdAt: new Date(),
-        });
-      }
-
-      return {
-        agentRole: 'context-agent',
-        status: 'completed',
-        lastPrompt,
-        llmResponse: lastLlmResponse,
-        artifacts,
-        signals: [],
-        tokensUsed: 0,
-        durationMs: Date.now() - startedAt,
-      };
-    } catch (err) {
-      lastError = err instanceof Error ? err : new Error(String(err));
-    }
+  protected buildPrompt(): string {
+    throw new Error('ContextAgent.buildPrompt is not used — see overridden run()');
   }
-
-  return {
-    agentRole: 'context-agent',
-    status: 'failed',
-    lastPrompt,
-    llmResponse: lastLlmResponse,
-    artifacts: [],
-    signals: [{
-      id: crypto.randomUUID(),
-      correlationId: task.correlationId,
-      type: 'CONTEXT_GAP',
-      severity: 'high',
-      sourceAgent: 'context-agent',
-      message: `Context agent failed: ${lastError?.message ?? 'unknown error'}`,
-      autoResolvable: false,
-      createdAt: new Date(),
-    }],
-    tokensUsed: 0,
-    durationMs: Date.now() - startedAt,
-  };
+  protected parseResponse(): AgentResult {
+    throw new Error('ContextAgent.parseResponse is not used — see overridden run()');
+  }
 }
 
 function parseContextUpdates(raw: string): Array<{ path: string; content: string }> {
