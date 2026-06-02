@@ -58,6 +58,27 @@ export async function registerMaintenanceRoutes(app: FastifyInstance): Promise<v
     },
   );
 
+  // GET /maintenance/runs/:id — single run detail with findings.
+  // Powers `gestalt maintenance show <runId>`. Cron-scheduled runs have
+  // `project_id IS NULL` so they are NOT membership-checked; per-project
+  // runs are. A non-member trying to read another project's run gets a
+  // 403 with the typed `NOT_PROJECT_MEMBER` code.
+  app.get<{ Params: { id: string } }>(
+    '/maintenance/runs/:id',
+    async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+      const { maintenanceRuns } = getRepositories();
+      const record = await maintenanceRuns.findById(request.params.id);
+      if (!record) {
+        return reply.code(404).send({ error: 'Maintenance run not found' });
+      }
+      if (record.projectId) {
+        if (!await checkProjectMembership(reply, request.user.id, request.user.role, record.projectId)) return;
+      }
+      return reply.send({ data: record });
+    },
+  );
+
   app.post<{ Body: TriggerBody }>(
     '/maintenance/trigger',
     { preHandler: requireRole('operator') },

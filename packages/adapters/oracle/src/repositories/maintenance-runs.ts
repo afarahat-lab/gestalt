@@ -27,4 +27,5 @@ export class OracleMaintenanceRunRepository implements MaintenanceRunRepository 
     },
   ): Promise<MaintenanceRunRecord> { return notImplemented(); }
   async list(_params: { projectId?: string; agentRole?: string; limit: number }): Promise<MaintenanceRunRecord[]> { return notImplemented(); }
+  async findById(_id: string): Promise<MaintenanceRunRecord | null> { return notImplemented(); }
 }

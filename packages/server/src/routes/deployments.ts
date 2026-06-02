@@ -24,6 +24,14 @@ import { checkProjectMembership } from '../auth/middleware';
 interface ListQuery {
   projectId?: string;
   limit?: string;
+  /**
+   * Optional filter to a single intent cycle. Used by
+   * `gestalt deploy show <intentId>` to fetch just that intent's
+   * deployment timeline without paging through every row. Pure
+   * client-side filter — `correlationId` is one of the
+   * `deployment_events`-eligible fields already returned.
+   */
+  correlationId?: string;
 }
 
 interface DeploymentSummary {
@@ -145,7 +153,15 @@ export async function registerDeploymentRoutes(app: FastifyInstance): Promise<vo
       // Maintain the "newest first" order after the parallel fetches.
       summaries.sort((a, b) => b.startedAt.localeCompare(a.startedAt));
 
-      return reply.send({ data: summaries });
+      // Optional `?correlationId=` filter — applied after enrichment
+      // so we don't have to special-case the merge step. Usually
+      // matches at most one row; we still return an array for
+      // consistency with the no-filter case.
+      const filtered = request.query.correlationId
+        ? summaries.filter((s) => s.correlationId === request.query.correlationId)
+        : summaries;
+
+      return reply.send({ data: filtered });
     },
   );
 }

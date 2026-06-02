@@ -11,9 +11,25 @@
  *   gestalt init-admin [--server <url>]
  *   gestalt projects list [--server <url>]
  *   gestalt projects use <name> [--server <url>]
- *   gestalt projects set-adapter <name> <adapter> [--server <url>]
+ *   gestalt projects set-adapter <name> <adapter>
+ *                                  [--auto-merge | --no-auto-merge]
+ *                                  [--merge-method squash|merge|rebase]
+ *                                  [--server <url>]
  *   gestalt run "<intent>" [--server <url>] [--priority critical|high|normal|low]
- *   gestalt status [--server <url>] [--id <correlationId>]
+ *   gestalt intent list [--project <name>] [--status <s>] [--limit 20]
+ *   gestalt intent show <id> [--watch]                — execution-flow graph
+ *   gestalt intent submit "<text>" [--project <name>] — alias of `run`
+ *   gestalt gate show <intentId>
+ *   gestalt deploy list [--project <name>] [--limit 20]
+ *   gestalt deploy show <intentId> [--project <name>]
+ *   gestalt maintenance list [--project <name>] [--agent <role>]
+ *   gestalt maintenance show <runId>
+ *   gestalt maintenance trigger <agentRole> <projectName>
+ *   gestalt maintenance reset-findings <projectName>
+ *   gestalt agents list <projectName>
+ *   gestalt agents validate <projectName>
+ *   gestalt agents active [--project <name>]
+ *   gestalt status [--server <url>] [--id <correlationId>] [--graph] [--watch]
  *   gestalt logs [--server <url>] [--follow] [--id <correlationId>]
  *   gestalt dashboard [--server <url>]
  *
@@ -40,14 +56,20 @@ import {
 } from './commands/config';
 import {
   maintenanceTriggerCommand, maintenanceResetFindingsCommand,
+  maintenanceListCommand, maintenanceShowCommand,
 } from './commands/maintenance';
 import {
   alertsListCommand, alertsShowCommand, alertsFixCommand, alertsDismissCommand,
   alertsResumeCommand, alertsAbortCommand, alertsAcknowledgeCommand,
 } from './commands/alerts';
 import {
-  agentsListCommand, agentsValidateCommand,
+  agentsListCommand, agentsValidateCommand, agentsActiveCommand,
 } from './commands/agents';
+import {
+  intentListCommand, intentShowCommand, intentSubmitCommand,
+} from './commands/intent';
+import { gateShowCommand } from './commands/gate';
+import { deployListCommand, deployShowCommand } from './commands/deploy';
 import {
   usersListCommand, usersAddCommand, usersRoleCommand, usersDeactivateCommand,
   usersAssignCommand, usersUnassignCommand, usersMembersCommand,
@@ -169,6 +191,30 @@ const maintenance = program
   .description('Operator commands for the maintenance layer (drift / alignment / gc / evaluation)');
 
 maintenance
+  .command('list')
+  .description('Table of recent maintenance runs (status, fixes, intents queued, duration)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <name>', 'Filter to a project by name (defaults to the current project)')
+  .option('--agent <role>', 'Filter to a single agent role (drift-agent | alignment-agent | gc-agent | evaluation-agent)')
+  .option('--limit <n>', 'Max rows to fetch (default 20, max 200)')
+  .action(async (opts: { server?: string; project?: string; agent?: string; limit?: string }) => {
+    await maintenanceListCommand({
+      server: opts.server,
+      project: opts.project,
+      agent: opts.agent,
+      limit: opts.limit,
+    }).catch(fatalError);
+  });
+
+maintenance
+  .command('show <runId>')
+  .description('Show one maintenance run\'s detail with the full findings list (id or 8-char prefix)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (runId: string, opts: { server?: string }) => {
+    await maintenanceShowCommand(runId, { server: opts.server }).catch(fatalError);
+  });
+
+maintenance
   .command('trigger <agentRole> <projectName>')
   .description('Run a maintenance agent now (CLI shortcut for the dashboard "run now" button)')
   .option('--server <url>', 'Server URL (one-shot override for this invocation)')
@@ -270,6 +316,15 @@ agents
     await agentsValidateCommand(projectName, { server: opts.server }).catch(fatalError);
   });
 
+agents
+  .command('active')
+  .description('Show currently-running agent executions (intent text, cycle progress, elapsed time, token total)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <name>', 'Filter to one project (intersects by correlationId)')
+  .action(async (opts: { server?: string; project?: string }) => {
+    await agentsActiveCommand({ server: opts.server, project: opts.project }).catch(fatalError);
+  });
+
 // gestalt users — platform user management (migration 010)
 const users = program
   .command('users')
@@ -348,14 +403,103 @@ program
     }).catch(fatalError);
   });
 
+// gestalt intent
+const intent = program
+  .command('intent')
+  .description('Inspect intents — list, show the execution graph, or submit a new one');
+
+intent
+  .command('list')
+  .description('Table of intents for the current project (status / priority / age / text)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <name>', 'Filter to a project by name (defaults to the current project)')
+  .option('--status <status>', 'Filter by intent status (generating | in-review | approved | deploying | deployed | failed | escalated | waiting-for-clarification)')
+  .option('--limit <n>', 'Max rows to fetch (default 20, max 100)')
+  .action(async (opts: { server?: string; project?: string; status?: string; limit?: string }) => {
+    await intentListCommand({
+      server: opts.server,
+      project: opts.project,
+      status: opts.status,
+      limit: opts.limit,
+    }).catch(fatalError);
+  });
+
+intent
+  .command('show <id>')
+  .description('Render the full execution-flow graph for one intent (accepts UUID or 8-char prefix)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--watch', 'Re-render every 3s until the intent reaches a terminal status')
+  .action(async (id: string, opts: { server?: string; watch?: boolean }) => {
+    await intentShowCommand(id, { server: opts.server, watch: opts.watch }).catch(fatalError);
+  });
+
+intent
+  .command('submit <text>')
+  .description('Submit a new intent (alias of `gestalt run` — same implementation)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <id>', 'Project ID (overrides current project)')
+  .option('--priority <level>', 'Task priority: critical|high|normal|low', 'normal')
+  .action(async (text: string, opts: { server?: string; project?: string; priority?: string }) => {
+    await intentSubmitCommand(text, {
+      server: opts.server,
+      projectId: opts.project,
+      priority: opts.priority as never,
+    }).catch(fatalError);
+  });
+
+// gestalt gate
+const gate = program
+  .command('gate')
+  .description('Inspect quality-gate runs (verdict, per-check status, signals)');
+
+gate
+  .command('show <intentId>')
+  .description('Show gate-layer detail for an intent (UUID or 8-char prefix)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (id: string, opts: { server?: string }) => {
+    await gateShowCommand(id, { server: opts.server }).catch(fatalError);
+  });
+
+// gestalt deploy
+const deploy = program
+  .command('deploy')
+  .description('Inspect deploy-layer activity — list deployments or show one timeline');
+
+deploy
+  .command('list')
+  .description('Table of recent deployments with status, branch, PR link, started timestamp')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <name>', 'Filter to a project by name (defaults to the current project)')
+  .option('--limit <n>', 'Max rows to fetch (default 20, max 100)')
+  .action(async (opts: { server?: string; project?: string; limit?: string }) => {
+    await deployListCommand({
+      server: opts.server,
+      project: opts.project,
+      limit: opts.limit,
+    }).catch(fatalError);
+  });
+
+deploy
+  .command('show <intentId>')
+  .description('Show the deployment timeline for one intent (PR → pipeline → staging → production [→ merged])')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <name>', 'Filter to a project by name (defaults to the current project)')
+  .action(async (id: string, opts: { server?: string; project?: string }) => {
+    await deployShowCommand(id, {
+      server: opts.server,
+      project: opts.project,
+    }).catch(fatalError);
+  });
+
 // gestalt status
 program
   .command('status')
-  .description('Show platform status and recent intents')
+  .description('Show platform status and recent intents (with --graph: full execution-flow renderer)')
   .option('--server <url>', 'Server URL (one-shot override for this invocation)')
   .option('--id <correlationId>', 'Show detail for a specific intent cycle')
-  .option('--watch', 'Refresh every 5 seconds')
-  .action(async (opts: { server?: string; id?: string; watch?: boolean }) => {
+  .option('--graph', 'When used with --id, render the execution-flow graph instead of the summary table')
+  .option('--watch', 'When used with --id, poll + re-render every 3s until terminal status')
+  .action(async (opts: { server?: string; id?: string; watch?: boolean; graph?: boolean }) => {
     await statusCommand(opts).catch(fatalError);
   });
 

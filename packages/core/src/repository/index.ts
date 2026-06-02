@@ -479,6 +479,12 @@ export interface MaintenanceRunRepository extends BaseRepository {
     agentRole?: string;
     limit: number;
   }): Promise<MaintenanceRunRecord[]>;
+  /**
+   * Fetch a single maintenance run by id. Returns null when the row
+   * does not exist (used by `GET /maintenance/runs/:id` so the route
+   * can distinguish 404 from a parsed-but-empty result).
+   */
+  findById(id: string): Promise<MaintenanceRunRecord | null>;
 }
 
 // ─── Finding attempt repository (ADR-018 idempotency guard) ──────────────────

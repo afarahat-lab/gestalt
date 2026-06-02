@@ -12,6 +12,7 @@ export interface ApiClientOptions {
 export interface IntentSummary {
   id: string;
   correlationId: string;
+  projectId: string;
   text: string;
   status: string;
   source: string;
@@ -27,11 +28,22 @@ export interface IntentDetail extends IntentSummary {
 
 export interface AgentExecution {
   id: string;
+  correlationId?: string;
+  intentId?: string;
   agentRole: string;
+  taskType?: string;
   status: string;
+  tokensUsed?: number;
   durationMs: number | null;
   startedAt: string | null;
   completedAt: string | null;
+  // Enrichment surfaced by GET /status/agents — intent text + cycle
+  // progress + running token total. Optional because the same shape
+  // is also returned by GET /intents/:id (where these fields are
+  // absent — the caller already has the intent text in scope).
+  intentText?: string;
+  cycleProgress?: { completed: number; total: number };
+  tokensSoFar?: number;
 }
 
 export interface SignalSummary {
@@ -168,6 +180,69 @@ export interface InterventionRecordDto {
   actorId: string;
   notes: string | null;
   createdAt: string;
+}
+
+// ─── Deployments (ADR-033 / ADR-034) ─────────────────────────────────────────
+
+export type DeploymentEventType =
+  | 'pr-opened'
+  | 'pipeline-triggered'
+  | 'pipeline-passed'
+  | 'pipeline-failed'
+  | 'promoted-staging'
+  | 'promoted-production'
+  | 'auto-merged';
+
+export interface DeploymentEvent {
+  id: string;
+  correlationId: string;
+  intentId: string;
+  eventType: DeploymentEventType;
+  environment: string | null;
+  prUrl: string | null;
+  prNumber: number | null;
+  runId: string | null;
+  deploymentUrl: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface DeploymentSummary {
+  intentId: string;
+  correlationId: string;
+  intentText: string;
+  status: string;
+  events: DeploymentEvent[];
+  prUrl: string | null;
+  prNumber: number | null;
+  branch: string | null;
+  runId: string | null;
+  deploymentUrl: string | null;
+  startedAt: string;
+  completedAt: string | null;
+}
+
+// ─── Maintenance runs (ADR-035) ──────────────────────────────────────────────
+
+export interface MaintenanceFinding {
+  type: string;
+  description: string;
+  affectedFiles: string[];
+  severity: 'low' | 'medium' | 'high';
+  suggestedAction: string;
+}
+
+export interface MaintenanceRunRecord {
+  id: string;
+  agentRole: string;
+  projectId: string | null;
+  status: 'running' | 'completed' | 'failed';
+  intentsQueued: number;
+  directFixes: number;
+  findings: MaintenanceFinding[];
+  durationMs: number | null;
+  runAt: string;
+  completedAt: string | null;
 }
 
 export interface UserSummary {
@@ -344,6 +419,28 @@ export class GestaltApiClient {
 
   async resetMaintenanceFindings(projectId: string): Promise<{ data: { deleted: number } }> {
     return this.delete(`/maintenance/findings/${projectId}`);
+  }
+
+  async listMaintenanceRuns(params: {
+    projectId?: string;
+    agentRole?: string;
+    limit?: number;
+  } = {}): Promise<{ data: MaintenanceRunRecord[] }> {
+    return this.get('/maintenance/runs', params as Record<string, unknown>);
+  }
+
+  async getMaintenanceRun(id: string): Promise<{ data: MaintenanceRunRecord }> {
+    return this.get(`/maintenance/runs/${id}`);
+  }
+
+  // ─── Deployments ───────────────────────────────────────────────────────────
+
+  async listDeployments(params: {
+    projectId: string;
+    limit?: number;
+    correlationId?: string;
+  }): Promise<{ data: DeploymentSummary[] }> {
+    return this.get('/deployments', params as Record<string, unknown>);
   }
 
   // ─── Agents (agents.yaml inspection — ADR-037) ────────────────────────────

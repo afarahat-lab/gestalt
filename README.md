@@ -70,13 +70,35 @@ git pull        # AGENTS.md, HARNESS.json, docs/* arrive locally
 ```bash
 gestalt run "Set up the initial project scaffold"
 gestalt status
-gestalt dashboard   # opens http://localhost:3000/app/
+gestalt intent show <id> --watch    # live execution-flow graph
+gestalt dashboard                   # opens http://localhost:3000/app/
 ```
 
 Agent-generated changes are committed and pushed back to the same Git repo —
 `git pull` again to receive them.
 
 **Full walkthrough:** [docs/guides/quick-start.md](docs/guides/quick-start.md)
+
+### 6. Inspect what happened
+
+The CLI surfaces the same data the dashboard does — every command works
+against a single intent or browses recent activity:
+
+| Command | What it shows |
+|---|---|
+| `gestalt intent list [--status <s>] [--project <name>]` | Table of intents (id, status, priority, age, text). |
+| `gestalt intent show <id> [--watch]` | Full execution-flow graph (Generate → Gate → Deploy → Signals). `--watch` re-renders every 3s until terminal status. |
+| `gestalt intent submit "<text>"` | Alias of `gestalt run` for noun-verb discoverability. |
+| `gestalt gate show <id>` | Quality-gate verdict + per-check status + signals for one cycle. |
+| `gestalt deploy list` | Recent deployments with status, branch, PR link. |
+| `gestalt deploy show <id>` | Deployment timeline (PR → pipeline → staging → production → merged) with timestamps. |
+| `gestalt maintenance list` | Recent maintenance runs (fixes, intents queued, duration). |
+| `gestalt maintenance show <runId>` | Run detail with the findings list. |
+| `gestalt agents active [--project <name>]` | Currently-running agent executions with intent text, elapsed time, token total, cycle progress. |
+| `gestalt status --id <id> --graph [--watch]` | Same execution-flow graph as `intent show`, accessed via the `status` namespace. |
+
+All commands accept an `<id>` as either a full UUID or an 8-char `correlationId`
+prefix — same form the list tables print.
 
 ---
 

@@ -1,5 +1,6 @@
 /**
- * gestalt agents — read + validate `agents.yaml` from the project repo.
+ * gestalt agents — read + validate `agents.yaml` from the project repo
+ * and inspect currently-running agent executions.
  *
  *   gestalt agents list <projectName>
  *     Calls GET /projects/:id/agents and prints two sections:
@@ -12,9 +13,16 @@
  *     Calls GET /projects/:id/agents/validate and prints
  *     "✓ agents.yaml valid (N custom agents defined)" or "✗ ..."
  *     plus any warnings the server surfaced.
+ *
+ *   gestalt agents active [--project <name>]
+ *     Calls GET /status/agents and prints currently-running agent
+ *     executions across the platform (or filtered to the current
+ *     project's intents). Each row shows the agent role, the
+ *     enriched intent text + cycle progress + token total, and the
+ *     elapsed wall-clock time since the agent started.
  */
 
-import { GestaltApiClient } from '../api/client';
+import { GestaltApiClient, type AgentExecution } from '../api/client';
 import { loadCliConfig, resolveServerUrl } from '../ui/config';
 import { printConnectionError, isConnectivityError } from '../ui/server-errors';
 import { c, blank, divider } from '../ui/prompts';
@@ -183,4 +191,92 @@ async function resolveProjectByName(
     process.exit(1);
   }
   return match;
+}
+
+// ─── agents active ───────────────────────────────────────────────────────────
+
+export interface AgentsActiveOptions {
+  server?: string;
+  project?: string;
+}
+
+export async function agentsActiveCommand(
+  options: AgentsActiveOptions = {},
+): Promise<void> {
+  const config = await loadCliConfig();
+  const serverUrl = resolveServerUrl(options, config);
+  if (!config.token) {
+    console.log(c.error('Not authenticated. Run: gestalt login'));
+    process.exit(1);
+  }
+  const client = new GestaltApiClient({ serverUrl, token: config.token });
+
+  try {
+    const res = await client.getActiveAgents();
+    let active = res.data;
+
+    // Optional `--project` filter — intersect by correlationId against
+    // the project's intents. The server's /status/agents endpoint is
+    // unscoped (operators see cross-project activity by default) so we
+    // narrow it here.
+    if (options.project) {
+      const project = await resolveProjectByName(client, options.project);
+      const intents = await client.listIntents({ projectId: project.id, limit: 100 });
+      const projectCorrIds = new Set(intents.data.map((i) => i.correlationId));
+      active = active.filter((a) => a.correlationId
+        ? projectCorrIds.has(a.correlationId)
+        : true);
+    }
+
+    renderActiveAgents(active);
+  } catch (err) {
+    if (isConnectivityError(err)) {
+      printConnectionError(serverUrl);
+    } else {
+      console.log(c.error(`Failed: ${err instanceof Error ? err.message : String(err)}`));
+    }
+    process.exit(1);
+  }
+}
+
+function renderActiveAgents(active: AgentExecution[]): void {
+  blank();
+  if (active.length === 0) {
+    console.log(c.bold('Active agents (0)'));
+    divider();
+    console.log(c.dim('No agents running — platform is idle.'));
+    blank();
+    return;
+  }
+  console.log(c.bold(`Active agents (${active.length})`));
+  divider();
+  for (const a of active) {
+    const elapsed = a.startedAt
+      ? formatElapsed(Date.now() - new Date(a.startedAt).getTime())
+      : '–';
+    const intentLine = a.intentText
+      ? `  "${truncate(a.intentText, 50)}"`
+      : '';
+    const tokens = a.tokensSoFar !== undefined && a.tokensSoFar > 0
+      ? `  ${c.dim(`${a.tokensSoFar.toLocaleString()} tokens`)}`
+      : '';
+    console.log(`${c.info('◎')} ${c.agent(a.agentRole.padEnd(20))}${intentLine}    ${c.dim(elapsed)}${tokens}`);
+    if (a.cycleProgress && a.cycleProgress.total > 0) {
+      console.log(`  ${c.dim(`step ${a.cycleProgress.completed} of ${a.cycleProgress.total}`)}`);
+    }
+  }
+  blank();
+}
+
+function truncate(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return text.slice(0, max - 1) + '…';
+}
+
+function formatElapsed(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rem = seconds % 60;
+  return `${minutes}m ${rem}s`;
 }

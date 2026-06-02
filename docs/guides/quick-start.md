@@ -275,12 +275,44 @@ gestalt run "Add a hello-world REST endpoint at GET /hello"
 
 Watch live agent activity:
 ```bash
-gestalt logs
+gestalt logs                              # SSE stream of every event
+gestalt agents active                     # currently-running agents
+gestalt intent show <id> --watch          # re-renders the execution
+                                          # graph every 3 seconds until
+                                          # the intent reaches a
+                                          # terminal status
+gestalt status --id <id> --graph --watch  # same renderer via the
+                                          # status namespace
 ```
 
-Check status:
+`gestalt intent show` (and the equivalent `gestalt status --id <id>
+--graph`) is the primary way to inspect a running or completed intent
+from the CLI. The graph groups agent executions by layer (Generate →
+Quality gate → Deploy) and inlines per-row details:
+
+```
+Generate
+  ✓ intent-agent          4.0s
+  ✓ code-agent            3.8s  1247 tokens
+  ✓ docs-check-agent      903ms  244 tokens [custom]
+Quality gate
+  ✓ constraint-agent      2ms
+  ✓ review-agent          1.4s
+Deploy
+  ✓ pr-agent              4.4s   PR #26
+  ✓ pipeline-agent        21.6s  run #26847601876
+  ✓ promotion-agent       4.3s   staging → production   ✓ auto-merged b7a61ae
+```
+
+`<id>` is either the full UUID or the 8-char `correlationId` prefix
+the table forms show.
+
+Check status (summary mode — no `--graph`):
 ```bash
-gestalt status
+gestalt status                            # platform overview + recent intents
+gestalt intent list                       # table view of recent intents
+gestalt deploy list                       # recent deployments
+gestalt maintenance list                  # recent maintenance runs
 ```
 
 Open the dashboard:
@@ -400,8 +432,18 @@ gestalt agents validate <projectName>  # check agents.yaml parses + valid
 | `gestalt projects set-adapter <name> <adapter>` | Once per CI swap | Switch pipeline adapter (`noop` ↔ `github-actions`) |
 | `gestalt run "<intent>"` | Daily | Submit work to agents |
 | `gestalt status` | Daily | Check platform and intent status |
+| `gestalt status --id <id> --graph [--watch]` | Daily | Execution-flow graph for an intent (live re-render with --watch) |
 | `gestalt logs` | Daily | Stream live agent activity |
 | `gestalt dashboard` | Daily | Open oversight dashboard |
+| `gestalt intent list` | Daily | Table of recent intents (status / priority / age / text) |
+| `gestalt intent show <id> [--watch]` | Daily | Execution-flow graph for one intent |
+| `gestalt intent submit "<text>"` | Discoverability | Alias of `gestalt run` |
+| `gestalt gate show <id>` | As needed | Quality-gate verdict + per-check status + signals |
+| `gestalt deploy list` | As needed | Recent deployments with status, branch, PR link |
+| `gestalt deploy show <id>` | As needed | Deployment timeline with timestamps |
+| `gestalt maintenance list` | As needed | Recent maintenance runs (fixes / intents queued) |
+| `gestalt maintenance show <runId>` | As needed | Maintenance run detail + findings list |
+| `gestalt agents active [--project <name>]` | As needed | Currently-running agents with intent text + token total |
 | `gestalt agents list <name>` | As needed | Show framework + custom agents for a project |
 | `gestalt agents validate <name>` | As needed | Validate `agents.yaml` and report warnings |
 

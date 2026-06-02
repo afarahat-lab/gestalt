@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-02 (Claude Code — `.gestalt/` spec files scoped by correlationId to prevent parallel-intent merge conflicts)
+**Last updated:** 2026-06-03 (Claude Code — CLI operational parity: `gestalt intent` / `gate` / `deploy` / `maintenance show` / `agents active` / `status --graph` / `status --watch`, with execution-flow graph renderer shared between `intent show` and `status --graph`)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -22,11 +22,12 @@ the historical record of how the state evolved._
   are summarised in the "Session log" entries dated 2026-05-29 / 30
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
-- All twelve migrations apply on startup: `001_initial`, `002_local_auth`,
+- All thirteen migrations apply on startup: `001_initial`, `002_local_auth`,
   `003_projects`, `004_deployments`, `005_maintenance`,
   `006_intent_clarification`, `007_execution_logs`,
   `008_finding_attempts`, `009_execution_log_model`,
-  `010_user_management`, `011_interventions`, `012_tool_calls`
+  `010_user_management`, `011_interventions`, `012_tool_calls`,
+  `013_auto_merge`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
 - **Dashboard SPA reachable in the browser, deep-linkable, no path
@@ -839,14 +840,129 @@ the historical record of how the state evolved._
   registers project on server, server clones repo, commits harness files,
   pushes; developer runs `git pull` to receive harness locally
 - `gestalt projects list`, `gestalt projects use <name>`, and
-  `gestalt projects set-adapter <name> <noop|github-actions>` working.
-  `set-adapter` clones the project repo, mutates `pipeline.adapter` in
+  `gestalt projects set-adapter <name> <noop|github-actions>
+  [--auto-merge | --no-auto-merge]
+  [--merge-method squash|merge|rebase]` working.
+  `set-adapter` clones the project repo, mutates `pipeline.adapter`
+  (and optionally `pipeline.autoMerge` / `pipeline.mergeMethod`) in
   `HARNESS.json`, commits as
-  `chore: update pipeline adapter to <adapter> [gestalt]`, and pushes
+  `chore: update pipeline <changed fields> [gestalt]`, and pushes
   to `defaultBranch` — HARNESS.json in the repo remains the source of
-  truth (ADR-032). Audit-logged as `project.config-updated`
+  truth (ADR-032). Multi-field patches commit ONE row atomically.
+  Audit-logged as `project.config-updated` with `changedFields[]`
+  + `previousValues` / `newValues` per field
 - `gestalt run` queues intent → orchestrator picks up → clones project
   repo fresh per cycle → runs generate loop against cloned harness files
+- **CLI operational parity (Session 1, 2026-06-03).** The CLI now
+  surfaces the same data the dashboard does, organised into
+  noun-verb subcommands per layer. No new server endpoints beyond
+  a `?correlationId=` filter on `GET /deployments` and a
+  `GET /maintenance/runs/:id` detail route. Shared
+  `packages/cli/src/ui/execution-graph.ts` renders the
+  Generate → Quality gate → Deploy flow grouped by layer with
+  per-row durations, token totals, custom-agent tags, and
+  inlined PR / run / merge-SHA extras. The renderer is shared
+  between `gestalt intent show` and `gestalt status --id <id>
+  --graph` — same `FRAMEWORK_AGENTS` set the dashboard's
+  `IntentDetail.tsx` uses.
+  - `gestalt intent list [--status <s>] [--project <name>]
+    [--limit 20]` — table with id-prefix / status badge /
+    priority / age / text
+  - `gestalt intent show <id> [--watch]` — full execution-flow
+    graph. Accepts UUID or 8-char correlationId prefix.
+    `--watch` polls every 3s and re-renders until the intent
+    reaches a terminal status (`deployed | failed |
+    escalated`) — uses `\x1b[2J\x1b[H` between renders,
+    Ctrl+C to detach
+  - `gestalt intent submit "<text>"` — alias of `gestalt run`,
+    same implementation
+  - `gestalt gate show <intentId>` — verdict (derived from
+    intent status), per-gate-agent rows with status / duration
+    / per-row summary (constraint violations, lint warnings,
+    test pass-fail, review findings), and the full signals
+    list
+  - `gestalt deploy list [--project <name>] [--limit 20]` —
+    table of recent deployments (id / status / PR / branch /
+    started). Backed by the existing `GET /deployments?projectId`
+  - `gestalt deploy show <intentId> [--project <name>]` —
+    timeline with per-event timestamps:
+    `HH:MM:SS  ✓ PR opened           PR #26`
+    `HH:MM:SS  ✓ Pipeline triggered  run #...`
+    + `Total deployment time: Ns`. Uses the new
+    `?correlationId=` filter on `GET /deployments`
+  - `gestalt maintenance list [--project <name>]
+    [--agent <role>] [--limit 20]` — table (id / agent /
+    status / fixes / intents / duration / age)
+  - `gestalt maintenance show <runId>` — run header + findings
+    list with per-finding severity badge, up-to-3 affected
+    files (and "and N more"), description, and suggested
+    action. Backed by the new `GET /maintenance/runs/:id`
+    route + `findById` repo method (postgres impl + oracle /
+    mssql throw-stubs)
+  - `gestalt agents active [--project <name>]` —
+    currently-running agent executions enriched with the
+    intent text, cycle progress (`step N of M`), elapsed
+    wall-clock time, and the running token total across the
+    cycle. Same enrichment the dashboard's ActiveAgents card
+    consumes. `--project` intersects by correlationId
+  - **`gestalt status --id <id> --graph [--watch]`** — same
+    execution-flow renderer as `intent show`, accessed via
+    the status namespace. `--watch` re-renders every 3s
+    (polling, not SSE — `gestalt logs` is the SSE surface)
+  - **Shared `resolveIntentId` helper**
+    (`packages/cli/src/ui/intent-resolver.ts`) — every command
+    that takes `<intentId>` translates UUID or 8-char
+    correlationId prefix to the intent's internal UUID via
+    the same path. `/intents/:id` keys on the intent UUID,
+    not the correlationId, so even a full correlationId
+    needs to be resolved first
+  - **Server additions, minimal**: `GET /deployments` accepts
+    an optional `?correlationId=<id>` query parameter (post-
+    enrichment client-side filter — usually matches at most
+    one row). `GET /maintenance/runs/:id` route returns
+    `{ data: MaintenanceRunRecord }`; cron-scheduled runs
+    (`project_id IS NULL`) are unscoped, per-project runs are
+    membership-checked. The `MaintenanceRunRepository`
+    interface gained `findById(id): Promise<MaintenanceRunRecord
+    | null>`; postgres impl + oracle / mssql throw-stubs
+  - **CLI types**: `IntentSummary` gained `projectId: string`
+    (the server always returns it; declaring it lets the new
+    commands avoid `as` casts). New
+    `DeploymentSummary` / `DeploymentEvent` /
+    `DeploymentEventType` / `MaintenanceRunRecord` /
+    `MaintenanceFinding` types mirror the server shapes
+  - Live verified:
+    - `gestalt intent list --limit 5` — table renders with
+      correct status badges and ages
+    - `gestalt intent show 8b3fcc4a` — execution graph
+      renders Generate / Gate / Deploy sections, the
+      `[custom]` tag on `docs-check-agent`, the auto-merged
+      SHA on the promotion-agent row, and "No signals"
+      when the cycle was clean
+    - `gestalt gate show 8b3fcc4a` — verdict `✓ passed`,
+      `constraint-agent  2ms  0 violations`,
+      `review-agent  1396ms  no concerns`, "No signals
+      emitted"
+    - `gestalt deploy show 8b3fcc4a` — full 6-event
+      timeline (`PR opened → Pipeline triggered → Pipeline
+      passed → Staging promoted → Auto-merged b7a61ae9 →
+      Production promoted`), `Total deployment time: 28s`
+    - `gestalt deploy list --limit 5` — 5 rows with status
+      badges + PR numbers + branch names
+    - `gestalt maintenance list --limit 5` — 5 rows; `show
+      <prefix>` against a project-scoped run shows the
+      header + "Findings (0)" panel
+    - `gestalt agents active` against a live cycle — shows
+      `◎ context-agent  "Add a startsWith utility..."  0s`
+      + `step 3 of 4`
+    - `gestalt status --id 8b3fcc4a --graph` — identical
+      graph to `intent show`; same renderer reached via
+      both commands
+    - `gestalt status --id <corr8> --watch --graph` against
+      a deploying intent — rendered 4 times in 12 seconds
+      (3s interval), showing the live transition from
+      `pipeline-agent ◎ running` to `pipeline-agent ✓
+      completed`
 - **Intent clarification flow wired end-to-end.** A vague intent
   (e.g. "make it better") no longer fails silently at the test-agent —
   the intent-agent runs, sees `successCriteria.length === 0` (or a
@@ -1295,6 +1411,86 @@ the historical record of how the state evolved._
     detection logic is unit-shaped and tested at the adapter level
     only. ADR-034 production-without-staging path also stays
     NoOp-validated since the cycle ran clean
+- **Auto-merge support (migration 013).** After staging promotion
+  succeeds, if `HARNESS.json` `pipeline.autoMerge === true`, the
+  promotion-agent calls `adapter.mergePullRequest()` BEFORE the
+  production promotion is dispatched. Default is `false` — existing
+  projects unaffected without opt-in.
+  - **Interface**: `PipelineAdapter.mergePullRequest({ projectId,
+    prNumber, mergeMethod?, commitTitle?, commitMessage? }) →
+    { merged, sha }`. `mergeMethod` defaults to `'squash'`
+  - **GitHubActionsAdapter**: `PUT /repos/{owner}/{repo}/pulls/
+    {pull_number}/merge`. Maps 405 → "PR is not mergeable — check
+    CI status and conflicts", 409 → "PR head was modified — cannot
+    merge safely". Reuses existing `throwIfAuthError` for missing
+    PAT scopes
+  - **NoOpPipelineAdapter**: returns
+    `{ merged: true, sha: 'noop-merge-sha' }`
+  - **`HarnessPipelineConfig`** typed interface in
+    `@gestalt/core/types` (`adapter`, optional `autoMerge`,
+    optional `mergeMethod: 'merge'|'squash'|'rebase'`).
+    `HarnessConfig.pipeline` retyped from `Record<string, unknown>`
+    so callers can read fields without casting
+  - **Payload chain**: `prNumber` + `intentText` thread through
+    `DeployPRPayload` → `DeployPipelinePayload` → `DeployPromotionPayload`
+    (the last two gained optional fields). Promotion-agent input
+    accepts both; missing `prNumber` is treated the same as
+    `autoMerge: false` (legacy in-flight queue jobs)
+  - **`auto-merged` deployment_events row** (migration 013 —
+    `ALTER TYPE deployment_event_type ADD VALUE IF NOT EXISTS
+    'auto-merged'`). Written by promotion-agent on successful
+    merge with `metadata: { sha, mergeMethod, adapter }` and
+    `prNumber` populated. Failure does NOT write a row — only
+    the SSE `deployment.updated { status: 'auto-merge-failed' }`
+    surfaces it
+  - **Non-fatal failure**: a 405 / 409 / other adapter error is
+    caught locally; the agent logs a warning, emits the
+    `auto-merge-failed` SSE event, and continues. Production
+    promotion fires; the intent still reaches `deployed`. The
+    PR stays open for manual merge — a transient GitHub API
+    blip cannot block a successful deployment
+  - **`maybeAutoMerge` runs in the staging branch only.**
+    `targetEnvironment === 'production'` never auto-merges
+    (production has no PR to merge — the artifact is already on
+    `main` via the staging merge). The agent reads HARNESS.json
+    from the same clone the promotion used (`createHarnessEngine
+    (workDir).loadHarnessConfig()`). Parse failure → log warn +
+    treat as `autoMerge: false`
+  - **Commit subject** is `<first line of intentText, ≤72 chars>
+    [gestalt <corr8>]` — matches the format the gate's
+    `dispatchDeployPR` uses for the original PR title, so the
+    squash-merge commit reads as a continuation. Falls back to
+    `Auto-merge [gestalt <corr8>]` when intentText is missing
+  - **CLI** — `gestalt projects set-adapter <name> <adapter>
+    [--auto-merge | --no-auto-merge] [--merge-method
+    squash|merge|rebase]`. Both `autoMerge` and `mergeMethod`
+    validated client-side (3-value whitelist for mergeMethod);
+    server re-validates. Multi-field patches commit one row to
+    HARNESS.json with subject `chore: update pipeline <changed
+    fields> [gestalt]`. Audit metadata carries `changedFields[]`
+    plus `previousValues` / `newValues` objects
+  - **Dashboard 5-node timeline**: Deployments view appends a
+    `Merged ✓` 5th node when an `auto-merged` event exists for
+    the cycle (event-presence-driven, NOT config-driven —
+    manual-merge projects never produce the row so stay at 4
+    nodes). Footer gains a "↗ View commit <sha7>" external link
+    when the merge SHA is known + the PR URL is on github.com
+  - **Template `corporate-ops-web-mobile/HARNESS.json` ships
+    with `autoMerge: false, mergeMethod: 'squash'`** as defaults.
+    `docs/reference/harness-config.md` documents the field
+    semantics, non-fatal failure rule, commit-subject format,
+    and CLI setting path
+  - Live verified end-to-end against `trackeros` real GitHub:
+    - **Stage 1 (autoMerge=false)** intent `53dfc2d4`: 5
+      deployment_events rows (no `auto-merged`); PR stays open;
+      intent `deployed`
+    - **Stage 2 (autoMerge=true)** intent `8b3fcc4a`: 6
+      deployment_events rows including `auto-merged` between
+      `promoted-staging` and `promoted-production`;
+      `metadata.sha = b7a61ae9` matches the real merge commit
+      on `trackeros/main`; HEAD of `main` advanced to the
+      squash-merge with the brief-specified subject. End-to-end
+      ~28 s wall-clock
 - **Gate ↔ generate feedback loop wired.** A `fail` verdict (auto-resolvable
   signals, no GP_BREACH) dispatches a `generate:intent` task back to the
   generate queue with `retryCount + 1` and the signals routed to the
@@ -1418,7 +1614,11 @@ the historical record of how the state evolved._
   `parseJsonb<Record<string, unknown>>(row.metadata, {})` in
   `../utils` so the `pr-opened` event's `branch` key (used by the
   Deployments view's branch chip) round-trips regardless of whether
-  postgres.js returns the column as an object or a string
+  postgres.js returns the column as an object or a string. The
+  `eventType` enum gained `'auto-merged'` via migration 013 — written
+  by promotion-agent on successful auto-merge (after
+  `promoted-staging`, before `promoted-production`), carries
+  `metadata.sha` + `metadata.mergeMethod`
 - `maintenanceRuns` — create (status=running), complete (final counts +
   findings JSONB + duration), list (filter by projectId / agentRole).
   Findings are JSONB-array-typed; the PG impl uses postgres.js's

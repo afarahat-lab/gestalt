@@ -9732,3 +9732,312 @@ Operator action — trackeros restored to baseline:
 
 No new Pending enhancements introduced.
 
+---
+
+### Session 2026-06-03 — Claude Code (CLI operational parity: gestalt intent / gate / deploy / agents active / status --graph / --watch)
+
+Closes the long-standing CLI-vs-dashboard gap. The dashboard has
+shown the full execution-flow graph + per-layer detail + active
+agents enrichment since the IntentDetail accordion landed; the CLI
+has only ever had `gestalt run` (submit + SSE stream) +
+`gestalt status` (summary table). This session adds three new
+command groups (`intent`, `gate`, `deploy`), extends `maintenance`
+and `agents` with read-only inspection subcommands, and surfaces the
+execution-flow graph from both `intent show` and `status --id <id>
+--graph`. All data comes from existing API endpoints — only two
+minimal server additions (`?correlationId` filter on `/deployments`
+and a `GET /maintenance/runs/:id` route + `findById` repo method).
+
+Changed:
+- `packages/server/src/routes/deployments.ts`: `ListQuery` extended
+  with optional `correlationId`. Filtered post-enrichment so the
+  merge step doesn't need special-casing — usually matches at most
+  one row; still returns an array for shape consistency. Used by
+  `gestalt deploy show <intentId>`
+- `packages/core/src/repository/index.ts`:
+  `MaintenanceRunRepository` gained
+  `findById(id): Promise<MaintenanceRunRecord | null>`. Returns
+  null when not found so `GET /maintenance/runs/:id` can
+  distinguish 404 from empty
+- `packages/adapters/postgres/src/repositories/maintenance-runs.ts`:
+  `findById` impl — `SELECT * FROM maintenance_runs WHERE id = $1
+  LIMIT 1`. `parseJsonb` on the findings column same as
+  `list`
+- `packages/adapters/{oracle,mssql}/src/repositories/maintenance-runs.ts`:
+  added `findById` throw-stubs for interface parity
+- `packages/server/src/routes/maintenance.ts`: new
+  `GET /maintenance/runs/:id` route. Cron-scheduled runs
+  (`projectId IS NULL`) are unscoped; per-project runs get the
+  same `checkProjectMembership` treatment every other read
+  endpoint uses
+- `packages/cli/src/api/client.ts`:
+  - `IntentSummary` gained `projectId: string` (the server has
+    always returned it; declaring it lets new commands avoid
+    `as` casts and use it for deployment-event lookup)
+  - `AgentExecution` widened with optional `correlationId`,
+    `intentId`, `taskType`, `tokensUsed`, `intentText`,
+    `cycleProgress`, `tokensSoFar` — fields the server already
+    returns; the dashboard's `IntentDetail` and `ActiveAgents`
+    consume them
+  - New `DeploymentEventType` union (matches the core repo + the
+    dashboard's local type), `DeploymentEvent`,
+    `DeploymentSummary`, `MaintenanceFinding`,
+    `MaintenanceRunRecord`
+  - New client methods: `listMaintenanceRuns`,
+    `getMaintenanceRun`, `listDeployments`
+- `packages/cli/src/ui/execution-graph.ts` (new): shared
+  renderer for the execution-flow graph. Exports
+  `renderExecutionGraph({ intent, deploymentEvents? })`,
+  `FRAMEWORK_AGENTS` (same 19-role set the dashboard uses),
+  layer classifiers (`isGenerateAgent`, `isGateAgent`,
+  `isDeployAgent`), `clearScreen()`, and
+  `isTerminalIntentStatus(status)`. Per-row formatters inline
+  deploy-agent extras (PR number, run id, staging → production
+  arrow, `✓ auto-merged <sha7>`). Customs (anything not in
+  FRAMEWORK_AGENTS) belong to the generate layer per ADR-037
+- `packages/cli/src/ui/intent-resolver.ts` (new):
+  `resolveIntentId(client, idOrPrefix, currentProjectId)`. Lists
+  the current project's intents (or server-wide for
+  platform-admins) and matches against `correlationId`
+  prefix or full equality. Ambiguous prefixes error with the
+  match count. Falls back to treating the input as the intent
+  UUID when it's a full UUID and nothing matches. Every command
+  that takes `<intentId>` uses this so 8-char prefixes work
+  the same way everywhere
+- `packages/cli/src/commands/intent.ts` (new):
+  - `intentListCommand` — table view of recent intents
+    (id-prefix, status badge, priority, age, text). Optional
+    `--status` filter validated against the 9-value union
+  - `intentShowCommand` — fetches `/intents/:id` +
+    `/deployments?correlationId=`, renders the graph.
+    `--watch` polls every 3s, clears the screen, re-renders
+    until terminal status; SIGINT handler prints "Detached"
+    and exits
+  - `intentSubmitCommand` — thin alias of `runCommand`, no
+    duplicate logic
+- `packages/cli/src/commands/gate.ts` (new):
+  - `gateShowCommand` — quality-gate detail for one intent.
+    Verdict derived from intent status (`approved | deploying
+    | deployed` → `✓ passed`, `failed` → `✗ failed`,
+    `escalated` → `⚠ escalated`, `in-review` → `◎ in review`).
+    Per-check rows show status glyph, role, duration, and a
+    per-role summary (constraint violations / lint warnings /
+    security findings / test pass-fail / review findings).
+    Signals table shows all signals for the cycle with the
+    blocking count
+- `packages/cli/src/commands/deploy.ts` (new):
+  - `deployListCommand` — table of recent deployments (id /
+    status / PR / branch / started)
+  - `deployShowCommand` — single deployment with header
+    (Branch / PR URL / Deployment URL / Status), per-event
+    timeline (`HH:MM:SS  ✓ <Label>  <extra>`), and `Total
+    deployment time: Ns`. Event extras: PR # / run # / merge
+    SHA / deployment URL. Pipeline-failed event renders with
+    `✗` glyph
+- `packages/cli/src/commands/maintenance.ts` (extended):
+  - New `maintenanceListCommand` — table of recent runs with
+    status badge, fixes count (green when > 0), intents
+    queued (amber when > 0), duration, age. `--agent` filter
+    validated against the 4-value union
+  - New `maintenanceShowCommand` — run header + findings list
+    with per-finding severity badge (`⚠ high` red, `⚠ medium`
+    amber, `⚠ low` dim), up-to-3 affected files (with "and N
+    more" overflow), description, `→ <suggested action>` line.
+    Accepts UUID or 8-char prefix
+- `packages/cli/src/commands/agents.ts` (extended):
+  - New `agentsActiveCommand` — calls `GET /status/agents`,
+    optional `--project` filter intersects by correlationId
+    against the project's intents. Per-row layout:
+    `◎ code-agent  "intent text..."  1m 23s  2,847 tokens`
+    + `step 4 of 6` below
+- `packages/cli/src/commands/status.ts` (extended):
+  - `--graph` flag — renders the execution-flow graph
+    (same `renderExecutionGraph` as `intent show`) instead of
+    the summary table when used with `--id`
+  - `--watch` flag — polls every 3s and re-renders until the
+    intent reaches a terminal status. Polling-based (the
+    brief: "the CLI already has SSE via `gestalt logs` —
+    `--watch` on `status` is a simpler re-render loop")
+  - Uses `resolveIntentId` so `--id` accepts UUID or 8-char
+    correlationId prefix — same as the new commands
+- `packages/cli/src/index.ts`:
+  - Top-of-file command comment expanded with the new
+    `intent` / `gate` / `deploy` / `maintenance list|show` /
+    `agents active` / `status --graph` / `status --watch`
+    entries
+  - Registered `gestalt intent list / show / submit` parent +
+    subcommands with `--status`, `--limit`, `--watch`,
+    `--priority` options
+  - Registered `gestalt gate show <intentId>` parent +
+    subcommand
+  - Registered `gestalt deploy list / show <intentId>` parent
+    + subcommands with `--project`, `--limit` options
+  - Extended `gestalt maintenance` with `list` (`--project`,
+    `--agent`, `--limit`) and `show <runId>`
+  - Extended `gestalt agents` with `active [--project <name>]`
+  - Extended `gestalt status` with `--graph` and `--watch`
+    options
+- `README.md`: Step 5 updated with `gestalt intent show <id>
+  --watch`. New Step 6 ("Inspect what happened") with the
+  full command-reference table covering every new
+  inspection command
+- `docs/guides/quick-start.md` Step 9: prefaced with
+  `gestalt intent show <id> --watch` as the primary way to
+  inspect a running or completed intent from the CLI. Added
+  a worked example of the graph layout (Generate / Quality
+  gate / Deploy with per-row durations + tokens +
+  auto-merge SHA). Summary command-reference table at the
+  bottom of the file gained rows for every new command
+
+Verified live against `trackeros`:
+- `pnpm -r build` clean across all 12 packages. Docker server
+  image rebuilt; reaches `Up (healthy)`. New routes register
+  on startup
+- `gestalt intent list --limit 5` — table renders with 5
+  rows, status badges correct, priorities + ages padded
+- `gestalt intent show 8b3fcc4a` — execution-flow graph
+  rendered with:
+  - Header box showing `Intent: Add a trimEnd utility...` +
+    `Status: deployed` + `ID: 8b3fcc4a`
+  - Generate section: 6 framework agents + 1 custom
+    (`docs-check-agent` tagged `[custom]` in purple)
+  - Quality gate section: constraint-agent + review-agent
+  - Deploy section: pr-agent `PR #26`, pipeline-agent
+    `run #26847601876`, two promotion-agent rows (staging +
+    production) with `✓ auto-merged b7a61ae` extra
+  - "No signals" footer
+- `gestalt gate show 8b3fcc4a` — verdict `✓ passed`,
+  constraint-agent `2ms 0 violations`, review-agent
+  `1396ms no concerns`, "No signals emitted"
+- `gestalt deploy list --limit 5` — 5 rows with status
+  badges, PR numbers, branches
+- `gestalt deploy show 8b3fcc4a` — branch +
+  `https://github.com/afarahat-lab/trackeros/pull/26` +
+  `✓ deployed` header, full 6-event timeline with
+  per-event timestamps, `Total deployment time: 28s`
+- `gestalt maintenance list --limit 5` — 5 project-scoped
+  rows; `gestalt maintenance show 97676a89` against the
+  gc-agent run shows the header + "Findings (0) — Agent
+  ran cleanly" panel
+- `gestalt agents active` — submitted a fresh intent
+  ("Add a startsWith utility..."); 8s later
+  `agents active` showed `◎ context-agent  "Add a
+  startsWith utility..."  0s` + `step 3 of 4`
+- **`gestalt status --id 8b3fcc4a --graph`** — same
+  execution-flow graph as `intent show`; confirms the
+  shared renderer reaches both commands
+- **`gestalt status --id <corr8> --watch --graph`** —
+  submitted a fresh intent
+  ("Add a endsWith utility..."); ran the watch command in
+  the background capturing output for 12 s; output
+  contained 4 "Intent:" lines (one per render), each
+  preceded by `\x1b[2J\x1b[H` (clear screen). The first
+  render showed `Status: deploying` with `pipeline-agent
+  ◎` running; subsequent renders showed the live
+  progression. Trailing "Press Ctrl+C to detach.
+  Re-rendering every 3s..." line confirms the loop is
+  polling at the correct interval
+- Server-side smoke: `GET /deployments?projectId=...
+  &correlationId=8b3fcc4a-...` returned a single
+  deployment with all 6 events.
+  `GET /maintenance/runs/97676a89-...` returned the run
+  record with `findings: []` and `intentsQueued: 0`
+
+Decisions made:
+- **`resolveIntentId` is a shared helper, not duplicated
+  per command.** The brief says "Internally calls gestalt
+  intent show logic" for the `--graph` flag. I factored the
+  resolver into `packages/cli/src/ui/intent-resolver.ts`
+  and made every command (`intent show`, `gate show`,
+  `deploy show`, `status --id`) use the same path. Means
+  an 8-char prefix means the same thing everywhere
+- **Translation step in `status --id` was load-bearing.**
+  Initial smoke test against `status --id <correlationId>`
+  returned `API error 404: Intent not found` because
+  `/intents/:id` keys on the intent UUID, not the
+  correlationId. The pre-existing summary path
+  (`showIntentDetail`) would have failed the same way — it
+  worked in prior sessions only because operators were
+  passing the intent UUID, not the correlationId. Adding
+  the resolver fixes all three paths (`--graph`, `--watch`,
+  summary)
+- **Execution-graph renderer is layer-grouped, not
+  chronological.** The brief's pseudocode showed three
+  sections (Generate / Quality gate / Deploy) with each
+  agent under the right one. Matches how the dashboard's
+  IntentDetail also groups by role (though IntentDetail
+  shows them chronologically too — the CLI's layered view
+  is the brief's choice). Custom agents land in the
+  generate layer per ADR-037 (`runs_after` defaults to
+  test-agent and resolves into the generate phase)
+- **`--watch` is polling, not SSE.** The brief was
+  explicit: "the CLI already has SSE via `gestalt logs` —
+  `--watch` on status is a simpler re-render loop". 3s
+  interval matches the dashboard's ActiveAgents card.
+  Polling adds at most 1 second of staleness vs. SSE
+  (which can deliver an event in < 1 s) and avoids the
+  complexity of incremental DOM-style diffs in the
+  terminal — clearing + re-rendering produces a clean
+  flicker-free update via `\x1b[2J\x1b[H`
+- **`agents active --project` filter is client-side**,
+  not a server query parameter. `GET /status/agents` is
+  unscoped today (operators see cross-project activity by
+  default); a server-side filter would require either
+  threading projectId through the enrichment cache or
+  intersecting after the fact. The client-side
+  intersection by correlationId against the project's
+  intent list (limit 100) is straightforward and matches
+  the dashboard's per-tab filtering pattern
+- **`intent submit` is a thin alias of `runCommand`,**
+  not a separate implementation. The brief said "Do not
+  duplicate code" — the new `intentSubmitCommand` just
+  calls `runCommand(text, options)`. Discoverability:
+  developers familiar with noun-verb CLIs (`docker container
+  run`, `git branch list`) find `intent submit` naturally;
+  legacy `gestalt run` remains the canonical short form
+- **Verdict on `gate show` is derived from intent status,
+  not stored.** The gate-orchestrator's verdict transitions
+  the intent (`approved | failed | escalated`); the verdict
+  itself is not persisted on its own. Mapping intent status
+  back to verdict is unambiguous and means no new schema
+- **`gate show` includes a "Cycles: N gate runs" hint
+  when the review-agent ran more than once.** The platform
+  doesn't store the gate-retry count on the intent today
+  (it's in the BullMQ payload only), so I surface
+  `agent_executions` count for `review-agent` as a proxy.
+  Captures the multi-cycle case visibly without needing a
+  schema change
+- **Deploy timeline derives total time from first event
+  to last event,** not from `intent.createdAt` to
+  `intent.updatedAt`. The deploy events bracket the
+  deploy-layer work specifically (excluding generate +
+  gate time) — that's the brief's "Total deployment time:
+  28s" semantics
+- **`MaintenanceRunRepository.findById` returns null,
+  not throws.** Same pattern every other repository's
+  `findById` follows (`intents`, `executions`, `users`,
+  `alerts`). The route is the right layer to translate
+  null → 404
+- **No new migrations + no schema changes.** The brief
+  was explicit. The repo interface change (`findById`)
+  is interface-only — every adapter must add it (postgres
+  + oracle + mssql stubs), but no DB-side changes. The
+  `?correlationId` filter on `/deployments` is a query
+  parameter, not a schema change
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker server image rebuilt; new routes register at startup;
+CLI rebuilt + linked. Full Stage 1 (no-args summary table)
++ Stage 2 (`status --graph` matching `intent show`) +
+Stage 3 (live `--watch` re-rendering every 3s during a
+running cycle) verified end-to-end. Execution-flow graph
+renders correctly for completed intents with all 3 layers
++ custom agents + auto-merged extras; `--watch` correctly
+re-renders during a live cycle from `pipeline-agent ◎` to
+`pipeline-agent ✓ completed`.
+
+No new Pending enhancements introduced. The dashboard ↔ CLI
+parity gap that prompted this session is now closed:
+operators who prefer the terminal have full read-only
+access to intent / gate / deploy / maintenance / agent
+state without opening the browser.

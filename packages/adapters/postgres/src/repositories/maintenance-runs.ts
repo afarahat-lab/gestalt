@@ -124,4 +124,12 @@ export class PostgresMaintenanceRunRepository implements MaintenanceRunRepositor
     `;
     return rows.map(rowToRecord);
   }
+
+  async findById(id: string): Promise<MaintenanceRunRecord | null> {
+    const db = getDb();
+    const [row] = await db<MaintenanceRunRow[]>`
+      SELECT * FROM maintenance_runs WHERE id = ${id} LIMIT 1
+    `;
+    return row ? rowToRecord(row) : null;
+  }
 }
