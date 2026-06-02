@@ -133,6 +133,7 @@ export class ContextFixer extends BaseLLMAgent {
         currentContent,
         intent,
         agentConfig,
+        projectRoot: workDir,
       });
       if (newContent === null) {
         return { committed: false, reason: 'llm-error' };
@@ -210,8 +211,9 @@ export class ContextFixer extends BaseLLMAgent {
     currentContent: string;
     intent: MaintenanceIntent;
     agentConfig: AgentConfig;
+    projectRoot: string;
   }): Promise<string | null> {
-    const { targetFile, currentContent, intent, agentConfig } = args;
+    const { targetFile, currentContent, intent, agentConfig, projectRoot } = args;
 
     // Persona built from agents.yaml — the original "technical writer"
     // role is the per-role default in agent-config-loader.ts, so
@@ -263,14 +265,36 @@ export class ContextFixer extends BaseLLMAgent {
     };
 
     try {
-      const content = await this.callLLMWithMessages(
+      // Amendment 2026-06 (follow-up) — context-fixer now drives the
+      // tool-use loop via `callLLMWithToolsMessages`. Same system+user
+      // pair the previous `callLLMWithMessages` path used, but the
+      // model can now `readFile` / `listDirectory` against the
+      // cloned tree to verify file state before producing its edit.
+      // Falls through to a plain LLM call when the operator strips
+      // `tools.builtin` from the context-fixer entry in agents.yaml.
+      const { response: content, toolCallLog } = await this.callLLMWithToolsMessages(
         [
           { role: 'system', content: system },
           { role: 'user',   content: user },
         ],
-        cfg,
-        `ctxfix-${intent.projectId}-${intent.type}`,
         `${system}\n\n${user}`,
+        cfg,
+        projectRoot,
+        `ctxfix-${intent.projectId}-${intent.type}`,
+      );
+      // Surface the tool-call summary in logs so operators can verify
+      // the tool-use loop fired (context-fixer's invocation isn't
+      // persisted in `agent_execution_logs` today — the direct-fix
+      // path doesn't create an intents row to anchor to).
+      log.info(
+        {
+          targetFile,
+          intentType: intent.type,
+          toolCallCount: toolCallLog.length,
+          toolNames: toolCallLog.map((t) => t.toolName),
+          modelUsed: this.lastModelUsed,
+        },
+        'context-fixer LLM call completed',
       );
       return stripFences(content);
     } catch (err) {

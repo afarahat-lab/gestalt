@@ -218,6 +218,64 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
     correlationId: string,
     mcpClients?: McpClient[],
   ): Promise<{ response: string; toolCallLog: ToolCallLogEntry[] }> {
+    return this.runToolLoop(
+      [{ role: 'user', content: prompt }],
+      prompt,
+      agentConfig,
+      projectRoot,
+      correlationId,
+      mcpClients,
+    );
+  }
+
+  /**
+   * Messages-array variant for agents that need a separate system
+   * message AND want tool-use (context-fixer is the motivating case
+   * — its ADR-018 "preserve all existing content" rule lives in the
+   * system role, but it also benefits from `readFile` access during
+   * reasoning).
+   *
+   * `promptForLog` is what gets persisted as `lastPrompt` — the
+   * dashboard's prompt panel shows this string verbatim, so callers
+   * typically pass the concatenated `${system}\n\n${user}` view of
+   * the messages. Same tools resolution + dispatch + MCP cache
+   * semantics as `callLLMWithTools`.
+   */
+  protected async callLLMWithToolsMessages(
+    messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+    promptForLog: string,
+    agentConfig: AgentConfig,
+    projectRoot: string,
+    correlationId: string,
+    mcpClients?: McpClient[],
+  ): Promise<{ response: string; toolCallLog: ToolCallLogEntry[] }> {
+    const history: ToolLoopMessage[] = messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+    }));
+    return this.runToolLoop(
+      history,
+      promptForLog,
+      agentConfig,
+      projectRoot,
+      correlationId,
+      mcpClients,
+    );
+  }
+
+  /**
+   * Shared tool-use loop body. Resolves tools (built-in + MCP),
+   * delegates to `callLLM` when the set is empty, otherwise drives
+   * the OpenAI function-calling loop with the supplied seed history.
+   */
+  private async runToolLoop(
+    history: ToolLoopMessage[],
+    promptForLog: string,
+    agentConfig: AgentConfig,
+    projectRoot: string,
+    correlationId: string,
+    mcpClients?: McpClient[],
+  ): Promise<{ response: string; toolCallLog: ToolCallLogEntry[] }> {
     const builtinDefs = this.resolveToolDefinitions(agentConfig.tools);
 
     const mcpDefs: ToolDefinition[] = [];
@@ -231,7 +289,20 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
     const tools: ToolDefinition[] = [...builtinDefs, ...mcpDefs];
 
     if (tools.length === 0) {
-      const response = await this.callLLM(prompt, agentConfig, correlationId);
+      // No tools → fall through to plain LLM call. For the
+      // messages-array entry the underlying call needs the messages
+      // shape; for the single-prompt entry the seed history is
+      // exactly `[{ role: 'user', content: prompt }]` which is the
+      // same as `callLLM` does internally.
+      const response = await this.callLLMWithMessages(
+        history.map((m) => ({
+          role: m.role === 'tool' ? 'user' : m.role,
+          content: typeof m.content === 'string' ? m.content : '',
+        })),
+        agentConfig,
+        correlationId,
+        promptForLog,
+      );
       this.lastToolCallLog = [];
       return { response, toolCallLog: [] };
     }
@@ -243,11 +314,8 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
 
     const client = getLLMClient(agentConfig.llm.model);
     this.lastModelUsed = client.getModel();
-    this.lastPrompt = prompt;
+    this.lastPrompt = promptForLog;
 
-    const history: ToolLoopMessage[] = [
-      { role: 'user', content: prompt },
-    ];
     const toolCallLog: ToolCallLogEntry[] = [];
     let totalToolCalls = 0;
     let finalText = '';
