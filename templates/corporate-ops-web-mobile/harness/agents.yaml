@@ -70,6 +70,26 @@ agents:
         - listDirectory     # explore the project structure
         - searchFiles       # find where things are defined
         - getFileTree       # understand project layout
+      # ADR-039 — MCP (Model Context Protocol) servers extend the
+      # agent with external tools (issue trackers, dashboards, docs).
+      # Tool names are auto-namespaced as `<serverName>__<toolName>`
+      # so they cannot shadow the built-ins.
+      #
+      # token_from sources:
+      #   harness            — reads HARNESS.json mcp.servers[].token
+      #                        (token sits in the project repo —
+      #                        visible to anyone with repo access)
+      #   project_credential — reuses the project Git PAT
+      #   env:VAR_NAME       — reads process.env.VAR_NAME on the
+      #                        server process (recommended for any
+      #                        sensitive secret)
+      # mcp:
+      #   - name: github
+      #     url: https://mcp.github.com/v1
+      #     token_from: env:GITHUB_MCP_TOKEN
+      #   - name: localfs
+      #     url: stdio:npx @modelcontextprotocol/server-filesystem /tmp/project
+      #     token_from: env:NOOP   # stdio servers usually don't need a token
     prompt_extensions: []
       # Example extensions:
       # - "Always use the Result<T,E> pattern for error handling"

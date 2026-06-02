@@ -48,7 +48,11 @@ export async function agentsListCommand(
       const extLabel = a.promptExtensionCount > 0
         ? c.dim(` · `) + c.warn(`${a.promptExtensionCount} prompt extension${a.promptExtensionCount === 1 ? '' : 's'}`)
         : '';
-      console.log(`  ${a.name.padEnd(18)} ${overrideLabel}${tempLabel}${extLabel}`);
+      const mcpCount = a.mcpServers?.length ?? 0;
+      const mcpLabel = mcpCount > 0
+        ? c.dim(` · `) + c.info(`MCP: ${a.mcpServers!.join(', ')}`)
+        : '';
+      console.log(`  ${a.name.padEnd(18)} ${overrideLabel}${tempLabel}${extLabel}${mcpLabel}`);
     }
     blank();
     console.log(c.bold('Custom agents'));

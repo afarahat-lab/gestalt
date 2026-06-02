@@ -34,6 +34,12 @@ interface ExecutionLogResponse {
       output: string;
       isError: boolean;
       calledAt: string;
+      /**
+       * ADR-039 — `'builtin'` for ADR-038 file tools, `'mcp:<name>'`
+       * for MCP-routed tools. Optional for backward compat with
+       * pre-039 rows where the field was not stored.
+       */
+      toolSource?: string;
     }>;
   } | null;
   artifacts: Array<{ id: string; type: string; path: string; content: string }>;
@@ -446,7 +452,10 @@ function ExecutionLogPanel({ data, showFull, onToggleFull, onCopy }: ExecutionLo
               <div style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', color: 'var(--text-primary)' }}>
                 {i + 1}. <strong>{tc.toolName}</strong>(
                 {JSON.stringify(tc.input)}
-                )
+                ){' '}
+                <span style={toolSourceBadge(tc.toolSource)}>
+                  {formatToolSource(tc.toolSource)}
+                </span>
               </div>
               <div style={{ fontFamily: 'var(--font-mono)', fontSize: '11px', color: 'var(--text-dim)', marginTop: '4px', whiteSpace: 'pre-wrap' }}>
                 {tc.isError ? '✗ ' : '→ '}
@@ -570,6 +579,28 @@ function PanelButton({ onClick, children }: { onClick: () => void; children: Rea
 function truncate(text: string): string {
   if (text.length <= PREVIEW_CHARS) return text;
   return text.slice(0, PREVIEW_CHARS) + '... (' + (text.length - PREVIEW_CHARS) + ' more chars)';
+}
+
+/**
+ * ADR-039 — tool-source label. `'builtin'` → `(built-in)`,
+ * `'mcp:<name>'` → `(MCP: <name>)`, anything else (legacy rows
+ * without the field) → `(built-in)` since pre-039 cycles only had
+ * file tools.
+ */
+function formatToolSource(source: string | undefined): string {
+  if (!source || source === 'builtin') return '(built-in)';
+  if (source.startsWith('mcp:')) return `(MCP: ${source.slice(4)})`;
+  return `(${source})`;
+}
+
+function toolSourceBadge(source: string | undefined): React.CSSProperties {
+  const isMcp = source?.startsWith('mcp:') ?? false;
+  return {
+    fontSize: '10px',
+    fontFamily: 'var(--font-mono)',
+    color: isMcp ? 'var(--purple)' : 'var(--text-dim)',
+    marginLeft: '4px',
+  };
 }
 
 // ─── Styles ──────────────────────────────────────────────────────────────────

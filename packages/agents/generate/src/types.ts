@@ -3,7 +3,7 @@
  * All types for the generate layer.
  */
 
-import type { AgentRole, ArtifactType, SignalType } from '@gestalt/core';
+import type { AgentRole, ArtifactType, SignalType, McpClient } from '@gestalt/core';
 
 // ─── Shared LLM call shape ───────────────────────────────────────────────────
 
@@ -33,20 +33,41 @@ export interface AgentLlmConfig {
 }
 
 /**
- * Per-agent tool configuration (ADR-038).
+ * One MCP server connection declared in `agents.yaml` (ADR-039).
+ * Resolved at agent-run time by the generate orchestrator via
+ * `resolveMcpClients(configs, harnessConfig, projectCredential)`.
+ *
+ * `tokenFrom` picks the credential source:
+ *   - `'harness'`           → look up in `HarnessConfig.mcp.servers[]`
+ *                            by matching `name`
+ *   - `'project_credential'`→ use the project's Git PAT
+ *   - `'env:VAR_NAME'`      → read `process.env.VAR_NAME` on the
+ *                            server (the only way to keep tokens
+ *                            out of the project repo)
+ */
+export interface McpServerConfig {
+  name: string;
+  url: string;
+  tokenFrom: 'harness' | 'project_credential' | `env:${string}`;
+}
+
+/**
+ * Per-agent tool configuration (ADR-038 + ADR-039).
  *
  * `builtin` lists the built-in file tools the agent may call —
  * `readFile`, `listDirectory`, `searchFiles`, `getFileTree`. Empty
- * array (the default for most roles) means "no tools, plain
- * single-shot LLM call".
+ * array (the default for most roles) means "no built-in tools".
  *
- * `mcp` is reserved for ADR-039 (MCP server integration). Today the
- * field is absent and the loader doesn't read it; declaring it here
- * means the schema doesn't shift when ADR-039 lands.
+ * `mcp` lists external MCP servers the agent connects to at run
+ * time (ADR-039). Tool definitions fetched from each server are
+ * merged with the built-in definitions; each tool is namespaced
+ * `<serverName>__<toolName>` so collisions across servers don't
+ * occur. MCP unavailability is non-fatal — the agent proceeds with
+ * whatever subset of tools resolved successfully.
  */
 export interface AgentToolConfig {
   builtin?: BuiltInToolName[];
-  // mcp: []  ← reserved for ADR-039
+  mcp?: McpServerConfig[];
 }
 
 import type { BuiltInToolName } from '@gestalt/core';
@@ -245,6 +266,18 @@ export interface HarnessConfig {
   constraints?: {
     rules: ConstraintRule[];
   };
+  /**
+   * Project-level MCP server credentials (ADR-039). Mirrors
+   * `HarnessConfig.mcp` in `@gestalt/core`. Read by the MCP token
+   * resolver when an agent's `tools.mcp[].token_from` is `'harness'`.
+   */
+  mcp?: {
+    servers: Array<{
+      name: string;
+      url: string;
+      token?: string;
+    }>;
+  };
 }
 
 export interface ArchitectureSpec {
@@ -401,6 +434,14 @@ export interface AgentTask {
    * this verbatim under an "Operator clarification" heading.
    */
   clarification?: string;
+  /**
+   * MCP clients (ADR-039) the orchestrator resolved once for this
+   * cycle. Populated only on agents that declared `tools.mcp[]` in
+   * `agents.yaml`. Lifecycle is owned by the orchestrator — agents
+   * borrow these but must not close them (a later agent step may
+   * reuse the same client).
+   */
+  mcpClients?: McpClient[];
 }
 
 // ─── Plan ─────────────────────────────────────────────────────────────────────

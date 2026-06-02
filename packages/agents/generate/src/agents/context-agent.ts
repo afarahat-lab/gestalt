@@ -41,19 +41,22 @@ export class ContextAgent extends BaseLLMAgent {
     }
 
     let lastError: Error | undefined;
-    const hasTools = (agentConfig.tools?.builtin?.length ?? 0) > 0;
+    const hasBuiltin = (agentConfig.tools?.builtin?.length ?? 0) > 0;
+    const hasMcp = (task.mcpClients?.length ?? 0) > 0;
+    const useTools = hasBuiltin || hasMcp;
     const projectRoot = task.contextSnapshot.projectRoot;
 
     for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
       try {
         const rawPrompt = buildContextPrompt(task.contextSnapshot, attempt);
         const prompt = applyAgentConfig(rawPrompt, agentConfig);
-        // ADR-038 — read existing context files via tools before
-        // proposing updates (context-agent's risk is over-writing
-        // accurate prose, so reading first matters more here than
-        // anywhere else).
-        const raw = hasTools
-          ? (await this.callLLMWithTools(prompt, agentConfig, projectRoot, task.correlationId)).response
+        // ADR-038 + ADR-039 — read existing context files via tools
+        // before proposing updates (context-agent's risk is over-
+        // writing accurate prose, so reading first matters more here
+        // than anywhere else). MCP clients also forwarded when the
+        // operator wired any external MCP servers for this agent.
+        const raw = useTools
+          ? (await this.callLLMWithTools(prompt, agentConfig, projectRoot, task.correlationId, task.mcpClients)).response
           : await this.callLLM(prompt, agentConfig, task.correlationId);
         const updates = parseContextUpdates(raw);
 

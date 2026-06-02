@@ -5,10 +5,9 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
 
 ---
 
-
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — Gate orchestrator creates GP_BREACH alert on escalate verdict + backfill for prior escalations)
+**Last updated:** 2026-06-02 (Claude Code — ADR-039 MCP (Model Context Protocol) integration for agent tool use)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -644,6 +643,121 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
     side, the API response, and the dashboard all get the
     correct array. Direct `jsonb_array_length` SQL probes
     fail; that's a quirk of the storage path, not a bug
+- **MCP (Model Context Protocol) integration — external
+  tool servers (ADR-039).** Extends ADR-038's built-in
+  file tools with project-declared external MCP servers.
+  Operators wire any compliant server (issue tracker,
+  monitoring dashboard, internal docs, the
+  `@modelcontextprotocol/server-filesystem` smoke target)
+  via `tools.mcp[]` in `agents.yaml` and the LLM sees its
+  tools merged with the four built-ins. No new endpoints,
+  no new migrations:
+  - **`McpClient`** in `@gestalt/core/tools/mcp-client.ts`.
+    Two transports via URL scheme: `http(s)://...` →
+    `StreamableHTTPClientTransport` (modern MCP-spec HTTP
+    + SSE); `stdio:<bin> <arg1> <arg2>...` →
+    `StdioClientTransport` (spawns the named child, speaks
+    JSON-RPC over stdin/stdout). The `@modelcontextprotocol/
+    sdk` v1.29 is ESM-only — `McpClient` dynamic-imports it
+    (same pattern as `globby`) so the CJS core package
+    builds clean. Tool names are namespaced
+    `<serverName>__<toolName>` on every `listTools()` result
+    so an MCP server can NEVER shadow a built-in
+  - **`resolveMcpClients`** in `@gestalt/core/tools/mcp-
+    resolver.ts`. Three credential sources via the
+    `tokenFrom` field on each declared server:
+    `'harness'` → reads `HARNESS.json` `mcp.servers[].token`
+    by matching `name`; `'project_credential'` → reuses the
+    project Git PAT (already loaded from
+    `project_git_credentials`); `'env:VAR_NAME'` → reads
+    `process.env.VAR_NAME` on the Gestalt server. Missing
+    tokens resolve to `undefined`; the client connects
+    anonymously and the SDK returns a clean error if the
+    server requires auth
+  - **`BaseLLMAgent.callLLMWithTools`** extended with
+    optional `mcpClients?: McpClient[]`. The agent fetches
+    every server's `listTools()` in parallel, merges with
+    the ADR-038 built-in defs, and indexes the MCP clients
+    by `<serverName>__` prefix into a Map. Per tool call
+    the dispatcher does an O(1) `findMcpForCall` against
+    the Map — prefix match → `mcpClient.executeTool(...)`,
+    miss → falls through to `executeFileTool(...)`. Every
+    `ToolCallLogEntry` records `toolSource: 'builtin' |
+    'mcp:<serverName>'` so the operator sees which
+    transport handled each call. The agent does NOT close
+    the MCP clients — that's the orchestrator's job
+  - **Per-cycle MCP client cache in the orchestrator.**
+    `handleIntentTask` keeps a `Map<serverName, McpClient>`
+    for the cycle. The new `resolveMcpForAgent` helper
+    looks up each agent's declared servers in the cache and
+    only calls `resolveMcpClients` for the ones that aren't
+    already open. The cache's `close()`s happen in the
+    `finally` block so a thrown agent run can't leak file
+    descriptors / SSE streams. Multiple agents declaring
+    the same server share one connection
+  - **Failure mode is non-fatal end to end.**
+    `McpClient.listTools()` returns `[]` on connection
+    failure (agent proceeds with whatever tools resolved);
+    `executeTool()` returns `{ isError: true, content: '...' }`
+    on any thrown error (LLM sees the error text and can
+    pick a different tool or give up). An unreachable MCP
+    server never aborts a cycle
+  - **Auto-detect of tool-loop trigger.** The previous
+    ADR-038 `hasTools` check looked only at
+    `agentConfig.tools.builtin.length`. Updated to
+    `hasBuiltin || hasMcp` so MCP-only agents (operator
+    disabled built-ins, kept just an MCP server) still
+    drive the function-calling loop. Backward compat: every
+    pre-039 agent with builtin tools still triggers as before
+  - **Observability surfaces.** Dashboard's IntentDetail
+    accordion renders a per-tool-call badge —
+    `readFile (built-in)` vs
+    `github__get_pull_request (MCP: github)`. The
+    `formatToolSource` helper handles the legacy null case
+    (pre-039 rows display as `(built-in)`).
+    `GET /projects/:id/agents` `frameworkAgents[].mcpServers`
+    lists the configured server names per agent. `gestalt
+    agents list <project>` prints `MCP: server1, server2`
+    next to each framework agent's row
+  - **Template seed.** `corporate-ops-web-mobile/harness/
+    agents.yaml` ships with a commented `tools.mcp:` block
+    under `code-agent`, including two example entries (HTTP
+    + stdio) plus a security note that `tokenFrom: harness`
+    puts the token in the project repo
+  - **No migrations.** `tool_calls` JSONB already stored
+    per-call rows from ADR-038; the new `toolSource` field
+    is purely additive on the persisted shape. Oracle /
+    MSSQL stubs are unaffected. One new runtime dep on
+    `@gestalt/core` (`@modelcontextprotocol/sdk@^1.29.0`);
+    agents import `McpClient` from `@gestalt/core` so the
+    agent-package surfaces don't add it
+  - **Stage 1 verification** (live, against trackeros, no
+    MCP wired): submitted clamp utility intent; cycle ran
+    11 agent executions through generate + gate + deploy in
+    ~80 s. `code-agent` made 2 real built-in tool calls
+    (`listDirectory`, `searchFiles`), each persisted with
+    `toolSource: 'builtin'`. Every framework agent's
+    `mcpServers` list was empty. Pipeline-agent failed for
+    an unrelated CI reason (project's test runner) — no MCP
+    code path crashed
+  - **Stage 2 verification** (live MCP server):
+    `@modelcontextprotocol/server-filesystem` v2026 spawned
+    via stdio (`stdio:npx -y @modelcontextprotocol/server-
+    filesystem /private/tmp/test-mcp-dir`). `McpClient.list
+    Tools()` returned 14 namespaced tools
+    (`testfs__read_file`, `testfs__write_file`,
+    `testfs__list_directory`, …) each carrying the
+    `[testfs]` description prefix. `executeTool(
+    'testfs__read_file', {path: '...'})` stripped the
+    namespace prefix and returned the file content
+    (`hello from mcp`). `resolveMcpClients` exercised with
+    `tokenFrom: 'env:NOOP_TOKEN'` — env-source resolution
+    works. Dispatch test confirmed the three invariants:
+    (1) `testfs__list_directory` → MCP `testfs`; (2)
+    `listDirectory` (no namespace) → built-in fallthrough;
+    (3) collision probe — a hypothetical built-in named
+    `testfs` would NOT be intercepted (prefix check is
+    `testfs__`, not `testfs`). Client close path clean
 - **Gate orchestrator creates a `GOLDEN_PRINCIPLE_BREACH`
   alert on every `escalate` verdict.** Closes an old gap:
   prior to this fix the gate transitioned the intent to
@@ -1878,266 +1992,7 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
 
 ---
 
-## Recent session entries
-
-### Session 2026-06-01 — Claude Code (scope enforcement + intent-agent scope minimisation + review-agent scaffolding awareness + narrowed HARNESS rules)
-
-Follow-up tightening of the prompt refactor. The prior session built
-the section structure (architecture / constraints / design / intent /
-principles / domain / signals / task); this session closes the three
-remaining failure modes that drove retry cycles on real user projects:
-
-  1. **Code-agent generated 8–12 files for narrow intents** ("fix tsx
-     version in package.json" → whole module tree). No explicit
-     "stay narrow" instruction reached the LLM
-  2. **Intent-agent produced over-broad `affectedDomains`**, giving
-     the code-agent's downstream scope check nothing concrete to
-     enforce
-  3. **Review-agent flagged scaffolding stubs as missing-RBAC/audit
-     violations** on every "Scaffold the project foundation"
-     intent — every scaffold cycle escalated to operator review
-     for stub code that was intentional
-
-Changed:
-- `packages/agents/generate/src/prompts/code-prompt.ts`: new
-  `scopeSection` inserted between Architecture and Constraint
-  rules. Renders the intent-agent's `affectedDomains` array
-  followed by explicit DO / DO-NOT rules — the brief's wording
-  verbatim ("If the intent fixes a bug or version → change ONLY
-  the affected file", "Do NOT generate shared infrastructure
-  unless the intent explicitly asks for it", etc.). The task
-  section was renamed from `## Your task` to `## Generate code
-  now` and gained a reinforcement clause: "stay within the
-  Scope section's rules — include ONLY files within the scope
-  defined above". Section order is now Architecture → Scope →
-  Constraints → Design → Intent → Principles → Domain →
-  Signals → Task — scope sits up high so the LLM internalises
-  it before reading the intent
-- `packages/agents/generate/src/prompts/intent-prompt.ts`:
-  appended a `## Scope minimisation — critical` block at the
-  end of the existing Rules section. Same heuristics as the
-  code-agent scope section ("Fix a version string →
-  affectedDomains: ['package.json']", "Err strongly on minimal
-  scope. Set outOfScope explicitly for anything the intent
-  doesn't mention so the downstream agents don't drift into
-  adjacent files"). Pairs with the code-agent's scope
-  enforcement — the intent-agent now produces tight scope
-  arrays so the code-agent has something concrete to enforce
-- `templates/corporate-ops-web-mobile/harness/HARNESS.json`:
-  constraint rules narrowed to the three brief-specified
-  rules (`no-any` high, `no-direct-db-outside-repository`
-  critical, `no-hardcoded-secrets` critical). The prior
-  session's eight rules included Gestalt-internal rules
-  (no-console-log, no-process-env-outside-config,
-  no-inline-rbac-checks, validate-input-with-zod,
-  audit-state-changes) that the brief explicitly says to
-  remove. Those rules ARE still enforced by the platform's
-  constraint-agent regex sweep at the gate (they're built
-  into `packages/agents/quality-gate/src/agents/constraint-agent.ts`)
-  but they don't surface in the code-agent's prompt anymore
-- `templates/corporate-ops-web-mobile/docs/GOLDEN_PRINCIPLES.md`:
-  rewrote to the brief's layout — `# Golden Principles —
-  {{projectName}}` heading, six principles each with a single
-  descriptive sentence (GP-001 Repository pattern, GP-002
-  Audit records, GP-003 Input validation, GP-004 No sensitive
-  data in logs, GP-005 RBAC enforcement, GP-006 Error
-  handling). The prior session's multi-paragraph descriptions
-  were dropped in favour of the brief's concise form. The
-  human-vs-platform-enforcement statement at the top remains
-- `packages/agents/quality-gate/src/types.ts`:
-  `GateTask.intentText?: string` added. Optional because
-  legacy dispatchers may not thread it; review-agent treats
-  absence as "no scaffolding hints available"
-- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
-  resolves the intent text from `payload.text` (retry leg) or
-  `intents.findById(payload.intentId).text` (first dispatch)
-  and threads it onto the `GateTask` before calling
-  `reviewAgent.review(task)`
-- `packages/agents/quality-gate/src/agents/llm-review-agent.ts`:
-  - new `detectScaffolding(intentText)` helper — substring
-    match (case-insensitive) against `['scaffold', 'set up',
-    'setup', 'initialise', 'initialize']`. The keyword list
-    is intentionally short — false positives here would let
-    real missing-implementation bugs slip past
-  - `review(task)` now calls `detectScaffolding(task.intentText)`
-    and passes the resulting `isScaffolding` boolean into
-    `buildReviewPrompt`
-  - `buildReviewPrompt` signature gained `isScaffolding`. When
-    true, the prompt prepends a `## Scaffolding mode — this
-    intent is a scaffold/setup` block with the brief's
-    explicit rules: "Do NOT flag missing implementations as
-    violations", "Do NOT flag missing RBAC/audit/Zod as GP
-    violations in stub code", "DO still flag: hardcoded
-    secrets, use of `any`, obviously broken logic, bad
-    imports, syntax errors", "If everything in the artifacts
-    is intentional skeleton, return overallVerdict: 'pass'
-    and an empty items array". When false the section is
-    omitted entirely — normal reviews are unaffected
-
-Verified live against `trackeros` (with the narrowed 3-rule
-HARNESS.json pushed to mirror the new template):
-
-- **Test 1 — narrow fix intent: "fix tsx version in
-  package.json — change tsx@^0.0.0 to tsx@^4.7.0"**
-  (correlation `a647b1cd`):
-  - Code-agent prompt persisted at 5848 chars — direct DB
-    inspection confirms every expected section:
-    `## Project architecture`, `## Scope — generate ONLY what
-    the intent asks for`, `## Constraint rules — violations
-    will fail the quality gate`, `## Design specification`,
-    `## Intent specification` (containing "fix tsx version"),
-    `## Golden principles — non-negotiable`, `## Domain
-    model`, `## Generate code now`. The narrowed rule
-    `no-direct-db-outside-repository` present verbatim
-  - **Code-agent generated exactly ONE file: `package.json`** ✓
-    The brief's verification criterion ("code-agent generates
-    ONLY package.json") met
-  - **Zero code-agent retries.** Just one code-agent run.
-    Brief's expected "0 or 1 retry cycles" criterion met
-  - Final intent escalated due to review-agent hallucinations
-    on the JSON file (it flagged "any usage" and "direct DB
-    call" in a `package.json` that contains neither) plus the
-    `usage-example-agent` noise — but those are downstream of
-    the scope fix and are separate concerns (the review-agent
-    hallucination on tiny JSON files is a separate issue;
-    the usage-example-agent is the brief's Fix 8 operator
-    action)
-- **Test 2 — scaffold intent: "Scaffold the project
-  foundation: package.json for a TypeScript application,
-  tsconfig.json, src/index.ts as the entry point"**
-  (correlation `b06cb312`):
-  - Review-agent prompt persisted across all three review
-    runs with the scaffolding-mode section present:
-    `## Scaffolding mode — this intent is a scaffold/setup`,
-    "Do NOT flag missing implementations", "Do NOT flag
-    missing RBAC/audit", "hardcoded secrets" (still
-    flagged) — all four indicator strings present in the
-    prompt
-  - **Review-agent emitted ZERO GP_BREACH signals and ZERO
-    review-CONSTRAINT_VIOLATION signals on the scaffolding
-    artifacts.** Prior scaffold cycles on similar intents
-    consistently produced "missing RBAC enforcement" or
-    "missing audit on POST" GP_BREACH findings. The brief's
-    "review-agent does not flag missing RBAC as a violation"
-    criterion is met
-  - **Intent reached `deploying` status** (not failed, not
-    escalated). The brief's "fewer retry cycles than before"
-    criterion met
-  - The remaining noise: 2 `CONSTRAINT_VIOLATION` signals
-    from the platform's built-in `no-console` regex check
-    in `constraint-agent.ts` (not from the new HARNESS rule
-    set; the platform-internal regex sweep is unchanged),
-    plus 3 `LINT_FAILURE` signals from
-    `usage-example-agent` (Fix 8 operator-removal pending)
-
-Operator action — pending on `trackeros` (Fix 8):
-- The `usage-example-agent` block in `trackeros/agents.yaml`
-  emits one LINT_FAILURE finding per generated file on
-  every cycle. It was added in an earlier signal-routing
-  verification session and is no longer needed
-- The diff to apply (the auto-mode classifier denied my
-  push attempt — pushes to a project repo's main are
-  correctly operator-only):
-
-  ```
-  # Edit trackeros/agents.yaml — delete the
-  # `- name: usage-example-agent` block from `custom_agents:`
-  # and add a one-line comment explaining why:
-
-  # usage-example-agent was removed 2026-06-01 — it emitted a LINT_FAILURE
-  # finding for every generated file (verification noise from an earlier
-  # signal-routing test) which inflated retry cycles. Keep the file lean.
-  custom_agents:
-    - name: docs-check-agent
-      role: "Documentation reviewer"
-      ...
-  ```
-
-  Until this lands, every trackeros cycle will surface
-  LINT_FAILURE signals from this agent regardless of actual
-  code quality
-
-Decisions made:
-- **Scope section sits between Architecture and Constraints,
-  NOT below Intent.** The brief's pseudocode placed it where
-  I put it. The reasoning: scope is a meta-constraint ("don't
-  generate files outside this set") and belongs with the
-  other non-negotiable rules at the top of the prompt, before
-  the LLM reads "what to build" and starts generating
-  candidates. Putting it under Intent would mean the model has
-  already imagined the file tree before reading the scope
-  rule, which empirically the LLM resolves toward more files
-  rather than fewer
-- **Section reinforcement at the task site.** `## Generate
-  code now` (renamed from `## Your task` to match the brief
-  more closely) ends with "stay within the Scope section's
-  rules — include ONLY files within the scope defined above".
-  The redundancy is deliberate — the LLM has read the scope
-  rule once at the top; reading the same constraint again at
-  the JSON-output instruction point catches the moment where
-  it's about to decide "what files do I list?"
-- **`detectScaffolding` uses a closed keyword list.** Five
-  keywords (scaffold, set up, setup, initialise, initialize).
-  Considered adding "bootstrap", "create the foundation",
-  "stand up", "spin up" but each adds false-positive risk on
-  legitimate fix intents ("create a price-formatter utility"
-  should NOT be treated as scaffolding). If the operator says
-  "Scaffold the project foundation" the keyword match is
-  unambiguous; anything more ambiguous belongs in a richer
-  classifier (LLM-based intent-typing) that's out of scope
-- **Scaffolding mode does NOT suppress the constraint section
-  or principles section.** The block prepends the existing
-  prompt — hardcoded secrets, `any` usage, obvious bugs are
-  still flagged. The narrow exemption is "missing
-  implementation" findings on stub code. The brief's wording
-  ("DO still flag: hardcoded secrets, use of any, obviously
-  broken logic") is verbatim in the prompt
-- **Template rule narrowing is more honest about the split.**
-  The prior session's eight rules conflated two concerns:
-  (1) what the constraint-agent regex sweep checks
-  internally (no-console, no-direct-llm-sdk, hardcoded-secret,
-  etc. — built into `constraint-agent.ts`) and (2) what the
-  PROJECT cares about (no-any, no-direct-db, no-hardcoded-
-  secrets in this template's case). The eight-rule version
-  was the union. The brief's three-rule version restores the
-  separation — platform-internal rules stay in
-  `constraint-agent.ts`, project rules in HARNESS.json. New
-  projects can extend `constraints.rules` with their own
-  conventions; the platform regex sweep continues to fire
-  underneath regardless
-- **`intentText` resolved at the gate orchestrator, not in
-  the review-agent.** Considered loading the intent from
-  inside the review-agent itself (it would need an
-  `intents.findById` call). Decided against because the gate
-  orchestrator already loads the intent for project
-  resolution (`resolveProjectFor` returns the project, but
-  the orchestrator has the intent id and could resolve the
-  intent text once and pass it as task data). Cleaner
-  encapsulation — the agent reads task.intentText, the
-  orchestrator owns the lookup
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Server image rebuilt. Two live verification cycles
-(narrow fix + scaffold) confirmed the brief's three
-verification criteria: narrow fix generated only
-package.json with zero code-agent retries; scaffold cycle
-emitted zero review-agent CONSTRAINT_VIOLATION / GP_BREACH
-signals and reached deploying status; the code-agent prompt
-shows the new `## Scope` and `## Constraint rules` sections
-in the persisted execution log.
-
-No new Pending enhancements introduced. One pre-existing
-adjacent issue surfaced during verification: on tiny narrow
-intents (single-file edits to non-code files like
-package.json), the review-agent occasionally hallucinates
-violations that aren't in the file. This is unrelated to the
-fixes in this session — it's a separate "review-agent
-behaviour on non-TypeScript artifacts" concern. Not added to
-Pending because it requires a different fix (probably skipping
-the review-agent for non-code artifacts, or seeding the prompt
-with the artifact type).
-
----
+## Last three session entries
 
 ### Session 2026-06-01 — Claude Code (agent tool use: built-in file tools + agents.yaml configuration — ADR-038, migration 012)
 
@@ -2630,3 +2485,320 @@ in the dashboard Alerts view as actionable GP_BREACH cards;
 future escalations will create their own alert automatically.
 
 No new Pending enhancements introduced.
+
+---
+
+### Session 2026-06-02 — Claude Code (ADR-039 MCP integration)
+
+Extends ADR-038 (built-in file tools) with the platform's external-
+integration mechanism: agents now connect to compliant MCP (Model
+Context Protocol) servers declared per-agent in `agents.yaml`. The
+generate orchestrator opens connections once per cycle, threads the
+matched subset to each agent's `AgentTask.mcpClients`, and closes
+the cache in `finally`. The OpenAI tool-calling loop is unchanged —
+MCP tools merge into the same flat tool list using a namespace
+prefix that prevents collisions with built-ins.
+
+Changed:
+- `packages/core/package.json`: added
+  `@modelcontextprotocol/sdk@^1.29.0` runtime dep. Agents in other
+  packages import `McpClient` from `@gestalt/core` — the SDK lives
+  in core only
+- `packages/core/src/types.ts`: `ToolCallLogEntry` gained
+  `toolSource?: string` (`'builtin'` or `'mcp:<name>'`)
+- `packages/core/src/harness/index.ts`: `HarnessConfig` gained
+  optional `mcp?: { servers: Array<{ name, url, token? }> }` —
+  feeds the `tokenFrom: 'harness'` resolver source
+- `packages/core/src/tools/mcp-client.ts` (new): the `McpClient`
+  class. Single-cycle scoped — connect lazily on first
+  `listTools`/`executeTool`, reuse the connection across calls,
+  close when the orchestrator's `finally` runs. Two transports
+  via URL scheme:
+  - `http(s)://...` → `StreamableHTTPClientTransport` (the modern
+    MCP-spec name for HTTP + SSE). Bearer auth via `Authorization`
+    header when a token resolves
+  - `stdio:<bin> <arg1> <arg2>...` → `StdioClientTransport` spawns
+    the named child process. Used for local servers via npx
+  - The SDK is ESM-only (`"type": "module"`); core builds CJS, so
+    every SDK import is a dynamic `import()` (same pattern as
+    `globby` in file-tools.ts). Untyped at the boundary
+    (`SdkClient` shape declared locally) to keep the SDK's type
+    surface out of every downstream package's `.d.ts`
+  - Tool naming: `<serverName>__<toolName>` on every `listTools()`
+    result; description prefixed `[serverName]`. The prefix is
+    stripped before `executeTool` calls the SDK
+  - Non-fatal everywhere: `listTools()` returns `[]` on any thrown
+    error; `executeTool()` returns
+    `{ isError: true, content: 'MCP error (...): ...' }`. The
+    orchestrator + LLM both proceed without that server's tools
+- `packages/core/src/tools/mcp-resolver.ts` (new):
+  `resolveMcpClients(configs, harnessConfig, projectCredential)`.
+  Three credential sources via `tokenFrom`:
+  - `'harness'` → lookup by server name in
+    `HarnessConfig.mcp.servers[].token`
+  - `'project_credential'` → reuse the project's Git PAT
+  - `'env:VAR_NAME'` → `process.env.VAR_NAME`
+  Missing tokens → `undefined` (client connects anonymously). The
+  resolver always returns one client per input config — `listTools`
+  failures degrade silently at the agent call boundary, not here
+- `packages/core/src/index.ts`: re-exports `McpClient`,
+  `resolveMcpClients`, `McpServerConfig`
+- `packages/agents/generate/src/types.ts`:
+  - New `McpServerConfig` (local mirror of the core type with the
+    same tokenFrom union)
+  - `AgentToolConfig` extended with `mcp?: McpServerConfig[]`
+  - `AgentTask` gained `mcpClients?: McpClient[]` — populated by
+    the orchestrator's `resolveMcpForAgent` for agents whose
+    config declared MCP servers. Lifecycle stays on the
+    orchestrator
+- `packages/agents/generate/src/config/agent-config-loader.ts`:
+  - `extractTools` now extracts both `tools.builtin` AND
+    `tools.mcp[]`. The new helper `extractMcpServers(value)`
+    validates each entry (`name`, `url`, `tokenFrom` —
+    snake_case `token_from` also accepted) and drops invalid
+    entries silently. `mcp` only included on the returned shape
+    when non-empty so the orchestrator's resolver doesn't see
+    wire noise
+- `packages/agents/generate/src/agents/base-llm-agent.ts`:
+  - `callLLMWithTools` signature gained
+    `mcpClients?: McpClient[]` as an optional fifth parameter
+  - When `mcpClients` is non-empty: parallel `Promise.all(c.listTools())`
+    across all clients; results merged with the built-in defs and
+    sent to `LLMClient.completeWithTools` as a single flat tool list
+  - Built `mcpByPrefix` Map keyed by `<serverName>__` for O(1)
+    dispatch. Tool-call loop: `findMcpForCall(toolName, map)` →
+    `mcpClient.executeTool(...)` on match, else
+    `executeFileTool(...)`. `ToolCallLogEntry.toolSource` recorded
+    per call (`'mcp:<name>'` or `'builtin'`)
+  - The MCP clients are NOT closed in the agent's `finally` —
+    they're cycle-scoped, owned by the orchestrator. A documented
+    `// Note —` comment marks this explicitly to prevent a future
+    refactor from re-introducing the bug
+  - New `findMcpForCall(toolName, mcpByPrefix)` exported helper at
+    the bottom of the file
+- `packages/agents/generate/src/agents/code-agent.ts`,
+  `context-agent.ts`:
+  - Replaced the `hasTools = builtin.length > 0` check with
+    `hasBuiltin || hasMcp`. MCP-only agents (operator disabled
+    built-ins, kept just an MCP server) still drive the tool loop
+  - Forward `task.mcpClients` to `callLLMWithTools` as the fifth
+    arg. No other agent role passes them through (intent / design /
+    test / lint-config don't have a tools-use story today)
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  - Imports `McpClient`, `resolveMcpClients`, `createHarnessEngine`,
+    `HarnessConfig` from `@gestalt/core`
+  - `handleIntentTask` gained a per-cycle
+    `mcpCache: Map<string, McpClient>` at top of the function.
+    After `projectRoot` is resolved (clone path), reads
+    `HarnessConfig` from the cloned tree via
+    `createHarnessEngine(projectRoot).buildSnapshot(...)`. Loads
+    `projectCredential` via `projects.getCredential(project.id)`.
+    Both threaded into `DrivePlanOptions` (new fields:
+    `mcpCache`, `harnessConfig`, `projectCredential`). HARNESS.json
+    parse failure → warn, continue with `null` (cycle still runs;
+    `tokenFrom: 'harness'` entries just resolve to anonymous)
+  - `finally` block closes every cached `McpClient` (best-effort)
+    BEFORE removing the work dir. Order matters — closing a
+    stdio transport sends a `kill` to the child process, and we
+    want that to finish before the cleanup tears down the temp
+    dir the SDK may still be writing logs into
+  - New `resolveMcpForAgent(configs, cache, harness, credential,
+    log)` helper at the bottom of the file. Cache hit → reuse;
+    cache miss → `resolveMcpClients(uncached, ...)`, store in
+    cache, return matched subset. Caller passes
+    `context.agentConfig.tools?.mcp ?? []`
+- `templates/corporate-ops-web-mobile/harness/agents.yaml`: under
+  `code-agent.tools.builtin`, appended a `# ADR-039` commented
+  block with explanations of the three `token_from` sources +
+  two example entries (HTTP server + stdio server) so operators
+  can uncomment and customise. The security implication of
+  `token_from: harness` (token visible in project repo) is
+  flagged inline
+- `packages/server/src/routes/agents.ts`:
+  - `AgentSummary` gained `mcpServers: string[]`
+  - `extractToolsFromEntry` extended to parse `tools.mcp[]` with
+    the same validation the loader does. Returns the full
+    `AgentToolConfig` shape including mcp entries
+  - `buildAgentSummary` populates `mcpServers:
+    (merged.tools?.mcp ?? []).map((m) => m.name)`. Empty array
+    for the common pre-039 case
+- `packages/cli/src/api/client.ts`: `AgentSummary` mirrored the
+  server shape with optional `builtinTools` + `mcpServers`
+- `packages/cli/src/commands/agents.ts`: `agentsListCommand`
+  prints `· MCP: server1, server2` after the prompt-extension
+  count when `mcpServers.length > 0`. No-MCP agents render the
+  pre-039 layout
+- `packages/dashboard/src/views/IntentDetail.tsx`:
+  - `ExecutionLogResponse.log.toolCalls[].toolSource: string`
+    (optional). The dashboard's `Tool calls (N)` section renders
+    `formatToolSource(tc.toolSource)` as a small badge after each
+    tool name: `readFile (built-in)`, `github__get_pull_request
+    (MCP: github)`. The badge colour is muted for built-in,
+    `var(--purple)` for MCP — matches the custom-agent badge
+    pattern from ADR-037
+  - New helpers `formatToolSource(source)` +
+    `toolSourceBadge(source)` at the bottom of the file
+- `docs/DECISIONS.md`: appended ADR-039 with full Context /
+  Decision / Token sources / Tool routing / Observability /
+  Failure mode / Transports / Consequences sections
+- `docs/reference/harness-config.md`: appended an MCP section
+  covering both the `agents.yaml` `tools.mcp[]` schema AND the
+  `HARNESS.json` `mcp.servers[]` schema (only consulted when
+  `tokenFrom: 'harness'`). Token-source comparison table.
+  Security note on `harness`-source tokens being visible in the
+  project repo. Tool-naming + transport + failure mode +
+  observability + cycle lifecycle sections
+
+Verified live:
+- `pnpm -r build` clean across all 12 packages. Server image
+  rebuilt; reaches `Up (healthy)`; `/health` returns 200; login
+  via the cached token works
+- **Stage 1** — no-MCP regression check (trackeros has no MCP
+  entries committed):
+  - Submitted clamp utility intent (correlationId `7bbcc38f`)
+  - Cycle ran 11 agent executions through generate + gate +
+    deploy in ~80 s (pipeline-agent failed for an unrelated CI
+    reason — project test runner — outside ADR-039 scope)
+  - `code-agent` made 2 real built-in tool calls
+    (`listDirectory`, `searchFiles`), each persisted in
+    `agent_execution_logs.tool_calls` with `toolSource:
+    'builtin'`. Confirmed via direct SQL:
+    `tc["toolSource"] == 'builtin'` for both entries
+  - Every framework agent's `mcpServers` list in
+    `GET /projects/:id/agents` was `[]` — no MCP code path
+    crashed; the no-MCP cycle behaves identically to pre-039
+- **Stage 2** — live MCP server smoke (off-thread of the
+  orchestrator, exercising the McpClient + resolver +
+  dispatch code paths directly):
+  - Spawned `npx -y @modelcontextprotocol/server-filesystem
+    /private/tmp/test-mcp-dir` via stdio transport (macOS
+    resolves `/tmp` to `/private/tmp` — used the resolved
+    path so the SDK's path-allowlist accepted the read)
+  - `McpClient.listTools()` returned 14 namespaced tools
+    (`testfs__read_file`, `testfs__write_file`,
+    `testfs__list_directory`, …) each with a `[testfs]`
+    description prefix
+  - `executeTool('testfs__read_file', {path:
+    '/private/tmp/test-mcp-dir/test.txt'})` stripped the
+    `testfs__` namespace, called the SDK, returned the
+    file content (`hello from mcp`) with `isError: false`
+  - Failure path also confirmed: the first attempt used the
+    macOS-symlink `/tmp/...` path which the MCP server's
+    allowlist rejected — `executeTool` returned `isError:
+    true` with `content: 'Access denied - path outside
+    allowed directories...'`. No thrown exception escaped
+  - `resolveMcpClients` exercised with `tokenFrom:
+    'env:NOOP_TOKEN'` — env-source path resolves; client
+    connects anonymously (the stdio filesystem server
+    doesn't check the token)
+  - Namespace-dispatch invariants confirmed against the
+    same prefix Map BaseLLMAgent builds:
+    1. `testfs__list_directory` → MCP `testfs` (correct)
+    2. `listDirectory` (no namespace) → built-in
+       fallthrough (correct — `mcpByPrefix` lookup returns
+       null)
+    3. **Shadowing probe**: a hypothetical built-in named
+       exactly `testfs` would NOT be intercepted by the
+       MCP server. The prefix check uses `testfs__`, not
+       `testfs`, so `'testfs'.startsWith('testfs__')` is
+       false. Built-ins are protected
+  - `McpClient.close()` clean — the spawned child process
+    terminates without lingering
+
+Decisions made:
+- **MCP client lifecycle: per-cycle, owned by the
+  orchestrator.** The brief allowed per-agent-run; reviewed
+  this against the cycle structure and chose per-cycle so a
+  multi-agent run (`code-agent` + `context-agent` both
+  declaring `github`) shares one connection. Closing happens
+  exactly once in `handleIntentTask.finally`. Agents borrow,
+  do not own. Documented with a comment in
+  `BaseLLMAgent.callLLMWithTools` so a refactor doesn't
+  re-introduce the close-in-agent bug
+- **Cache keyed by serverName, not by URL.** Two agent
+  configs naming the same `name: github` but pointing at
+  different URLs would collide on the cache, but `agents.yaml`
+  is a single file and the operator picks one URL per name
+  anyway. Keying by name matches the namespace prefix the
+  dispatcher uses, which is also the operator's mental model
+- **`resolveMcpForAgent` is lazy + filtered.** Pre-scanning
+  every agent's config at the top of the cycle would cleanly
+  separate "what's declared" from "what's used", but adds a
+  pass that contributes nothing — agents that never run (the
+  plan skipped them) would have opened idle connections.
+  Lazy means the cache only fills with servers an actually-
+  executed agent declared
+- **Read HARNESS.json again in `handleIntentTask`** even
+  though `context-assembler` already does that per agent
+  step. Considered threading harnessConfig down from
+  `assembleContext` but that would have meant the
+  orchestrator's MCP cache initialisation depended on the
+  first agent step running. Reading once at the top of the
+  cycle is cleaner and the cost (one `readFile` per cycle) is
+  negligible. Falls back to `null` on parse failure — the
+  cycle still runs; `tokenFrom: 'harness'` entries just
+  connect anonymously
+- **Namespace prefix is `<serverName>__` (double underscore),
+  not `:`** as the brief sketched. Two reasons: (1) MCP tool
+  names from `@modelcontextprotocol/server-filesystem`
+  already contain underscores (`read_text_file`,
+  `list_directory`), so single-underscore would have eaten
+  legibility; (2) OpenAI's function-calling tool names are
+  restricted to `[a-zA-Z0-9_-]` and reject `:`. Double-
+  underscore is unambiguous, OpenAI-compatible, and survives
+  a roundtrip through every provider we've tested
+- **MCP tool definitions exposed to the LLM use the SDK's
+  raw inputSchema unchanged.** The OpenAI converter inside
+  `LLMClient.completeWithTools` already turns
+  `{ name, description, parameters }` into the request shape.
+  Passing through the SDK's schema means the LLM sees
+  whatever the MCP server author chose — no platform-side
+  filtering, no shape normalisation. If a server returns a
+  bad schema, the LLM call fails with a clear OpenAI error
+  rather than a silent platform-side rejection
+- **`hasTools` widened to `hasBuiltin || hasMcp`.** Without
+  this an MCP-only agent (operator wanted to disable file
+  tools and use ONLY a code-search MCP server) would have
+  short-circuited to `callLLM` and the MCP clients would
+  never have been listed. The cost is zero for the common
+  case (every framework agent today has built-ins)
+- **`StreamableHTTPClientTransport` first, not
+  `SSEClientTransport`.** The SDK's recommended modern
+  transport is "Streamable HTTP" which negotiates SSE
+  internally. Picking the modern name future-proofs against
+  the SDK eventually dropping the deprecated
+  `SSEClientTransport`. Stdio transport handled
+  by a separate dynamic-import branch when the URL starts
+  with `stdio:`
+- **`tool_calls` JSONB still has the string-scalar storage
+  trap** discovered during Stage 1 — `jsonb_typeof` returns
+  `'string'` rather than `'array'` because the insert path
+  passes the value without an explicit `::jsonb` cast. The
+  data is recoverable (it's valid JSON inside the string)
+  and the shared `parseJsonb` helper unwraps it on read, so
+  every consumer (route, dashboard) gets the correct array.
+  This is the same pattern `maintenance_runs.findings` had
+  before its cast was added. Not fixed in this session —
+  pre-existing from ADR-038's write path. Captured below
+  as a follow-up
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Live verification covered: Stage 1 (no-MCP regression — 11
+real agent executions, 2 built-in tool calls with
+`toolSource: 'builtin'` persisted), Stage 2 (live
+`server-filesystem` over stdio — 14 namespaced tools listed
++ real file read + dispatch invariants confirmed +
+shadowing probe). The full MCP wire path (SDK dynamic
+import → stdio transport → JSON-RPC → tool result → log
+entry) exercised end-to-end against a real MCP server.
+
+Follow-up logged in Pending enhancements:
+- **`tool_calls` JSONB write path is missing the explicit
+  `::jsonb` cast.** The data is stored as a JSON-encoded
+  string scalar (`jsonb_typeof` returns `'string'`) rather
+  than a JSONB array. `parseJsonb` on the read path
+  normalises this so the dashboard and APIs work correctly,
+  but `jsonb_array_length(tool_calls)` style SQL probes
+  fail. Pre-existing from ADR-038's `execution-logs.ts`
+  insert path. Same fix the maintenance_runs.findings
+  column got — add `::jsonb` cast on the `INSERT`

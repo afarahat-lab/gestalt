@@ -18,6 +18,11 @@ export { ok, err } from './types';
 // Tools (ADR-038)
 export { FILE_TOOL_DEFINITIONS, executeFileTool } from './tools/file-tools';
 
+// MCP — Model Context Protocol (ADR-039)
+export { McpClient } from './tools/mcp-client';
+export { resolveMcpClients } from './tools/mcp-resolver';
+export type { McpServerConfig } from './tools/mcp-resolver';
+
 // Config
 export type { GestaltConfig, ServerConfig, DatabaseConfig, QueueConfig, LLMConfig, AuthConfig } from './config/index';
 export { loadConfig, GestaltConfigError } from './config/index';

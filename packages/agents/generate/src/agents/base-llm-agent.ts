@@ -44,6 +44,7 @@ import {
   type ToolDefinition, type ToolCall, type ToolResult, type ToolCallLogEntry,
   type BuiltInToolName,
   type ToolLoopMessage,
+  type McpClient,
 } from '@gestalt/core';
 import type {
   AgentTask, AgentResult, AgentConfig, FeedbackSignal,
@@ -209,12 +210,35 @@ export abstract class BaseLLMAgent {
     agentConfig: AgentConfig,
     projectRoot: string,
     correlationId: string,
+    mcpClients?: McpClient[],
   ): Promise<{ response: string; toolCallLog: ToolCallLogEntry[] }> {
-    const tools = this.resolveToolDefinitions(agentConfig.tools);
+    // Built-in tool definitions resolved from `tools.builtin`.
+    const builtinDefs = this.resolveToolDefinitions(agentConfig.tools);
+
+    // MCP tool definitions fetched per-server at the top of the run
+    // (ADR-039). One round trip per server; cached as `mcpDefs`
+    // through the entire tool-use loop. listTools() returns `[]` on
+    // any per-server failure so a flaky MCP doesn't block the others.
+    const mcpDefs: ToolDefinition[] = [];
+    if (mcpClients && mcpClients.length > 0) {
+      const perServer = await Promise.all(
+        mcpClients.map((c) => c.listTools()),
+      );
+      for (const list of perServer) mcpDefs.push(...list);
+    }
+
+    const tools: ToolDefinition[] = [...builtinDefs, ...mcpDefs];
+
     if (tools.length === 0) {
       const response = await this.callLLM(prompt, agentConfig, correlationId);
       this.lastToolCallLog = [];
       return { response, toolCallLog: [] };
+    }
+
+    // Index MCP clients by namespace prefix for O(1) dispatch.
+    const mcpByPrefix = new Map<string, McpClient>();
+    if (mcpClients) {
+      for (const c of mcpClients) mcpByPrefix.set(`${c.serverName}__`, c);
     }
 
     const client = getLLMClient(agentConfig.llm.model);
@@ -228,69 +252,90 @@ export abstract class BaseLLMAgent {
     let totalToolCalls = 0;
     let finalText = '';
 
-    for (let turn = 0; turn < MAX_TOOL_CALLS + 1; turn++) {
-      const result = await client.completeWithTools({
-        messages: history,
-        tools,
-        ...(agentConfig.llm.temperature !== undefined ? { temperature: agentConfig.llm.temperature } : {}),
-        ...(agentConfig.llm.maxTokens !== undefined ? { maxTokens: agentConfig.llm.maxTokens } : {}),
-        correlationId,
-      });
-      if (!result.ok) {
-        throw new Error(`LLM call failed: ${result.error.message}`);
-      }
+    try {
+      for (let turn = 0; turn < MAX_TOOL_CALLS + 1; turn++) {
+        const result = await client.completeWithTools({
+          messages: history,
+          tools,
+          ...(agentConfig.llm.temperature !== undefined ? { temperature: agentConfig.llm.temperature } : {}),
+          ...(agentConfig.llm.maxTokens !== undefined ? { maxTokens: agentConfig.llm.maxTokens } : {}),
+          correlationId,
+        });
+        if (!result.ok) {
+          throw new Error(`LLM call failed: ${result.error.message}`);
+        }
 
-      const { text, toolCalls, stopReason } = result.value;
-      if (text.length > 0) finalText = text;
+        const { text, toolCalls, stopReason } = result.value;
+        if (text.length > 0) finalText = text;
 
-      // No tool calls OR provider says we're done → exit.
-      if (stopReason === 'stop' || toolCalls.length === 0) {
-        break;
-      }
+        // No tool calls OR provider says we're done → exit.
+        if (stopReason === 'stop' || toolCalls.length === 0) {
+          break;
+        }
 
-      // Append the assistant turn carrying its tool_calls so the
-      // provider can match the tool_result messages we add next.
-      history.push({
-        role: 'assistant',
-        content: text.length > 0 ? text : null,
-        toolCalls,
-      });
-
-      // Execute each tool call and append the result messages.
-      for (const call of toolCalls) {
-        if (totalToolCalls >= MAX_TOOL_CALLS) break;
-        totalToolCalls++;
-
-        const platformCall: ToolCall = {
-          id: call.id,
-          name: call.name,
-          input: call.input,
-        };
-        const toolResult: ToolResult = await executeFileTool(platformCall, projectRoot);
-
+        // Append the assistant turn carrying its tool_calls so the
+        // provider can match the tool_result messages we add next.
         history.push({
-          role: 'tool',
-          toolCallId: call.id,
-          content: toolResult.content,
+          role: 'assistant',
+          content: text.length > 0 ? text : null,
+          toolCalls,
         });
 
-        toolCallLog.push({
-          toolName: call.name,
-          input: call.input,
-          output: toolResult.content.slice(0, TOOL_OUTPUT_LOG_TRUNCATE),
-          isError: toolResult.isError,
-          calledAt: new Date(),
-        });
-      }
+        // Execute each tool call and append the result messages.
+        for (const call of toolCalls) {
+          if (totalToolCalls >= MAX_TOOL_CALLS) break;
+          totalToolCalls++;
 
-      if (totalToolCalls >= MAX_TOOL_CALLS) {
-        // Safety cap hit — give the model one more turn with the
-        // existing tool results so it can synthesise an answer rather
-        // than getting cut off mid-thought. The break above prevented
-        // any further calls; this iteration runs without appending new
-        // tool requests, then the next stop_reason check exits.
-        // Intentionally fall through.
+          // Dispatch by namespace: any tool call whose name starts
+          // with `<serverName>__` is routed to the matching MCP
+          // client. Everything else falls through to the built-in
+          // file-tool dispatcher. The check is a prefix-only test
+          // so the LLM can't smuggle a built-in name with an MCP
+          // namespace prepended.
+          const mcpClient = findMcpForCall(call.name, mcpByPrefix);
+
+          let toolResult: ToolResult;
+          let toolSource: string;
+          if (mcpClient) {
+            toolResult = await mcpClient.executeTool(call.name, call.input, call.id);
+            toolSource = `mcp:${mcpClient.serverName}`;
+          } else {
+            const platformCall: ToolCall = {
+              id: call.id,
+              name: call.name,
+              input: call.input,
+            };
+            toolResult = await executeFileTool(platformCall, projectRoot);
+            toolSource = 'builtin';
+          }
+
+          history.push({
+            role: 'tool',
+            toolCallId: call.id,
+            content: toolResult.content,
+          });
+
+          toolCallLog.push({
+            toolName: call.name,
+            input: call.input,
+            output: toolResult.content.slice(0, TOOL_OUTPUT_LOG_TRUNCATE),
+            isError: toolResult.isError,
+            calledAt: new Date(),
+            toolSource,
+          });
+        }
+
+        if (totalToolCalls >= MAX_TOOL_CALLS) {
+          // Safety cap hit — give the model one more turn with the
+          // existing tool results so it can synthesise an answer
+          // rather than getting cut off mid-thought.
+        }
       }
+    } finally {
+      // Note — the agent does NOT close the MCP clients here. The
+      // orchestrator caches them per-cycle and may share them across
+      // agent steps (code-agent then context-agent both calling the
+      // same MCP server). The orchestrator owns the close.
     }
 
     this.lastLlmResponse = finalText;
@@ -334,4 +379,22 @@ export abstract class BaseLLMAgent {
       createdAt: new Date(),
     };
   }
+}
+
+/**
+ * Routes a tool call to the matching MCP client by namespace prefix
+ * (ADR-039). Returns null when no prefix matches — the caller falls
+ * through to the built-in dispatcher in that case. The prefix check
+ * is the only thing that decides MCP vs built-in; an LLM cannot
+ * smuggle a built-in name with an MCP namespace prepended because
+ * we look up the FULL prefix `<serverName>__`.
+ */
+function findMcpForCall(
+  toolName: string,
+  mcpByPrefix: Map<string, McpClient>,
+): McpClient | null {
+  for (const [prefix, client] of mcpByPrefix.entries()) {
+    if (toolName.startsWith(prefix)) return client;
+  }
+  return null;
 }

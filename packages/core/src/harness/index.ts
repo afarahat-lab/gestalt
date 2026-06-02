@@ -86,6 +86,20 @@ export interface HarnessConfig {
   identity?: Record<string, unknown>;
   pipeline?: Record<string, unknown>;
   maintenance?: Record<string, unknown>;
+  /**
+   * Project-level MCP server credentials (ADR-039). Referenced from
+   * `agents.yaml` via `tools.mcp[].token_from: 'harness'`. Tokens
+   * stored here are visible to anyone with repo read access — for
+   * sensitive credentials use `token_from: env:VAR_NAME` instead.
+   * See docs/reference/harness-config.md for the security model.
+   */
+  mcp?: {
+    servers: Array<{
+      name: string;
+      url: string;
+      token?: string;
+    }>;
+  };
 }
 
 // ─── Context snapshot (what agents receive) ───────────────────────────────────

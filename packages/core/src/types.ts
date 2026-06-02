@@ -203,6 +203,12 @@ export type BuiltInToolName =
  * chars before storage. The full result has already been fed back to
  * the LLM in the live loop; the persisted entry is for operator
  * audit, not for re-execution.
+ *
+ * `toolSource` (ADR-039) distinguishes built-in file tools
+ * (`'builtin'`) from MCP server tools (`'mcp:<serverName>'`).
+ * Optional for forward compatibility — pre-ADR-039 rows return
+ * `undefined`; the dashboard renders an empty source badge in that
+ * case so the absence is visible without breaking the layout.
  */
 export interface ToolCallLogEntry {
   toolName: string;
@@ -210,6 +216,7 @@ export interface ToolCallLogEntry {
   output: string;
   isError: boolean;
   calledAt: Date;
+  toolSource?: string;
 }
 
 // ─── Result type (typed error handling) ──────────────────────────────────────

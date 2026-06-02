@@ -98,6 +98,10 @@ export interface AgentSummary {
   temperature: number | null;
   maxTokens: number | null;
   promptExtensionCount: number;
+  /** ADR-038 — resolved built-in tool names. */
+  builtinTools?: string[];
+  /** ADR-039 — declared MCP server names from `tools.mcp[]`. */
+  mcpServers?: string[];
 }
 
 export interface CustomAgentDefinition {

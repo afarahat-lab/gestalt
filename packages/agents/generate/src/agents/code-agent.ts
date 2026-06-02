@@ -30,21 +30,23 @@ export class CodeAgent extends BaseLLMAgent {
     const { agentConfig } = task.contextSnapshot;
     let lastError: Error | undefined;
 
-    const hasTools = (agentConfig.tools?.builtin?.length ?? 0) > 0;
+    const hasBuiltin = (agentConfig.tools?.builtin?.length ?? 0) > 0;
+    const hasMcp = (task.mcpClients?.length ?? 0) > 0;
+    const useTools = hasBuiltin || hasMcp;
     const projectRoot = task.contextSnapshot.projectRoot;
 
     for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
       try {
         const rawPrompt = buildCodePrompt(task.contextSnapshot, attempt, task.priorSignals);
         const prompt = applyAgentConfig(rawPrompt, agentConfig);
-        // ADR-038 — when the resolved agentConfig declares any
-        // built-in tools, drive the OpenAI function-calling loop so
-        // the LLM can read existing files before generating. Falls
+        // ADR-038 + ADR-039 — drive the OpenAI function-calling loop
+        // whenever the resolved agentConfig declares built-in tools OR
+        // the orchestrator passed MCP clients for this cycle. Falls
         // through to plain `callLLM` for legacy projects (no
-        // agents.yaml) and any agent role where the operator has
-        // disabled tools.
-        const raw = hasTools
-          ? (await this.callLLMWithTools(prompt, agentConfig, projectRoot, task.correlationId)).response
+        // agents.yaml, no MCP) and any agent role where the operator
+        // has disabled both.
+        const raw = useTools
+          ? (await this.callLLMWithTools(prompt, agentConfig, projectRoot, task.correlationId, task.mcpClients)).response
           : await this.callLLM(prompt, agentConfig, task.correlationId);
         const codeFiles = parseCodeFiles(raw, task.correlationId);
         if (codeFiles.length === 0) throw new Error('LLM returned no code files');

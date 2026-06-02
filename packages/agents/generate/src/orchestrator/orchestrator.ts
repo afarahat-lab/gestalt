@@ -15,10 +15,12 @@ import { simpleGit } from 'simple-git';
 import {
   createWorker, dispatch, getRepositories, getLLMClient,
   createContextLogger, emitLiveEvent, QUEUE_NAMES,
+  McpClient, resolveMcpClients, createHarnessEngine,
 } from '@gestalt/core';
 import type {
   TaskMessage, TaskResult, QueueConfig,
   Artifact, PlatformSignal, ExecutionStatus, AgentRole, SignalType, SignalSeverity,
+  HarnessConfig,
 } from '@gestalt/core';
 import type { GeneratedArtifact } from '../types';
 import { buildExecutionPlan, getReadySteps, isPlanComplete, hasPlanFailed } from './plan-builder';
@@ -152,6 +154,11 @@ async function handleIntentTask(
   let projectRoot = payload.projectRoot ?? null;
   let workDir: string | null = null;
   let project: Awaited<ReturnType<typeof projects.findById>> | null = null;
+  // Per-cycle MCP client cache (ADR-039). One client per unique
+  // serverName; reused across agent steps (code-agent and context-
+  // agent may both declare the same server). Closed in `finally` so
+  // a thrown agent run can't leak transport / file descriptors.
+  const mcpCache = new Map<string, McpClient>();
 
   try {
     // On the resume leg (POST /intents/:id/clarify) the caller only
@@ -204,6 +211,21 @@ async function handleIntentTask(
 
     await transitionIntent(payload.intentId, correlationId, 'generating');
 
+    // Read HarnessConfig from the cloned tree — ADR-039 token
+    // resolution may need `mcp.servers[].token` entries declared in
+    // HARNESS.json (the `tokenFrom: 'harness'` source).
+    let harnessConfig: HarnessConfig | null = null;
+    try {
+      const snap = await createHarnessEngine(projectRoot).buildSnapshot(correlationId);
+      harnessConfig = snap.harness;
+    } catch (err) {
+      childLog.warn({ err }, 'Could not read HARNESS.json — MCP harness-source tokens unavailable');
+    }
+    // Project Git PAT — feeds the `tokenFrom: 'project_credential'`
+    // source. Already loaded if we cloned ourselves; for the resume
+    // path (payload.projectRoot supplied) we look it up.
+    const projectCredential = await projects.getCredential(project.id);
+
     const retryCount = payload.retryCount ?? 0;
     const priorSignals = payload.priorSignals ?? [];
 
@@ -234,6 +256,9 @@ async function handleIntentTask(
       {
         intentSource,
         clarification: clarificationText,
+        mcpCache,
+        harnessConfig,
+        projectCredential,
       },
     );
 
@@ -310,6 +335,15 @@ async function handleIntentTask(
     await transitionIntent(payload.intentId, correlationId, 'failed').catch(() => {});
     throw err;
   } finally {
+    // ADR-039 — close every MCP client this cycle opened. Best-
+    // effort; a thrown close shouldn't mask the original error path.
+    if (mcpCache.size > 0) {
+      await Promise.all(
+        Array.from(mcpCache.values()).map((c) =>
+          c.close().catch(() => undefined),
+        ),
+      );
+    }
     if (workDir) {
       await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
     }
@@ -335,6 +369,28 @@ async function handleIntentTask(
 interface DrivePlanOptions {
   intentSource: 'human' | 'maintenance-agent';
   clarification?: string;
+  /**
+   * ADR-039 — per-cycle MCP client cache. Keyed by `serverName`.
+   * `resolveMcpForAgent` populates it lazily the first time any
+   * agent declares a given server; later agent steps reuse the
+   * cached client. The orchestrator's `finally` block closes every
+   * entry once the cycle is over.
+   */
+  mcpCache: Map<string, McpClient>;
+  /**
+   * HarnessConfig read from the cloned tree. Feeds the
+   * `tokenFrom: 'harness'` resolver source. `null` only when
+   * HARNESS.json failed to parse (the cycle still runs; MCP servers
+   * relying on harness tokens simply connect anonymously).
+   */
+  harnessConfig: HarnessConfig | null;
+  /**
+   * Project Git PAT. Feeds the `tokenFrom: 'project_credential'`
+   * source. `null` when the project has no credential on file (e.g.
+   * a public-repo registration); MCP servers asking for it will
+   * connect anonymously.
+   */
+  projectCredential: string | null;
 }
 
 async function drivePlan(
@@ -411,6 +467,17 @@ async function drivePlan(
         try {
           const routedSignals = signalsForAgent(agentRole);
           const context = await assembleContext(projectRoot, plan, agentRole, intentText, routedSignals);
+          // ADR-039 — resolve MCP clients for this agent's declared
+          // servers. Cached by serverName across the cycle so
+          // multiple agents that depend on the same MCP server share
+          // one connection.
+          const mcpForAgent = resolveMcpForAgent(
+            context.agentConfig.tools?.mcp ?? [],
+            opts.mcpCache,
+            opts.harnessConfig,
+            opts.projectCredential,
+            childLog,
+          );
           const task = {
             taskId: crypto.randomUUID(),
             correlationId: plan.correlationId,
@@ -426,6 +493,7 @@ async function drivePlan(
             intentSource: opts.intentSource,
             clarification:
               agentRole === 'intent-agent' ? opts.clarification : undefined,
+            mcpClients: mcpForAgent.length > 0 ? mcpForAgent : undefined,
           };
 
           // Per-agent LLM routing happens inside BaseLLMAgent.callLLM
@@ -610,6 +678,55 @@ async function drivePlan(
  * `lastModelUsed` which are per-call diagnostics, not persistent
  * agent state).
  */
+/**
+ * ADR-039 — turns an agent's declared `tools.mcp[]` into a matched
+ * array of live `McpClient` instances, using the per-cycle cache to
+ * avoid opening the same server twice. The cache survives across
+ * agent steps (code-agent + context-agent both declaring `github`
+ * share one connection); the orchestrator's `finally` block closes
+ * every cached entry once the cycle is over.
+ *
+ * Token-resolution failures are non-fatal — `resolveMcpClients`
+ * returns clients that connect anonymously if the token slot is
+ * empty, and `McpClient.listTools()` returns `[]` on connection
+ * failure so the LLM proceeds without that server's tools.
+ */
+function resolveMcpForAgent(
+  agentMcpConfigs: import('../types').McpServerConfig[],
+  cache: Map<string, McpClient>,
+  harnessConfig: HarnessConfig | null,
+  projectCredential: string | null,
+  childLog: ReturnType<typeof createContextLogger>,
+): McpClient[] {
+  if (agentMcpConfigs.length === 0) return [];
+  const unresolved: import('../types').McpServerConfig[] = [];
+  const clients: McpClient[] = [];
+  for (const cfg of agentMcpConfigs) {
+    const cached = cache.get(cfg.name);
+    if (cached) {
+      clients.push(cached);
+    } else {
+      unresolved.push(cfg);
+    }
+  }
+  if (unresolved.length > 0) {
+    const newClients = resolveMcpClients(
+      unresolved,
+      // resolveMcpClients tolerates an empty harness — only the
+      // 'harness' token source needs the lookup, and that source is
+      // optional per server config.
+      (harnessConfig ?? { name: '', description: '', version: '', constraints: { rules: [] }, qualityGate: { maxRetries: 0, signalsToHuman: [] } }) as HarnessConfig,
+      projectCredential,
+    );
+    for (const c of newClients) {
+      cache.set(c.serverName, c);
+      clients.push(c);
+      childLog.debug({ server: c.serverName }, 'MCP client added to cycle cache');
+    }
+  }
+  return clients;
+}
+
 function newAgentForRole(agentRole: AgentRole): BaseLLMAgent {
   switch (agentRole) {
     case 'intent-agent':      return new IntentAgent();

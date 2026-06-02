@@ -55,6 +55,13 @@ interface AgentSummary {
    * built-in file tool names when the agent has full access.
    */
   builtinTools: string[];
+  /**
+   * ADR-039 — declared MCP server names from `tools.mcp[]`. Empty
+   * array for agents that did not wire any external MCP server. The
+   * list is the configured set, not a live-availability check
+   * (resolution + connect happens at cycle time).
+   */
+  mcpServers: string[];
 }
 
 function authenticatedGitUrl(gitUrl: string, token: string): string {
@@ -253,6 +260,7 @@ function buildAgentSummary(role: string, yamlRaw: string | null): AgentSummary {
     maxTokens: merged.llm.maxTokens ?? null,
     promptExtensionCount: merged.promptExtensions.length,
     builtinTools: merged.tools?.builtin ?? [],
+    mcpServers: (merged.tools?.mcp ?? []).map((m) => m.name),
   };
 }
 
@@ -291,15 +299,42 @@ function extractToolsFromEntry(
   if (!toolsKey || typeof toolsKey !== 'object') {
     return { builtin: [...(baselineTools?.builtin ?? [])] };
   }
-  const builtinIn = (toolsKey as Record<string, unknown>)['builtin'];
-  if (!Array.isArray(builtinIn)) {
-    return { builtin: [...(baselineTools?.builtin ?? [])] };
-  }
+  const toolsRec = toolsKey as Record<string, unknown>;
+  const builtinIn = toolsRec['builtin'];
   const validNames = new Set(['readFile', 'listDirectory', 'searchFiles', 'getFileTree']);
-  return {
-    builtin: builtinIn.filter(
-      (s): s is 'readFile' | 'listDirectory' | 'searchFiles' | 'getFileTree' =>
-        typeof s === 'string' && validNames.has(s),
-    ),
-  };
+  const builtin = Array.isArray(builtinIn)
+    ? builtinIn.filter(
+        (s): s is 'readFile' | 'listDirectory' | 'searchFiles' | 'getFileTree' =>
+          typeof s === 'string' && validNames.has(s),
+      )
+    : [...(baselineTools?.builtin ?? [])];
+
+  // ADR-039 — surface declared MCP servers in the summary. Apply the
+  // same validation the loader does so an operator typo doesn't show
+  // up as a phantom server in `gestalt agents list`.
+  const mcpIn = toolsRec['mcp'];
+  const mcp: NonNullable<AgentConfig['tools']>['mcp'] = [];
+  if (Array.isArray(mcpIn)) {
+    for (const item of mcpIn) {
+      if (!item || typeof item !== 'object') continue;
+      const rec = item as Record<string, unknown>;
+      const name = rec['name'];
+      const url = rec['url'];
+      const tokenFromRaw = rec['tokenFrom'] ?? rec['token_from'];
+      if (typeof name !== 'string' || !name) continue;
+      if (typeof url !== 'string' || !url) continue;
+      if (typeof tokenFromRaw !== 'string' || !tokenFromRaw) continue;
+      if (
+        tokenFromRaw !== 'harness' &&
+        tokenFromRaw !== 'project_credential' &&
+        !tokenFromRaw.startsWith('env:')
+      ) continue;
+      mcp!.push({
+        name,
+        url,
+        tokenFrom: tokenFromRaw as 'harness' | 'project_credential' | `env:${string}`,
+      });
+    }
+  }
+  return mcp && mcp.length > 0 ? { builtin, mcp } : { builtin };
 }

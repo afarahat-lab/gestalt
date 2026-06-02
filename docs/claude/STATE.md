@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-01 (Claude Code — Gate orchestrator creates GP_BREACH alert on escalate verdict + backfill for prior escalations)
+**Last updated:** 2026-06-02 (Claude Code — ADR-039 MCP (Model Context Protocol) integration for agent tool use)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -644,6 +644,121 @@ the historical record of how the state evolved._
     side, the API response, and the dashboard all get the
     correct array. Direct `jsonb_array_length` SQL probes
     fail; that's a quirk of the storage path, not a bug
+- **MCP (Model Context Protocol) integration — external
+  tool servers (ADR-039).** Extends ADR-038's built-in
+  file tools with project-declared external MCP servers.
+  Operators wire any compliant server (issue tracker,
+  monitoring dashboard, internal docs, the
+  `@modelcontextprotocol/server-filesystem` smoke target)
+  via `tools.mcp[]` in `agents.yaml` and the LLM sees its
+  tools merged with the four built-ins. No new endpoints,
+  no new migrations:
+  - **`McpClient`** in `@gestalt/core/tools/mcp-client.ts`.
+    Two transports via URL scheme: `http(s)://...` →
+    `StreamableHTTPClientTransport` (modern MCP-spec HTTP
+    + SSE); `stdio:<bin> <arg1> <arg2>...` →
+    `StdioClientTransport` (spawns the named child, speaks
+    JSON-RPC over stdin/stdout). The `@modelcontextprotocol/
+    sdk` v1.29 is ESM-only — `McpClient` dynamic-imports it
+    (same pattern as `globby`) so the CJS core package
+    builds clean. Tool names are namespaced
+    `<serverName>__<toolName>` on every `listTools()` result
+    so an MCP server can NEVER shadow a built-in
+  - **`resolveMcpClients`** in `@gestalt/core/tools/mcp-
+    resolver.ts`. Three credential sources via the
+    `tokenFrom` field on each declared server:
+    `'harness'` → reads `HARNESS.json` `mcp.servers[].token`
+    by matching `name`; `'project_credential'` → reuses the
+    project Git PAT (already loaded from
+    `project_git_credentials`); `'env:VAR_NAME'` → reads
+    `process.env.VAR_NAME` on the Gestalt server. Missing
+    tokens resolve to `undefined`; the client connects
+    anonymously and the SDK returns a clean error if the
+    server requires auth
+  - **`BaseLLMAgent.callLLMWithTools`** extended with
+    optional `mcpClients?: McpClient[]`. The agent fetches
+    every server's `listTools()` in parallel, merges with
+    the ADR-038 built-in defs, and indexes the MCP clients
+    by `<serverName>__` prefix into a Map. Per tool call
+    the dispatcher does an O(1) `findMcpForCall` against
+    the Map — prefix match → `mcpClient.executeTool(...)`,
+    miss → falls through to `executeFileTool(...)`. Every
+    `ToolCallLogEntry` records `toolSource: 'builtin' |
+    'mcp:<serverName>'` so the operator sees which
+    transport handled each call. The agent does NOT close
+    the MCP clients — that's the orchestrator's job
+  - **Per-cycle MCP client cache in the orchestrator.**
+    `handleIntentTask` keeps a `Map<serverName, McpClient>`
+    for the cycle. The new `resolveMcpForAgent` helper
+    looks up each agent's declared servers in the cache and
+    only calls `resolveMcpClients` for the ones that aren't
+    already open. The cache's `close()`s happen in the
+    `finally` block so a thrown agent run can't leak file
+    descriptors / SSE streams. Multiple agents declaring
+    the same server share one connection
+  - **Failure mode is non-fatal end to end.**
+    `McpClient.listTools()` returns `[]` on connection
+    failure (agent proceeds with whatever tools resolved);
+    `executeTool()` returns `{ isError: true, content: '...' }`
+    on any thrown error (LLM sees the error text and can
+    pick a different tool or give up). An unreachable MCP
+    server never aborts a cycle
+  - **Auto-detect of tool-loop trigger.** The previous
+    ADR-038 `hasTools` check looked only at
+    `agentConfig.tools.builtin.length`. Updated to
+    `hasBuiltin || hasMcp` so MCP-only agents (operator
+    disabled built-ins, kept just an MCP server) still
+    drive the function-calling loop. Backward compat: every
+    pre-039 agent with builtin tools still triggers as before
+  - **Observability surfaces.** Dashboard's IntentDetail
+    accordion renders a per-tool-call badge —
+    `readFile (built-in)` vs
+    `github__get_pull_request (MCP: github)`. The
+    `formatToolSource` helper handles the legacy null case
+    (pre-039 rows display as `(built-in)`).
+    `GET /projects/:id/agents` `frameworkAgents[].mcpServers`
+    lists the configured server names per agent. `gestalt
+    agents list <project>` prints `MCP: server1, server2`
+    next to each framework agent's row
+  - **Template seed.** `corporate-ops-web-mobile/harness/
+    agents.yaml` ships with a commented `tools.mcp:` block
+    under `code-agent`, including two example entries (HTTP
+    + stdio) plus a security note that `tokenFrom: harness`
+    puts the token in the project repo
+  - **No migrations.** `tool_calls` JSONB already stored
+    per-call rows from ADR-038; the new `toolSource` field
+    is purely additive on the persisted shape. Oracle /
+    MSSQL stubs are unaffected. One new runtime dep on
+    `@gestalt/core` (`@modelcontextprotocol/sdk@^1.29.0`);
+    agents import `McpClient` from `@gestalt/core` so the
+    agent-package surfaces don't add it
+  - **Stage 1 verification** (live, against trackeros, no
+    MCP wired): submitted clamp utility intent; cycle ran
+    11 agent executions through generate + gate + deploy in
+    ~80 s. `code-agent` made 2 real built-in tool calls
+    (`listDirectory`, `searchFiles`), each persisted with
+    `toolSource: 'builtin'`. Every framework agent's
+    `mcpServers` list was empty. Pipeline-agent failed for
+    an unrelated CI reason (project's test runner) — no MCP
+    code path crashed
+  - **Stage 2 verification** (live MCP server):
+    `@modelcontextprotocol/server-filesystem` v2026 spawned
+    via stdio (`stdio:npx -y @modelcontextprotocol/server-
+    filesystem /private/tmp/test-mcp-dir`). `McpClient.list
+    Tools()` returned 14 namespaced tools
+    (`testfs__read_file`, `testfs__write_file`,
+    `testfs__list_directory`, …) each carrying the
+    `[testfs]` description prefix. `executeTool(
+    'testfs__read_file', {path: '...'})` stripped the
+    namespace prefix and returned the file content
+    (`hello from mcp`). `resolveMcpClients` exercised with
+    `tokenFrom: 'env:NOOP_TOKEN'` — env-source resolution
+    works. Dispatch test confirmed the three invariants:
+    (1) `testfs__list_directory` → MCP `testfs`; (2)
+    `listDirectory` (no namespace) → built-in fallthrough;
+    (3) collision probe — a hypothetical built-in named
+    `testfs` would NOT be intercepted (prefix check is
+    `testfs__`, not `testfs`). Client close path clean
 - **Gate orchestrator creates a `GOLDEN_PRINCIPLE_BREACH`
   alert on every `escalate` verdict.** Closes an old gap:
   prior to this fix the gate transitioned the intent to

@@ -750,3 +750,143 @@ a `mcp?:` field so the schema doesn't shift when ADR-039 lands.
 - Dashboard IntentDetail accordion renders a "Tool calls (N)"
   section between the prompt and the LLM response when the row has
   any tool_calls entries; empty array → section hidden.
+
+---
+
+## ADR-039 — MCP (Model Context Protocol) for external integrations
+
+**Status:** Implemented (2026-06-01)
+**Extends:** ADR-038
+
+### Context
+
+ADR-038 gave agents four read-only file tools so they could discover
+existing project content before generating output. Real engineering
+work needs more: read an issue from the project tracker, look up an
+API spec from Confluence, query a metrics dashboard, look at a Slack
+thread that prompted the intent. Building a typed adapter for each
+external system would have us re-implementing the same surface every
+quarter; the industry has converged on **Model Context Protocol
+(MCP)** — a JSON-RPC-over-HTTP/stdio protocol where any compliant
+server exposes a `listTools` + `callTool` API the LLM can drive.
+
+Constraints we accepted:
+- **Built-in tools (ADR-038) keep their role** — the four file tools
+  are part of the platform contract. MCP is the extension mechanism
+  for everything else.
+- **Per-agent declarative config in `agents.yaml`** — same shape as
+  built-in tools, no code change to enable a new integration.
+- **Token resolution must not put secrets in the project repo by
+  default** — `env:VAR_NAME` is the recommended source for sensitive
+  PATs; harness-stored tokens are visible to anyone with repo
+  access and are flagged as such in `harness-config.md`.
+- **MCP failures must be non-fatal** — an unreachable server should
+  degrade the agent's capabilities, not abort the cycle.
+- **No new repository or migration** — `tool_calls` JSONB already
+  stores per-call rows; we add an optional `toolSource` field.
+
+### Decision
+
+Agents may declare external MCP servers in `agents.yaml`:
+
+```yaml
+agents:
+  code-agent:
+    tools:
+      builtin: [readFile, listDirectory, searchFiles, getFileTree]
+      mcp:
+        - name: github
+          url: https://mcp.github.com/v1
+          token_from: env:GITHUB_MCP_TOKEN
+```
+
+Three token sources are supported, resolved by `resolveMcpClients` in
+`@gestalt/core/tools/mcp-resolver`:
+
+1. **`harness`** — looks up `mcp.servers[].token` in `HARNESS.json`
+   by matching server name. The token sits in the project repo —
+   document the visibility implications to the operator.
+2. **`project_credential`** — reuses the project's Git PAT (already
+   loaded from `project_git_credentials`).
+3. **`env:VAR_NAME`** — reads `process.env.VAR_NAME` on the server
+   process. Recommended path for sensitive secrets; survives a
+   `git pull` of the project repo by never being in it.
+
+The generate orchestrator resolves MCP clients **once per cycle**
+into a `Map<serverName, McpClient>` cache and threads the matched
+subset to each agent's `AgentTask.mcpClients`. Multiple agents
+declaring the same server share one transport connection. The cache
+is closed (best-effort) in the orchestrator's `finally` block so a
+thrown agent run can't leak file descriptors / SSE streams.
+
+`BaseLLMAgent.callLLMWithTools` accepts an optional `mcpClients?:
+McpClient[]`, merges every server's `listTools()` output with the
+built-in definitions, and dispatches tool calls by namespace prefix
+(`<serverName>__<toolName>`). The OpenAI tool-calling loop is
+unchanged — the LLM sees one flat tool list with namespaced names,
+which keeps the contract identical across providers.
+
+### Tool routing — what the agent does with each call
+
+The dispatcher in `BaseLLMAgent.callLLMWithTools` indexes MCP clients
+by their `<serverName>__` prefix into a `Map`. For every tool the
+LLM invokes:
+
+```
+for each (prefix, client) in mcpByPrefix:
+  if toolName.startsWith(prefix):
+    return mcpClient.executeTool(toolName, args, toolCallId)
+fallthrough → executeFileTool(toolName, args, projectRoot)
+```
+
+This means an MCP server cannot shadow a built-in: an MCP server
+named `readFile` couldn't intercept the built-in because the prefix
+is `readFile__`, not `readFile`. The LLM sees `readFile`
+(built-in) and `readFile__readFile` (MCP) as two distinct tools.
+
+### Observability
+
+`ToolCallLogEntry.toolSource` (`'builtin' | 'mcp:<name>'`) tells the
+operator which transport handled each call. Stored in
+`agent_execution_logs.tool_calls` JSONB; rendered by the dashboard
+IntentDetail accordion as a small badge after each tool name
+(`readFile (built-in)` vs `github__get_pull_request (MCP: github)`).
+`GET /projects/:id/agents` returns the list of MCP servers each
+agent has wired; `gestalt agents list` prints them in the framework
+agents table.
+
+### Failure mode
+
+`McpClient.listTools()` and `McpClient.executeTool()` both catch
+every thrown error from the SDK and return safe values (`[]` and
+`{ isError: true, content: '...' }` respectively). The agent
+proceeds with whatever tools resolved successfully. The LLM sees
+the error text in the tool result and is free to pick a different
+tool or give up — the orchestrator does not abort the step on MCP
+failure.
+
+### Transports
+
+Two SDK transports are supported via URL scheme:
+- `http(s)://...` → `StreamableHTTPClientTransport` (the
+  MCP-spec-name for modern HTTP+SSE). Bearer-auth via `Authorization`
+  header when a token is resolved.
+- `stdio:<binary> <arg1> <arg2>...` → `StdioClientTransport` spawns
+  the child process and speaks JSON-RPC over its stdin/stdout. Used
+  for local test servers (`npx @modelcontextprotocol/server-
+  filesystem /tmp/xyz`) and for any self-hosted server the operator
+  wants to run as a child.
+
+### Consequences
+
+- **One new dep** — `@modelcontextprotocol/sdk` on `@gestalt/core`
+  only. Agents import `McpClient` from `@gestalt/core`.
+- **No new migration** — `tool_calls` JSONB stores the new
+  `toolSource` field; the column already exists from ADR-038.
+- **Oracle / MSSQL stubs unaffected** — no new repository methods.
+- **Cycle wall-clock grows by network latency × tool count.** An
+  agent that makes one MCP call adds the round-trip; the cycle is
+  still bounded by the existing `MAX_TOOL_CALLS` cap from ADR-038.
+- **Tokens via `tokenFrom: 'harness'` are visible in the project
+  repo.** Documented in `harness-config.md` so operators choose
+  `env:VAR_NAME` for anything sensitive.

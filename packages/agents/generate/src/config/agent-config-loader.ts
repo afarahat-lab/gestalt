@@ -19,7 +19,7 @@ import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { parse } from 'yaml';
 import { createContextLogger } from '@gestalt/core';
-import type { AgentConfig, AgentsYaml, CustomAgentDefinition, AgentLlmConfig, AgentToolConfig } from '../types';
+import type { AgentConfig, AgentsYaml, CustomAgentDefinition, AgentLlmConfig, AgentToolConfig, McpServerConfig } from '../types';
 import type { BuiltInToolName } from '@gestalt/core';
 
 const log = createContextLogger({ module: 'agent-config-loader' });
@@ -219,14 +219,53 @@ function extractTools(entry: AgentConfig, baseline: AgentToolConfig): AgentToolC
   if (!toolsKey || typeof toolsKey !== 'object') {
     return { builtin: [...(baseline.builtin ?? [])] };
   }
-  const builtinIn = (toolsKey as Record<string, unknown>)['builtin'];
-  if (!Array.isArray(builtinIn)) {
-    return { builtin: [...(baseline.builtin ?? [])] };
+  const toolsRec = toolsKey as Record<string, unknown>;
+
+  const builtinIn = toolsRec['builtin'];
+  const builtin = Array.isArray(builtinIn)
+    ? builtinIn.filter(
+        (s): s is BuiltInToolName => typeof s === 'string' && VALID_BUILTIN_TOOLS.has(s as BuiltInToolName),
+      )
+    : [...(baseline.builtin ?? [])];
+
+  const mcp = extractMcpServers(toolsRec['mcp']);
+
+  // Only include `mcp` when the operator actually defined something.
+  // Empty array would be wire noise for the orchestrator's resolver.
+  return mcp.length > 0 ? { builtin, mcp } : { builtin };
+}
+
+/**
+ * Parses `tools.mcp[]` from YAML (ADR-039). Each entry must have
+ * `name`, `url`, and `tokenFrom` (or `token_from` — snake_case is the
+ * YAML house style). Invalid entries are dropped silently so an
+ * operator typo doesn't crash the cycle — `gestalt agents validate`
+ * surfaces parse warnings before any intent submission.
+ */
+function extractMcpServers(value: unknown): McpServerConfig[] {
+  if (!Array.isArray(value)) return [];
+  const out: McpServerConfig[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as Record<string, unknown>;
+    const name = rec['name'];
+    const url = rec['url'];
+    const tokenFromRaw = rec['tokenFrom'] ?? rec['token_from'];
+    if (typeof name !== 'string' || !name) continue;
+    if (typeof url !== 'string' || !url) continue;
+    if (typeof tokenFromRaw !== 'string' || !tokenFromRaw) continue;
+    if (
+      tokenFromRaw !== 'harness' &&
+      tokenFromRaw !== 'project_credential' &&
+      !tokenFromRaw.startsWith('env:')
+    ) continue;
+    out.push({
+      name,
+      url,
+      tokenFrom: tokenFromRaw as McpServerConfig['tokenFrom'],
+    });
   }
-  const filtered = builtinIn.filter(
-    (s): s is BuiltInToolName => typeof s === 'string' && VALID_BUILTIN_TOOLS.has(s as BuiltInToolName),
-  );
-  return { builtin: filtered };
+  return out;
 }
 
 function extractPromptExtensions(entry: AgentConfig): string[] {

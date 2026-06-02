@@ -406,3 +406,104 @@ infrastructure agents and the review-agent (ADR-013).
 - The dashboard's IntentDetail accordion renders custom-agent rows with a
   purple agent-role colour and a `custom` badge so operators can
   distinguish them at a glance
+
+---
+
+## MCP (Model Context Protocol) servers (ADR-039)
+
+ADR-039 extends ADR-038's built-in file tools with external integrations
+via MCP. Agents declare external servers in `agents.yaml` under
+`tools.mcp[]`; the orchestrator resolves credentials, opens the
+connection once per cycle, and the LLM sees the server's tools merged
+into its flat tool list.
+
+### `agents.yaml` schema
+
+```yaml
+agents:
+  code-agent:
+    tools:
+      builtin: [readFile, listDirectory, searchFiles, getFileTree]
+      mcp:
+        - name: github                      # used as the tool-name prefix
+          url: https://mcp.github.com/v1    # http(s):// or stdio:<bin> <args>
+          token_from: env:GITHUB_MCP_TOKEN  # token resolution source
+```
+
+### `HARNESS.json` schema (optional, only when `token_from: harness`)
+
+```jsonc
+{
+  "mcp": {
+    "servers": [
+      { "name": "internal-docs", "url": "https://mcp.internal", "token": "..." }
+    ]
+  }
+}
+```
+
+`HARNESS.json` is only consulted for entries whose `token_from` is
+`'harness'`. The lookup matches `mcp.servers[].name` against the
+`agents.yaml` entry's `name`.
+
+### Token sources
+
+| `token_from`           | Where the token comes from                  | When to pick this                                                |
+|------------------------|---------------------------------------------|------------------------------------------------------------------|
+| `harness`              | `HARNESS.json` `mcp.servers[].token`        | The token can be in the project repo (low-sensitivity / test).   |
+| `project_credential`   | The project's Git PAT (same one used for clone + push) | The MCP server accepts the same auth as the Git host.   |
+| `env:VAR_NAME`         | `process.env.VAR_NAME` on the Gestalt server | **Recommended for sensitive secrets.** Token never enters the project repo. |
+
+> **Security note.** Tokens under `token_from: 'harness'` are stored in
+> the project's Git repo and visible to anyone with repo access (read
+> and via Git history forever). Use `env:VAR_NAME` for anything sensitive
+> — the token then lives on the Gestalt server's environment only and
+> survives `git pull` without ever being committed.
+
+### Tool naming
+
+Every tool the MCP server exposes is automatically namespaced
+`<serverName>__<toolName>` so it can't shadow a built-in. The LLM sees
+the namespaced names; the dispatcher routes by prefix:
+
+```
+readFile                       → built-in file tool (ADR-038)
+github__get_pull_request       → MCP server "github"
+testfs__read_file              → MCP server "testfs"
+```
+
+### Transport
+
+- `http(s)://...` URLs use the modern Streamable HTTP transport. Bearer
+  auth via `Authorization` header when a token resolves.
+- `stdio:<binary> <arg1> <arg2>...` spawns the named child process and
+  speaks JSON-RPC over its stdin/stdout. Typical for local MCP servers
+  like `stdio:npx @modelcontextprotocol/server-filesystem /tmp/test`.
+
+### Failure mode
+
+- Connect / `listTools` failure → that server contributes 0 tools to the
+  LLM. Cycle continues with the remaining tools.
+- `callTool` failure → the LLM receives a tool result with `isError:
+  true` and a human-readable error text. The LLM is free to retry with
+  different arguments, pick a different tool, or give up.
+
+### Observability
+
+- `agent_execution_logs.tool_calls[].toolSource` — `'builtin'` or
+  `'mcp:<serverName>'` per call.
+- Dashboard IntentDetail accordion renders the source as a badge next
+  to each tool call: `readFile (built-in)` vs
+  `github__get_pull_request (MCP: github)`.
+- `GET /projects/:id/agents` `frameworkAgents[].mcpServers` lists the
+  configured server names per agent.
+- `gestalt agents list <project>` prints the MCP server list under
+  each framework agent row.
+
+### Cycle lifecycle
+
+The orchestrator resolves MCP clients ONCE per cycle and caches them
+by server name. A subsequent agent step (e.g. context-agent then
+code-agent both declaring `github`) reuses the existing connection;
+the cache is closed (best-effort) in the orchestrator's `finally`
+block.
