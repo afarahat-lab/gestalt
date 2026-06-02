@@ -157,23 +157,86 @@ export async function select(
 
 // ─── Tables ───────────────────────────────────────────────────────────────────
 
+/**
+ * ANSI escape regex — matches CSI `m`-terminated SGR sequences
+ * (colour / style). Constructed from a String.fromCharCode call so
+ * the literal ESC byte (0x1B) doesn't need to live in source text
+ * (some tools strip it on save). Captures every common chalk
+ * output (`[31m`, `[1m`, `[39m`, `[0m`, etc.).
+ */
+const ESC = String.fromCharCode(0x1b);
+const ANSI_REGEX = new RegExp(ESC + '\\[[0-9;]*m', 'g');
+
+function visualLength(s: string): number {
+  return s.replace(ANSI_REGEX, '').length;
+}
+
+/** Right-pads `s` to `width` visible columns, ignoring ANSI codes. */
+function visualPadEnd(s: string, width: number): string {
+  const len = visualLength(s);
+  if (len >= width) return s;
+  return s + ' '.repeat(width - len);
+}
+
+/**
+ * Truncates `s` to `width` visible columns while preserving any
+ * embedded ANSI escape sequences. If `s` fits, returns it unchanged;
+ * otherwise appends an ANSI reset so cut-off colour doesn't bleed
+ * into the next column.
+ *
+ * Plain `.slice(0, width)` is broken for coloured strings — it
+ * counts the 4-9 escape bytes (e.g. `[32m` = 5 chars) toward the
+ * visible width, so a short value with colour codes can lose its
+ * actual visible character entirely. That was the bug behind the
+ * report of "first char of name missing": `c.success('*')` is 10
+ * raw chars; `slice(0, width - 1)` on a 3-wide column cut to
+ * `[32m` plus a broken trailing `[`, dropping the `*` and
+ * confusing the terminal's escape parser into consuming the next
+ * column's first character.
+ */
+function visualTruncate(s: string, width: number): string {
+  if (visualLength(s) <= width) return s;
+  const ansiPattern = new RegExp('^' + ESC + '\\[[0-9;]*m');
+  let out = '';
+  let visible = 0;
+  let i = 0;
+  while (i < s.length && visible < width) {
+    if (s[i] === ESC && s[i + 1] === '[') {
+      const tail = s.slice(i).match(ansiPattern);
+      if (tail) {
+        out += tail[0];
+        i += tail[0].length;
+        continue;
+      }
+    }
+    out += s[i];
+    visible++;
+    i++;
+  }
+  return out + ESC + '[0m';
+}
+
 export function printTable(
   rows: Array<Record<string, string>>,
   columns: Array<{ key: string; header: string; width?: number }>,
 ): void {
-  // Print header
+  // Print header (no ANSI on headers — plain padEnd is fine)
   const header = columns
     .map((col) => col.header.padEnd(col.width ?? 20))
     .join('  ');
   console.log(chalk.bold(header));
   divider();
 
-  // Print rows
+  // Print rows — visual-length-aware truncation + padding so chalk
+  // colour codes don't get cut mid-escape (which made the terminal
+  // either eat the actual visible character OR leak colour into
+  // subsequent columns).
   for (const row of rows) {
     const line = columns
       .map((col) => {
-        const val = (row[col.key] ?? '').slice(0, (col.width ?? 20) - 1);
-        return val.padEnd(col.width ?? 20);
+        const width = col.width ?? 20;
+        const raw = row[col.key] ?? '';
+        return visualPadEnd(visualTruncate(raw, width), width);
       })
       .join('  ');
     console.log(line);
