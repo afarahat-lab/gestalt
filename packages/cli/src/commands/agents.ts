@@ -94,19 +94,33 @@ export async function agentsValidateCommand(
     blank();
     console.log(c.dim(`Validating agents.yaml for ${project.name} ...`));
     const res = await client.validateAgents(project.id);
-    const { valid, warnings, customAgents } = res.data;
+    const { valid, warnings, customAgents, executionOrder, error } = res.data;
     blank();
     if (valid) {
       const noun = customAgents === 1 ? 'agent' : 'agents';
       console.log(c.success(`✓ agents.yaml valid (${customAgents} custom ${noun} defined)`));
     } else {
       console.log(c.error('✗ agents.yaml invalid'));
+      if (error) {
+        console.log(`  ${c.error(error)}`);
+      }
     }
     if (warnings.length > 0) {
       blank();
       console.log(c.dim('Warnings:'));
       for (const w of warnings) {
         console.log(`  ${c.warn('!')} ${w}`);
+      }
+    }
+    // Show resolved execution order so operators see exactly which
+    // framework agent each custom agent runs after — including the
+    // default `test-agent` for customs that omitted `runs_after`.
+    if (executionOrder && executionOrder.length > 0) {
+      blank();
+      console.log(c.dim('Custom agent execution order:'));
+      const padTo = Math.max(...executionOrder.map((e) => e.runsAfter.length));
+      for (const entry of executionOrder) {
+        console.log(`  ${entry.runsAfter.padEnd(padTo)} → ${c.info(entry.name)}`);
       }
     }
     blank();

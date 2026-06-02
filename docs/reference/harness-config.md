@@ -318,7 +318,7 @@ custom_agents:
   - name: security-review-agent
     role: "Application security reviewer"
     goal: "Identify OWASP Top 10 vulnerabilities in generated code"
-    runs_after: code-agent       # OPTIONAL — parsed but not enforced yet
+    runs_after: code-agent       # run right after code-agent finishes
     llm:
       model: ~                   # null = platform default
       temperature: 0.1
@@ -336,11 +336,73 @@ custom_agents:
 | `name` | yes | string | Unique agent name; becomes `agent_executions.agent_role`. Surfaces as the row label in the dashboard's IntentDetail accordion. |
 | `role` | yes | string | LLM persona (`You are <role>...`) |
 | `goal` | yes | string | One-line statement of intent |
-| `runs_after` | no | string | Framework agent name (e.g. `code-agent`). Parsed but not enforced in Step 2 — all custom agents run after all framework agents regardless. Captured for forward compatibility |
+| `runs_after` | no | string \| null | Framework agent name (e.g. `code-agent`) OR another custom-agent name. The orchestrator runs this custom agent immediately after the named agent completes. `null` (omitted) defaults to `test-agent` — same effect as pre-enforcement behaviour. See **runs_after enforcement** below for valid targets + cycle detection |
 | `llm.model` | no | string \| null | Override the platform default model. `~` (null) means "use default" |
 | `llm.temperature` | no | number | LLM temperature override |
 | `llm.max_tokens` | no | number | LLM max-tokens override (camelCase `maxTokens` also accepted) |
 | `prompt` | yes | string | Prompt template with `{{placeholders}}` — see below |
+
+### runs_after enforcement (ADR-037, shipped 2026-06-02)
+
+`runs_after` interleaves custom agents into the framework graph.
+Without it, every custom agent runs at the end (after `test-agent`)
+in declaration order. With it, agents fire as soon as their declared
+predecessor completes.
+
+**Valid `runs_after` targets:**
+- A framework agent name: `intent-agent`, `design-agent`,
+  `context-agent`, `lint-config-agent`, `code-agent`, `test-agent`
+- Another custom agent declared in the same `agents.yaml`
+- `null` / omitted — defaults to `test-agent`
+
+**Invalid configurations (all caught by `gestalt agents validate`
++ rejected at intent submission):**
+- Unknown target — typo in a framework agent name, or referencing a
+  custom agent that doesn't exist
+- Self-loop — `runs_after: <same agent>`
+- Cycle — e.g. agent A depends on B and B depends on A (or any
+  longer cycle). Detected by Kahn's algorithm on the dependency
+  graph; the validator emits `Cycle detected in custom agent
+  dependencies: a → b → a.`
+
+**At runtime:**
+- The orchestrator schedules customs ONCE per cycle at startup.
+  Invalid config → typed `CONTEXT_GAP` signal → intent transitions
+  to `failed` BEFORE any framework agent runs
+- After each framework step completes (`completed` OR `skipped`,
+  not `failed`), the orchestrator runs every custom that named it
+  in `runs_after`
+- After each custom completes, the orchestrator walks
+  `runs_after: <thatCustomName>` dependents recursively (capped at
+  20 levels deep — a guard against runaway chains, NOT a
+  correctness fence; the cycle check already prevents loops)
+- Custom agent context snapshot includes every artifact produced
+  through the framework step that triggered it — same shape
+  pre-enforcement customs received
+
+**`gestalt agents validate` output:**
+
+A valid config prints the resolved execution order alongside the
+pass message:
+
+```
+✓ agents.yaml valid (2 custom agents defined)
+
+Custom agent execution order:
+  code-agent → security-review-agent
+  test-agent → docs-check-agent
+```
+
+An invalid config prints the scheduler error verbatim and exits
+non-zero:
+
+```
+✗ agents.yaml invalid
+  Custom agent 'security-review-agent' declares runs_after:
+  'nonexistent-agent' but no agent with that name exists.
+  Valid targets: code-agent, context-agent, design-agent,
+  intent-agent, lint-config-agent, test-agent
+```
 
 ### Prompt placeholders
 

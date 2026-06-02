@@ -173,10 +173,23 @@ agents:
 #
 # Example — uncomment and edit to enable:
 #
+# runs_after — ordering hint (ADR-037 / runs_after enforcement,
+#   2026-06-02). Names the framework agent OR another custom agent
+#   that must complete before this custom agent runs. Omit (or set to
+#   null) to default to `test-agent` — the last framework generate
+#   agent — which matches the pre-enforcement "run at the end"
+#   behaviour. Valid framework targets: intent-agent, design-agent,
+#   context-agent, lint-config-agent, code-agent, test-agent.
+#   Unknown targets and cycles in the custom-agent graph are caught
+#   by `gestalt agents validate` and fail intent submission with a
+#   CONTEXT_GAP signal.
+#
 # custom_agents:
 #   - name: security-review-agent
 #     role: "Application security reviewer"
 #     goal: "Identify OWASP Top 10 vulnerabilities in generated code"
+#     runs_after: code-agent      # run right after code-agent finishes
+#                                 # — before test-agent generates tests
 #     llm:
 #       model: ~           # null = platform default; override with e.g. "gpt-4o"
 #       temperature: 0.1
@@ -201,3 +214,20 @@ agents:
 #         ],
 #         "summary": "one line"
 #       }
+#
+#   - name: performance-agent
+#     role: "Performance reviewer"
+#     goal: "Spot N+1 queries, sync I/O on hot paths"
+#     runs_after: security-review-agent   # depend on another custom
+#     llm: { temperature: 0.1 }
+#     prompt: |
+#       ...
+#
+#   - name: docs-check-agent
+#     role: "Documentation reviewer"
+#     goal: "Ensure exported functions have JSDoc"
+#     runs_after: test-agent              # run after tests are generated
+#     llm: { temperature: 0.1 }
+#     prompt: |
+#       Check JSDoc on these files: {{artifacts}}
+#       Return JSON: { "passed": true, "findings": [], "summary": "ok" }

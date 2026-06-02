@@ -364,7 +364,9 @@ function normaliseCustomAgent(input: unknown): CustomAgentDefinition | null {
     name,
     role,
     goal,
-    ...(runsAfter ? { runsAfter } : {}),
+    // null (not undefined) when absent — scheduler keys off this
+    // to apply the `test-agent` default. Matches the brief's shape.
+    runsAfter: runsAfter && runsAfter.trim() ? runsAfter.trim() : null,
     llm,
     prompt,
   };

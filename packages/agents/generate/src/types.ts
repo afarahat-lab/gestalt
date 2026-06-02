@@ -128,17 +128,36 @@ export interface CustomAgentDefinition {
   name: string;
   role: string;
   goal: string;
-  /** Framework agent name (e.g. `code-agent`) the custom agent should
-   *  run after. Parsed but NOT enforced in Step 2 — all custom agents
-   *  run after all framework agents regardless. Captured for forward
-   *  compatibility. */
-  runsAfter?: string;
+  /** Framework agent name (e.g. `code-agent`) OR another custom agent
+   *  name. The orchestrator runs this custom agent immediately after
+   *  the named agent completes (ADR-037, runs_after enforcement
+   *  shipped 2026-06-02). `null` (or omitted in YAML) defaults to
+   *  `test-agent` — the last framework generate agent in the fixed
+   *  graph — so legacy configs that didn't declare `runs_after`
+   *  behave identically. Unknown targets and cycles in the
+   *  custom-agent dependency graph throw at orchestrator startup
+   *  and emit `CONTEXT_GAP`. */
+  runsAfter: string | null;
   llm: AgentLlmConfig;
   /** Template with `{{role}}`, `{{goal}}`, `{{artifacts}}`,
    *  `{{goldenPrinciples}}`, `{{intentText}}`, `{{projectName}}`
    *  placeholders. Unknown placeholders are left in place
    *  (debuggable, matches the template-engine convention). */
   prompt: string;
+  tools?: AgentToolConfig;
+}
+
+/**
+ * Custom agent definition + its resolved dependency. Output of
+ * `scheduleCustomAgents` — agents are sorted so each appears AFTER
+ * its dependency in the array. `dependsOn` is the resolved target
+ * name (framework agent or another custom agent); never null on
+ * a scheduled node (the scheduler coalesces `runsAfter: null` to
+ * the default).
+ */
+export interface CustomAgentNode {
+  definition: CustomAgentDefinition;
+  dependsOn: string;
 }
 
 export interface CustomAgentFinding {

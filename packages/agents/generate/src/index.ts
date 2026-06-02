@@ -9,12 +9,13 @@ export type {
   ExecutionPlan, PlanStep, GateFeedback, OrchestratorState,
   FeedbackSignal, DesignArtifact, DomainChange, ApiContract, ComponentSpec,
   AgentConfig, AgentLlmConfig, AgentsYaml,
-  CustomAgentDefinition, CustomAgentResult, CustomAgentFinding,
+  CustomAgentDefinition, CustomAgentResult, CustomAgentFinding, CustomAgentNode,
 } from './types';
 
 // Agent configuration (agents.yaml — Step 1 + Step 2 of agent externalisation)
 export { loadAgentConfig, defaultAgentConfig, loadCustomAgents } from './config/agent-config-loader';
 export { runCustomAgent } from './agents/custom-agent-runner';
+export { scheduleCustomAgents, FRAMEWORK_AGENT_NAMES } from './orchestrator/custom-agent-scheduler';
 
 // Orchestrator
 export { buildExecutionPlan, getReadySteps, isPlanComplete, hasPlanFailed, getPriorArtifacts } from './orchestrator/plan-builder';

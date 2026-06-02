@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-02 (Claude Code — Two cleanup fixes: no-gestalt-internal-deps constraint rule + JSONB write path typed-helper migration)
+**Last updated:** 2026-06-02 (Claude Code — runs_after enforcement: custom agents now interleave into the framework graph via topological scheduling)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -1707,6 +1707,91 @@ the historical record of how the state evolved._
     `#a855f7`, the platform's `--purple`). Custom rows
     interspersed with framework rows in the chronological
     execution list
+
+**`runs_after` enforcement for custom agents (ADR-037 follow-up).**
+Topologically schedules custom agents so they interleave into the
+framework graph instead of running as a single block at the end of
+drivePlan. Closes the original ADR-037 caveat ("parsed but not
+enforced"):
+- **`CustomAgentDefinition.runsAfter: string | null`**. `null` (or
+  omitted in YAML) defaults to `'test-agent'` — the last framework
+  generate agent — so legacy configs without `runs_after` behave
+  identically to before. New: target may be a framework agent OR
+  another custom agent in the same `agents.yaml`
+- **New `scheduleCustomAgents(definitions): CustomAgentNode[]`** in
+  `packages/agents/generate/src/orchestrator/custom-agent-scheduler.ts`.
+  Validates every `runs_after` target before any topo work; rejects
+  unknown targets, self-loops, and cycles (Kahn's algorithm). On
+  success returns nodes in topologically-sorted order with
+  `dependsOn` resolved to a concrete string. Exported from the
+  package public surface
+- **Orchestrator interleaves at the per-step boundary.** After
+  `transitionIntent('generating')` the orchestrator loads + schedules
+  customs ONCE per cycle. Scheduler throw → typed `CONTEXT_GAP` signal
+  + intent → `failed` BEFORE any framework agent runs. Otherwise
+  builds two adjacency maps (framework→custom[], custom→custom[]) and
+  threads both into `DrivePlanOptions`. Inside `drivePlan`, after
+  each framework step's status becomes `completed` or `skipped`
+  (NOT `failed`), the per-step branch calls
+  `runCustomChainFromList(...)` against the dependent set, which
+  walks the custom→custom map recursively with a depth cap of 20
+- **Single-node runner** — `runOneCustomAgentNode(node, ctx,
+  intentId, correlationId, childLog)` — replaces the prior cycle-
+  level `runCustomAgentsForCycle`. Per-node executions get their
+  own `agent_executions` row + SSE + execution log + signal mapping,
+  same shape the pre-enforcement code produced
+- **Server validate route** (`GET /projects/:id/agents/validate`)
+  now runs `scheduleCustomAgents` after parsing the YAML. Valid →
+  `{ valid: true, executionOrder: [{name, runsAfter}, ...] }`.
+  Invalid → `{ valid: false, error: '...' }`. Empty array when no
+  customs are defined. Operators catch typos and cycles before
+  submitting any intent
+- **CLI** (`gestalt agents validate <projectName>`) prints the
+  resolved order under the pass message: e.g.
+  ```
+  ✓ agents.yaml valid (1 custom agent defined)
+  Custom agent execution order:
+    test-agent → docs-check-agent
+  ```
+  Invalid configs print the scheduler error verbatim
+- **Template + docs.** `agents.yaml` template comments document
+  `runs_after`, the default-to-test-agent rule, and the cycle
+  detection behaviour. `docs/reference/harness-config.md` schema
+  table updated with the enforcement semantics + a worked example
+  of valid/invalid CLI output
+- **Verified live** against `trackeros`:
+  - **Scheduler unit smoke (8 invariants)** — null default,
+    explicit framework target, custom→custom chain ordered,
+    unknown target throws, self-loop throws, two-node cycle
+    detected, three-node cycle detected, declaration-order
+    stability
+  - **Loader+scheduler smoke (4 brief tests)** — Test 1 (security
+    after code, docs after test → valid order printed); Test 3
+    (cycle → `Cycle detected in custom agent dependencies: agent-a
+    → agent-b`); Test 4 (unknown target → `Custom agent 'my-agent'
+    declares runs_after: 'nonexistent-agent' but no agent with that
+    name exists. Valid targets: ...`); bonus three-stage chain
+    `code-agent → security → perf → trailer`
+  - **Server validate endpoint** — `GET /projects/<trackeros>/agents/
+    validate` returns `valid: true, executionOrder:
+    [{name: 'docs-check-agent', runsAfter: 'test-agent'}]` — the
+    legacy `null` default resolves correctly
+  - **CLI `gestalt agents validate trackeros`** — prints exactly
+    the brief's format: `✓ agents.yaml valid (1 custom agent
+    defined)` + `Custom agent execution order: test-agent →
+    docs-check-agent`
+  - **Live intent cycle** (`e43b3246-29c0-47ca-bcef-f21aa18fdd55`,
+    isNonEmpty utility) — `agent_executions` order confirms
+    interleaving: intent-agent → design-agent → context-agent →
+    code-agent → test-agent → **docs-check-agent** (generate:custom,
+    fires right after test-agent) → constraint-agent → review-agent
+    → pr-agent → pipeline-agent. Pre-enforcement, the same
+    docs-check-agent would have run after the gate dispatch in a
+    separate phase. Pipeline-agent failed for unrelated CI reason
+  - **No regression for the trackeros legacy config** — the
+    existing `docs-check-agent` (no `runs_after` declared) still
+    runs after test-agent and produces the same signals it always
+    did
 
 **Step 1: externalise agent prompts to agents.yaml — implemented.**
 - Every LLM-reasoning agent reads its persona (`role`, `goal`), LLM

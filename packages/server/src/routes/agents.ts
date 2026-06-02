@@ -26,7 +26,7 @@ import {
   getRepositories, createContextLogger, type ProjectRecord,
 } from '@gestalt/core';
 import {
-  loadCustomAgents, defaultAgentConfig,
+  loadCustomAgents, defaultAgentConfig, scheduleCustomAgents,
 } from '@gestalt/agents-generate';
 import type {
   CustomAgentDefinition, AgentConfig, AgentsYaml,
@@ -193,8 +193,12 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
         warnings.push('agents.yaml present but has no "agents" key — defaults will be used');
       }
 
-      // Count custom agents using the loader's validation contract.
+      // Count custom agents using the loader's validation contract
+      // AND topologically schedule them so the operator gets the
+      // resolved execution order before submitting an intent.
       let customAgentsCount = 0;
+      let executionOrder: Array<{ name: string; runsAfter: string }> = [];
+      let scheduleError: string | null = null;
       try {
         const tmp = await mkdtemp(join(tmpdir(), `gestalt-agents-parse-`));
         try {
@@ -202,6 +206,19 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
           await fs.writeFile(join(tmp, 'agents.yaml'), yamlRaw, 'utf8');
           const defs = await loadCustomAgents(tmp);
           customAgentsCount = defs.length;
+          // runs_after enforcement — surface scheduling errors as
+          // first-class validation failures so `gestalt agents
+          // validate` catches operator typos and cycles before any
+          // intent runs.
+          try {
+            const scheduled = scheduleCustomAgents(defs);
+            executionOrder = scheduled.map((n) => ({
+              name: n.definition.name,
+              runsAfter: n.dependsOn,
+            }));
+          } catch (err) {
+            scheduleError = err instanceof Error ? err.message : String(err);
+          }
         } finally {
           await rm(tmp, { recursive: true, force: true }).catch(() => undefined);
         }
@@ -221,11 +238,23 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
         );
       }
 
+      if (scheduleError !== null) {
+        return reply.send({
+          data: {
+            valid: false,
+            warnings,
+            customAgents: customAgentsCount,
+            error: scheduleError,
+          },
+        });
+      }
+
       return reply.send({
         data: {
           valid: warnings.length === 0,
           warnings,
           customAgents: customAgentsCount,
+          executionOrder,
         },
       });
     },

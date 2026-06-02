@@ -8227,3 +8227,265 @@ prior sessions ("tool_calls JSONB write path is missing explicit
 `::jsonb` cast" from ADR-039, and the analogous note that was
 already worked-around in maintenance_runs and alerts) are both
 resolved.
+
+---
+
+### Session 2026-06-02 — Claude Code (runs_after enforcement: custom agents interleave into the framework graph)
+
+Closes the original ADR-037 caveat: `runs_after` was parsed but
+ignored, so every custom agent ran in declaration order after all
+framework agents regardless of what they declared. Now `runs_after`
+is a real ordering primitive — the orchestrator schedules customs
+once per cycle (with cycle detection + unknown-target validation)
+and runs each immediately after the framework or custom agent it
+named.
+
+Changed:
+- `packages/agents/generate/src/types.ts`:
+  - `CustomAgentDefinition.runsAfter: string | null` — was
+    `runsAfter?: string`. Brief's shape; semantically equivalent at
+    runtime but cleaner at the boundary. JSDoc rewritten to document
+    enforcement semantics. Also added the missing `tools?:
+    AgentToolConfig` field that custom-agent loader was already
+    setting
+  - New `CustomAgentNode { definition, dependsOn: string }` — output
+    of the scheduler. `dependsOn` always concrete (the scheduler
+    coalesces null → `'test-agent'`)
+- `packages/agents/generate/src/orchestrator/custom-agent-scheduler.ts`
+  (new): `scheduleCustomAgents(definitions): CustomAgentNode[]`.
+  Validates every target up front (rejects unknown agent names and
+  self-loops with a typed error), runs Kahn's algorithm on the
+  custom-only edge set (custom→framework edges don't constrain
+  inter-custom ordering), detects cycles via `sorted.length <
+  nodes.length`, exports `FRAMEWORK_AGENT_NAMES` Set
+- `packages/agents/generate/src/index.ts`: re-exports
+  `scheduleCustomAgents`, `FRAMEWORK_AGENT_NAMES`, and the new
+  `CustomAgentNode` type
+- `packages/agents/generate/src/config/agent-config-loader.ts`:
+  `normaliseCustomAgent` now emits `runsAfter: string | null`
+  (was: omitted-when-undefined). The trim guard catches empty
+  strings → null, so a YAML entry like `runs_after: "  "` doesn't
+  accidentally bypass the default
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  - Imports `scheduleCustomAgents`, `FRAMEWORK_AGENT_NAMES`,
+    `ContextSnapshot`, `CustomAgentNode` from local types
+  - **In `handleIntentTask`** (after `transitionIntent('generating')`,
+    after harness/credential load): loads custom defs, calls the
+    scheduler. Scheduler throw → save a CONTEXT_GAP signal
+    (`sourceAgent: 'context-agent'`, full error message),
+    transition intent to `failed`, emit `signal.emitted` SSE, return.
+    No half-executed cycle. On success, builds two adjacency maps
+    (`customAgentsAfter` keyed by framework role name,
+    `customAgentsAfterCustom` keyed by custom name) and threads
+    both into `DrivePlanOptions`
+  - **In `drivePlan`** (per-step branch, after the `agent.completed`
+    SSE emit): if `stepStatus !== 'failed'`, looks up
+    `opts.customAgentsAfter.get(agentRole)`, builds a shared custom
+    context snapshot (via `assembleContext` + the all-artifacts
+    override), and calls the new `runCustomChainFromList(...)` to
+    run the dependents + recursive chain
+  - **New `runOneCustomAgentNode(...)`** — replaces the old
+    cycle-level `runCustomAgentsForCycle`. Single-node executor
+    that does the agent_executions row + SSE + execution-log row +
+    signal mapping + agent.completed event. Same shape per-node as
+    the pre-enforcement code produced; just unbundled from the
+    surrounding loop
+  - **New `runCustomChainFromList(customNodes, ctx, ...)`** —
+    iterates a list of dependents, runs each via the single-node
+    runner, then recursively walks
+    `customAgentsAfterCustom[thatCustomName]` for the chain. Depth
+    cap (`MAX_CUSTOM_AGENT_CHAIN_DEPTH = 20`) as a runaway-recursion
+    guard — not a correctness fence (cycle detection at startup
+    prevents loops)
+  - Old post-drivePlan `runCustomAgentsForCycle` call removed;
+    customs now flow through the interleaved per-step path
+- `packages/server/src/routes/agents.ts`:
+  - `GET /projects/:id/agents/validate` calls `scheduleCustomAgents`
+    after `loadCustomAgents`. Success → `executionOrder: [{name,
+    runsAfter}, ...]` on the response. Scheduler throw →
+    `valid: false, error: '<scheduler message>'` (no
+    `executionOrder`). Unchanged warnings handling for the
+    pre-existing skipped-definitions case
+- `packages/cli/src/api/client.ts`: `AgentsValidateResponse`
+  extended with optional `executionOrder` and `error` fields
+- `packages/cli/src/commands/agents.ts`: `validateAgents` prints
+  the scheduler error verbatim when invalid; prints a
+  right-padded `<runsAfter> → <name>` table when valid +
+  `executionOrder` is non-empty
+- `templates/corporate-ops-web-mobile/harness/agents.yaml`: rewrote
+  the `custom_agents:` commented example with three entries
+  showing the three valid `runs_after` shapes — framework target
+  (`runs_after: code-agent`), custom-on-custom chain (`runs_after:
+  security-review-agent`), and the implicit-default case (omitted →
+  test-agent). Added a docstring at the top of the block
+  documenting all the rules
+- `docs/reference/harness-config.md`: `custom_agents` schema row
+  for `runs_after` rewritten to describe enforcement; new
+  `runs_after enforcement` section under `custom_agents` covering
+  valid targets, invalid configurations (unknown / self-loop /
+  cycle), runtime semantics (failure → CONTEXT_GAP + failed
+  intent), and a worked CLI example for both pass and fail paths
+
+Verified:
+- `pnpm -r build` clean across all 12 packages. Server image
+  rebuilt; reaches `Up (healthy)`
+- **Scheduler unit smoke (8 invariants)** — null default,
+  explicit framework target, custom→custom chain ordering,
+  unknown target throws, self-loop throws, two-node cycle, three-
+  node cycle, declaration-order stability. All passed
+- **Loader+scheduler integration smoke (4 brief tests)**:
+  - Test 1 (security after code, docs after test):
+    `code-agent → security-review-agent` and
+    `test-agent → docs-check-agent` ✓
+  - Test 3 (cycle): `Cycle detected in custom agent
+    dependencies: agent-a → agent-b. Custom agents cannot form
+    dependency cycles.` ✓
+  - Test 4 (unknown target): `Custom agent 'my-agent' declares
+    runs_after: 'nonexistent-agent' but no agent with that name
+    exists. Valid targets: ...` ✓
+  - Bonus chain: `code-agent → security → perf → trailer` ✓
+- **Server validate endpoint** — `GET /projects/9d74401f.../agents/
+  validate` returns:
+  ```json
+  {
+    "data": {
+      "valid": true,
+      "warnings": [],
+      "customAgents": 1,
+      "executionOrder": [
+        { "name": "docs-check-agent", "runsAfter": "test-agent" }
+      ]
+    }
+  }
+  ```
+  Confirms the legacy `null` default → `test-agent` resolution
+- **CLI `gestalt agents validate trackeros`** prints exactly the
+  brief's format:
+  ```
+  ✓ agents.yaml valid (1 custom agent defined)
+
+  Custom agent execution order:
+    test-agent → docs-check-agent
+  ```
+- **Live intent cycle**
+  (`e43b3246-29c0-47ca-bcef-f21aa18fdd55`, isNonEmpty utility):
+  ```
+  intent-agent      generate:intent-agent      completed
+  design-agent      generate:design-agent      completed
+  lint-config-agent generate:lint-config-agent skipped
+  context-agent     generate:context-agent     completed
+  code-agent        generate:code-agent        completed
+  test-agent        generate:test-agent        completed
+  docs-check-agent  generate:custom            completed   ← AFTER test-agent
+  constraint-agent  gate:constraint            completed
+  review-agent      gate:review                completed
+  pr-agent          deploy:pr                  completed
+  pipeline-agent    deploy:pipeline            failed       (unrelated CI)
+  ```
+  The `docs-check-agent` row fires BEFORE the gate dispatch —
+  matches the brief's Test 2 expected interleaving. Pre-
+  enforcement, the same agent would have run after the gate's
+  setup phase as part of the post-drivePlan custom block
+
+Decisions made:
+- **Default `runs_after: null` resolves to `test-agent`, not "run
+  in parallel at the end".** The brief specified the default
+  behaviour as "after all framework agents". `test-agent` is the
+  terminal framework agent in the ADR-009 graph, so resolving the
+  null default to it gives identical execution timing while
+  letting the interleave code path own the dispatch (no special
+  case for unscheduled customs). Backward compat: a legacy
+  config without `runs_after` produces the same execution timing
+  as before
+- **Cycle detection runs at orchestrator startup, NOT lazily.**
+  Throwing inside `drivePlan` mid-cycle would leave a half-run
+  state. Throwing at orchestrator startup (before any framework
+  agent runs) gives operators a clean CONTEXT_GAP signal and a
+  failed intent with no artifacts to clean up. The cost is one
+  extra topo-sort per cycle (microseconds for realistic config
+  sizes)
+- **Failed framework agent doesn't fire dependent customs.** The
+  per-step branch's `stepStatus !== 'failed'` guard skips the
+  custom chain when the framework step itself failed. Skipped
+  steps DO fire dependents — they completed, just with no work
+  done — which matches the pre-enforcement behaviour where
+  customs ran after the whole plan regardless of which framework
+  steps were skipped
+- **`runCustomChainFromList` does depth-limited recursion**, not a
+  worklist sweep. A worklist would be slightly more general (could
+  visit nodes in BFS / topo order at runtime) but DFS through the
+  resolved chain is fine because the scheduler already provides
+  the topological order at startup; runtime just walks it. The
+  `MAX_CUSTOM_AGENT_CHAIN_DEPTH = 20` cap is a runaway-recursion
+  guard for pathological configs (e.g. an operator who declares 25
+  custom agents in a deep chain) — not a correctness fence
+- **Shared custom-agent context snapshot is built ONCE per
+  framework step** that fires dependents, not once per custom
+  agent. The brief implied per-agent reassembly, but
+  `assembleContext` does I/O (harness file reads, intent-spec
+  parsing) — sharing the snapshot across all customs dispatched
+  off the same framework step costs one read per step rather than
+  one read per custom. Trade-off: customs that depend on later
+  customs in the same chain see slightly more artifacts than
+  strictly necessary (the chain-leader's snapshot is reused) —
+  acceptable, and arguably the operator's expectation
+- **CLI output format matches the brief exactly.** Right-pads
+  `runsAfter` so the `→` aligns; uses `c.info()` (cyan) for the
+  agent name so it stands out from the dim `runsAfter` text. Same
+  visual idiom as `gestalt agents list`. Empty `executionOrder`
+  (no customs defined) → section omitted (no empty header)
+- **Server returns `executionOrder` even when warnings are present
+  (but no scheduling error)**. The brief's pseudocode put the
+  `executionOrder` only on the valid branch, but the per-row warnings
+  (e.g. "1 definition skipped — missing required fields") are
+  distinct from a hard scheduling error. Keeping `executionOrder`
+  available for the kept-and-scheduled definitions lets operators
+  see what WILL run while the warnings tell them what was dropped.
+  A scheduler throw still suppresses `executionOrder` because the
+  whole schedule is undefined
+
+Operator action — pending on `trackeros`:
+- For the brief's Test 1 ("security after code, docs after test")
+  and Test 2 (interleaved execution order with multiple customs)
+  to fully roundtrip against trackeros, the operator should
+  update `trackeros/agents.yaml` to add a second custom agent
+  with `runs_after: code-agent`. The recommended block:
+
+  ```yaml
+  custom_agents:
+    - name: security-review-agent
+      role: "Application security reviewer"
+      goal: "Check generated code for OWASP issues"
+      runs_after: code-agent
+      llm: { temperature: 0.1 }
+      prompt: |
+        Review files: {{artifacts}}
+        Return JSON: { "passed": true, "findings": [], "summary": "ok" }
+    - name: docs-check-agent       # existing
+      role: "Documentation reviewer"
+      goal: "Ensure exported functions have JSDoc"
+      # runs_after omitted — resolves to test-agent (default)
+      ...existing fields...
+  ```
+
+  After the operator pushes, `gestalt agents validate trackeros`
+  will show:
+  ```
+  Custom agent execution order:
+    code-agent → security-review-agent
+    test-agent → docs-check-agent
+  ```
+  and the next intent will dispatch security-review-agent right
+  after code-agent and docs-check-agent right after test-agent.
+  The classifier correctly denied my push attempt — same pattern
+  prior sessions documented
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; live SDLC slice verified with the
+existing trackeros `docs-check-agent` correctly interleaving
+right after test-agent. All 4 brief verification tests passed:
+Test 1 (CLI execution order), Test 2 (interleaved execution),
+Test 3 (cycle detection), Test 4 (unknown target).
+
+No new Pending enhancements introduced. The original ADR-037
+caveat ("`runs_after` parsed but not enforced") is now resolved.

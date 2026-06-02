@@ -126,6 +126,13 @@ export interface AgentsValidateResponse {
   valid: boolean;
   warnings: string[];
   customAgents: number;
+  /** Resolved custom-agent execution order from the scheduler.
+   *  Empty array when no customs are defined or when scheduling
+   *  threw. ADR-037 / runs_after enforcement. */
+  executionOrder?: Array<{ name: string; runsAfter: string }>;
+  /** Scheduling error (unknown runs_after target, cycle, self-loop).
+   *  When present, `valid` is `false` and `executionOrder` is empty. */
+  error?: string;
 }
 
 // ─── Users + memberships (migration 010) ─────────────────────────────────────
