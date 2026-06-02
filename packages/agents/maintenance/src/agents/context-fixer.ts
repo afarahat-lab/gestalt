@@ -39,8 +39,9 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { simpleGit } from 'simple-git';
 import { createContextLogger } from '@gestalt/core';
-import { loadAgentConfig, BaseLLMAgent } from '@gestalt/agents-generate';
-import type { AgentConfig, AgentResult } from '@gestalt/agents-generate';
+import { loadAgentConfig, BaseLLMAgent } from '@gestalt/core';
+import type { AgentConfig } from '@gestalt/core';
+import type { AgentResult } from '@gestalt/agents-generate';
 import type { MaintenanceIntent } from '../types';
 import { authenticatedGitUrl, maintenanceIntentPrefix } from './util';
 

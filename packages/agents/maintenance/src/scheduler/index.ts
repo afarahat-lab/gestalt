@@ -24,7 +24,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import cron from 'node-cron';
 import { simpleGit } from 'simple-git';
-import { createContextLogger } from '@gestalt/core';
+import { createContextLogger, BaseOrchestrator } from '@gestalt/core';
 import type { QueueConfig, MaintenanceRunRecord } from '@gestalt/core';
 import type { HarnessSubset } from '../types';
 import { runDriftAgent } from '../agents/drift-agent';
@@ -52,7 +52,22 @@ const SCHEDULE_ALIGNMENT  = '0 3 * * *';
 const SCHEDULE_GC         = '0 4 * * 5';
 const SCHEDULE_EVALUATION = '*/15 * * * *';
 
+/**
+ * Maintenance orchestrator (Amendment 2026-06 — `extends
+ * BaseOrchestrator` for the structural goal of every orchestrator
+ * sharing one base. context-fixer (the LLM-using maintenance agent)
+ * picks up the new tool-config defaults via `loadAgentConfig` from
+ * core directly).
+ */
+export class MaintenanceOrchestrator extends BaseOrchestrator {
+  constructor() { super('maintenance-orchestrator'); }
+}
+
 export function startMaintenanceScheduler(config: MaintenanceSchedulerConfig): void {
+  // Instantiate the class for future use of shared services. The
+  // existing cron-driven `triggerMaintenanceRun` continues to drive
+  // per-agent execution.
+  new MaintenanceOrchestrator();
   cron.schedule(SCHEDULE_DRIFT,      () => void triggerMaintenanceRun({ agentName: 'drift-agent',      config }));
   cron.schedule(SCHEDULE_ALIGNMENT,  () => void triggerMaintenanceRun({ agentName: 'alignment-agent',  config }));
   cron.schedule(SCHEDULE_GC,         () => void triggerMaintenanceRun({ agentName: 'gc-agent',         config }));

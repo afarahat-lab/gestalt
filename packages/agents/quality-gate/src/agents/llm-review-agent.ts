@@ -28,8 +28,9 @@ import { readFile } from 'fs/promises';
 import { join } from 'path';
 import type { ArtifactRef, GateAgentResult, GateSignal, GateTask } from '../types';
 import type { Artifact, ConstraintRule, SignalSeverity } from '@gestalt/core';
-import { loadAgentConfig, BaseLLMAgent } from '@gestalt/agents-generate';
-import type { AgentConfig, AgentResult } from '@gestalt/agents-generate';
+import { loadAgentConfig, BaseLLMAgent } from '@gestalt/core';
+import type { AgentConfig } from '@gestalt/core';
+import type { AgentResult } from '@gestalt/agents-generate';
 
 interface LLMReviewItem {
   file?: string;
@@ -111,7 +112,19 @@ export class ReviewAgent extends BaseLLMAgent {
     let review: LLMReview;
     let raw: string | undefined;
     try {
-      raw = await this.callLLM(prompt, agentConfig, task.correlationId);
+      // Amendment 2026-06 — review-agent gains tool access. The
+      // per-role default (`readFile`, `searchFiles`) lets the model
+      // spot-check files referenced in the artifact set before
+      // flagging issues, which produces fewer false positives on
+      // big diffs. Falls through to plain `callLLM` when the
+      // operator's agents.yaml strips the tools.
+      const toolResult = await this.callLLMWithTools(
+        prompt,
+        agentConfig,
+        task.harnessConfig.projectRoot,
+        task.correlationId,
+      );
+      raw = toolResult.response;
       review = parseReview(raw);
     } catch {
       // LLM call or JSON parse failed. Treat as `errored` — the gate

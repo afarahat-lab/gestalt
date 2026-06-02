@@ -114,6 +114,30 @@ export interface CodeLocation {
   rule?: string;
 }
 
+/**
+ * Cross-layer agent signal — alias of `PlatformSignal` introduced
+ * when BaseLLMAgent moved to `@gestalt/core` (2026-06-02). The
+ * generate / quality-gate / maintenance packages re-export this as
+ * `FeedbackSignal` so historical call sites keep working.
+ */
+export type FeedbackSignal = PlatformSignal;
+
+/**
+ * Lifecycle status of a single agent step. Used by all three layers
+ * (generate, gate, maintenance) — moved to core alongside
+ * BaseLLMAgent. `'clarification-needed'` is generate-specific (the
+ * intent-agent's pause path); other layers only use the first five
+ * values. `'skipped'` covers steps the plan declared but the runtime
+ * decided not to execute (e.g. lint-config-agent on greenfield).
+ */
+export type AgentStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'skipped'
+  | 'clarification-needed';
+
 // ─── Artifact ─────────────────────────────────────────────────────────────────
 
 export type ArtifactType =

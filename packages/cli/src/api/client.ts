@@ -120,6 +120,14 @@ export interface CustomAgentDefinition {
 export interface AgentsListResponse {
   frameworkAgents: AgentSummary[];
   customAgents: CustomAgentDefinition[];
+  /** Amendment 2026-06 — three-layer partition of the framework
+   *  agents. Optional on the wire so older server builds without
+   *  the field don't break the CLI's parse. */
+  layers?: {
+    generate: { framework: AgentSummary[]; custom: CustomAgentDefinition[] };
+    gate: { framework: AgentSummary[]; infrastructure: string[] };
+    maintenance: { llm: AgentSummary[]; infrastructure: string[] };
+  };
 }
 
 export interface AgentsValidateResponse {

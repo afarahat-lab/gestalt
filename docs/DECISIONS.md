@@ -751,6 +751,56 @@ a `mcp?:` field so the schema doesn't shift when ADR-039 lands.
   section between the prompt and the LLM response when the row has
   any tool_calls entries; empty array → section hidden.
 
+### Amendment 2026-06 — BaseLLMAgent + BaseOrchestrator + uniform tool/MCP access
+
+- **`BaseLLMAgent` moved to `@gestalt/core`.** All agent layers
+  (generate, gate, maintenance) import the same implementation.
+  The generate package keeps re-export shims at the old paths so
+  existing imports keep working. The class is now generic over
+  task / result shapes (`BaseLLMAgent<TTask, TResult>`) so each
+  layer can declare its own typed pair without forcing
+  generate-specific shapes into core.
+- **`BaseOrchestrator` added to `@gestalt/core`.** Slim
+  services-oriented class — protected helpers for `closeMcpClients`,
+  `loadHarness`, and `resolveAgentContext` (combines
+  `loadAgentConfig` + `resolveMcpClients` with a per-cycle MCP
+  cache shared across agent steps). Each of the three layer
+  orchestrators (`GenerateOrchestrator`, `GateOrchestrator`,
+  `MaintenanceOrchestrator`) `extends BaseOrchestrator`. The
+  amendment deliberately deviates from the brief's pseudocode
+  template-method pattern (`withProjectClone` controlling the
+  cycle lifecycle, single `execute(ctx)` entry) — generate's
+  resume / clarification / retry flow doesn't fit a single
+  template, so the base provides shared services rather than
+  forcing a uniform shape.
+- **`loadAgentConfig` + `loadCustomAgents` moved to
+  `@gestalt/core/agents/agent-config-loader`** with re-export
+  shims from agents-generate. Quality-gate and maintenance now
+  import these from core directly — they no longer need
+  `@gestalt/agents-generate` for anything other than residual
+  `AgentResult` re-exports.
+- **`PER_ROLE_DEFAULTS` expanded** to include `review-agent` (gate
+  layer, file tools: `readFile + searchFiles`), `drift-agent` and
+  `alignment-agent` (maintenance layer, full file-tool set), and
+  `context-fixer` (maintenance layer, narrow `readFile +
+  listDirectory`). Operators may override via `agents.yaml`; new
+  `gestalt init` projects ship with these defaults in the template.
+- **review-agent switched from `callLLM` to `callLLMWithTools`**
+  so it can spot-check files referenced in the artifact set
+  before flagging issues. Falls through to plain LLM call when
+  the operator strips tools via `agents.yaml`.
+- **`GET /projects/:id/agents` payload extended** with a
+  `layers: { generate, gate, maintenance }` field partitioning
+  the framework agents by layer + listing infrastructure agents
+  (`constraint-agent`, `lint-agent`, `security-agent`,
+  `test-runner-agent` under gate; `gc-agent`, `evaluation-agent`
+  under maintenance). The legacy `frameworkAgents` /
+  `customAgents` fields stay on the response so older
+  dashboard / CLI builds keep working.
+- **`gestalt agents list <projectName>` renders by layer** —
+  Generate / Gate / Maintenance sections with each LLM agent's
+  resolved `tools:` and `MCP:` set surfaced inline.
+
 ---
 
 ## ADR-039 — MCP (Model Context Protocol) for external integrations

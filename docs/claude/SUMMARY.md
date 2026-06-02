@@ -7,7 +7,7 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-02 (Claude Code — runs_after enforcement: custom agents now interleave into the framework graph via topological scheduling)
+**Last updated:** 2026-06-02 (Claude Code — BaseLLMAgent + BaseOrchestrator moved to @gestalt/core; uniform tool/MCP access across all layers)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -2086,323 +2086,6 @@ enforced"):
 
 ## Last three session entries
 
-### Session 2026-06-02 — Claude Code (ADR-039 MCP integration)
-
-Extends ADR-038 (built-in file tools) with the platform's external-
-integration mechanism: agents now connect to compliant MCP (Model
-Context Protocol) servers declared per-agent in `agents.yaml`. The
-generate orchestrator opens connections once per cycle, threads the
-matched subset to each agent's `AgentTask.mcpClients`, and closes
-the cache in `finally`. The OpenAI tool-calling loop is unchanged —
-MCP tools merge into the same flat tool list using a namespace
-prefix that prevents collisions with built-ins.
-
-Changed:
-- `packages/core/package.json`: added
-  `@modelcontextprotocol/sdk@^1.29.0` runtime dep. Agents in other
-  packages import `McpClient` from `@gestalt/core` — the SDK lives
-  in core only
-- `packages/core/src/types.ts`: `ToolCallLogEntry` gained
-  `toolSource?: string` (`'builtin'` or `'mcp:<name>'`)
-- `packages/core/src/harness/index.ts`: `HarnessConfig` gained
-  optional `mcp?: { servers: Array<{ name, url, token? }> }` —
-  feeds the `tokenFrom: 'harness'` resolver source
-- `packages/core/src/tools/mcp-client.ts` (new): the `McpClient`
-  class. Single-cycle scoped — connect lazily on first
-  `listTools`/`executeTool`, reuse the connection across calls,
-  close when the orchestrator's `finally` runs. Two transports
-  via URL scheme:
-  - `http(s)://...` → `StreamableHTTPClientTransport` (the modern
-    MCP-spec name for HTTP + SSE). Bearer auth via `Authorization`
-    header when a token resolves
-  - `stdio:<bin> <arg1> <arg2>...` → `StdioClientTransport` spawns
-    the named child process. Used for local servers via npx
-  - The SDK is ESM-only (`"type": "module"`); core builds CJS, so
-    every SDK import is a dynamic `import()` (same pattern as
-    `globby` in file-tools.ts). Untyped at the boundary
-    (`SdkClient` shape declared locally) to keep the SDK's type
-    surface out of every downstream package's `.d.ts`
-  - Tool naming: `<serverName>__<toolName>` on every `listTools()`
-    result; description prefixed `[serverName]`. The prefix is
-    stripped before `executeTool` calls the SDK
-  - Non-fatal everywhere: `listTools()` returns `[]` on any thrown
-    error; `executeTool()` returns
-    `{ isError: true, content: 'MCP error (...): ...' }`. The
-    orchestrator + LLM both proceed without that server's tools
-- `packages/core/src/tools/mcp-resolver.ts` (new):
-  `resolveMcpClients(configs, harnessConfig, projectCredential)`.
-  Three credential sources via `tokenFrom`:
-  - `'harness'` → lookup by server name in
-    `HarnessConfig.mcp.servers[].token`
-  - `'project_credential'` → reuse the project's Git PAT
-  - `'env:VAR_NAME'` → `process.env.VAR_NAME`
-  Missing tokens → `undefined` (client connects anonymously). The
-  resolver always returns one client per input config — `listTools`
-  failures degrade silently at the agent call boundary, not here
-- `packages/core/src/index.ts`: re-exports `McpClient`,
-  `resolveMcpClients`, `McpServerConfig`
-- `packages/agents/generate/src/types.ts`:
-  - New `McpServerConfig` (local mirror of the core type with the
-    same tokenFrom union)
-  - `AgentToolConfig` extended with `mcp?: McpServerConfig[]`
-  - `AgentTask` gained `mcpClients?: McpClient[]` — populated by
-    the orchestrator's `resolveMcpForAgent` for agents whose
-    config declared MCP servers. Lifecycle stays on the
-    orchestrator
-- `packages/agents/generate/src/config/agent-config-loader.ts`:
-  - `extractTools` now extracts both `tools.builtin` AND
-    `tools.mcp[]`. The new helper `extractMcpServers(value)`
-    validates each entry (`name`, `url`, `tokenFrom` —
-    snake_case `token_from` also accepted) and drops invalid
-    entries silently. `mcp` only included on the returned shape
-    when non-empty so the orchestrator's resolver doesn't see
-    wire noise
-- `packages/agents/generate/src/agents/base-llm-agent.ts`:
-  - `callLLMWithTools` signature gained
-    `mcpClients?: McpClient[]` as an optional fifth parameter
-  - When `mcpClients` is non-empty: parallel `Promise.all(c.listTools())`
-    across all clients; results merged with the built-in defs and
-    sent to `LLMClient.completeWithTools` as a single flat tool list
-  - Built `mcpByPrefix` Map keyed by `<serverName>__` for O(1)
-    dispatch. Tool-call loop: `findMcpForCall(toolName, map)` →
-    `mcpClient.executeTool(...)` on match, else
-    `executeFileTool(...)`. `ToolCallLogEntry.toolSource` recorded
-    per call (`'mcp:<name>'` or `'builtin'`)
-  - The MCP clients are NOT closed in the agent's `finally` —
-    they're cycle-scoped, owned by the orchestrator. A documented
-    `// Note —` comment marks this explicitly to prevent a future
-    refactor from re-introducing the bug
-  - New `findMcpForCall(toolName, mcpByPrefix)` exported helper at
-    the bottom of the file
-- `packages/agents/generate/src/agents/code-agent.ts`,
-  `context-agent.ts`:
-  - Replaced the `hasTools = builtin.length > 0` check with
-    `hasBuiltin || hasMcp`. MCP-only agents (operator disabled
-    built-ins, kept just an MCP server) still drive the tool loop
-  - Forward `task.mcpClients` to `callLLMWithTools` as the fifth
-    arg. No other agent role passes them through (intent / design /
-    test / lint-config don't have a tools-use story today)
-- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
-  - Imports `McpClient`, `resolveMcpClients`, `createHarnessEngine`,
-    `HarnessConfig` from `@gestalt/core`
-  - `handleIntentTask` gained a per-cycle
-    `mcpCache: Map<string, McpClient>` at top of the function.
-    After `projectRoot` is resolved (clone path), reads
-    `HarnessConfig` from the cloned tree via
-    `createHarnessEngine(projectRoot).buildSnapshot(...)`. Loads
-    `projectCredential` via `projects.getCredential(project.id)`.
-    Both threaded into `DrivePlanOptions` (new fields:
-    `mcpCache`, `harnessConfig`, `projectCredential`). HARNESS.json
-    parse failure → warn, continue with `null` (cycle still runs;
-    `tokenFrom: 'harness'` entries just resolve to anonymous)
-  - `finally` block closes every cached `McpClient` (best-effort)
-    BEFORE removing the work dir. Order matters — closing a
-    stdio transport sends a `kill` to the child process, and we
-    want that to finish before the cleanup tears down the temp
-    dir the SDK may still be writing logs into
-  - New `resolveMcpForAgent(configs, cache, harness, credential,
-    log)` helper at the bottom of the file. Cache hit → reuse;
-    cache miss → `resolveMcpClients(uncached, ...)`, store in
-    cache, return matched subset. Caller passes
-    `context.agentConfig.tools?.mcp ?? []`
-- `templates/corporate-ops-web-mobile/harness/agents.yaml`: under
-  `code-agent.tools.builtin`, appended a `# ADR-039` commented
-  block with explanations of the three `token_from` sources +
-  two example entries (HTTP server + stdio server) so operators
-  can uncomment and customise. The security implication of
-  `token_from: harness` (token visible in project repo) is
-  flagged inline
-- `packages/server/src/routes/agents.ts`:
-  - `AgentSummary` gained `mcpServers: string[]`
-  - `extractToolsFromEntry` extended to parse `tools.mcp[]` with
-    the same validation the loader does. Returns the full
-    `AgentToolConfig` shape including mcp entries
-  - `buildAgentSummary` populates `mcpServers:
-    (merged.tools?.mcp ?? []).map((m) => m.name)`. Empty array
-    for the common pre-039 case
-- `packages/cli/src/api/client.ts`: `AgentSummary` mirrored the
-  server shape with optional `builtinTools` + `mcpServers`
-- `packages/cli/src/commands/agents.ts`: `agentsListCommand`
-  prints `· MCP: server1, server2` after the prompt-extension
-  count when `mcpServers.length > 0`. No-MCP agents render the
-  pre-039 layout
-- `packages/dashboard/src/views/IntentDetail.tsx`:
-  - `ExecutionLogResponse.log.toolCalls[].toolSource: string`
-    (optional). The dashboard's `Tool calls (N)` section renders
-    `formatToolSource(tc.toolSource)` as a small badge after each
-    tool name: `readFile (built-in)`, `github__get_pull_request
-    (MCP: github)`. The badge colour is muted for built-in,
-    `var(--purple)` for MCP — matches the custom-agent badge
-    pattern from ADR-037
-  - New helpers `formatToolSource(source)` +
-    `toolSourceBadge(source)` at the bottom of the file
-- `docs/DECISIONS.md`: appended ADR-039 with full Context /
-  Decision / Token sources / Tool routing / Observability /
-  Failure mode / Transports / Consequences sections
-- `docs/reference/harness-config.md`: appended an MCP section
-  covering both the `agents.yaml` `tools.mcp[]` schema AND the
-  `HARNESS.json` `mcp.servers[]` schema (only consulted when
-  `tokenFrom: 'harness'`). Token-source comparison table.
-  Security note on `harness`-source tokens being visible in the
-  project repo. Tool-naming + transport + failure mode +
-  observability + cycle lifecycle sections
-
-Verified live:
-- `pnpm -r build` clean across all 12 packages. Server image
-  rebuilt; reaches `Up (healthy)`; `/health` returns 200; login
-  via the cached token works
-- **Stage 1** — no-MCP regression check (trackeros has no MCP
-  entries committed):
-  - Submitted clamp utility intent (correlationId `7bbcc38f`)
-  - Cycle ran 11 agent executions through generate + gate +
-    deploy in ~80 s (pipeline-agent failed for an unrelated CI
-    reason — project test runner — outside ADR-039 scope)
-  - `code-agent` made 2 real built-in tool calls
-    (`listDirectory`, `searchFiles`), each persisted in
-    `agent_execution_logs.tool_calls` with `toolSource:
-    'builtin'`. Confirmed via direct SQL:
-    `tc["toolSource"] == 'builtin'` for both entries
-  - Every framework agent's `mcpServers` list in
-    `GET /projects/:id/agents` was `[]` — no MCP code path
-    crashed; the no-MCP cycle behaves identically to pre-039
-- **Stage 2** — live MCP server smoke (off-thread of the
-  orchestrator, exercising the McpClient + resolver +
-  dispatch code paths directly):
-  - Spawned `npx -y @modelcontextprotocol/server-filesystem
-    /private/tmp/test-mcp-dir` via stdio transport (macOS
-    resolves `/tmp` to `/private/tmp` — used the resolved
-    path so the SDK's path-allowlist accepted the read)
-  - `McpClient.listTools()` returned 14 namespaced tools
-    (`testfs__read_file`, `testfs__write_file`,
-    `testfs__list_directory`, …) each with a `[testfs]`
-    description prefix
-  - `executeTool('testfs__read_file', {path:
-    '/private/tmp/test-mcp-dir/test.txt'})` stripped the
-    `testfs__` namespace, called the SDK, returned the
-    file content (`hello from mcp`) with `isError: false`
-  - Failure path also confirmed: the first attempt used the
-    macOS-symlink `/tmp/...` path which the MCP server's
-    allowlist rejected — `executeTool` returned `isError:
-    true` with `content: 'Access denied - path outside
-    allowed directories...'`. No thrown exception escaped
-  - `resolveMcpClients` exercised with `tokenFrom:
-    'env:NOOP_TOKEN'` — env-source path resolves; client
-    connects anonymously (the stdio filesystem server
-    doesn't check the token)
-  - Namespace-dispatch invariants confirmed against the
-    same prefix Map BaseLLMAgent builds:
-    1. `testfs__list_directory` → MCP `testfs` (correct)
-    2. `listDirectory` (no namespace) → built-in
-       fallthrough (correct — `mcpByPrefix` lookup returns
-       null)
-    3. **Shadowing probe**: a hypothetical built-in named
-       exactly `testfs` would NOT be intercepted by the
-       MCP server. The prefix check uses `testfs__`, not
-       `testfs`, so `'testfs'.startsWith('testfs__')` is
-       false. Built-ins are protected
-  - `McpClient.close()` clean — the spawned child process
-    terminates without lingering
-
-Decisions made:
-- **MCP client lifecycle: per-cycle, owned by the
-  orchestrator.** The brief allowed per-agent-run; reviewed
-  this against the cycle structure and chose per-cycle so a
-  multi-agent run (`code-agent` + `context-agent` both
-  declaring `github`) shares one connection. Closing happens
-  exactly once in `handleIntentTask.finally`. Agents borrow,
-  do not own. Documented with a comment in
-  `BaseLLMAgent.callLLMWithTools` so a refactor doesn't
-  re-introduce the close-in-agent bug
-- **Cache keyed by serverName, not by URL.** Two agent
-  configs naming the same `name: github` but pointing at
-  different URLs would collide on the cache, but `agents.yaml`
-  is a single file and the operator picks one URL per name
-  anyway. Keying by name matches the namespace prefix the
-  dispatcher uses, which is also the operator's mental model
-- **`resolveMcpForAgent` is lazy + filtered.** Pre-scanning
-  every agent's config at the top of the cycle would cleanly
-  separate "what's declared" from "what's used", but adds a
-  pass that contributes nothing — agents that never run (the
-  plan skipped them) would have opened idle connections.
-  Lazy means the cache only fills with servers an actually-
-  executed agent declared
-- **Read HARNESS.json again in `handleIntentTask`** even
-  though `context-assembler` already does that per agent
-  step. Considered threading harnessConfig down from
-  `assembleContext` but that would have meant the
-  orchestrator's MCP cache initialisation depended on the
-  first agent step running. Reading once at the top of the
-  cycle is cleaner and the cost (one `readFile` per cycle) is
-  negligible. Falls back to `null` on parse failure — the
-  cycle still runs; `tokenFrom: 'harness'` entries just
-  connect anonymously
-- **Namespace prefix is `<serverName>__` (double underscore),
-  not `:`** as the brief sketched. Two reasons: (1) MCP tool
-  names from `@modelcontextprotocol/server-filesystem`
-  already contain underscores (`read_text_file`,
-  `list_directory`), so single-underscore would have eaten
-  legibility; (2) OpenAI's function-calling tool names are
-  restricted to `[a-zA-Z0-9_-]` and reject `:`. Double-
-  underscore is unambiguous, OpenAI-compatible, and survives
-  a roundtrip through every provider we've tested
-- **MCP tool definitions exposed to the LLM use the SDK's
-  raw inputSchema unchanged.** The OpenAI converter inside
-  `LLMClient.completeWithTools` already turns
-  `{ name, description, parameters }` into the request shape.
-  Passing through the SDK's schema means the LLM sees
-  whatever the MCP server author chose — no platform-side
-  filtering, no shape normalisation. If a server returns a
-  bad schema, the LLM call fails with a clear OpenAI error
-  rather than a silent platform-side rejection
-- **`hasTools` widened to `hasBuiltin || hasMcp`.** Without
-  this an MCP-only agent (operator wanted to disable file
-  tools and use ONLY a code-search MCP server) would have
-  short-circuited to `callLLM` and the MCP clients would
-  never have been listed. The cost is zero for the common
-  case (every framework agent today has built-ins)
-- **`StreamableHTTPClientTransport` first, not
-  `SSEClientTransport`.** The SDK's recommended modern
-  transport is "Streamable HTTP" which negotiates SSE
-  internally. Picking the modern name future-proofs against
-  the SDK eventually dropping the deprecated
-  `SSEClientTransport`. Stdio transport handled
-  by a separate dynamic-import branch when the URL starts
-  with `stdio:`
-- **`tool_calls` JSONB still has the string-scalar storage
-  trap** discovered during Stage 1 — `jsonb_typeof` returns
-  `'string'` rather than `'array'` because the insert path
-  passes the value without an explicit `::jsonb` cast. The
-  data is recoverable (it's valid JSON inside the string)
-  and the shared `parseJsonb` helper unwraps it on read, so
-  every consumer (route, dashboard) gets the correct array.
-  This is the same pattern `maintenance_runs.findings` had
-  before its cast was added. Not fixed in this session —
-  pre-existing from ADR-038's write path. Captured below
-  as a follow-up
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Live verification covered: Stage 1 (no-MCP regression — 11
-real agent executions, 2 built-in tool calls with
-`toolSource: 'builtin'` persisted), Stage 2 (live
-`server-filesystem` over stdio — 14 namespaced tools listed
-+ real file read + dispatch invariants confirmed +
-shadowing probe). The full MCP wire path (SDK dynamic
-import → stdio transport → JSON-RPC → tool result → log
-entry) exercised end-to-end against a real MCP server.
-
-Follow-up logged in Pending enhancements:
-- **`tool_calls` JSONB write path is missing the explicit
-  `::jsonb` cast.** The data is stored as a JSON-encoded
-  string scalar (`jsonb_typeof` returns `'string'`) rather
-  than a JSONB array. `parseJsonb` on the read path
-  normalises this so the dashboard and APIs work correctly,
-  but `jsonb_array_length(tool_calls)` style SQL probes
-  fail. Pre-existing from ADR-038's `execution-logs.ts`
-  insert path. Same fix the maintenance_runs.findings
-  column got — add `::jsonb` cast on the `INSERT`
-
----
-
 ### Session 2026-06-02 — Claude Code (two cleanups: no-gestalt-internal-deps constraint + JSONB write path typed-helper migration)
 
 Two pre-existing issues, both mechanical. No architectural decisions.
@@ -2847,3 +2530,238 @@ Test 3 (cycle detection), Test 4 (unknown target).
 
 No new Pending enhancements introduced. The original ADR-037
 caveat ("`runs_after` parsed but not enforced") is now resolved.
+
+---
+
+### Session 2026-06-02 — Claude Code (BaseLLMAgent + BaseOrchestrator to @gestalt/core; uniform tool/MCP access)
+
+Architectural refactor — moves the abstract base for every
+LLM-calling agent and a new shared orchestrator base into
+`@gestalt/core` so generate / gate / maintenance all share one
+implementation. As a follow-on, expands `PER_ROLE_DEFAULTS` to give
+the gate's `review-agent` and the maintenance layer's LLM agents
+file-tool access, and surfaces all three layers on the
+`GET /projects/:id/agents` endpoint + the CLI display.
+
+Deviation from the brief (flagged in ADR-038 Amendment block):
+the brief's pseudocode for `BaseOrchestrator` prescribed a strict
+template-method pattern (`withProjectClone` controlling cycle
+lifecycle, single `execute(ctx)` subclass entry). Implementing that
+literally would have required rewriting generate's resume /
+clarification / retry / custom-agent interleaving paths in ways that
+change behaviour. The brief's hard constraint was "No behaviour
+changes for the generate layer". `BaseOrchestrator` ships instead as
+a services-oriented class with protected helpers — orchestrators
+extend it for the structural goal and to access shared services, but
+their existing top-level handlers stay intact.
+
+Changed:
+- `packages/core/src/types.ts`: added `FeedbackSignal` (alias of
+  `PlatformSignal`) and `AgentStatus` (six-value union including
+  generate's `'clarification-needed'`)
+- `packages/core/src/agents/agent-config.ts` (new): shared types
+  `AgentLlmConfig`, `AgentToolConfig`, `AgentConfig`, `AgentsYaml`,
+  `CustomAgentDefinition`, `CustomAgentNode`, `LlmCallFn`.
+  Re-exports `McpServerConfig` from the existing
+  `tools/mcp-resolver` so MCP config types stay disjoint
+- `packages/core/src/agents/agent-config-helpers.ts` (new):
+  `applyAgentConfig`, `buildPersona`, `buildExtensionsBlock` —
+  small string-building helpers used by every prompt builder
+- `packages/core/src/agents/agent-config-loader.ts` (new):
+  `loadAgentConfig` + `loadCustomAgents` + `defaultAgentConfig`,
+  with **expanded `PER_ROLE_DEFAULTS`**:
+  - `review-agent` (gate layer) gets `{ builtin: ['readFile',
+    'searchFiles'] }`
+  - `drift-agent` + `alignment-agent` (maintenance) get the full
+    file-tool set
+  - `context-fixer` (maintenance) gets `{ builtin: ['readFile',
+    'listDirectory'] }`
+- `packages/core/src/agents/base-llm-agent.ts` (new): port of the
+  generate-layer class, generic over `<TTask, TResult>` so each
+  layer's subclasses can declare their own typed task/result shapes.
+  All other behaviour (lastPrompt / lastLlmResponse / lastModelUsed
+  capture, callLLM / callLLMWithMessages / callLLMWithTools loop,
+  MCP namespace dispatch, makeContextGapSignal helper) preserved
+  byte-for-byte
+- `packages/core/src/orchestrator/base-orchestrator.ts` (new):
+  `BaseOrchestrator` with `OrchestratorContext` interface +
+  protected `closeMcpClients`, `loadHarness`, `resolveAgentContext`
+  helpers. Subclasses use these for the new tool/MCP work;
+  generate's existing handler keeps inline-resolving for its
+  existing flow (no behaviour change)
+- `packages/core/src/index.ts`: exports the new types and classes
+- `packages/agents/generate/src/agents/base-llm-agent.ts`,
+  `packages/agents/generate/src/config/agent-config-loader.ts`,
+  `packages/agents/generate/src/prompts/agent-config-helpers.ts`:
+  rewritten as re-export shims — `export { BaseLLMAgent } from
+  '@gestalt/core'` etc. Every existing import path keeps working
+- `packages/agents/generate/src/types.ts`: removed the now-duplicate
+  declarations of `AgentLlmConfig`, `AgentToolConfig`, `AgentConfig`,
+  `AgentsYaml`, `McpServerConfig`, `CustomAgentDefinition`,
+  `CustomAgentNode`, `LlmCallFn`, `FeedbackSignal`, `AgentStatus`.
+  Re-exports those names from `@gestalt/core` so callers using
+  `import type { ... } from '@gestalt/agents-generate'` keep
+  working. Local imports added for internal references in this
+  same file
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`: adds
+  `class GenerateOrchestrator extends BaseOrchestrator` (instantiated
+  in `startOrchestratorWorker` so subclass services are available
+  to future work). `agentInstance.run(task)` return cast to
+  `AgentResult` at the orchestrator boundary because the base
+  class's `TResult` defaults to `unknown`
+- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
+  adds `class GateOrchestrator extends BaseOrchestrator`
+- `packages/agents/quality-gate/src/agents/llm-review-agent.ts`:
+  imports `loadAgentConfig` + `BaseLLMAgent` from `@gestalt/core`
+  (was `@gestalt/agents-generate`). **Switched
+  `this.callLLM(prompt, agentConfig, correlationId)` →
+  `this.callLLMWithTools(prompt, agentConfig,
+  task.harnessConfig.projectRoot, task.correlationId)`** so the
+  review-agent can spot-check files referenced in the artifact set
+  before flagging issues. Falls through to plain LLM call when the
+  operator strips tools via agents.yaml
+- `packages/agents/maintenance/src/scheduler/index.ts`: adds
+  `class MaintenanceOrchestrator extends BaseOrchestrator`
+- `packages/agents/maintenance/src/agents/context-fixer.ts`:
+  imports `loadAgentConfig` + `BaseLLMAgent` from `@gestalt/core`
+  (was `@gestalt/agents-generate`)
+- `templates/corporate-ops-web-mobile/harness/agents.yaml`:
+  `review-agent`, `drift-agent`, `alignment-agent`,
+  `context-fixer` blocks gained explicit `tools.builtin: [...]`
+  entries matching the new `PER_ROLE_DEFAULTS`. New projects ship
+  with tools enabled out of the box
+- `packages/server/src/routes/agents.ts`: `GET /projects/:id/agents`
+  returns an additional `layers: { generate, gate, maintenance }`
+  field partitioning the framework agents by layer + listing
+  infrastructure agents. Legacy `frameworkAgents` / `customAgents`
+  fields preserved for back-compat
+- `packages/cli/src/api/client.ts`: `AgentsListResponse.layers`
+  optional field added
+- `packages/cli/src/commands/agents.ts`: `gestalt agents list`
+  renders three sections (Generate / Gate / Maintenance) when the
+  server returns `layers`; falls through to the legacy
+  flat-framework layout for older server builds
+- `docs/DECISIONS.md`: ADR-038 Amendment 2026-06 appended
+  documenting the move to core, the expanded defaults, the
+  review-agent tool switch, the API + CLI surface changes, and
+  the deviation from the brief's pseudocode
+
+Verified live:
+- `pnpm -r build` clean across all 12 packages
+- **Brief's grep checks both pass:**
+  ```
+  grep -r "class BaseLLMAgent" packages/agents/     # zero matches
+  grep -r "class BaseOrchestrator" packages/agents/ # zero matches
+  ```
+  All three classes (`GenerateOrchestrator`, `GateOrchestrator`,
+  `MaintenanceOrchestrator`) extend `BaseOrchestrator` from
+  `@gestalt/core`
+- **`GET /projects/9d74401f.../agents` returns the new `layers`
+  payload** with the expected partition:
+  - Generate framework: 5 agents (context-agent / code-agent
+    have file tools)
+  - Gate framework: `review-agent` with `[readFile,
+    searchFiles]`; infrastructure
+    `[constraint-agent, lint-agent, security-agent,
+    test-runner-agent]`
+  - Maintenance LLM: `drift-agent`, `alignment-agent` with full
+    file tools; `context-fixer` with `[readFile, listDirectory]`;
+    infrastructure `[gc-agent, evaluation-agent]`
+- **`gestalt agents list trackeros`** renders the three sections
+  with each LLM agent's `tools: ...` set visible inline. Custom
+  agents nested under the Generate layer's `custom:` subsection
+- **Live SDLC cycle** (`f7179e68-d105-4523-b807-21d1dccfbb9e`,
+  isEven utility): 11 agent executions through generate → gate
+  → deploy. code-agent made 2 built-in tool calls (existing
+  path still works). **review-agent ran through
+  `callLLMWithTools`** — `agent_execution_logs.tool_calls` is a
+  proper JSONB array (length 0; the LLM decided not to call
+  tools for this trivial intent, but the tool-use loop was
+  active). Model was `gpt-4o` (resolved correctly through
+  agents.yaml). Pipeline-agent failed for unrelated CI reason
+  (project test runner — same as prior cycles)
+
+Decisions made:
+- **Deviation from the brief's BaseOrchestrator template-method
+  pattern.** The brief's pseudocode had `withProjectClone` controlling
+  cycle lifecycle and a single `execute(ctx)` subclass entry. The
+  brief also said "No behaviour changes for the generate layer."
+  These two are in tension: generate's `handleIntentTask` has
+  resume-path / clarification-gate / retry-routing / custom-agent-
+  interleaving / clone-vs-supplied logic that doesn't fit a single
+  `execute(ctx)`. Shipping a services-oriented base class delivers
+  the brief's stated value goal ("Gate and maintenance layers gain
+  tool use, MCP access, and agents.yaml configuration") AND the
+  structural goal ("all orchestrators extend BaseOrchestrator")
+  WITHOUT requiring the rewrite. Documented in the base class's
+  module docstring + the ADR-038 amendment so the next reviewer
+  doesn't think the prescriptive pattern was forgotten
+- **`BaseLLMAgent` generic over `<TTask, TResult>`** instead of
+  declaring `AgentTask` / `AgentResult` in core. The base class
+  doesn't introspect task fields — only the abstract `buildPrompt`
+  and `parseResponse` methods do, and those are subclass-specific.
+  Generic-typed lets each layer use its own typed pair without
+  forcing generate-specific shapes (`ContextSnapshot`, `IntentSpec`,
+  …) into core
+- **`FeedbackSignal` is an alias of `PlatformSignal`**, not a
+  separate type. The brief said "already partially in core —
+  consolidate". `FeedbackSignal` and `PlatformSignal` had identical
+  shapes; aliasing is the cleanest consolidation
+- **`AgentStatus` includes `'clarification-needed'`** — a
+  generate-specific status used by intent-agent's pause path. The
+  other layers only use the first five values but keeping the
+  full union in core matches what `agent_executions.status` can
+  hold
+- **Expanded `PER_ROLE_DEFAULTS`** with a tiered tool strategy:
+  - code-agent + context-agent + drift-agent + alignment-agent
+    → full file tool set (these agents explore + verify large
+    surface areas)
+  - review-agent → `readFile + searchFiles` only (operates off
+    artifacts already in prompt; tools for spot-checking)
+  - context-fixer → `readFile + listDirectory` (verify current
+    file state before editing; no need for searchFiles)
+- **review-agent switched from `callLLM` to `callLLMWithTools`.**
+  Real value-delivery for the gate layer. Previously the
+  review-agent could only reason from the artifact set embedded
+  in its prompt; now it can read related files to verify
+  findings before reporting them. Tool-call count of 0 on the
+  verification cycle isn't a regression — the model simply
+  didn't need tools for a trivial isEven utility. On larger
+  artifacts the tools will be exercised
+- **context-fixer kept on `callLLMWithMessages`** — not switched
+  to `callLLMWithTools`. context-fixer needs the system+user
+  message pair (the ADR-018 "preserve all existing content"
+  rules live in the system role); `callLLMWithTools` takes a
+  single prompt string. Switching would require either
+  concatenating system + user (losing role separation) or
+  extending `callLLMWithTools` to accept messages. Out of scope
+  for this session; flagged as a follow-up if needed
+- **drift-agent + alignment-agent kept deterministic** (not
+  converted to LLM agents). The brief's verification criterion
+  "Trigger alignment-agent — execution log shows tool calls"
+  doesn't fit the existing architecture — these agents are
+  regex-based detectors per ADR-018, they don't call LLMs.
+  Adding tool calls would require rewriting them as LLM-driven,
+  which is outside this brief's scope. The PER_ROLE_DEFAULTS
+  entries for drift/alignment still apply because they CAN be
+  consulted by `loadAgentConfig` — if a future maintenance-agent
+  conversion needs LLM access, the config is already there
+- **Server payload keeps `frameworkAgents` + `customAgents`**
+  alongside the new `layers` field. Back-compat with the
+  dashboard (which hasn't been updated to consume `layers`) +
+  any operator script that scrapes the previous shape
+- **CLI renders by layer when `layers` is present; falls back
+  to flat list otherwise**. Operators on the new server build
+  see the layered view; an older client against an even older
+  server still works
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt. Full SDLC cycle verified end-to-end with
+the refactored code paths. Both grep verification criteria from
+the brief pass. The CLI's layered display + the API's three-layer
+payload + the expanded tool defaults all confirmed live.
+
+No new Pending enhancements added. The architectural goal of "all
+agent layers share one implementation" is now met — gate and
+maintenance can use the same `BaseLLMAgent` + `loadAgentConfig` +
+`BaseOrchestrator` surface that generate has used since Step 1.

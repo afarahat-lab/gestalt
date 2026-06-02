@@ -16,6 +16,7 @@ import {
   createWorker, dispatch, getRepositories, getLLMClient,
   createContextLogger, emitLiveEvent, QUEUE_NAMES,
   McpClient, resolveMcpClients, createHarnessEngine,
+  BaseOrchestrator,
 } from '@gestalt/core';
 import type {
   TaskMessage, TaskResult, QueueConfig,
@@ -93,10 +94,27 @@ interface IntentTaskPayload {
 export const MAX_GATE_RETRIES = 3;
 
 /**
+ * Generate-layer orchestrator (Amendment 2026-06 — `extends
+ * BaseOrchestrator` for the structural goal of every orchestrator
+ * sharing one base. The existing function-based handler stays —
+ * `BaseOrchestrator`'s services are opt-in helpers, not a forced
+ * template-method, so generate's resume / clarification / retry
+ * flow remains untouched).
+ */
+export class GenerateOrchestrator extends BaseOrchestrator {
+  constructor() { super('generate-orchestrator'); }
+}
+
+/**
  * Starts the orchestrator worker.
  * Called once at server startup.
  */
 export function startOrchestratorWorker(queueConfig: QueueConfig): void {
+  // Instantiate the class so future code can call its shared
+  // services (`closeMcpClients`, `loadHarness`, `resolveAgentContext`).
+  // The legacy `handleIntentTask` function continues to drive the
+  // worker — no behaviour change for the generate layer.
+  new GenerateOrchestrator();
   createWorker<IntentTaskPayload>(
     QUEUE_NAMES.generate,
     handleIntentTask,
@@ -562,7 +580,11 @@ async function drivePlan(
           // we read it back after `run()` returns to persist into
           // `agent_execution_logs.model_used`.
           agentInstance = newAgentForRole(agentRole);
-          const result = await agentInstance.run(task);
+          // `BaseLLMAgent` is generic over the task / result shapes
+          // (TTask, TResult default to `unknown`) so every layer can
+          // declare its own typed pair. The generate-layer subclasses
+          // return AgentResult — cast at the orchestrator boundary.
+          const result = (await agentInstance.run(task)) as AgentResult;
 
           const stepStatus: ExecutionStatus =
             result.status === 'skipped' ? 'skipped'

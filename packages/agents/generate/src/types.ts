@@ -1,164 +1,35 @@
 /**
  * @package @gestalt/agents-generate
  * All types for the generate layer.
+ *
+ * Agent configuration types (`AgentConfig`, `AgentsYaml`,
+ * `CustomAgentDefinition`, …) and the `AgentStatus` / `FeedbackSignal`
+ * shapes moved to `@gestalt/core` in 2026-06 so every layer shares
+ * one source of truth. Re-exported here for back-compat with the
+ * older import paths.
  */
 
 import type { AgentRole, ArtifactType, SignalType, McpClient } from '@gestalt/core';
+// Local imports so types declared in this file can reference the
+// moved shapes by name (re-exporting alone doesn't bring them into
+// scope for use as type annotations within this module).
+import type {
+  AgentConfig as CoreAgentConfig,
+  FeedbackSignal as CoreFeedbackSignal,
+  AgentStatus as CoreAgentStatus,
+} from '@gestalt/core';
 
-// ─── Shared LLM call shape ───────────────────────────────────────────────────
+type AgentConfig = CoreAgentConfig;
+type FeedbackSignal = CoreFeedbackSignal;
+type AgentStatus = CoreAgentStatus;
 
-/**
- * Function the orchestrator hands every LLM-using agent. Agents pass
- * their `agentConfig.llm` as the second argument so per-agent
- * temperature / maxTokens land on the wire.
- */
-export type LlmCallFn = (
-  prompt: string,
-  overrides?: { temperature?: number; maxTokens?: number; model?: string },
-) => Promise<string>;
-
-// ─── Agent configuration (agents.yaml) ───────────────────────────────────────
-
-/**
- * Per-agent LLM tuning. Each field is optional — anything absent falls
- * back to either the platform default (`loadConfig().llm.model`,
- * provider's defaults for temperature / max tokens) or the loader's
- * baseline value, depending on the field.
- */
-export interface AgentLlmConfig {
-  temperature?: number;
-  maxTokens?: number;
-  /** If absent, use the platform default from loadConfig().llm.model. */
-  model?: string;
-}
-
-/**
- * One MCP server connection declared in `agents.yaml` (ADR-039).
- * Resolved at agent-run time by the generate orchestrator via
- * `resolveMcpClients(configs, harnessConfig, projectCredential)`.
- *
- * `tokenFrom` picks the credential source:
- *   - `'harness'`           → look up in `HarnessConfig.mcp.servers[]`
- *                            by matching `name`
- *   - `'project_credential'`→ use the project's Git PAT
- *   - `'env:VAR_NAME'`      → read `process.env.VAR_NAME` on the
- *                            server (the only way to keep tokens
- *                            out of the project repo)
- */
-export interface McpServerConfig {
-  name: string;
-  url: string;
-  tokenFrom: 'harness' | 'project_credential' | `env:${string}`;
-}
-
-/**
- * Per-agent tool configuration (ADR-038 + ADR-039).
- *
- * `builtin` lists the built-in file tools the agent may call —
- * `readFile`, `listDirectory`, `searchFiles`, `getFileTree`. Empty
- * array (the default for most roles) means "no built-in tools".
- *
- * `mcp` lists external MCP servers the agent connects to at run
- * time (ADR-039). Tool definitions fetched from each server are
- * merged with the built-in definitions; each tool is namespaced
- * `<serverName>__<toolName>` so collisions across servers don't
- * occur. MCP unavailability is non-fatal — the agent proceeds with
- * whatever subset of tools resolved successfully.
- */
-export interface AgentToolConfig {
-  builtin?: BuiltInToolName[];
-  mcp?: McpServerConfig[];
-}
-
-import type { BuiltInToolName } from '@gestalt/core';
-
-/**
- * One agent's configurable surface. `role` and `goal` become the LLM
- * persona; `promptExtensions` is a flat list of standing project rules
- * the prompt builder appends verbatim under "Project-specific
- * instructions" near the end of every prompt. `tools` (ADR-038)
- * controls whether `BaseLLMAgent.callLLMWithTools` is wired in.
- */
-export interface AgentConfig {
-  role: string;
-  goal: string;
-  llm: AgentLlmConfig;
-  promptExtensions: string[];
-  tools: AgentToolConfig;
-}
-
-/**
- * Top-level shape of `agents.yaml`. The keys under `agents` map to the
- * platform's `AgentRole` values (intent-agent, design-agent, code-agent,
- * test-agent, review-agent, drift-agent, alignment-agent, context-fixer,
- * etc.) — only LLM-using agents are addressable here. Infrastructure
- * agents (constraint-agent, test-runner-agent, pipeline-agent,
- * promotion-agent, gc-agent) ignore the file.
- */
-export interface AgentsYaml {
-  agents: Record<string, AgentConfig>;
-  /** Project-defined LLM agents that run after framework generate agents
-   *  and before dispatch to the quality gate (ADR-037). Loaded via
-   *  `loadCustomAgents(projectRoot)` and executed by
-   *  `runCustomAgent(definition, ctx, correlationId)`. */
-  customAgents?: CustomAgentDefinition[];
-}
-
-// ─── Custom agents (Step 2 — ADR-037) ────────────────────────────────────────
-
-/**
- * Project-defined LLM agent declared in `agents.yaml` under
- * `custom_agents:`. Generic shape — no deterministic execution path.
- * The runner substitutes `{{role}} / {{goal}} / {{artifacts}} /
- * {{goldenPrinciples}} / {{intentText}} / {{projectName}}` placeholders
- * in `prompt` and sends the result to the configured LLM.
- *
- * Findings come back as a structured JSON response:
- *   { passed, findings: [{ severity, file, description }], summary }
- *
- * Severity routes to a signal type the gate evaluates:
- *   - high   → CONSTRAINT_VIOLATION
- *   - low/medium → LINT_FAILURE
- *   - error  → CONTEXT_GAP (so the gate sees the agent broke)
- *
- * Custom agents NEVER emit GOLDEN_PRINCIPLE_BREACH — that signal type
- * is reserved for framework infrastructure agents and the review-agent.
- */
-export interface CustomAgentDefinition {
-  name: string;
-  role: string;
-  goal: string;
-  /** Framework agent name (e.g. `code-agent`) OR another custom agent
-   *  name. The orchestrator runs this custom agent immediately after
-   *  the named agent completes (ADR-037, runs_after enforcement
-   *  shipped 2026-06-02). `null` (or omitted in YAML) defaults to
-   *  `test-agent` — the last framework generate agent in the fixed
-   *  graph — so legacy configs that didn't declare `runs_after`
-   *  behave identically. Unknown targets and cycles in the
-   *  custom-agent dependency graph throw at orchestrator startup
-   *  and emit `CONTEXT_GAP`. */
-  runsAfter: string | null;
-  llm: AgentLlmConfig;
-  /** Template with `{{role}}`, `{{goal}}`, `{{artifacts}}`,
-   *  `{{goldenPrinciples}}`, `{{intentText}}`, `{{projectName}}`
-   *  placeholders. Unknown placeholders are left in place
-   *  (debuggable, matches the template-engine convention). */
-  prompt: string;
-  tools?: AgentToolConfig;
-}
-
-/**
- * Custom agent definition + its resolved dependency. Output of
- * `scheduleCustomAgents` — agents are sorted so each appears AFTER
- * its dependency in the array. `dependsOn` is the resolved target
- * name (framework agent or another custom agent); never null on
- * a scheduled node (the scheduler coalesces `runsAfter: null` to
- * the default).
- */
-export interface CustomAgentNode {
-  definition: CustomAgentDefinition;
-  dependsOn: string;
-}
+// ─── Shared LLM call shape (re-exports) ──────────────────────────────────────
+export type {
+  AgentLlmConfig, AgentToolConfig, AgentConfig, AgentsYaml,
+  McpServerConfig, CustomAgentDefinition, CustomAgentNode,
+  LlmCallFn,
+  FeedbackSignal, AgentStatus,
+} from '@gestalt/core';
 
 export interface CustomAgentFinding {
   severity: 'high' | 'medium' | 'low';
@@ -190,20 +61,7 @@ export type Complexity = 'small' | 'medium' | 'large';
 
 export type AmbiguityImpact = 'low' | 'medium' | 'high';
 
-export type AgentStatus =
-  | 'pending'
-  | 'running'
-  | 'completed'
-  | 'skipped'
-  | 'failed'
-  /**
-   * Distinct from `failed`. The agent ran successfully but discovered the
-   * input is too vague to proceed (no success criteria, or a high-impact
-   * ambiguity). The orchestrator translates this into an Alert + a
-   * `waiting-for-clarification` intent status. The operator can resume
-   * the cycle by POSTing to `/intents/:id/clarify`.
-   */
-  | 'clarification-needed';
+// AgentStatus moved to @gestalt/core (re-exported at the top of this file).
 
 export type OrchestratorState =
   | 'received'
@@ -375,18 +233,7 @@ export interface GeneratedArtifact {
 }
 
 // ─── Agent communication ─────────────────────────────────────────────────────
-
-export interface FeedbackSignal {
-  id: string;
-  correlationId: string;
-  type: SignalType;
-  severity: 'low' | 'medium' | 'high' | 'critical';
-  sourceAgent: AgentRole;
-  message: string;
-  location?: { file: string; line?: number };
-  autoResolvable: boolean;
-  createdAt: Date;
-}
+// FeedbackSignal moved to @gestalt/core (re-exported at the top of this file).
 
 export interface ClarificationNeeded {
   reason: string;

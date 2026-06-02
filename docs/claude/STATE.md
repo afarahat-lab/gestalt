@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-02 (Claude Code — runs_after enforcement: custom agents now interleave into the framework graph via topological scheduling)
+**Last updated:** 2026-06-02 (Claude Code — BaseLLMAgent + BaseOrchestrator moved to @gestalt/core; uniform tool/MCP access across all layers)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 

@@ -33,6 +33,7 @@ import { simpleGit } from 'simple-git';
 import {
   createWorker, dispatch, getRepositories,
   createContextLogger, emitLiveEvent, QUEUE_NAMES,
+  BaseOrchestrator,
 } from '@gestalt/core';
 import type {
   TaskMessage, TaskResult, TaskPriority, QueueConfig,
@@ -170,7 +171,22 @@ function defaultGateHarnessConfig(projectRoot: string): GateHarnessConfig {
   };
 }
 
+/**
+ * Quality-gate orchestrator (Amendment 2026-06 — `extends
+ * BaseOrchestrator` for the structural goal of every orchestrator
+ * sharing one base. The review-agent now uses `callLLMWithTools`
+ * with the per-role default readFile + searchFiles set so it can
+ * verify findings against actual file content; the change is on
+ * the agent itself, not on the orchestrator's drive loop).
+ */
+export class GateOrchestrator extends BaseOrchestrator {
+  constructor() { super('gate-orchestrator'); }
+}
+
 export function startGateWorker(queueConfig: QueueConfig): void {
+  // Instantiate the class for future use of shared services. The
+  // existing handleGateTask function continues to drive the worker.
+  new GateOrchestrator();
   createWorker<GateTaskPayload>(
     QUEUE_NAMES.gate,
     handleGateTask,

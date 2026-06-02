@@ -1,0 +1,367 @@
+/**
+ * Abstract base class for every LLM-calling agent in the platform.
+ *
+ * Lives in `@gestalt/core` so the generate, gate, and maintenance
+ * layers all extend the same implementation. Re-exported under the
+ * same name from `@gestalt/agents-generate` for back-compat with
+ * existing import paths.
+ *
+ * Type parameters:
+ *   TTask    — subclass-specific task shape passed to `run()`. The
+ *              base class doesn't introspect its fields; the only
+ *              constraint is what `run` / `buildPrompt` /
+ *              `parseResponse` need to read. Default is `unknown`
+ *              so subclasses can declare their own typed shape via
+ *              `extends BaseLLMAgent<MyTask, MyResult>` or via
+ *              method overrides.
+ *   TResult  — subclass-specific result shape returned by `run()`.
+ *
+ * Subclasses implement:
+ *   buildPrompt(task)    — construct the prompt body. Persona +
+ *                          project-specific instructions are applied
+ *                          by `run()`; the subclass should NOT call
+ *                          `applyAgentConfig` again — double-application
+ *                          would duplicate the persona line.
+ *   parseResponse(raw,
+ *                 task)  — parse the LLM output into a result.
+ *
+ * The base provides:
+ *   run(task)            — template method: build → callLLM → parse.
+ *                          Subclasses that need internal retry loops
+ *                          override `run` and call `this.callLLM` /
+ *                          `this.callLLMWithTools` inside their own
+ *                          loop.
+ *   callLLM(prompt,
+ *           agentConfig,
+ *           correlationId)
+ *                        — shared LLM call. Routes through
+ *                          `getLLMClient(agentConfig.llm.model)` so
+ *                          the per-agent model override picks the
+ *                          right client.
+ *   callLLMWithTools(prompt,
+ *                    agentConfig,
+ *                    projectRoot,
+ *                    correlationId,
+ *                    mcpClients?)
+ *                        — function-calling loop (ADR-038 + ADR-039).
+ *                          MCP clients optional; when absent the loop
+ *                          uses built-in tools only.
+ *   callLLMWithMessages(messages,
+ *                       agentConfig,
+ *                       correlationId,
+ *                       promptForLog)
+ *                        — messages-array variant for agents needing
+ *                          a separate system message (e.g.
+ *                          context-fixer).
+ *   makeContextGapSignal(correlationId, message)
+ *                        — helper for the common "I failed and can't
+ *                          recover" path most subclasses use to mark
+ *                          a result as `status: 'failed'`.
+ *
+ * Instance fields:
+ *   lastPrompt           — prompt sent on the most recent call
+ *   lastLlmResponse      — raw response text from the most recent call
+ *   lastModelUsed        — resolved model name (after override lookup)
+ *   lastToolCallLog      — tool-call audit history for the most recent
+ *                          `callLLMWithTools` invocation
+ *
+ * The orchestrator reads these fields after `run()` returns and
+ * persists them into `agent_execution_logs.{prompt, llm_response,
+ * model_used, tool_calls}`. Generic so callers can either match the
+ * generate layer's `AgentTask<ContextSnapshot>` shape OR a custom
+ * task shape (review-agent's `GateTask`, context-fixer's intent +
+ * project bundle).
+ */
+
+import {
+  getLLMClient,
+} from '../llm/index';
+import {
+  FILE_TOOL_DEFINITIONS, executeFileTool,
+} from '../tools/file-tools';
+import type {
+  ToolDefinition, ToolCall, ToolResult, ToolCallLogEntry,
+  BuiltInToolName, AgentRole, FeedbackSignal,
+} from '../types';
+import type { ToolLoopMessage } from '../llm/index';
+import type { McpClient } from '../tools/mcp-client';
+import type { AgentConfig } from './agent-config';
+import { applyAgentConfig } from './agent-config-helpers';
+
+/**
+ * Safety cap on tool calls per agent run (ADR-038). Prevents an
+ * agent from chewing through provider quota on a runaway plan.
+ */
+const MAX_TOOL_CALLS = 10;
+
+/** Tool-call output truncated to this many chars before storage in
+ *  `agent_execution_logs.tool_calls`. Full results still go to the
+ *  LLM via the live loop. */
+const TOOL_OUTPUT_LOG_TRUNCATE = 500;
+
+export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
+  protected readonly agentRole: AgentRole;
+
+  /** Prompt actually sent to the LLM on the most recent call. */
+  lastPrompt: string | null = null;
+
+  /** Raw response text returned by the LLM on the most recent call. */
+  lastLlmResponse: string | null = null;
+
+  /** Model the LLM call routed to after `agents.yaml` override
+   *  resolution. Null on instances that never made an LLM call. */
+  lastModelUsed: string | null = null;
+
+  /** Tool-call history from the most recent `callLLMWithTools`
+   *  invocation (ADR-038). Empty array when the agent didn't use
+   *  tools. */
+  lastToolCallLog: ToolCallLogEntry[] = [];
+
+  constructor(agentRole: AgentRole) {
+    this.agentRole = agentRole;
+  }
+
+  /**
+   * Template method: build → wrap with persona/extensions → call LLM
+   * → parse. Subclasses that need an internal retry loop OR a
+   * pre-flight skip check override `run()` directly and call
+   * `this.callLLM(...)` themselves.
+   *
+   * The base implementation assumes `task` exposes
+   * `contextSnapshot.agentConfig` and `correlationId` — generate's
+   * `AgentTask` matches that shape. Gate / maintenance subclasses
+   * use a different task shape and override `run()` to handle
+   * config + correlation resolution themselves.
+   */
+  async run(task: TTask): Promise<TResult> {
+    const t = task as unknown as {
+      correlationId: string;
+      contextSnapshot: { agentConfig: AgentConfig };
+    };
+    const { agentConfig } = t.contextSnapshot;
+    const rawPrompt = this.buildPrompt(task);
+    const prompt = applyAgentConfig(rawPrompt, agentConfig);
+    const raw = await this.callLLM(prompt, agentConfig, t.correlationId);
+    return this.parseResponse(raw, task);
+  }
+
+  /**
+   * Construct the prompt body. Persona + project-specific
+   * instructions (`applyAgentConfig`) are applied by `run()` — do
+   * NOT call `applyAgentConfig` here.
+   */
+  protected abstract buildPrompt(task: TTask): string;
+
+  /**
+   * Parse the raw LLM response into a result.
+   */
+  protected abstract parseResponse(raw: string, task: TTask): TResult;
+
+  /**
+   * Shared LLM call. Routes through `getLLMClient(model)` so the
+   * per-agent model override picks the right client. Captures
+   * `lastPrompt`, `lastLlmResponse`, and `lastModelUsed` on the
+   * instance so the caller can read them after `run()` returns.
+   */
+  protected async callLLM(
+    prompt: string,
+    agentConfig: AgentConfig,
+    correlationId: string,
+  ): Promise<string> {
+    return this.callLLMWithMessages(
+      [{ role: 'user', content: prompt }],
+      agentConfig,
+      correlationId,
+      prompt,
+    );
+  }
+
+  /**
+   * Messages-array variant for agents that need a separate system
+   * message. `promptForLog` is what gets stored in `this.lastPrompt`.
+   */
+  protected async callLLMWithMessages(
+    messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+    agentConfig: AgentConfig,
+    correlationId: string,
+    promptForLog: string,
+  ): Promise<string> {
+    const client = getLLMClient(agentConfig.llm.model);
+    this.lastModelUsed = client.getModel();
+    this.lastPrompt = promptForLog;
+    const result = await client.complete({
+      messages,
+      ...(agentConfig.llm.temperature !== undefined ? { temperature: agentConfig.llm.temperature } : {}),
+      ...(agentConfig.llm.maxTokens !== undefined ? { maxTokens: agentConfig.llm.maxTokens } : {}),
+      correlationId,
+    });
+    if (!result.ok) {
+      throw new Error(`LLM call failed: ${result.error.message}`);
+    }
+    this.lastLlmResponse = result.value.content;
+    return result.value.content;
+  }
+
+  /**
+   * Tool-loop LLM call (ADR-038 + ADR-039). When the agent's
+   * resolved tool config is empty AND no MCP clients were supplied,
+   * delegates to `callLLM` so callers can branch on `hasTools` at
+   * the call site without writing two branches.
+   *
+   * MCP clients are NOT closed here — the orchestrator caches them
+   * per-cycle and may share them across agent steps.
+   */
+  protected async callLLMWithTools(
+    prompt: string,
+    agentConfig: AgentConfig,
+    projectRoot: string,
+    correlationId: string,
+    mcpClients?: McpClient[],
+  ): Promise<{ response: string; toolCallLog: ToolCallLogEntry[] }> {
+    const builtinDefs = this.resolveToolDefinitions(agentConfig.tools);
+
+    const mcpDefs: ToolDefinition[] = [];
+    if (mcpClients && mcpClients.length > 0) {
+      const perServer = await Promise.all(
+        mcpClients.map((c) => c.listTools()),
+      );
+      for (const list of perServer) mcpDefs.push(...list);
+    }
+
+    const tools: ToolDefinition[] = [...builtinDefs, ...mcpDefs];
+
+    if (tools.length === 0) {
+      const response = await this.callLLM(prompt, agentConfig, correlationId);
+      this.lastToolCallLog = [];
+      return { response, toolCallLog: [] };
+    }
+
+    const mcpByPrefix = new Map<string, McpClient>();
+    if (mcpClients) {
+      for (const c of mcpClients) mcpByPrefix.set(`${c.serverName}__`, c);
+    }
+
+    const client = getLLMClient(agentConfig.llm.model);
+    this.lastModelUsed = client.getModel();
+    this.lastPrompt = prompt;
+
+    const history: ToolLoopMessage[] = [
+      { role: 'user', content: prompt },
+    ];
+    const toolCallLog: ToolCallLogEntry[] = [];
+    let totalToolCalls = 0;
+    let finalText = '';
+
+    for (let turn = 0; turn < MAX_TOOL_CALLS + 1; turn++) {
+      const result = await client.completeWithTools({
+        messages: history,
+        tools,
+        ...(agentConfig.llm.temperature !== undefined ? { temperature: agentConfig.llm.temperature } : {}),
+        ...(agentConfig.llm.maxTokens !== undefined ? { maxTokens: agentConfig.llm.maxTokens } : {}),
+        correlationId,
+      });
+      if (!result.ok) {
+        throw new Error(`LLM call failed: ${result.error.message}`);
+      }
+
+      const { text, toolCalls, stopReason } = result.value;
+      if (text.length > 0) finalText = text;
+
+      if (stopReason === 'stop' || toolCalls.length === 0) {
+        break;
+      }
+
+      history.push({
+        role: 'assistant',
+        content: text.length > 0 ? text : null,
+        toolCalls,
+      });
+
+      for (const call of toolCalls) {
+        if (totalToolCalls >= MAX_TOOL_CALLS) break;
+        totalToolCalls++;
+
+        const mcpClient = findMcpForCall(call.name, mcpByPrefix);
+
+        let toolResult: ToolResult;
+        let toolSource: string;
+        if (mcpClient) {
+          toolResult = await mcpClient.executeTool(call.name, call.input, call.id);
+          toolSource = `mcp:${mcpClient.serverName}`;
+        } else {
+          const platformCall: ToolCall = {
+            id: call.id,
+            name: call.name,
+            input: call.input,
+          };
+          toolResult = await executeFileTool(platformCall, projectRoot);
+          toolSource = 'builtin';
+        }
+
+        history.push({
+          role: 'tool',
+          toolCallId: call.id,
+          content: toolResult.content,
+        });
+
+        toolCallLog.push({
+          toolName: call.name,
+          input: call.input,
+          output: toolResult.content.slice(0, TOOL_OUTPUT_LOG_TRUNCATE),
+          isError: toolResult.isError,
+          calledAt: new Date(),
+          toolSource,
+        });
+      }
+
+      if (totalToolCalls >= MAX_TOOL_CALLS) {
+        // Safety cap hit — let the model do one more synthesis turn.
+      }
+    }
+
+    this.lastLlmResponse = finalText;
+    this.lastToolCallLog = toolCallLog;
+    return { response: finalText, toolCallLog };
+  }
+
+  private resolveToolDefinitions(tools: AgentConfig['tools']): ToolDefinition[] {
+    const builtin = tools?.builtin ?? [];
+    if (builtin.length === 0) return [];
+    const allowed = new Set<BuiltInToolName>(builtin);
+    return FILE_TOOL_DEFINITIONS.filter((d) => allowed.has(d.name as BuiltInToolName));
+  }
+
+  /**
+   * Helper for subclasses: build a `CONTEXT_GAP` feedback signal
+   * tagged with this agent's role.
+   */
+  protected makeContextGapSignal(
+    correlationId: string,
+    message: string,
+  ): FeedbackSignal {
+    return {
+      id: crypto.randomUUID(),
+      correlationId,
+      type: 'CONTEXT_GAP',
+      severity: 'high',
+      sourceAgent: this.agentRole,
+      message,
+      autoResolvable: false,
+      createdAt: new Date(),
+    };
+  }
+}
+
+/**
+ * Routes a tool call to the matching MCP client by namespace prefix
+ * (ADR-039). Returns null when no prefix matches.
+ */
+function findMcpForCall(
+  toolName: string,
+  mcpByPrefix: Map<string, McpClient>,
+): McpClient | null {
+  for (const [prefix, client] of mcpByPrefix.entries()) {
+    if (toolName.startsWith(prefix)) return client;
+  }
+  return null;
+}

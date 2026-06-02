@@ -7,7 +7,7 @@
 export type {
   AgentRole, SignalType, SignalSeverity, TaskType, TaskPriority,
   TaskMessage, TaskResult, TaskResultStatus,
-  PlatformSignal, CodeLocation,
+  PlatformSignal, FeedbackSignal, AgentStatus, CodeLocation,
   Artifact, ArtifactType,
   UserRole, ProjectRole,
   ToolDefinition, ToolCall, ToolResult, BuiltInToolName, ToolCallLogEntry,
@@ -22,6 +22,24 @@ export { FILE_TOOL_DEFINITIONS, executeFileTool } from './tools/file-tools';
 export { McpClient } from './tools/mcp-client';
 export { resolveMcpClients } from './tools/mcp-resolver';
 export type { McpServerConfig } from './tools/mcp-resolver';
+
+// Agent base + configuration + orchestrator base (Amendment 2026-06
+// — moved to core from agents-generate so every layer shares one
+// implementation).
+export { BaseLLMAgent } from './agents/base-llm-agent';
+export { BaseOrchestrator } from './orchestrator/base-orchestrator';
+export type { OrchestratorContext } from './orchestrator/base-orchestrator';
+export {
+  loadAgentConfig, loadCustomAgents, defaultAgentConfig,
+} from './agents/agent-config-loader';
+export {
+  applyAgentConfig, buildPersona, buildExtensionsBlock,
+} from './agents/agent-config-helpers';
+export type {
+  AgentConfig, AgentLlmConfig, AgentToolConfig, AgentsYaml,
+  CustomAgentDefinition, CustomAgentNode,
+  LlmCallFn,
+} from './agents/agent-config';
 
 // Config
 export type { GestaltConfig, ServerConfig, DatabaseConfig, QueueConfig, LLMConfig, AuthConfig } from './config/index';

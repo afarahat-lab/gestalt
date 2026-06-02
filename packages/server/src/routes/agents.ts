@@ -41,6 +41,33 @@ const FRAMEWORK_LLM_AGENTS = [
   'context-fixer',
 ] as const;
 
+/** Generate-layer framework LLM roles — the six agents the orchestrator
+ *  drives in the fixed plan. */
+const GENERATE_FRAMEWORK_ROLES = new Set([
+  'intent-agent', 'design-agent', 'context-agent',
+  'lint-config-agent', 'code-agent', 'test-agent',
+]);
+
+/** Gate-layer framework LLM roles. constraint-agent / lint-agent /
+ *  security-agent / test-runner-agent are deterministic infrastructure
+ *  and surface separately as `infrastructure`. */
+const GATE_FRAMEWORK_ROLES = new Set(['review-agent']);
+const GATE_INFRASTRUCTURE_AGENTS = [
+  'constraint-agent', 'lint-agent', 'security-agent', 'test-runner-agent',
+];
+
+/** Maintenance-layer LLM roles — context-fixer is the LLM-driven path;
+ *  drift-agent and alignment-agent appear here because they declare
+ *  LLM config in agents.yaml (their detector phase is deterministic
+ *  today; their findings flow through the context-fixer LLM call
+ *  for application). */
+const MAINTENANCE_LLM_ROLES = new Set([
+  'drift-agent', 'alignment-agent', 'context-fixer',
+]);
+const MAINTENANCE_INFRASTRUCTURE_AGENTS = [
+  'gc-agent', 'evaluation-agent',
+];
+
 interface AgentSummary {
   name: string;
   role: string;
@@ -135,10 +162,37 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
         }
       }
 
+      // Amendment 2026-06 — partition framework agents into the
+      // three layers so `gestalt agents list` and the dashboard can
+      // surface where each agent runs (generate vs gate vs
+      // maintenance). The legacy `frameworkAgents` array is kept on
+      // the response so existing dashboard / CLI builds keep working.
+      const layers = {
+        generate: {
+          framework: frameworkAgents.filter((a) =>
+            GENERATE_FRAMEWORK_ROLES.has(a.name),
+          ),
+          custom: customAgents,
+        },
+        gate: {
+          framework: frameworkAgents.filter((a) =>
+            GATE_FRAMEWORK_ROLES.has(a.name),
+          ),
+          infrastructure: GATE_INFRASTRUCTURE_AGENTS,
+        },
+        maintenance: {
+          llm: frameworkAgents.filter((a) =>
+            MAINTENANCE_LLM_ROLES.has(a.name),
+          ),
+          infrastructure: MAINTENANCE_INFRASTRUCTURE_AGENTS,
+        },
+      };
+
       return reply.send({
         data: {
           frameworkAgents,
           customAgents,
+          layers,
         },
       });
     },

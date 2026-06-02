@@ -35,12 +35,12 @@ export async function agentsListCommand(
     blank();
     console.log(c.dim(`Reading agents.yaml for ${project.name} ...`));
     const res = await client.listAgents(project.id);
-    const { frameworkAgents, customAgents } = res.data;
+    const { frameworkAgents, customAgents, layers } = res.data;
 
-    blank();
-    console.log(c.bold('Framework agents'));
-    divider();
-    for (const a of frameworkAgents) {
+    // Amendment 2026-06 — render by layer when the server's new
+    // `layers` field is present. Falls through to the flat list for
+    // older server builds.
+    const renderRow = (a: typeof frameworkAgents[0]) => {
       const overrideLabel = a.modelOverride
         ? c.dim(`model: `) + a.modelOverride
         : c.dim(`model: (platform default)`);
@@ -48,26 +48,64 @@ export async function agentsListCommand(
       const extLabel = a.promptExtensionCount > 0
         ? c.dim(` · `) + c.warn(`${a.promptExtensionCount} prompt extension${a.promptExtensionCount === 1 ? '' : 's'}`)
         : '';
+      const builtinTools = a.builtinTools?.length ?? 0;
+      const toolsLabel = builtinTools > 0
+        ? c.dim(` · `) + c.info(`tools: ${a.builtinTools!.join(', ')}`)
+        : '';
       const mcpCount = a.mcpServers?.length ?? 0;
       const mcpLabel = mcpCount > 0
         ? c.dim(` · `) + c.info(`MCP: ${a.mcpServers!.join(', ')}`)
         : '';
-      console.log(`  ${a.name.padEnd(18)} ${overrideLabel}${tempLabel}${extLabel}${mcpLabel}`);
-    }
-    blank();
-    console.log(c.bold('Custom agents'));
-    divider();
-    if (customAgents.length === 0) {
-      console.log(c.dim('  None defined. Add a `custom_agents:` block to agents.yaml.'));
-    } else {
-      for (const ca of customAgents) {
-        const modelLabel = ca.llm.model
-          ? c.dim(' · model: ') + ca.llm.model
-          : c.dim(' · model: (platform default)');
-        console.log(`  ${c.success('+')} ${ca.name.padEnd(28)} ${c.dim('— ' + (ca.role || 'no role'))}${modelLabel}`);
+      console.log(`  ${a.name.padEnd(18)} ${overrideLabel}${tempLabel}${extLabel}${toolsLabel}${mcpLabel}`);
+    };
+
+    if (layers) {
+      blank();
+      console.log(c.bold('Generate layer'));
+      divider();
+      for (const a of layers.generate.framework) renderRow(a);
+      if (layers.generate.custom.length > 0) {
+        blank();
+        console.log(c.dim('  custom:'));
+        for (const ca of layers.generate.custom) {
+          const modelLabel = ca.llm.model
+            ? c.dim(' · model: ') + ca.llm.model
+            : c.dim(' · model: (platform default)');
+          console.log(`    ${c.success('+')} ${ca.name.padEnd(26)} ${c.dim('— ' + (ca.role || 'no role'))}${modelLabel}`);
+        }
       }
+      blank();
+      console.log(c.bold('Gate layer'));
+      divider();
+      for (const a of layers.gate.framework) renderRow(a);
+      console.log(c.dim(`  infrastructure: ${layers.gate.infrastructure.join(', ')}`));
+      blank();
+      console.log(c.bold('Maintenance layer'));
+      divider();
+      for (const a of layers.maintenance.llm) renderRow(a);
+      console.log(c.dim(`  infrastructure: ${layers.maintenance.infrastructure.join(', ')}`));
+      blank();
+    } else {
+      // Back-compat fallback — older servers without `layers`.
+      blank();
+      console.log(c.bold('Framework agents'));
+      divider();
+      for (const a of frameworkAgents) renderRow(a);
+      blank();
+      console.log(c.bold('Custom agents'));
+      divider();
+      if (customAgents.length === 0) {
+        console.log(c.dim('  None defined. Add a `custom_agents:` block to agents.yaml.'));
+      } else {
+        for (const ca of customAgents) {
+          const modelLabel = ca.llm.model
+            ? c.dim(' · model: ') + ca.llm.model
+            : c.dim(' · model: (platform default)');
+          console.log(`  ${c.success('+')} ${ca.name.padEnd(28)} ${c.dim('— ' + (ca.role || 'no role'))}${modelLabel}`);
+        }
+      }
+      blank();
     }
-    blank();
   } catch (err) {
     if (isConnectivityError(err)) {
       printConnectionError(serverUrl);

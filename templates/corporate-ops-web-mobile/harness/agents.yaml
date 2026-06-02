@@ -104,6 +104,7 @@ agents:
       max_tokens: 6000
     prompt_extensions: []
 
+  # ── Gate layer (Amendment 2026-06: tools enabled by default) ──
   review-agent:
     role: "Senior engineer and code reviewer"
     goal: "Assess generated code quality and architectural correctness"
@@ -111,8 +112,14 @@ agents:
       model: ~
       temperature: 0.1
       max_tokens: 4000
+    tools:
+      # Narrower than code-agent — review-agent operates primarily
+      # off the artifact set already in its prompt; the tools are for
+      # spot-checking referenced files before flagging issues.
+      builtin: [readFile, searchFiles]
     prompt_extensions: []
 
+  # ── Maintenance layer (Amendment 2026-06: tools enabled) ──────
   drift-agent:
     role: "Technical documentation specialist"
     goal: "Detect when project documentation has fallen behind the codebase"
@@ -120,6 +127,8 @@ agents:
       model: ~
       temperature: 0.1
       max_tokens: 2000
+    tools:
+      builtin: [readFile, listDirectory, searchFiles, getFileTree]
     prompt_extensions: []
 
   alignment-agent:
@@ -129,6 +138,8 @@ agents:
       model: ~
       temperature: 0.1
       max_tokens: 2000
+    tools:
+      builtin: [readFile, listDirectory, searchFiles, getFileTree]
     prompt_extensions: []
 
   context-fixer:
@@ -138,6 +149,10 @@ agents:
       model: ~
       temperature: 0.2
       max_tokens: 8192
+    tools:
+      # Pared-down set — context-fixer verifies the current file
+      # state before editing, but doesn't need to enumerate the tree.
+      builtin: [readFile, listDirectory]
     prompt_extensions: []
 
 
