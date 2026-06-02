@@ -15,7 +15,7 @@
  * are loud.
  */
 
-import { GestaltApiClient, type ProjectRoleString, type UserRoleString } from '../api/client';
+import { GestaltApiClient, type ProjectRoleString, type UserRoleString, type UserSummary } from '../api/client';
 import { loadCliConfig, resolveServerUrl } from '../ui/config';
 import { printConnectionError, isConnectivityError } from '../ui/server-errors';
 import { c, blank, divider, printTable, prompt, promptSecret, confirm, select } from '../ui/prompts';
@@ -118,10 +118,47 @@ export async function usersAddCommand(email: string, options: BaseOptions = {}):
 
 // ─── role ────────────────────────────────────────────────────────────────────
 
-async function resolveUserByEmail(client: GestaltApiClient, email: string): Promise<{ id: string; email: string; role: UserRoleString } | null> {
+/**
+ * Returns every user row whose email matches (case-insensitive).
+ *
+ * Why this exists: per ADR-026, PlatformUser is a shadow record
+ * keyed by `(idp_subject, auth_provider)`. A single human who signs
+ * in via more than one IdP has one row per provider — same email,
+ * different IDs. The `users` admin surfaces have to handle that
+ * case explicitly; quietly picking the first row (which was the
+ * previous behaviour) hits the wrong record when a duplicate
+ * exists.
+ */
+async function resolveUsersByEmail(client: GestaltApiClient, email: string): Promise<UserSummary[]> {
   const { data: users } = await client.listUsers({ search: email });
-  const match = users.find((u) => u.email.toLowerCase() === email.toLowerCase());
-  return match ?? null;
+  return users.filter((u) => u.email.toLowerCase() === email.toLowerCase());
+}
+
+/** Single-match helper for commands that operate on one user row
+ *  (role / assign / unassign). Returns null when no match; prints
+ *  a disambiguation message + exits when there are multiple. */
+async function resolveSingleUserByEmail(
+  client: GestaltApiClient,
+  email: string,
+  commandLabel: string,
+): Promise<UserSummary | null> {
+  const matches = await resolveUsersByEmail(client, email);
+  if (matches.length === 0) return null;
+  if (matches.length === 1) return matches[0]!;
+  console.log(c.error(
+    `Email '${email}' has ${matches.length} user records (one per IdP provider).`,
+  ));
+  blank();
+  console.log(c.dim('Rows:'));
+  for (const u of matches) {
+    const deact = u.deactivatedAt ? c.error('(deactivated)') : '';
+    console.log(`  ${u.id.slice(0, 8)}…  provider=${u.authProvider}  role=${u.role}  ${deact}`);
+  }
+  blank();
+  console.log(c.dim(
+    `\`${commandLabel}\` operates on a single row — re-run against the dashboard's Admin view if you need to pick a specific provider.`,
+  ));
+  process.exit(1);
 }
 
 export async function usersRoleCommand(
@@ -135,7 +172,7 @@ export async function usersRoleCommand(
   }
   const { client, serverUrl } = await getClient(options);
   try {
-    const user = await resolveUserByEmail(client, email);
+    const user = await resolveSingleUserByEmail(client, email, 'users role');
     if (!user) {
       console.log(c.error(`No user with email '${email}'.`));
       process.exit(1);
@@ -152,19 +189,47 @@ export async function usersRoleCommand(
 export async function usersDeactivateCommand(email: string, options: BaseOptions = {}): Promise<void> {
   const { client, serverUrl } = await getClient(options);
   try {
-    const user = await resolveUserByEmail(client, email);
-    if (!user) {
+    // ADR-026 — multiple shadow rows per human are normal (one per
+    // IdP). The operator's intent in saying "deactivate this user"
+    // is to block ALL access, which means hitting every row that
+    // shares the email. List them up front so the operator sees
+    // what's about to happen; the confirmation message names the
+    // count.
+    const matches = await resolveUsersByEmail(client, email);
+    if (matches.length === 0) {
       console.log(c.error(`No user with email '${email}'.`));
       process.exit(1);
     }
+    const active = matches.filter((u) => !u.deactivatedAt);
+    if (active.length === 0) {
+      console.log(c.dim(`All ${matches.length} row(s) for '${email}' are already deactivated. Nothing to do.`));
+      return;
+    }
     blank();
-    const ok = await confirm(`Deactivate ${email}? This will block all access.`, false);
+    if (matches.length > 1) {
+      console.log(c.dim(`Email '${email}' has ${matches.length} user records (one per IdP provider):`));
+      for (const u of matches) {
+        const status = u.deactivatedAt
+          ? c.error('deactivated')
+          : c.success('active');
+        console.log(`  ${u.id.slice(0, 8)}…  provider=${u.authProvider}  role=${u.role}  ${status}`);
+      }
+      blank();
+    }
+    const prompt = active.length === 1
+      ? `Deactivate ${email}? This will block all access.`
+      : `Deactivate ${active.length} active row(s) for ${email}? This will block all access from every IdP.`;
+    const ok = await confirm(prompt, false);
     if (!ok) {
       console.log(c.dim('Aborted.'));
       return;
     }
-    await client.deactivateUser(user.id);
-    console.log(c.success(`✓ User deactivated: ${email}`));
+    let deactivated = 0;
+    for (const u of active) {
+      await client.deactivateUser(u.id);
+      deactivated++;
+    }
+    console.log(c.success(`✓ Deactivated ${deactivated} row(s) for ${email}.`));
     blank();
   } catch (err) {
     handleError(err, serverUrl, 'deactivate user');
@@ -185,7 +250,7 @@ export async function usersAssignCommand(
   }
   const { client, serverUrl } = await getClient(options);
   try {
-    const user = await resolveUserByEmail(client, email);
+    const user = await resolveSingleUserByEmail(client, email, 'users assign');
     if (!user) {
       console.log(c.error(`No user with email '${email}'.`));
       process.exit(1);
@@ -210,7 +275,7 @@ export async function usersUnassignCommand(
 ): Promise<void> {
   const { client, serverUrl } = await getClient(options);
   try {
-    const user = await resolveUserByEmail(client, email);
+    const user = await resolveSingleUserByEmail(client, email, 'users unassign');
     if (!user) {
       console.log(c.error(`No user with email '${email}'.`));
       process.exit(1);
