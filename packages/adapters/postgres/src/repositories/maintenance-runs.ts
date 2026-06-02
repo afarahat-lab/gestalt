@@ -58,11 +58,11 @@ export class PostgresMaintenanceRunRepository implements MaintenanceRunRepositor
     run: Omit<MaintenanceRunRecord, 'id' | 'runAt' | 'completedAt'>,
   ): Promise<MaintenanceRunRecord> {
     const db = getDb();
-    // `::jsonb` cast on the JSON-stringified array — without it postgres
-    // implicit-casts the bound TEXT to a jsonb *string scalar* (wraps
-    // the whole array as a JSON string), not a jsonb *array*. postgres.js
-    // binds JS strings as TEXT parameters, and PostgreSQL's text→jsonb
-    // implicit conversion is a quote-and-wrap, not a parse.
+    // `db.json(...)` — postgres.js typed JSONB binding. The previous
+    // `${JSON.stringify(arr)}::jsonb` pattern looks correct but
+    // actually stores the value as a JSONB string scalar
+    // (`jsonb_typeof = 'string'`, `data = "[{...}]"`). See
+    // execution-logs.ts for the full rationale.
     const [row] = await db<MaintenanceRunRow[]>`
       INSERT INTO maintenance_runs (
         agent_role, project_id, status,
@@ -73,7 +73,7 @@ export class PostgresMaintenanceRunRepository implements MaintenanceRunRepositor
         ${run.status},
         ${run.intentsQueued},
         ${run.directFixes},
-        ${JSON.stringify(run.findings ?? [])}::jsonb,
+        ${db.json((run.findings ?? []) as unknown as Parameters<typeof db.json>[0])},
         ${run.durationMs}
       )
       RETURNING *
@@ -98,7 +98,7 @@ export class PostgresMaintenanceRunRepository implements MaintenanceRunRepositor
         status         = ${result.status},
         intents_queued = ${result.intentsQueued},
         direct_fixes   = ${result.directFixes},
-        findings       = ${JSON.stringify(result.findings)}::jsonb,
+        findings       = ${db.json(result.findings as unknown as Parameters<typeof db.json>[0])},
         duration_ms    = ${result.durationMs},
         completed_at   = NOW()
       WHERE id = ${id}

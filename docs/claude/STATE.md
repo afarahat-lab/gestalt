@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-02 (Claude Code — ADR-039 MCP (Model Context Protocol) integration for agent tool use)
+**Last updated:** 2026-06-02 (Claude Code — Two cleanup fixes: no-gestalt-internal-deps constraint rule + JSONB write path typed-helper migration)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -635,15 +635,20 @@ the historical record of how the state evolved._
     rendered the `readFile` call with the actual file
     content as its output preview (screenshot saved during
     verification)
-  - JSONB storage trap noted: postgres.js wraps
-    `${JSON.stringify(arr)}::jsonb` as a JSONB string
-    scalar rather than parsing to an array on insert. Same
-    behaviour every other JSONB-array column hits (see
-    maintenance_runs.findings). The shared `parseJsonb`
-    helper handles the unwrap on read — the application
-    side, the API response, and the dashboard all get the
-    correct array. Direct `jsonb_array_length` SQL probes
-    fail; that's a quirk of the storage path, not a bug
+  - JSONB write path uses postgres.js's typed `db.json(...)`
+    helper, so `tool_calls`, `findings`, `context`, and
+    `metadata` columns all store as real JSONB values
+    (`jsonb_typeof = 'array'`/`'object'`). The earlier
+    `${JSON.stringify(arr)}::jsonb` pattern was a trap —
+    postgres.js bound the stringified text as a TEXT
+    parameter and `::jsonb` parsed it as a JSONB string
+    scalar (`"[{...}]"`). Direct SQL probes
+    (`jsonb_array_length`, `jsonb_typeof`) now work
+    against every JSONB column. Note the typing tweak:
+    `db.json(value as unknown as Parameters<typeof
+    db.json>[0])` — the postgres.js `JSONValue` requires
+    a structural index signature that typed interfaces
+    don't auto-satisfy
 - **MCP (Model Context Protocol) integration — external
   tool servers (ADR-039).** Extends ADR-038's built-in
   file tools with project-declared external MCP servers.
@@ -1416,12 +1421,14 @@ the historical record of how the state evolved._
   postgres.js returns the column as an object or a string
 - `maintenanceRuns` — create (status=running), complete (final counts +
   findings JSONB + duration), list (filter by projectId / agentRole).
-  Findings are JSONB-array-typed; the PG impl uses an explicit
-  `::jsonb` cast on insert/update (without it postgres' implicit
-  text→jsonb cast wraps the whole array as a JSON string scalar) and
-  the shared `parseJsonb<MaintenanceFinding[]>(row.findings, [])` in
-  `../utils` normalises the read path against postgres.js returning
-  either a parsed array or a raw JSON string
+  Findings are JSONB-array-typed; the PG impl uses postgres.js's
+  typed `db.json(...)` helper on insert/update (the
+  `${JSON.stringify(arr)}::jsonb` pattern looked correct but
+  actually stored the array as a JSONB string scalar — see the
+  ADR-038 tool-calls bullet above for the full rationale). The
+  shared `parseJsonb<MaintenanceFinding[]>(row.findings, [])` in
+  `../utils` still normalises the read path for back-compat with
+  legacy rows written before the typed-helper switch
 - `findingAttempts` — upsertAttempt (INSERT ... ON CONFLICT ... DO
   UPDATE so concurrent runs increment atomically without a read-
   modify-write race), getAttempts (filter by projectId + IN-list of

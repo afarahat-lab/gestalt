@@ -65,11 +65,17 @@ export class PostgresAgentExecutionLogRepository implements AgentExecutionLogRep
     log: Omit<AgentExecutionLogRecord, 'id' | 'createdAt'>,
   ): Promise<AgentExecutionLogRecord> {
     const db = getDb();
-    // Explicit `::jsonb` cast on tool_calls — without it postgres'
-    // implicit text→jsonb conversion wraps the whole array as a JSONB
-    // string scalar instead of an array. Same trap maintenance_runs +
-    // alerts handle.
-    const toolCallsJson = JSON.stringify(log.toolCalls ?? []);
+    // postgres.js `db.json(...)` is the typed helper that binds the
+    // value as a real JSONB value. The `${JSON.stringify(...)}::jsonb`
+    // pattern we used to ship looked correct but actually stores the
+    // string as a JSONB string scalar (`jsonb_typeof = 'string'`,
+    // `data = "[{...}]"`); confirmed empirically against postgres@3.4.
+    // See the shared `parseJsonb` helper on the read path — it
+    // unwrapped the trap on the way out, which is why the bug went
+    // unnoticed at the application level. Switching every JSONB write
+    // site to `db.json(...)` makes the column shape correct so direct
+    // SQL probes (`jsonb_array_length`, `jsonb_typeof = 'array'`)
+    // work.
     const [row] = await db<LogRow[]>`
       INSERT INTO agent_execution_logs (
         execution_id, correlation_id, agent_role,
@@ -87,7 +93,7 @@ export class PostgresAgentExecutionLogRepository implements AgentExecutionLogRep
         ${log.signalTypes},
         ${log.errorMessage},
         ${log.modelUsed},
-        ${toolCallsJson}::jsonb
+        ${db.json((log.toolCalls ?? []) as unknown as Parameters<typeof db.json>[0])}
       )
       RETURNING *
     `;

@@ -101,7 +101,10 @@ export function buildCodePrompt(
     `- If the intent adds one function → generate ONLY that file and its test\n` +
     `- If the intent says "scaffold" or "set up" → broader scope is acceptable\n` +
     `- Do NOT generate shared infrastructure unless the intent explicitly asks for it\n` +
-    `- Do NOT generate files that are not directly required by the success criteria`;
+    `- Do NOT generate files that are not directly required by the success criteria\n` +
+    `- NEVER add @gestalt/* packages as dependencies in package.json. ` +
+    `These are internal Gestalt platform packages, not npm packages.\n` +
+    `- NEVER import from @gestalt/* in generated application code.`;
 
   // ── 3. Constraint rules (from HARNESS.json) ────────────────────────
   const constraintRules = ctx.harness?.constraints?.rules ?? [];

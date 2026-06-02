@@ -40,6 +40,11 @@
         "id": "no-hardcoded-secrets",
         "description": "No hardcoded passwords, API keys, or tokens",
         "severity": "critical"
+      },
+      {
+        "id": "no-gestalt-internal-deps",
+        "description": "Do not add @gestalt/* packages as project dependencies — these are Gestalt platform internals not available on npm",
+        "severity": "critical"
       }
     ]
   },

@@ -7,7 +7,7 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-02 (Claude Code — ADR-039 MCP (Model Context Protocol) integration for agent tool use)
+**Last updated:** 2026-06-02 (Claude Code — Two cleanup fixes: no-gestalt-internal-deps constraint rule + JSONB write path typed-helper migration)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -634,15 +634,20 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
     rendered the `readFile` call with the actual file
     content as its output preview (screenshot saved during
     verification)
-  - JSONB storage trap noted: postgres.js wraps
-    `${JSON.stringify(arr)}::jsonb` as a JSONB string
-    scalar rather than parsing to an array on insert. Same
-    behaviour every other JSONB-array column hits (see
-    maintenance_runs.findings). The shared `parseJsonb`
-    helper handles the unwrap on read — the application
-    side, the API response, and the dashboard all get the
-    correct array. Direct `jsonb_array_length` SQL probes
-    fail; that's a quirk of the storage path, not a bug
+  - JSONB write path uses postgres.js's typed `db.json(...)`
+    helper, so `tool_calls`, `findings`, `context`, and
+    `metadata` columns all store as real JSONB values
+    (`jsonb_typeof = 'array'`/`'object'`). The earlier
+    `${JSON.stringify(arr)}::jsonb` pattern was a trap —
+    postgres.js bound the stringified text as a TEXT
+    parameter and `::jsonb` parsed it as a JSONB string
+    scalar (`"[{...}]"`). Direct SQL probes
+    (`jsonb_array_length`, `jsonb_typeof`) now work
+    against every JSONB column. Note the typing tweak:
+    `db.json(value as unknown as Parameters<typeof
+    db.json>[0])` — the postgres.js `JSONValue` requires
+    a structural index signature that typed interfaces
+    don't auto-satisfy
 - **MCP (Model Context Protocol) integration — external
   tool servers (ADR-039).** Extends ADR-038's built-in
   file tools with project-declared external MCP servers.
@@ -1415,12 +1420,14 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
   postgres.js returns the column as an object or a string
 - `maintenanceRuns` — create (status=running), complete (final counts +
   findings JSONB + duration), list (filter by projectId / agentRole).
-  Findings are JSONB-array-typed; the PG impl uses an explicit
-  `::jsonb` cast on insert/update (without it postgres' implicit
-  text→jsonb cast wraps the whole array as a JSON string scalar) and
-  the shared `parseJsonb<MaintenanceFinding[]>(row.findings, [])` in
-  `../utils` normalises the read path against postgres.js returning
-  either a parsed array or a raw JSON string
+  Findings are JSONB-array-typed; the PG impl uses postgres.js's
+  typed `db.json(...)` helper on insert/update (the
+  `${JSON.stringify(arr)}::jsonb` pattern looked correct but
+  actually stored the array as a JSONB string scalar — see the
+  ADR-038 tool-calls bullet above for the full rationale). The
+  shared `parseJsonb<MaintenanceFinding[]>(row.findings, [])` in
+  `../utils` still normalises the read path for back-compat with
+  legacy rows written before the typed-helper switch
 - `findingAttempts` — upsertAttempt (INSERT ... ON CONFLICT ... DO
   UPDATE so concurrent runs increment atomically without a read-
   modify-write race), getAttempts (filter by projectId + IN-list of
@@ -1994,353 +2001,6 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
 
 ## Last three session entries
 
-### Session 2026-06-01 — Claude Code (agent tool use: built-in file tools + agents.yaml configuration — ADR-038, migration 012)
-
-The single largest capability bump since custom agents shipped.
-Agents currently receive a static `ContextSnapshot` and make a single
-LLM call; they can't read existing project files during reasoning,
-producing two visible failure modes:
-
-  1. `code-agent` over-generates — without seeing what already
-     exists it falls back to its training-data prior and produces
-     whole module trees for narrow intents (the motivating
-     `fix tsx version in package.json` case generated 8–12 files
-     until the previous scope-enforcement session).
-  2. Maintenance agents work from regex approximations rather than
-     real file content.
-
-This session ships the tool-use loop. Agents declare tools in
-`agents.yaml`; built-in file tools (`readFile`, `listDirectory`,
-`searchFiles`, `getFileTree`) execute against the cloned project repo
-in a read-only sandbox; the Anthropic-style tool-use loop drives
-LLM → tool execution → LLM iteration until the model stops calling
-tools. Lives in `BaseLLMAgent` so every layer can adopt it.
-
-Changed:
-- `docs/DECISIONS.md`: appended ADR-038 with the full
-  Context / Decision / Rationale / Consequences blocks.
-  Critical note on the LLM-provider shape — the platform's
-  `LLMClient` speaks OpenAI/Azure chat-completions, not
-  Anthropic; the brief's pseudocode mapped cleanly to OpenAI's
-  `tools[{ type: 'function', function: {...} }]` request shape
-  with `choices[0].message.tool_calls` + `finish_reason` on the
-  response, semantics identical
-- `packages/core/src/types.ts`: new `ToolDefinition`,
-  `ToolCall`, `ToolResult`, `BuiltInToolName`, and
-  `ToolCallLogEntry` types
-- `packages/core/src/tools/file-tools.ts` (new):
-  `FILE_TOOL_DEFINITIONS` (the four built-ins, JSON-schema
-  `inputSchema` per the OpenAI function-calling expectation) +
-  `executeFileTool(call, projectRoot)`. All operations are
-  read-only and bounded by `safePath()` (resolves against the
-  project root + rejects anything outside it). `MAX_FILE_SIZE
-  = 100_000` chars, `MAX_SEARCH_RESULTS = 20`, `MAX_TREE_DEPTH
-  = 4`. `IGNORED_DIRECTORIES` covers `node_modules`, `dist`,
-  `.git`, `.gestalt`, `coverage`, `.next`, `.turbo`.
-  `searchFiles` uses `globby` v14 via dynamic import (ESM-only).
-  Pattern is regex-by-default with literal-substring fallback
-  on `new RegExp(...)` throw — operator typos in the search
-  pattern don't crash the tool
-- `packages/core/src/llm/index.ts`:
-  - new `LLMToolCall`, `ToolLoopMessage`,
-    `CompleteWithToolsRequest`, `CompleteWithToolsResponse`
-    types
-  - new `LLMClient.completeWithTools(request)` method. Sends
-    the OpenAI `tools` parameter, parses
-    `choices[0].message.tool_calls` (with `arguments` JSON-
-    parsed once at this layer so callers see typed
-    `Record<string, unknown>` instead of strings),
-    surfaces `finish_reason` as a typed `stopReason` union
-    (`stop` / `tool_calls` / `length` / `content_filter` /
-    `unknown`). No retries today — the tool-use loop's
-    `MAX_TOOL_CALLS = 10` caps total provider calls per
-    agent run, and the caller's outer retry cycle (gate
-    retry, internal JSON-parse retry) is the right boundary
-    for transient failures
-  - new internal `toolLoopMessageToOpenAI` helper maps
-    platform-facing `ToolLoopMessage` to OpenAI wire shape
-    (system/user content, assistant content + tool_calls,
-    tool result with `tool_call_id`)
-  - `OpenAIResponse` extended with optional `tool_calls` +
-    `finish_reason` on `message`
-- `packages/core/src/index.ts`: re-exports
-  `FILE_TOOL_DEFINITIONS`, `executeFileTool`, the new types,
-  and `LLMToolCall` / `ToolLoopMessage` / `CompleteWithToolsRequest`
-  / `CompleteWithToolsResponse`
-- `packages/core/package.json`: added `globby ^14.0.0` as
-  runtime dep (ESM-only — `file-tools.ts` uses dynamic import)
-- `packages/agents/generate/src/types.ts`:
-  - new `AgentToolConfig` (today: `builtin?: BuiltInToolName[]`;
-    `mcp?:` reserved for ADR-039)
-  - `AgentConfig` gained required `tools: AgentToolConfig`.
-    Required because the loader's per-role table always fills
-    it; partial yaml entries still produce a complete config
-    via merge with the baseline
-- `packages/agents/generate/src/config/agent-config-loader.ts`:
-  - `GENERIC_FALLBACK` extended with `tools: { builtin: [] }`
-  - `PER_ROLE_DEFAULTS`: `code-agent` and `context-agent` get
-    `tools: { ...ALL_FILE_TOOLS }` (all four built-ins).
-    Every other agent's entry gets `tools: { builtin: [] }`
-    so behaviour is unchanged
-  - `fallbackFor()` clones the tools array so callers can't
-    accidentally mutate the per-role baseline
-  - new `extractTools(entry, baseline)` reads `tools.builtin`
-    from the YAML entry, falls back to the baseline when
-    absent / malformed, drops unknown tool names so operator
-    typos don't crash. Wired into the merge step
-- `packages/agents/generate/src/agents/base-llm-agent.ts`:
-  - new instance field `lastToolCallLog: ToolCallLogEntry[] = []`
-  - new protected method `callLLMWithTools(prompt, agentConfig,
-    projectRoot, correlationId)`. Loop body:
-    1. `getLLMClient(agentConfig.llm.model)` → captures
-       `lastModelUsed`
-    2. Maintain a `history: ToolLoopMessage[]`; first entry
-       is `{ role: 'user', content: prompt }`
-    3. Per iteration call `client.completeWithTools(...)`
-    4. Update `finalText` from any text content on the turn
-    5. If `stopReason === 'stop'` or no tool calls → exit
-    6. Push assistant turn carrying `tool_calls` so the
-       provider can match the upcoming tool-result messages
-    7. Execute each call via `executeFileTool(...,
-       projectRoot)` (capped at `MAX_TOOL_CALLS = 10`);
-       append `{ role: 'tool', toolCallId, content }`
-       messages; record each call in `toolCallLog` with
-       `output` truncated to 500 chars
-  - new private `resolveToolDefinitions(toolConfig)` filters
-    `FILE_TOOL_DEFINITIONS` against the agent's
-    `tools.builtin` allow-list. Unknown names ignored
-  - Empty tool list → method delegates to `callLLM` so callers
-    have a single call shape regardless of configuration
-- `packages/agents/generate/src/agents/code-agent.ts`:
-  branches on `hasTools = (agentConfig.tools?.builtin?.length ?? 0)
-  > 0`. When true, calls
-  `this.callLLMWithTools(prompt, agentConfig, projectRoot,
-  correlationId).response`; when false, plain `callLLM`. The
-  internal retry loop (JSON-parse failures, "zero code files"
-  responses) sits OUTSIDE the tool loop — each retry attempt is
-  its own full tool-use session
-- `packages/agents/generate/src/agents/context-agent.ts`: same
-  pattern. Context-agent has even higher need for `readFile`
-  because over-writing accurate prose is its worst failure
-  mode
-- `packages/agents/generate/src/prompts/code-prompt.ts`: new
-  `toolsSection` at the TOP of the prompt body when
-  `agentConfig.tools.builtin` is non-empty. Section text is
-  the brief's verbatim "Workflow for modification intents" +
-  "Workflow for new file intents" blocks
-- `packages/adapters/postgres/src/migrations/012_tool_calls.sql`
-  (new): `ALTER TABLE agent_execution_logs ADD COLUMN
-  tool_calls JSONB NOT NULL DEFAULT '[]'::jsonb;`. Pre-
-  migration rows + non-LLM agents come back as `[]` without
-  backfill
-- `packages/core/src/repository/index.ts`:
-  `AgentExecutionLogRecord` gained
-  `toolCalls: ToolCallLogEntry[]`
-- `packages/adapters/postgres/src/repositories/execution-logs.ts`:
-  - `LogRow` gained `toolCalls: unknown`; `rowToRecord` uses
-    `parseJsonb<ToolCallLogEntry[]>(row.toolCalls, [])` to
-    normalise postgres.js's parsed-object vs raw-JSON-string
-    return shapes
-  - `save()` writes `${JSON.stringify(log.toolCalls ?? [])}::jsonb`
-    with the explicit cast pattern the maintenance_runs +
-    alerts repos use
-- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
-  both `executionLogs.save` sites (success + thrown-agent
-  paths) and the custom-agent save site now pass
-  `toolCalls: agentInstance?.lastToolCallLog ?? []` (custom
-  agents pass `[]`)
-- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`,
-  `packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`:
-  every `executionLogs.save` site passes `toolCalls: []`
-  (gate + deploy agents don't currently use tools)
-- `packages/server/src/routes/agents.ts`:
-  - `AgentSummary` gained `builtinTools: string[]`
-  - `mergeAgentEntry` now reads `tools.builtin` from the YAML
-    entry via the new `extractToolsFromEntry` helper
-  - `buildAgentSummary` returns `builtinTools: merged.tools?.
-    builtin ?? []` so `gestalt agents list` and the dashboard
-    can show the effective tool set per agent
-- `packages/dashboard/src/views/IntentDetail.tsx`:
-  - `ExecutionLogResponse.log.toolCalls?: Array<...>` added
-    (typed for the front-end consumer)
-  - New `Tool calls (N)` `<Section>` renders between Prompt
-    and LLM response when `log.toolCalls.length > 0` (empty
-    → section hidden). Each entry shows the tool name, JSON
-    input, and a 200-char output preview. `isError: true`
-    entries render with a red left border (accent for
-    success, red for failure)
-- `templates/corporate-ops-web-mobile/harness/agents.yaml`:
-  seeded `tools.builtin: [readFile, listDirectory,
-  searchFiles, getFileTree]` for both `code-agent` and
-  `context-agent`. Operators can drop or add tools per project
-  without touching framework code
-
-Verified live against `trackeros` (agents.yaml patched + pushed
-to enable tools on the two roles — the operator action that
-should land on every project that wants tool use today):
-
-- Migration 012 applied cleanly on first boot; `\d
-  agent_execution_logs` shows the new `tool_calls` column with
-  `NOT NULL DEFAULT '[]'::jsonb`
-- Submitted the brief's verification intent ("fix tsx version
-  in package.json — change tsx@^0.0.0 to tsx@^4.7.0"). The
-  code-agent completed in 21 s wall-clock (vs ~14 s on the
-  non-tool baseline — the extra time is exactly the
-  `readFile` tool-execution round-trip)
-- **Code-agent persisted prompt has the new
-  `## File tools available` section** at the top of the
-  prompt body. Direct DB query:
-  `prompt LIKE '%## File tools available%' = true`,
-  `prompt LIKE '%getFileTree%' = true`. Prompt size 6663 chars
-- **Code-agent's `tool_calls` JSONB has one entry:** `[{
-  "toolName": "readFile", "input": { "path": "package.json" },
-  "output": "{\\n  \\"name\\": \\"trackeros\\", … \\"tsx\\":
-  \\"^0.0.0\\"\\n  }\\n}", "isError": false, "calledAt":
-  "2026-06-01T19:08:23.572Z" }]`. The model chose to read the
-  real file before generating ✓
-- **The generated `package.json` (the ONLY artifact)
-  preserves every field verbatim from the real file** —
-  `name: "trackeros"`, `version: "0.1.0"`, `private: true`,
-  `packageManager: "pnpm@9.15.4"`, all scripts, all
-  dev-dependencies — and changes ONLY the tsx version to
-  `^4.7.0`. The previous (pre-tools) version of the
-  code-agent would have hallucinated a package.json with
-  plausible-looking defaults rather than the real content.
-  Surgical change end-to-end ✓
-- **`GET /executions/:id/log` API response** returns
-  `toolCalls: [...]` with the unwrapped array shape — the
-  `parseJsonb` read-path helper correctly normalises
-  postgres.js's JSONB-as-string scalar quirk
-- **Dashboard verified via headless Chrome (CDP).**
-  Logged in as `a@b.c`, navigated to the intent detail,
-  expanded the code-agent row. **`Tool calls (1)` section
-  renders between the Prompt and LLM response sections**
-  with `1. readFile({"path":"package.json"})` on the
-  header line and the actual package.json content on the
-  output line (truncated to 200 chars per entry as
-  designed). Screenshot captured at `/tmp/dashboard-toolcalls.png`
-- **`GET /projects/:id/agents`** confirms the new
-  `builtinTools` field: `code-agent` and `context-agent`
-  return `['readFile', 'listDirectory', 'searchFiles',
-  'getFileTree']`; every other framework agent returns `[]`
-
-Decisions made:
-- **OpenAI tool-calling format, not Anthropic.** The brief's
-  pseudocode used Anthropic content-block shape; the platform
-  is OpenAI/Azure-compatible (see the `baseUrl/chat/completions`
-  in `LLMClient`). The implementation maps directly to the
-  OpenAI `tools[{ type: 'function', function: { name,
-  description, parameters } }]` request + `choices[0].
-  message.tool_calls` + `finish_reason` response. Semantics
-  identical; the function-calling spec is a 1:1 mapping with
-  the Anthropic tool-use spec. Documented at the top of
-  ADR-038 so the next implementer doesn't get confused
-- **Loop safety cap = 10 tool calls per agent run, hard
-  number not configurable today.** Operators don't think in
-  terms of "how many tool calls" — they think in terms of
-  "did the agent get its job done". The cap exists for
-  runaway protection (an LLM stuck in a tool-call loop chews
-  provider quota fast); 10 is enough headroom for realistic
-  exploration patterns (`getFileTree` → 2–3 `readFile`s →
-  generate is the common case). If the cap becomes a problem
-  in practice, surface it later as an `agents.yaml`
-  `tools.maxCalls:` field — keeping it hard today avoids
-  surfacing a config knob no one needs yet
-- **`callLLMWithTools` delegates to `callLLM` when tools
-  empty.** Avoids the alternative ("call sites branch on
-  hasTools and call one of two methods") — keeps the call
-  surface clean. The cost is a method-level branch each
-  invocation, which is free
-- **Tool call output truncated at storage to 500 chars; the
-  live loop sees the full result.** A 100 KB README dumped
-  into the audit log for every cycle would blow up the
-  table fast. The full content already flowed back to the
-  LLM in the live message history; the persisted entry
-  exists so an operator can see "agent called readFile on
-  package.json — got [start of file]…" at a glance. If a
-  later audit really needs the full result, re-running the
-  tool against the project tree at the time of the original
-  cycle is the right approach (the tool is deterministic
-  for unchanged files)
-- **Path traversal: hard throw, not "return error", at the
-  resolution layer.** A traversal attempt should never
-  return data to the LLM, even via an `isError: true`
-  message — that information is what an attacker would
-  use to learn the project layout. The `executeFileTool`
-  wrapper catches the throw and produces the error result
-  shape; the LLM sees "Error: Path traversal blocked: …"
-  which is enough information for it to retry with a valid
-  path. The actual resolved-path comparison
-  (`resolved.startsWith(resolvedRoot + '/')`) prevents the
-  `/var/foo` vs `/var/foobar` edge case
-- **`globby` ESM-only — dynamic import is mandatory.** The
-  `@gestalt/core` package targets CJS output today; static
-  `import { globby }` would break the build. Documented in
-  the source comment so the next reviewer doesn't try to
-  "clean it up". When the workspace moves to ESM, the
-  dynamic import becomes redundant but stays correct
-- **Tool definitions live in core, executed at the agent
-  layer.** Considered putting `executeFileTool` somewhere
-  closer to the agents (e.g., the orchestrator). Decided
-  on `@gestalt/core` because every layer that uses
-  `BaseLLMAgent` already imports core, and putting the
-  executor next to the definitions keeps the path-traversal
-  guard in one place. If MCP integration (ADR-039) ships,
-  the same module gains an `executeMcpTool` function and
-  the agent-side dispatch grows a class check; the
-  definitions table stays the source of truth for
-  "what tools exist"
-- **JSONB storage trap noted but not fixed.** postgres.js
-  wraps `${JSON.stringify(arr)}::jsonb` as a JSONB string
-  scalar instead of parsing — every JSONB-array column
-  in the platform hits this (maintenance_runs.findings,
-  alerts.context, deployment_events.metadata, the new
-  agent_execution_logs.tool_calls). The shared `parseJsonb`
-  helper handles the unwrap on read. A "proper" fix would
-  audit every write site to use postgres.js's
-  `db.json(value)` helper — out of scope for this session.
-  Direct SQL probes (`jsonb_array_length`) fail; the
-  application path works. Documented in STATE.md so the
-  next operator who runs a direct SQL probe knows why
-- **The "operator action" gap that ships today.** The
-  template's seeded `agents.yaml` enables tools, but
-  existing projects bootstrapped before this session have
-  no `tools:` key on their `code-agent` block — they
-  default to the per-role baseline (which DOES have
-  tools), but only because the loader's baseline ships
-  the four-tool set. New `gestalt init` projects work
-  out of the box; legacy projects work transparently
-  (the loader picks up the baseline). Operators who
-  want to override (e.g., disable a tool for a paranoid
-  audit) need to add the `tools.builtin: [...]` array to
-  their committed `agents.yaml`. Documented this in the
-  agents.yaml template's surrounding comments
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Migration 012 applied. Server image rebuilt. Tool-use loop
-verified end-to-end on the tsx-version-fix intent: the
-code-agent called `readFile({ path: "package.json" })`,
-received the actual file content, and produced a one-line
-surgical edit that preserved every other field verbatim.
-The tool call landed on `agent_execution_logs.tool_calls` as
-expected; the dashboard's IntentDetail accordion renders
-the new `Tool calls (1)` section with the file content
-preview. The `GET /projects/:id/agents` summary endpoint
-surfaces the effective tool set per agent.
-
-Pending follow-up (low priority): the JSONB-string-scalar
-storage trap should eventually be fixed at the write path
-for every JSONB-array column. Today the read side normalises
-correctly via `parseJsonb`; direct SQL probes need the
-`(col#>>'{}')::jsonb` unwrap. Not added to the Pending
-enhancements list because it's purely cosmetic — every
-consumer of these columns reads through the application
-which handles it.
-
-No new Pending enhancements introduced.
-
----
-
 ### Session 2026-06-01 — Claude Code (gate orchestrator creates GP_BREACH alert on escalate + one-shot backfill)
 
 Operator-reported bug: "I see an escalated intent but no alerts —
@@ -2802,3 +2462,188 @@ Follow-up logged in Pending enhancements:
   fail. Pre-existing from ADR-038's `execution-logs.ts`
   insert path. Same fix the maintenance_runs.findings
   column got — add `::jsonb` cast on the `INSERT`
+
+---
+
+### Session 2026-06-02 — Claude Code (two cleanups: no-gestalt-internal-deps constraint + JSONB write path typed-helper migration)
+
+Two pre-existing issues, both mechanical. No architectural decisions.
+
+**Fix 1 — Prevent code-agent adding `@gestalt/*` to user project
+dependencies.** The code-agent has a known tendency to scaffold
+project `package.json` files with `@gestalt/core` / `@gestalt/server`
+entries because those names appear in its training data and in the
+project's harness context. Those packages are platform internals
+not published to npm — the resulting `package.json` is unusable.
+
+**Fix 2 — JSONB write path uses postgres.js's typed `db.json()`
+helper.** Every JSONB-array column in the platform was being stored
+as a JSON-encoded string scalar (`jsonb_typeof = 'string'`) rather
+than a true JSONB array. The `parseJsonb` helper on the read path
+unwrapped the trap so the application worked correctly, but direct
+SQL probes (`jsonb_array_length`, `jsonb_typeof = 'array'`) failed.
+The brief proposed an explicit `::jsonb` cast fix; empirical probe
+disproved that — see "Decisions made" below.
+
+Changed:
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`: added
+  the `no-gestalt-internal-deps` rule (critical) to
+  `constraints.rules`. New `gestalt init` projects ship with it
+- `packages/agents/generate/src/prompts/code-prompt.ts`: scope
+  section gained two explicit rules — "NEVER add @gestalt/*
+  packages as dependencies in package.json" and "NEVER import
+  from @gestalt/* in generated application code". Sits right
+  after the existing scope rules so the LLM sees it before
+  reading the intent
+- `packages/agents/generate/src/prompts/intent-prompt.ts`: scope
+  minimisation section gained the trailing instruction "Never
+  include @gestalt/* packages in generated package.json files.
+  These are internal Gestalt platform packages, not available on
+  npm." The intent-agent now sets `outOfScope` tighter when an
+  intent touches `package.json`
+- `packages/adapters/postgres/src/repositories/execution-logs.ts`:
+  `tool_calls` INSERT switched from `${JSON.stringify(arr)}::jsonb`
+  to `${db.json((arr) as unknown as Parameters<typeof db.json>[0])}`.
+  Inline comment documents the empirical finding so the next
+  refactor doesn't accidentally revert
+- `packages/adapters/postgres/src/repositories/maintenance-runs.ts`:
+  `findings` INSERT + `findings` UPDATE both switched to
+  `db.json(...)` with the same cast pattern
+- `packages/adapters/postgres/src/repositories/alerts.ts`:
+  `context` INSERT switched to `db.json(...)`
+- `packages/adapters/postgres/src/repositories/deployment-events.ts`:
+  `metadata` INSERT switched to `db.json(...)`
+- `docs/claude/STATE.md`: ADR-038 tool-calls bullet + Postgres
+  adapter `maintenanceRuns` bullet rewritten — both now describe
+  the `db.json()` path as the source of truth. The "JSONB storage
+  trap noted" caveat under ADR-038 is replaced with the resolved
+  status. Last-updated line and current-state header updated
+
+Empirical investigation:
+- Wrote a small probe inside the running server container against
+  the live postgres, testing three patterns side-by-side:
+  ```
+  await sql`INSERT VALUES (1, 'cast',   ${JSON.stringify(arr)}::jsonb)`
+  await sql`INSERT VALUES (2, 'helper', ${sql.json(arr)})`
+  await sql`INSERT VALUES (3, 'raw',    ${arr})`
+  ```
+  Results:
+  - #1 `cast`: `jsonb_typeof = 'string'`, stored as
+    `"[{\"a\":1},...]"` (the bug)
+  - #2 `helper`: `jsonb_typeof = 'array'` ✓
+  - #3 `raw`: `jsonb_typeof = 'array'` ✓
+  The brief's recommendation of `::jsonb` is actually wrong —
+  postgres.js's text parameter binding + the cast still leaves a
+  JSONB string scalar. The fix is `db.json(value)` or direct array
+  binding. Picked `db.json` because it's self-documenting at the
+  call site (the next reviewer sees "JSON-typed binding" rather
+  than guessing why a raw object is being bound)
+
+Verified live:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt; reaches `Up (healthy)`
+- Submitted `isPositive` utility intent against trackeros
+  (correlationId `8c7a53ba`). Cycle ran generate + gate +
+  deploy in ~60 s (pipeline-agent failed for the same
+  unrelated CI reason that hit the ADR-039 verification — out
+  of scope here)
+- **All 4 SQL probes return correct JSONB types:**
+  ```
+  tool_calls (new):           jsonb_typeof = array, length = 2
+  maintenance_runs.findings:  jsonb_typeof = array, length = 0
+  alerts.context:             jsonb_typeof = object
+  deployment_events.metadata: jsonb_typeof = object
+  ```
+  The new `tool_calls` row from the verification cycle stores
+  the code-agent's 2 real built-in tool calls as a JSONB array
+  — previously this exact row would have been a string scalar
+- **Fix 1 verification:**
+  - Code-agent's persisted prompt contains the
+    `NEVER add @gestalt/*` scope rule (`POSITION('@gestalt/'
+    IN prompt) > 0` returns `true`)
+  - Generated artifacts (`src/shared/utils/is-positive.ts`,
+    `src/shared/utils/__tests__/is-positive.test.ts`) contain
+    zero `@gestalt/` references
+  - The `no-gestalt-internal-deps` constraint rule is NOT yet
+    in trackeros's HARNESS.json (operator action — see below)
+    so it isn't in the constraint-rules section of the prompt,
+    but the hardcoded scope rule alone was enough to suppress
+    the behaviour on this cycle
+- Read path still works for legacy rows: existing alerts /
+  maintenance_runs / deployment_events rows that were written
+  before this session as JSONB string scalars continue to be
+  unwrapped correctly by `parseJsonb` on read. No backfill
+  needed — the application path was always correct, only the
+  storage shape changed
+
+Decisions made:
+- **`db.json()` over `::jsonb`.** The brief's
+  `${JSON.stringify(arr)}::jsonb` recommendation was disproven
+  empirically. Switching every call site to postgres.js's typed
+  helper is the actually-correct fix, not the syntactic one.
+  Documented inline in `execution-logs.ts` so future maintainers
+  don't re-introduce the trap
+- **Cast through `unknown`.** postgres.js's `JSONValue` requires
+  a structural `[prop: string]: ...` index signature that typed
+  interfaces (`ToolCallLogEntry[]`,
+  `Record<string, unknown>`, `MaintenanceFinding[]`) don't
+  satisfy by default. The pattern is
+  `db.json(value as unknown as Parameters<typeof db.json>[0])`
+  — same idiom CLAUDE.md's "no any" rule allows. Picked
+  `Parameters<typeof db.json>[0]` over importing postgres's
+  `JSONValue` directly because the inner type doesn't need to
+  be named at the call site
+- **No backfill.** Legacy rows (alerts created before this
+  session, maintenance_runs from earlier cycles, deployment_events
+  from the ADR-039 cycle) remain stored as JSONB string scalars.
+  The `parseJsonb` helper unwraps both shapes on the read path,
+  so the dashboard, API responses, and application code all
+  produce identical output regardless of how the row was
+  written. A migration to coerce legacy rows to proper JSONB
+  arrays would be cosmetic; the application contract is
+  unchanged
+- **No new operator action for Fix 1 today.** Fix 1a (template)
+  is shipped — new projects get the rule. Fix 1b/1c (prompts)
+  are shipped — every project benefits regardless of HARNESS.json
+  contents. Fix 1d (push to trackeros/HARNESS.json) is the
+  operator action documented below; the auto-mode classifier
+  correctly denied my push attempt (pushing to a project repo's
+  main is operator-only — same pattern the previous sessions
+  documented)
+
+Operator action — pending on `trackeros`:
+- Update `trackeros/HARNESS.json` to add `no-gestalt-internal-deps`
+  to `constraints.rules`. The recommended commit:
+
+  ```
+  cd <trackeros working tree>
+  git pull
+  # Edit HARNESS.json; append to constraints.rules:
+  #   {
+  #     "id": "no-gestalt-internal-deps",
+  #     "description": "Do not add @gestalt/* packages as project
+  #       dependencies — these are Gestalt platform internals not
+  #       available on npm",
+  #     "severity": "critical"
+  #   }
+  git add HARNESS.json
+  git commit -m "constraints: add no-gestalt-internal-deps rule"
+  git push
+  ```
+
+  Until this lands, trackeros cycles still rely solely on the
+  prompt-level scope rule (which is sufficient for typical
+  cases). After the operator pushes, the constraint-agent's
+  regex pattern + the LLM review-agent will both check the rule
+  explicitly
+
+Build status: `pnpm -r build` clean across all 12 packages. Server
+image rebuilt; one full SDLC slice verified end-to-end (intent →
+generate → gate → deploy). All four JSONB columns now store true
+JSONB types as confirmed by direct SQL probes.
+
+No new Pending enhancements introduced. The two follow-ups from
+prior sessions ("tool_calls JSONB write path is missing explicit
+`::jsonb` cast" from ADR-039, and the analogous note that was
+already worked-around in maintenance_runs and alerts) are both
+resolved.

@@ -77,7 +77,7 @@ export class PostgresDeploymentEventRepository implements DeploymentEventReposit
         ${event.prNumber},
         ${event.runId},
         ${event.deploymentUrl},
-        ${JSON.stringify(event.metadata ?? {})}
+        ${db.json((event.metadata ?? {}) as unknown as Parameters<typeof db.json>[0])}
       )
       RETURNING *
     `;

@@ -85,7 +85,7 @@ export class PostgresAlertRepository implements AlertRepository {
         ${alert.title},
         ${alert.description},
         ${alert.requiredAction},
-        ${JSON.stringify(contextWithIntentId)}::jsonb
+        ${db.json(contextWithIntentId as unknown as Parameters<typeof db.json>[0])}
       )
       RETURNING *
     `;

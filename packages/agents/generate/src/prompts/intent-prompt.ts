@@ -124,6 +124,9 @@ intent doesn't mention so the downstream agents don't drift into adjacent
 files. If the intent mentions a single file path, that file goes in
 affectedDomains and the rest of the project goes in outOfScope (e.g.
 outOfScope: ["everything outside package.json"]).
+
+Never include @gestalt/* packages in generated package.json files.
+These are internal Gestalt platform packages, not available on npm.
 `;
   return applyAgentConfig(body, ctx.agentConfig);
 }

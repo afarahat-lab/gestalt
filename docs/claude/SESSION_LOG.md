@@ -8042,3 +8042,188 @@ Follow-up logged in Pending enhancements:
   fail. Pre-existing from ADR-038's `execution-logs.ts`
   insert path. Same fix the maintenance_runs.findings
   column got — add `::jsonb` cast on the `INSERT`
+
+---
+
+### Session 2026-06-02 — Claude Code (two cleanups: no-gestalt-internal-deps constraint + JSONB write path typed-helper migration)
+
+Two pre-existing issues, both mechanical. No architectural decisions.
+
+**Fix 1 — Prevent code-agent adding `@gestalt/*` to user project
+dependencies.** The code-agent has a known tendency to scaffold
+project `package.json` files with `@gestalt/core` / `@gestalt/server`
+entries because those names appear in its training data and in the
+project's harness context. Those packages are platform internals
+not published to npm — the resulting `package.json` is unusable.
+
+**Fix 2 — JSONB write path uses postgres.js's typed `db.json()`
+helper.** Every JSONB-array column in the platform was being stored
+as a JSON-encoded string scalar (`jsonb_typeof = 'string'`) rather
+than a true JSONB array. The `parseJsonb` helper on the read path
+unwrapped the trap so the application worked correctly, but direct
+SQL probes (`jsonb_array_length`, `jsonb_typeof = 'array'`) failed.
+The brief proposed an explicit `::jsonb` cast fix; empirical probe
+disproved that — see "Decisions made" below.
+
+Changed:
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`: added
+  the `no-gestalt-internal-deps` rule (critical) to
+  `constraints.rules`. New `gestalt init` projects ship with it
+- `packages/agents/generate/src/prompts/code-prompt.ts`: scope
+  section gained two explicit rules — "NEVER add @gestalt/*
+  packages as dependencies in package.json" and "NEVER import
+  from @gestalt/* in generated application code". Sits right
+  after the existing scope rules so the LLM sees it before
+  reading the intent
+- `packages/agents/generate/src/prompts/intent-prompt.ts`: scope
+  minimisation section gained the trailing instruction "Never
+  include @gestalt/* packages in generated package.json files.
+  These are internal Gestalt platform packages, not available on
+  npm." The intent-agent now sets `outOfScope` tighter when an
+  intent touches `package.json`
+- `packages/adapters/postgres/src/repositories/execution-logs.ts`:
+  `tool_calls` INSERT switched from `${JSON.stringify(arr)}::jsonb`
+  to `${db.json((arr) as unknown as Parameters<typeof db.json>[0])}`.
+  Inline comment documents the empirical finding so the next
+  refactor doesn't accidentally revert
+- `packages/adapters/postgres/src/repositories/maintenance-runs.ts`:
+  `findings` INSERT + `findings` UPDATE both switched to
+  `db.json(...)` with the same cast pattern
+- `packages/adapters/postgres/src/repositories/alerts.ts`:
+  `context` INSERT switched to `db.json(...)`
+- `packages/adapters/postgres/src/repositories/deployment-events.ts`:
+  `metadata` INSERT switched to `db.json(...)`
+- `docs/claude/STATE.md`: ADR-038 tool-calls bullet + Postgres
+  adapter `maintenanceRuns` bullet rewritten — both now describe
+  the `db.json()` path as the source of truth. The "JSONB storage
+  trap noted" caveat under ADR-038 is replaced with the resolved
+  status. Last-updated line and current-state header updated
+
+Empirical investigation:
+- Wrote a small probe inside the running server container against
+  the live postgres, testing three patterns side-by-side:
+  ```
+  await sql`INSERT VALUES (1, 'cast',   ${JSON.stringify(arr)}::jsonb)`
+  await sql`INSERT VALUES (2, 'helper', ${sql.json(arr)})`
+  await sql`INSERT VALUES (3, 'raw',    ${arr})`
+  ```
+  Results:
+  - #1 `cast`: `jsonb_typeof = 'string'`, stored as
+    `"[{\"a\":1},...]"` (the bug)
+  - #2 `helper`: `jsonb_typeof = 'array'` ✓
+  - #3 `raw`: `jsonb_typeof = 'array'` ✓
+  The brief's recommendation of `::jsonb` is actually wrong —
+  postgres.js's text parameter binding + the cast still leaves a
+  JSONB string scalar. The fix is `db.json(value)` or direct array
+  binding. Picked `db.json` because it's self-documenting at the
+  call site (the next reviewer sees "JSON-typed binding" rather
+  than guessing why a raw object is being bound)
+
+Verified live:
+- `pnpm -r build` clean across all 12 packages
+- Server image rebuilt; reaches `Up (healthy)`
+- Submitted `isPositive` utility intent against trackeros
+  (correlationId `8c7a53ba`). Cycle ran generate + gate +
+  deploy in ~60 s (pipeline-agent failed for the same
+  unrelated CI reason that hit the ADR-039 verification — out
+  of scope here)
+- **All 4 SQL probes return correct JSONB types:**
+  ```
+  tool_calls (new):           jsonb_typeof = array, length = 2
+  maintenance_runs.findings:  jsonb_typeof = array, length = 0
+  alerts.context:             jsonb_typeof = object
+  deployment_events.metadata: jsonb_typeof = object
+  ```
+  The new `tool_calls` row from the verification cycle stores
+  the code-agent's 2 real built-in tool calls as a JSONB array
+  — previously this exact row would have been a string scalar
+- **Fix 1 verification:**
+  - Code-agent's persisted prompt contains the
+    `NEVER add @gestalt/*` scope rule (`POSITION('@gestalt/'
+    IN prompt) > 0` returns `true`)
+  - Generated artifacts (`src/shared/utils/is-positive.ts`,
+    `src/shared/utils/__tests__/is-positive.test.ts`) contain
+    zero `@gestalt/` references
+  - The `no-gestalt-internal-deps` constraint rule is NOT yet
+    in trackeros's HARNESS.json (operator action — see below)
+    so it isn't in the constraint-rules section of the prompt,
+    but the hardcoded scope rule alone was enough to suppress
+    the behaviour on this cycle
+- Read path still works for legacy rows: existing alerts /
+  maintenance_runs / deployment_events rows that were written
+  before this session as JSONB string scalars continue to be
+  unwrapped correctly by `parseJsonb` on read. No backfill
+  needed — the application path was always correct, only the
+  storage shape changed
+
+Decisions made:
+- **`db.json()` over `::jsonb`.** The brief's
+  `${JSON.stringify(arr)}::jsonb` recommendation was disproven
+  empirically. Switching every call site to postgres.js's typed
+  helper is the actually-correct fix, not the syntactic one.
+  Documented inline in `execution-logs.ts` so future maintainers
+  don't re-introduce the trap
+- **Cast through `unknown`.** postgres.js's `JSONValue` requires
+  a structural `[prop: string]: ...` index signature that typed
+  interfaces (`ToolCallLogEntry[]`,
+  `Record<string, unknown>`, `MaintenanceFinding[]`) don't
+  satisfy by default. The pattern is
+  `db.json(value as unknown as Parameters<typeof db.json>[0])`
+  — same idiom CLAUDE.md's "no any" rule allows. Picked
+  `Parameters<typeof db.json>[0]` over importing postgres's
+  `JSONValue` directly because the inner type doesn't need to
+  be named at the call site
+- **No backfill.** Legacy rows (alerts created before this
+  session, maintenance_runs from earlier cycles, deployment_events
+  from the ADR-039 cycle) remain stored as JSONB string scalars.
+  The `parseJsonb` helper unwraps both shapes on the read path,
+  so the dashboard, API responses, and application code all
+  produce identical output regardless of how the row was
+  written. A migration to coerce legacy rows to proper JSONB
+  arrays would be cosmetic; the application contract is
+  unchanged
+- **No new operator action for Fix 1 today.** Fix 1a (template)
+  is shipped — new projects get the rule. Fix 1b/1c (prompts)
+  are shipped — every project benefits regardless of HARNESS.json
+  contents. Fix 1d (push to trackeros/HARNESS.json) is the
+  operator action documented below; the auto-mode classifier
+  correctly denied my push attempt (pushing to a project repo's
+  main is operator-only — same pattern the previous sessions
+  documented)
+
+Operator action — pending on `trackeros`:
+- Update `trackeros/HARNESS.json` to add `no-gestalt-internal-deps`
+  to `constraints.rules`. The recommended commit:
+
+  ```
+  cd <trackeros working tree>
+  git pull
+  # Edit HARNESS.json; append to constraints.rules:
+  #   {
+  #     "id": "no-gestalt-internal-deps",
+  #     "description": "Do not add @gestalt/* packages as project
+  #       dependencies — these are Gestalt platform internals not
+  #       available on npm",
+  #     "severity": "critical"
+  #   }
+  git add HARNESS.json
+  git commit -m "constraints: add no-gestalt-internal-deps rule"
+  git push
+  ```
+
+  Until this lands, trackeros cycles still rely solely on the
+  prompt-level scope rule (which is sufficient for typical
+  cases). After the operator pushes, the constraint-agent's
+  regex pattern + the LLM review-agent will both check the rule
+  explicitly
+
+Build status: `pnpm -r build` clean across all 12 packages. Server
+image rebuilt; one full SDLC slice verified end-to-end (intent →
+generate → gate → deploy). All four JSONB columns now store true
+JSONB types as confirmed by direct SQL probes.
+
+No new Pending enhancements introduced. The two follow-ups from
+prior sessions ("tool_calls JSONB write path is missing explicit
+`::jsonb` cast" from ADR-039, and the analogous note that was
+already worked-around in maintenance_runs and alerts) are both
+resolved.
