@@ -7,7 +7,7 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-02 (Claude Code — corporate identity: Kerberos/SAML/OIDC providers implemented + auth.config.json schema per ADR-040)
+**Last updated:** 2026-06-02 (Claude Code — corporate identity verified end-to-end against Keycloak fixture; OIDC + SAML pass with role mapping from IdP groups)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -2086,241 +2086,6 @@ enforced"):
 
 ## Last three session entries
 
-### Session 2026-06-02 — Claude Code (BaseLLMAgent + BaseOrchestrator to @gestalt/core; uniform tool/MCP access)
-
-Architectural refactor — moves the abstract base for every
-LLM-calling agent and a new shared orchestrator base into
-`@gestalt/core` so generate / gate / maintenance all share one
-implementation. As a follow-on, expands `PER_ROLE_DEFAULTS` to give
-the gate's `review-agent` and the maintenance layer's LLM agents
-file-tool access, and surfaces all three layers on the
-`GET /projects/:id/agents` endpoint + the CLI display.
-
-Deviation from the brief (flagged in ADR-038 Amendment block):
-the brief's pseudocode for `BaseOrchestrator` prescribed a strict
-template-method pattern (`withProjectClone` controlling cycle
-lifecycle, single `execute(ctx)` subclass entry). Implementing that
-literally would have required rewriting generate's resume /
-clarification / retry / custom-agent interleaving paths in ways that
-change behaviour. The brief's hard constraint was "No behaviour
-changes for the generate layer". `BaseOrchestrator` ships instead as
-a services-oriented class with protected helpers — orchestrators
-extend it for the structural goal and to access shared services, but
-their existing top-level handlers stay intact.
-
-Changed:
-- `packages/core/src/types.ts`: added `FeedbackSignal` (alias of
-  `PlatformSignal`) and `AgentStatus` (six-value union including
-  generate's `'clarification-needed'`)
-- `packages/core/src/agents/agent-config.ts` (new): shared types
-  `AgentLlmConfig`, `AgentToolConfig`, `AgentConfig`, `AgentsYaml`,
-  `CustomAgentDefinition`, `CustomAgentNode`, `LlmCallFn`.
-  Re-exports `McpServerConfig` from the existing
-  `tools/mcp-resolver` so MCP config types stay disjoint
-- `packages/core/src/agents/agent-config-helpers.ts` (new):
-  `applyAgentConfig`, `buildPersona`, `buildExtensionsBlock` —
-  small string-building helpers used by every prompt builder
-- `packages/core/src/agents/agent-config-loader.ts` (new):
-  `loadAgentConfig` + `loadCustomAgents` + `defaultAgentConfig`,
-  with **expanded `PER_ROLE_DEFAULTS`**:
-  - `review-agent` (gate layer) gets `{ builtin: ['readFile',
-    'searchFiles'] }`
-  - `drift-agent` + `alignment-agent` (maintenance) get the full
-    file-tool set
-  - `context-fixer` (maintenance) gets `{ builtin: ['readFile',
-    'listDirectory'] }`
-- `packages/core/src/agents/base-llm-agent.ts` (new): port of the
-  generate-layer class, generic over `<TTask, TResult>` so each
-  layer's subclasses can declare their own typed task/result shapes.
-  All other behaviour (lastPrompt / lastLlmResponse / lastModelUsed
-  capture, callLLM / callLLMWithMessages / callLLMWithTools loop,
-  MCP namespace dispatch, makeContextGapSignal helper) preserved
-  byte-for-byte
-- `packages/core/src/orchestrator/base-orchestrator.ts` (new):
-  `BaseOrchestrator` with `OrchestratorContext` interface +
-  protected `closeMcpClients`, `loadHarness`, `resolveAgentContext`
-  helpers. Subclasses use these for the new tool/MCP work;
-  generate's existing handler keeps inline-resolving for its
-  existing flow (no behaviour change)
-- `packages/core/src/index.ts`: exports the new types and classes
-- `packages/agents/generate/src/agents/base-llm-agent.ts`,
-  `packages/agents/generate/src/config/agent-config-loader.ts`,
-  `packages/agents/generate/src/prompts/agent-config-helpers.ts`:
-  rewritten as re-export shims — `export { BaseLLMAgent } from
-  '@gestalt/core'` etc. Every existing import path keeps working
-- `packages/agents/generate/src/types.ts`: removed the now-duplicate
-  declarations of `AgentLlmConfig`, `AgentToolConfig`, `AgentConfig`,
-  `AgentsYaml`, `McpServerConfig`, `CustomAgentDefinition`,
-  `CustomAgentNode`, `LlmCallFn`, `FeedbackSignal`, `AgentStatus`.
-  Re-exports those names from `@gestalt/core` so callers using
-  `import type { ... } from '@gestalt/agents-generate'` keep
-  working. Local imports added for internal references in this
-  same file
-- `packages/agents/generate/src/orchestrator/orchestrator.ts`: adds
-  `class GenerateOrchestrator extends BaseOrchestrator` (instantiated
-  in `startOrchestratorWorker` so subclass services are available
-  to future work). `agentInstance.run(task)` return cast to
-  `AgentResult` at the orchestrator boundary because the base
-  class's `TResult` defaults to `unknown`
-- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
-  adds `class GateOrchestrator extends BaseOrchestrator`
-- `packages/agents/quality-gate/src/agents/llm-review-agent.ts`:
-  imports `loadAgentConfig` + `BaseLLMAgent` from `@gestalt/core`
-  (was `@gestalt/agents-generate`). **Switched
-  `this.callLLM(prompt, agentConfig, correlationId)` →
-  `this.callLLMWithTools(prompt, agentConfig,
-  task.harnessConfig.projectRoot, task.correlationId)`** so the
-  review-agent can spot-check files referenced in the artifact set
-  before flagging issues. Falls through to plain LLM call when the
-  operator strips tools via agents.yaml
-- `packages/agents/maintenance/src/scheduler/index.ts`: adds
-  `class MaintenanceOrchestrator extends BaseOrchestrator`
-- `packages/agents/maintenance/src/agents/context-fixer.ts`:
-  imports `loadAgentConfig` + `BaseLLMAgent` from `@gestalt/core`
-  (was `@gestalt/agents-generate`)
-- `templates/corporate-ops-web-mobile/harness/agents.yaml`:
-  `review-agent`, `drift-agent`, `alignment-agent`,
-  `context-fixer` blocks gained explicit `tools.builtin: [...]`
-  entries matching the new `PER_ROLE_DEFAULTS`. New projects ship
-  with tools enabled out of the box
-- `packages/server/src/routes/agents.ts`: `GET /projects/:id/agents`
-  returns an additional `layers: { generate, gate, maintenance }`
-  field partitioning the framework agents by layer + listing
-  infrastructure agents. Legacy `frameworkAgents` / `customAgents`
-  fields preserved for back-compat
-- `packages/cli/src/api/client.ts`: `AgentsListResponse.layers`
-  optional field added
-- `packages/cli/src/commands/agents.ts`: `gestalt agents list`
-  renders three sections (Generate / Gate / Maintenance) when the
-  server returns `layers`; falls through to the legacy
-  flat-framework layout for older server builds
-- `docs/DECISIONS.md`: ADR-038 Amendment 2026-06 appended
-  documenting the move to core, the expanded defaults, the
-  review-agent tool switch, the API + CLI surface changes, and
-  the deviation from the brief's pseudocode
-
-Verified live:
-- `pnpm -r build` clean across all 12 packages
-- **Brief's grep checks both pass:**
-  ```
-  grep -r "class BaseLLMAgent" packages/agents/     # zero matches
-  grep -r "class BaseOrchestrator" packages/agents/ # zero matches
-  ```
-  All three classes (`GenerateOrchestrator`, `GateOrchestrator`,
-  `MaintenanceOrchestrator`) extend `BaseOrchestrator` from
-  `@gestalt/core`
-- **`GET /projects/9d74401f.../agents` returns the new `layers`
-  payload** with the expected partition:
-  - Generate framework: 5 agents (context-agent / code-agent
-    have file tools)
-  - Gate framework: `review-agent` with `[readFile,
-    searchFiles]`; infrastructure
-    `[constraint-agent, lint-agent, security-agent,
-    test-runner-agent]`
-  - Maintenance LLM: `drift-agent`, `alignment-agent` with full
-    file tools; `context-fixer` with `[readFile, listDirectory]`;
-    infrastructure `[gc-agent, evaluation-agent]`
-- **`gestalt agents list trackeros`** renders the three sections
-  with each LLM agent's `tools: ...` set visible inline. Custom
-  agents nested under the Generate layer's `custom:` subsection
-- **Live SDLC cycle** (`f7179e68-d105-4523-b807-21d1dccfbb9e`,
-  isEven utility): 11 agent executions through generate → gate
-  → deploy. code-agent made 2 built-in tool calls (existing
-  path still works). **review-agent ran through
-  `callLLMWithTools`** — `agent_execution_logs.tool_calls` is a
-  proper JSONB array (length 0; the LLM decided not to call
-  tools for this trivial intent, but the tool-use loop was
-  active). Model was `gpt-4o` (resolved correctly through
-  agents.yaml). Pipeline-agent failed for unrelated CI reason
-  (project test runner — same as prior cycles)
-
-Decisions made:
-- **Deviation from the brief's BaseOrchestrator template-method
-  pattern.** The brief's pseudocode had `withProjectClone` controlling
-  cycle lifecycle and a single `execute(ctx)` subclass entry. The
-  brief also said "No behaviour changes for the generate layer."
-  These two are in tension: generate's `handleIntentTask` has
-  resume-path / clarification-gate / retry-routing / custom-agent-
-  interleaving / clone-vs-supplied logic that doesn't fit a single
-  `execute(ctx)`. Shipping a services-oriented base class delivers
-  the brief's stated value goal ("Gate and maintenance layers gain
-  tool use, MCP access, and agents.yaml configuration") AND the
-  structural goal ("all orchestrators extend BaseOrchestrator")
-  WITHOUT requiring the rewrite. Documented in the base class's
-  module docstring + the ADR-038 amendment so the next reviewer
-  doesn't think the prescriptive pattern was forgotten
-- **`BaseLLMAgent` generic over `<TTask, TResult>`** instead of
-  declaring `AgentTask` / `AgentResult` in core. The base class
-  doesn't introspect task fields — only the abstract `buildPrompt`
-  and `parseResponse` methods do, and those are subclass-specific.
-  Generic-typed lets each layer use its own typed pair without
-  forcing generate-specific shapes (`ContextSnapshot`, `IntentSpec`,
-  …) into core
-- **`FeedbackSignal` is an alias of `PlatformSignal`**, not a
-  separate type. The brief said "already partially in core —
-  consolidate". `FeedbackSignal` and `PlatformSignal` had identical
-  shapes; aliasing is the cleanest consolidation
-- **`AgentStatus` includes `'clarification-needed'`** — a
-  generate-specific status used by intent-agent's pause path. The
-  other layers only use the first five values but keeping the
-  full union in core matches what `agent_executions.status` can
-  hold
-- **Expanded `PER_ROLE_DEFAULTS`** with a tiered tool strategy:
-  - code-agent + context-agent + drift-agent + alignment-agent
-    → full file tool set (these agents explore + verify large
-    surface areas)
-  - review-agent → `readFile + searchFiles` only (operates off
-    artifacts already in prompt; tools for spot-checking)
-  - context-fixer → `readFile + listDirectory` (verify current
-    file state before editing; no need for searchFiles)
-- **review-agent switched from `callLLM` to `callLLMWithTools`.**
-  Real value-delivery for the gate layer. Previously the
-  review-agent could only reason from the artifact set embedded
-  in its prompt; now it can read related files to verify
-  findings before reporting them. Tool-call count of 0 on the
-  verification cycle isn't a regression — the model simply
-  didn't need tools for a trivial isEven utility. On larger
-  artifacts the tools will be exercised
-- **context-fixer kept on `callLLMWithMessages`** — not switched
-  to `callLLMWithTools`. context-fixer needs the system+user
-  message pair (the ADR-018 "preserve all existing content"
-  rules live in the system role); `callLLMWithTools` takes a
-  single prompt string. Switching would require either
-  concatenating system + user (losing role separation) or
-  extending `callLLMWithTools` to accept messages. Out of scope
-  for this session; flagged as a follow-up if needed
-- **drift-agent + alignment-agent kept deterministic** (not
-  converted to LLM agents). The brief's verification criterion
-  "Trigger alignment-agent — execution log shows tool calls"
-  doesn't fit the existing architecture — these agents are
-  regex-based detectors per ADR-018, they don't call LLMs.
-  Adding tool calls would require rewriting them as LLM-driven,
-  which is outside this brief's scope. The PER_ROLE_DEFAULTS
-  entries for drift/alignment still apply because they CAN be
-  consulted by `loadAgentConfig` — if a future maintenance-agent
-  conversion needs LLM access, the config is already there
-- **Server payload keeps `frameworkAgents` + `customAgents`**
-  alongside the new `layers` field. Back-compat with the
-  dashboard (which hasn't been updated to consume `layers`) +
-  any operator script that scrapes the previous shape
-- **CLI renders by layer when `layers` is present; falls back
-  to flat list otherwise**. Operators on the new server build
-  see the layered view; an older client against an even older
-  server still works
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Server image rebuilt. Full SDLC cycle verified end-to-end with
-the refactored code paths. Both grep verification criteria from
-the brief pass. The CLI's layered display + the API's three-layer
-payload + the expanded tool defaults all confirmed live.
-
-No new Pending enhancements added. The architectural goal of "all
-agent layers share one implementation" is now met — gate and
-maintenance can use the same `BaseLLMAgent` + `loadAgentConfig` +
-`BaseOrchestrator` surface that generate has used since Step 1.
-
----
-
 ### Session 2026-06-02 — Claude Code (context-fixer gains tool access via callLLMWithToolsMessages)
 
 Follow-up to the BaseLLMAgent-to-core session. Closes the
@@ -2702,3 +2467,168 @@ No new Pending enhancements added. ADR-040 closes the long-
 standing identity stub gap; the three providers are now real
 implementations rather than `throw new Error('not yet
 implemented')` placeholders.
+
+---
+
+### Session 2026-06-02 — Claude Code (corporate identity verified end-to-end via Keycloak fixture)
+
+Brings up a Keycloak-backed test IdP under `fixtures/identity-test/`,
+drives both OIDC and SAML flows end-to-end via curl + cookie jar
+from inside the gestalt-server-1 container, and verifies the JWT +
+DB shadow user shape. Surfaced three real bugs in the ADR-040
+implementation along the way.
+
+Changed:
+
+- `fixtures/identity-test/` (new directory):
+  - `docker-compose.yml` — Keycloak 25 service with realm import,
+    `KC_HOSTNAME_URL=http://gestalt-keycloak:8080` pinned so the
+    issuer URLs in tokens match what the gestalt server discovered.
+    Attaches to the existing `gestalt_default` network so the
+    server can reach Keycloak via docker DNS
+  - `gestalt-test-realm.json` — minimal but functional realm:
+    OIDC client `gestalt-oidc` (confidential, with client_secret,
+    PKCE, `groups` claim mapper); SAML client at entity ID
+    `http://localhost:3000` (with signed assertions, email +
+    displayName + groups attribute mappers); two test users
+    (`alice` in group `gestalt-admins`, `bob` in group `users`)
+  - `auth.config.json.example` — copy-paste-ready config matching
+    the realm. Operators substitute the live SAML signing cert at
+    use time (Keycloak regenerates it on container recreate)
+  - `oidc-flow.sh` — 7-step curl + cookie-jar flow: hit
+    `/auth/oidc/login`, follow to Keycloak's authorize endpoint,
+    POST credentials, follow the callback redirect, decode the JWT
+  - `saml-flow.sh` — same shape but handles the IdP's auto-submit
+    HTML form (extracts the SAMLResponse + RelayState + ACS URL,
+    URL-encodes the base64 value, POSTs to the SP callback)
+  - `README.md` — setup / smoke / tear-down instructions, why
+    docker DNS is used instead of localhost
+- `docs/guides/identity/local-testing.md` (new): operator-facing
+  pointer at the fixture; test-user table + the quick-smoke recipe
+
+Real bugs surfaced + fixed during verification:
+
+1. **`@fastify/formbody` plugin was not registered.** Without it,
+   any `application/x-www-form-urlencoded` POST body
+   (browser-issued SAML response or local login from a real form)
+   came back 415. Fixed in `packages/server/src/app.ts` —
+   registered alongside the existing CORS plugin. This was a
+   showstopper for SAML at any real customer integration; the
+   smoke test surfaced it immediately
+2. **OIDC callback dropped the `iss` query parameter.** The
+   provider constructed `{ code, state }` manually from the
+   request's query string. RFC 9207 (and `openid-client` v5's
+   strict validation) requires the `iss` parameter to be
+   forwarded — it's how the client confirms the authorization
+   response came from the expected authorization server. Fix
+   in `packages/server/src/auth/providers/oidc.ts`: forward
+   every string-valued query param to `client.callback`
+3. **`toIdentityConfig` dropped `attributeMapping`,
+   `wantAssertionsSigned`, and `identifierFormat`** when
+   translating `auth.config.json` to the legacy `IdentityConfig`.
+   Result: the SamlProvider fell back to the Azure-AD-style
+   default attribute URIs regardless of what the operator
+   configured. Fix in `packages/server/src/auth/auth-config.ts`:
+   pass the optional fields through. Added the fields to the
+   legacy `SamlConfig` type so the chain stays well-typed.
+   Without this, group-based role mapping in the brief's
+   example config would have silently failed for any IdP whose
+   group attribute name wasn't the default Azure URI
+
+Other touches:
+- `packages/server/src/auth/types.ts`: `SamlConfig` extended with
+  optional `attributeMapping`, `wantAssertionsSigned`,
+  `identifierFormat` fields (was: only the 4 legacy fields)
+- `packages/server/src/auth/providers/saml.ts`: `SamlConfigExt`
+  alias collapsed to `type SamlConfigExt = SamlConfig` now that
+  the base type carries the wider fields
+- `packages/server/package.json`: `@fastify/formbody@^7.4.0`
+  added to dependencies
+
+Verified live end-to-end (Keycloak fixture, alice user):
+
+**OIDC flow** (`/tmp/oidc-flow.sh` inside gestalt-server-1):
+- `/auth/oidc/login` → 302 to Keycloak authorize URL with PKCE
+  state nonce
+- Keycloak HTML login form fetched, form action URL extracted
+- `POST username=alice&password=alice123` → 302 to
+  `http://localhost:3000/auth/oidc/callback?state=...&iss=...&code=...`
+- Server callback exchanged code with Keycloak (`iss` validation
+  passes — the fix from item 2 above), validated ID token
+  signature, extracted claims
+- Final redirect: `/app/?token=<jwt>`
+- **JWT payload**: `{email: alice@gestalt-test.local, role:
+  platform-admin, provider: oidc, sub: cff038c8-..., iat: ...,
+  exp: ...}` — role correctly resolved from `gestalt-admins`
+  group via `roleMapping.platformAdmin`
+- DB upsert: `users.email=alice@gestalt-test.local,
+  role=platform-admin, auth_provider=oidc,
+  idp_groups={gestalt-admins}`
+
+**SAML flow** (`/tmp/saml-flow.sh` inside gestalt-server-1):
+- `/auth/saml/login` → 302 to Keycloak SAML endpoint with
+  SAMLRequest
+- Keycloak login form fetched, credentials POSTed
+- Keycloak returned 200 with auto-submit form HTML containing
+  the SAMLResponse + RelayState + ACS URL
+- SAMLResponse URL-encoded + POSTed to
+  `http://localhost:3000/auth/saml/callback` (parsed by
+  `@fastify/formbody` — the fix from item 1 above)
+- Server validated the signed assertion against the IdP cert,
+  extracted `email` / `displayName` / `groups` per the
+  configured `attributeMapping` (passed through — the fix from
+  item 3 above)
+- Final redirect: `/app/?token=<jwt>`
+- **JWT payload**: `{email: alice@gestalt-test.local, role:
+  platform-admin, provider: saml, sub: a37041b9-..., iat: ...,
+  exp: ...}` — same role resolution as OIDC
+- DB upsert: separate row with `auth_provider=saml` (the
+  PlatformUser shadow record is per-provider; alice now has
+  two rows, one per IdP)
+
+Stage 1 (no regression) re-verified after teardown — Keycloak
+removed, auth.config.json removed, server restarted →
+`GET /auth/providers` returns `{"providers":["local"]}`.
+
+Decisions made:
+
+- **Keycloak as the test IdP**, not a tiny custom SAML/OIDC
+  fake. Keycloak's standards compliance is the closest match
+  for what real customers (ADFS, Azure AD, Okta) will throw at
+  the platform. Exercises the same code paths a real customer
+  IdP would — caught all three bugs precisely because Keycloak
+  isn't lenient about what it accepts/sends
+- **`KC_HOSTNAME_URL` pinned to the docker DNS name**
+  (`http://gestalt-keycloak:8080`). Without this, Keycloak
+  issues different URLs in tokens depending on what hostname
+  the request used. The smoke runs everything from inside the
+  gestalt-server-1 container where docker DNS resolves
+  `gestalt-keycloak:8080`, so the issuer URL in tokens matches
+  what the OIDC client discovered. Real customer deployments
+  have a single public hostname so this doesn't apply
+- **Smoke scripts live in `fixtures/identity-test/`, not in
+  CI yet.** They require manual setup (Keycloak bring-up,
+  cert injection into auth.config.json) — automatable but not
+  worth the CI complexity until the platform ships its first
+  automated integration-test layer. Future work
+- **OIDC param forwarding** uses every string-valued query
+  param, not just `iss`. The brief's pseudocode forwarded
+  `{code, state}`; the openid-client docs are explicit that
+  it expects the full params object. Forwarding everything is
+  future-proof — RFC 9207's `iss` is the immediate
+  motivation, but other extensions land in the same place
+- **Three bug fixes shipped in the same commit** as the
+  fixture. They were discovered by the fixture, are tightly
+  coupled to its existence, and would be confusing to commit
+  separately ("why did this bug exist?" → "the test that
+  surfaced it"). Tracked in the changelog above so future
+  history reads cleanly
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker server image rebuilt 3× during verification (each
+bug-fix → rebuild → re-verify cycle). Keycloak fixture
+removed cleanly after verification; local-only auth back in
+its prior state. Both OIDC and SAML now fully verified
+end-to-end with role mapping from IdP groups; Kerberos
+remains Stage-1-only (requires real AD + krb5.keytab — out of
+scope for a local IdP fixture).

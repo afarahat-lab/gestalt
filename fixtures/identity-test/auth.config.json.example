@@ -1,0 +1,31 @@
+{
+  "providers": {
+    "oidc": {
+      "enabled": true,
+      "issuer": "http://gestalt-keycloak:8080/realms/gestalt-test",
+      "clientId": "gestalt-oidc",
+      "clientSecret": "gestalt-oidc-secret",
+      "redirectUri": "http://localhost:3000/auth/oidc/callback",
+      "scope": "openid profile email",
+      "groupsClaim": "groups"
+    },
+    "saml": {
+      "enabled": true,
+      "entryPoint": "http://gestalt-keycloak:8080/realms/gestalt-test/protocol/saml",
+      "issuer": "http://localhost:3000",
+      "cert": "REPLACE_WITH_CERT_FROM_curl_http://gestalt-keycloak:8080/realms/gestalt-test/protocol/saml/descriptor",
+      "callbackUrl": "http://localhost:3000/auth/saml/callback",
+      "wantAssertionsSigned": true,
+      "identifierFormat": "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+      "attributeMapping": {
+        "email": "email",
+        "displayName": "displayName",
+        "groups": "groups"
+      }
+    }
+  },
+  "roleMapping": {
+    "platformAdmin": ["gestalt-admins"],
+    "defaultRole": "user"
+  }
+}

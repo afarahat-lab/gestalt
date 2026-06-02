@@ -13,6 +13,7 @@
 import Fastify from 'fastify';
 import staticPlugin from '@fastify/static';
 import corsPlugin from '@fastify/cors';
+import formbodyPlugin from '@fastify/formbody';
 import { join } from 'path';
 import type { GestaltConfig } from '@gestalt/core';
 import { createContextLogger } from '@gestalt/core';
@@ -62,6 +63,12 @@ export async function createApp(
       : true,
     credentials: true,
   });
+
+  // application/x-www-form-urlencoded parser — needed for the SAML
+  // assertion POST callback (IdP submits the SAMLResponse via a
+  // standard browser form). Fastify only parses JSON out of the
+  // box; without this the SAML ACS endpoint returns 415.
+  await app.register(formbodyPlugin);
 
   // ─── Auth middleware ────────────────────────────────────────────────────────
 

@@ -1,0 +1,53 @@
+services:
+  # Keycloak test IdP — supports both OIDC and SAML for end-to-end
+  # verification of the corporate identity providers (ADR-040). Not
+  # part of the production stack; used to exercise the auth code
+  # paths without needing customer-specific IdP credentials.
+  #
+  # Bring up:    docker-compose -f fixtures/identity-test/docker-compose.yml up -d
+  # Tear down:   docker-compose -f fixtures/identity-test/docker-compose.yml down -v
+  #
+  # Realm + clients + test user are imported on first start from the
+  # mounted JSON. Admin console at http://localhost:8080/admin/
+  # (admin / admin) — useful for inspecting the realm.
+  keycloak:
+    image: quay.io/keycloak/keycloak:25.0
+    container_name: gestalt-keycloak
+    command:
+      - start-dev
+      - --import-realm
+      - --http-port=8080
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      # Pin issuer URLs so both the gestalt server (inside the
+      # docker network) and the host browser see the same hostname.
+      # We use the docker network hostname here so both paths agree
+      # on the issuer URL in OIDC tokens.
+      KC_HOSTNAME_URL: 'http://gestalt-keycloak:8080'
+      KC_HOSTNAME_ADMIN_URL: 'http://localhost:8080'
+      KC_HOSTNAME_STRICT: 'false'
+      KC_HOSTNAME_STRICT_HTTPS: 'false'
+      KC_HTTP_ENABLED: 'true'
+      # Allow proxied access via the X-Forwarded-Host header so we
+      # can drive the flow from the host (port 8080 → keycloak:8080)
+      # while Keycloak still claims gestalt-keycloak:8080 as the issuer.
+      KC_PROXY: 'edge'
+    ports:
+      - '8080:8080'
+    volumes:
+      - ./gestalt-test-realm.json:/opt/keycloak/data/import/gestalt-test-realm.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e 'GET /realms/master HTTP/1.0\\r\\n\\r\\n' >&3 && cat <&3 | head -1 | grep -q '200 OK'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks:
+      - gestalt-default
+
+# Reuse the network the main compose creates so Gestalt's server
+# can reach Keycloak (and vice versa) at predictable hostnames.
+networks:
+  gestalt-default:
+    external: true
+    name: gestalt_default

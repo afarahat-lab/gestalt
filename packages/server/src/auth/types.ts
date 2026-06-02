@@ -28,6 +28,17 @@ export interface SamlConfig {
   issuer: string;         // SP entity ID (our identifier to the IdP)
   cert: string;           // IdP signing certificate (PEM)
   callbackUrl: string;    // Our ACS URL e.g. https://gestalt.company.com/auth/saml/callback
+  // ADR-040 — optional fields surfaced through auth.config.json so
+  // the SamlProvider can resolve the right attribute names per
+  // IdP. Default attribute mapping matches Azure AD / ADFS claim
+  // URIs when these are absent.
+  attributeMapping?: {
+    email: string;
+    displayName: string;
+    groups?: string;
+  };
+  wantAssertionsSigned?: boolean;
+  identifierFormat?: string;
 }
 
 export interface OidcConfig {

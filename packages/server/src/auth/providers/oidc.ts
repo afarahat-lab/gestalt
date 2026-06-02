@@ -124,9 +124,17 @@ export class OidcProvider implements AuthProvider {
 
     let tokenSet;
     try {
+      // Forward every callback param — `openid-client` validates
+      // `iss` against the discovered issuer (OAuth 2.1 authorization
+      // server identifier — RFC 9207). Dropping any param to construct
+      // `{ code, state }` manually breaks `iss` validation.
+      const params: Record<string, string> = {};
+      for (const [k, v] of Object.entries(req.query)) {
+        if (typeof v === 'string') params[k] = v;
+      }
       tokenSet = await this.client.callback(
         this.config.callbackUrl,
-        { code, state },
+        params,
         { state, code_verifier: stored.codeVerifier },
       );
     } catch (err) {

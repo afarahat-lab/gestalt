@@ -9108,3 +9108,168 @@ No new Pending enhancements added. ADR-040 closes the long-
 standing identity stub gap; the three providers are now real
 implementations rather than `throw new Error('not yet
 implemented')` placeholders.
+
+---
+
+### Session 2026-06-02 — Claude Code (corporate identity verified end-to-end via Keycloak fixture)
+
+Brings up a Keycloak-backed test IdP under `fixtures/identity-test/`,
+drives both OIDC and SAML flows end-to-end via curl + cookie jar
+from inside the gestalt-server-1 container, and verifies the JWT +
+DB shadow user shape. Surfaced three real bugs in the ADR-040
+implementation along the way.
+
+Changed:
+
+- `fixtures/identity-test/` (new directory):
+  - `docker-compose.yml` — Keycloak 25 service with realm import,
+    `KC_HOSTNAME_URL=http://gestalt-keycloak:8080` pinned so the
+    issuer URLs in tokens match what the gestalt server discovered.
+    Attaches to the existing `gestalt_default` network so the
+    server can reach Keycloak via docker DNS
+  - `gestalt-test-realm.json` — minimal but functional realm:
+    OIDC client `gestalt-oidc` (confidential, with client_secret,
+    PKCE, `groups` claim mapper); SAML client at entity ID
+    `http://localhost:3000` (with signed assertions, email +
+    displayName + groups attribute mappers); two test users
+    (`alice` in group `gestalt-admins`, `bob` in group `users`)
+  - `auth.config.json.example` — copy-paste-ready config matching
+    the realm. Operators substitute the live SAML signing cert at
+    use time (Keycloak regenerates it on container recreate)
+  - `oidc-flow.sh` — 7-step curl + cookie-jar flow: hit
+    `/auth/oidc/login`, follow to Keycloak's authorize endpoint,
+    POST credentials, follow the callback redirect, decode the JWT
+  - `saml-flow.sh` — same shape but handles the IdP's auto-submit
+    HTML form (extracts the SAMLResponse + RelayState + ACS URL,
+    URL-encodes the base64 value, POSTs to the SP callback)
+  - `README.md` — setup / smoke / tear-down instructions, why
+    docker DNS is used instead of localhost
+- `docs/guides/identity/local-testing.md` (new): operator-facing
+  pointer at the fixture; test-user table + the quick-smoke recipe
+
+Real bugs surfaced + fixed during verification:
+
+1. **`@fastify/formbody` plugin was not registered.** Without it,
+   any `application/x-www-form-urlencoded` POST body
+   (browser-issued SAML response or local login from a real form)
+   came back 415. Fixed in `packages/server/src/app.ts` —
+   registered alongside the existing CORS plugin. This was a
+   showstopper for SAML at any real customer integration; the
+   smoke test surfaced it immediately
+2. **OIDC callback dropped the `iss` query parameter.** The
+   provider constructed `{ code, state }` manually from the
+   request's query string. RFC 9207 (and `openid-client` v5's
+   strict validation) requires the `iss` parameter to be
+   forwarded — it's how the client confirms the authorization
+   response came from the expected authorization server. Fix
+   in `packages/server/src/auth/providers/oidc.ts`: forward
+   every string-valued query param to `client.callback`
+3. **`toIdentityConfig` dropped `attributeMapping`,
+   `wantAssertionsSigned`, and `identifierFormat`** when
+   translating `auth.config.json` to the legacy `IdentityConfig`.
+   Result: the SamlProvider fell back to the Azure-AD-style
+   default attribute URIs regardless of what the operator
+   configured. Fix in `packages/server/src/auth/auth-config.ts`:
+   pass the optional fields through. Added the fields to the
+   legacy `SamlConfig` type so the chain stays well-typed.
+   Without this, group-based role mapping in the brief's
+   example config would have silently failed for any IdP whose
+   group attribute name wasn't the default Azure URI
+
+Other touches:
+- `packages/server/src/auth/types.ts`: `SamlConfig` extended with
+  optional `attributeMapping`, `wantAssertionsSigned`,
+  `identifierFormat` fields (was: only the 4 legacy fields)
+- `packages/server/src/auth/providers/saml.ts`: `SamlConfigExt`
+  alias collapsed to `type SamlConfigExt = SamlConfig` now that
+  the base type carries the wider fields
+- `packages/server/package.json`: `@fastify/formbody@^7.4.0`
+  added to dependencies
+
+Verified live end-to-end (Keycloak fixture, alice user):
+
+**OIDC flow** (`/tmp/oidc-flow.sh` inside gestalt-server-1):
+- `/auth/oidc/login` → 302 to Keycloak authorize URL with PKCE
+  state nonce
+- Keycloak HTML login form fetched, form action URL extracted
+- `POST username=alice&password=alice123` → 302 to
+  `http://localhost:3000/auth/oidc/callback?state=...&iss=...&code=...`
+- Server callback exchanged code with Keycloak (`iss` validation
+  passes — the fix from item 2 above), validated ID token
+  signature, extracted claims
+- Final redirect: `/app/?token=<jwt>`
+- **JWT payload**: `{email: alice@gestalt-test.local, role:
+  platform-admin, provider: oidc, sub: cff038c8-..., iat: ...,
+  exp: ...}` — role correctly resolved from `gestalt-admins`
+  group via `roleMapping.platformAdmin`
+- DB upsert: `users.email=alice@gestalt-test.local,
+  role=platform-admin, auth_provider=oidc,
+  idp_groups={gestalt-admins}`
+
+**SAML flow** (`/tmp/saml-flow.sh` inside gestalt-server-1):
+- `/auth/saml/login` → 302 to Keycloak SAML endpoint with
+  SAMLRequest
+- Keycloak login form fetched, credentials POSTed
+- Keycloak returned 200 with auto-submit form HTML containing
+  the SAMLResponse + RelayState + ACS URL
+- SAMLResponse URL-encoded + POSTed to
+  `http://localhost:3000/auth/saml/callback` (parsed by
+  `@fastify/formbody` — the fix from item 1 above)
+- Server validated the signed assertion against the IdP cert,
+  extracted `email` / `displayName` / `groups` per the
+  configured `attributeMapping` (passed through — the fix from
+  item 3 above)
+- Final redirect: `/app/?token=<jwt>`
+- **JWT payload**: `{email: alice@gestalt-test.local, role:
+  platform-admin, provider: saml, sub: a37041b9-..., iat: ...,
+  exp: ...}` — same role resolution as OIDC
+- DB upsert: separate row with `auth_provider=saml` (the
+  PlatformUser shadow record is per-provider; alice now has
+  two rows, one per IdP)
+
+Stage 1 (no regression) re-verified after teardown — Keycloak
+removed, auth.config.json removed, server restarted →
+`GET /auth/providers` returns `{"providers":["local"]}`.
+
+Decisions made:
+
+- **Keycloak as the test IdP**, not a tiny custom SAML/OIDC
+  fake. Keycloak's standards compliance is the closest match
+  for what real customers (ADFS, Azure AD, Okta) will throw at
+  the platform. Exercises the same code paths a real customer
+  IdP would — caught all three bugs precisely because Keycloak
+  isn't lenient about what it accepts/sends
+- **`KC_HOSTNAME_URL` pinned to the docker DNS name**
+  (`http://gestalt-keycloak:8080`). Without this, Keycloak
+  issues different URLs in tokens depending on what hostname
+  the request used. The smoke runs everything from inside the
+  gestalt-server-1 container where docker DNS resolves
+  `gestalt-keycloak:8080`, so the issuer URL in tokens matches
+  what the OIDC client discovered. Real customer deployments
+  have a single public hostname so this doesn't apply
+- **Smoke scripts live in `fixtures/identity-test/`, not in
+  CI yet.** They require manual setup (Keycloak bring-up,
+  cert injection into auth.config.json) — automatable but not
+  worth the CI complexity until the platform ships its first
+  automated integration-test layer. Future work
+- **OIDC param forwarding** uses every string-valued query
+  param, not just `iss`. The brief's pseudocode forwarded
+  `{code, state}`; the openid-client docs are explicit that
+  it expects the full params object. Forwarding everything is
+  future-proof — RFC 9207's `iss` is the immediate
+  motivation, but other extensions land in the same place
+- **Three bug fixes shipped in the same commit** as the
+  fixture. They were discovered by the fixture, are tightly
+  coupled to its existence, and would be confusing to commit
+  separately ("why did this bug exist?" → "the test that
+  surfaced it"). Tracked in the changelog above so future
+  history reads cleanly
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker server image rebuilt 3× during verification (each
+bug-fix → rebuild → re-verify cycle). Keycloak fixture
+removed cleanly after verification; local-only auth back in
+its prior state. Both OIDC and SAML now fully verified
+end-to-end with role mapping from IdP groups; Kerberos
+remains Stage-1-only (requires real AD + krb5.keytab — out of
+scope for a local IdP fixture).

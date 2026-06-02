@@ -136,6 +136,9 @@ export function toIdentityConfig(file: AuthFileConfig): IdentityConfig {
       issuer: s.issuer,
       cert: s.cert,
       callbackUrl: s.callbackUrl,
+      ...(s.attributeMapping ? { attributeMapping: s.attributeMapping } : {}),
+      ...(s.wantAssertionsSigned !== undefined ? { wantAssertionsSigned: s.wantAssertionsSigned } : {}),
+      ...(s.identifierFormat ? { identifierFormat: s.identifierFormat } : {}),
     });
   }
   if (file.providers.oidc?.enabled) {

@@ -48,15 +48,11 @@ const DEFAULT_ATTRIBUTE_MAPPING = {
 };
 
 /**
- * The wider config shape (post-ADR-040). The legacy `SamlConfig`
- * type doesn't carry `attributeMapping` or `wantAssertionsSigned`;
- * the provider reads them off the supplied object directly.
+ * The wider config shape — `SamlConfig` (in `../types`) now carries
+ * the ADR-040 optional fields. This alias kept for callers that
+ * reference the old name.
  */
-interface SamlConfigExt extends SamlConfig {
-  attributeMapping?: Partial<typeof DEFAULT_ATTRIBUTE_MAPPING>;
-  wantAssertionsSigned?: boolean;
-  identifierFormat?: string;
-}
+type SamlConfigExt = SamlConfig;
 
 export class SamlProvider implements AuthProvider {
   readonly type = 'saml' as const;
@@ -113,6 +109,11 @@ export class SamlProvider implements AuthProvider {
       throw new AuthenticationError('SAML assertion empty', 'INVALID_TOKEN');
     }
     const profile = result.profile;
+    // Debug — surface the profile shape so operators can wire the
+    // right attribute mapping on first integration. Logs at debug
+    // level in production; logs the keys + sample values at info
+    // during verification.
+    log.debug({ profileKeys: Object.keys(profile) }, 'SAML profile keys');
 
     const email = pickString(profile, this.attributeMapping.email)
       ?? pickString(profile, 'nameID')

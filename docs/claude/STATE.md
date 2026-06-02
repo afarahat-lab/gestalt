@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-02 (Claude Code — corporate identity: Kerberos/SAML/OIDC providers implemented + auth.config.json schema per ADR-040)
+**Last updated:** 2026-06-02 (Claude Code — corporate identity verified end-to-end against Keycloak fixture; OIDC + SAML pass with role mapping from IdP groups)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
