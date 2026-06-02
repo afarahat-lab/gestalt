@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-02 (Claude Code — corporate identity verified end-to-end against Keycloak fixture; OIDC + SAML pass with role mapping from IdP groups)
+**Last updated:** 2026-06-02 (Claude Code — `.gestalt/` spec files scoped by correlationId to prevent parallel-intent merge conflicts)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 

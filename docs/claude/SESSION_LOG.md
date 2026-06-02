@@ -9273,3 +9273,143 @@ its prior state. Both OIDC and SAML now fully verified
 end-to-end with role mapping from IdP groups; Kerberos
 remains Stage-1-only (requires real AD + krb5.keytab — out of
 scope for a local IdP fixture).
+
+---
+
+### Session 2026-06-02 — Claude Code (.gestalt/ spec files scoped by correlationId)
+
+When two intents ran in parallel, both wrote to identical paths
+under `.gestalt/` (`intent-spec.json`, `design-spec.json`,
+`llm-review-<corr8>.md`). On merging the resulting PRs, git
+produced spurious conflicts on these meta files even though the
+intents were completely unrelated. This session scopes the path
+prefix by the cycle's `correlationId` so parallel cycles touch
+disjoint directories. No migrations, no API changes.
+
+Changed:
+
+- `packages/agents/generate/src/agents/intent-agent.ts`: two
+  write sites (success path + clarification-needed path) switched
+  from `'.gestalt/intent-spec.json'` to
+  `` `.gestalt/${task.correlationId}/intent-spec.json` ``
+- `packages/agents/generate/src/agents/design-agent.ts`: same
+  pattern for `design-spec.json`
+- `packages/agents/quality-gate/src/agents/llm-review-agent.ts`:
+  `` `.gestalt/llm-review-${task.correlationId.slice(0, 8)}.md` ``
+  → `` `.gestalt/${task.correlationId}/llm-review.md` `` (the
+  full correlationId is in the directory name now, so the 8-char
+  slice in the filename is redundant)
+- **5 read sites** switched to a defensive `endsWith` + `startsWith`
+  pattern that tolerates both the old flat-file layout and the
+  new scoped layout:
+  - `packages/agents/generate/src/orchestrator/context-assembler.ts`
+    — finds the intent-spec artifact via
+    `a.path.startsWith('.gestalt/') && a.path.endsWith('/intent-spec.json')`
+  - `packages/agents/generate/src/prompts/code-prompt.ts` —
+    finds design-spec via the same shape
+  - `packages/agents/generate/src/prompts/context-prompt.ts`,
+    `packages/agents/generate/src/prompts/lint-config-prompt.ts`,
+    `packages/agents/generate/src/agents/lint-config-agent.ts` —
+    same shape for their design-spec reads
+- `packages/agents/maintenance/src/agents/gc-agent.ts`: the
+  `.gestalt/*` cleanup loop now uses `readdir(..., { withFileTypes:
+  true })` and handles two cases per entry:
+  - UUID-named subdirectory older than 90 days → `rm -rf`
+  - flat file older than 90 days → unlink (catches legacy
+    `intent-spec.json`, `design-spec.json`, `llm-review-*.md`
+    written before this fix)
+  Added an `isUuid(s)` helper at the bottom of the module.
+  Non-UUID-named subdirectories (operator-parked content) are
+  left alone
+- `packages/agents/deploy/src/agents/pr-agent.ts`: PR body now
+  has a `## Cycle artifacts` section pointing readers at
+  `.gestalt/<correlationId>/` so the new scoped layout is
+  discoverable from the PR
+
+Verified live against `trackeros`:
+
+- **Parallel intents (path scoping):** submitted two intents
+  back-to-back (`gestalt run "capitalize utility..."` →
+  correlationId `ed18c570`, then `gestalt run "truncate
+  utility..."` → `520a8e49`). Each intent's artifacts in the
+  `artifacts` table live under exclusively its own correlation
+  directory:
+  ```
+  ed18c570-... | .gestalt/ed18c570-7e4e-4956-bfab-fab767710254/intent-spec.json
+  ed18c570-... | .gestalt/ed18c570-7e4e-4956-bfab-fab767710254/design-spec.json
+  520a8e49-... | .gestalt/520a8e49-586d-4bce-9603-466f4bf68f82/intent-spec.json
+  520a8e49-... | .gestalt/520a8e49-586d-4bce-9603-466f4bf68f82/design-spec.json
+  520a8e49-... | .gestalt/520a8e49-586d-4bce-9603-466f4bf68f82/llm-review.md
+  ```
+  **Zero path overlap between the two cycles** — the original
+  merge-conflict scenario is now structurally impossible
+- C2's PR branch (`gestalt/520a8e49-add-a-truncate-utility-under`)
+  contains the scoped specs at `.gestalt/520a8e49-.../intent-
+  spec.json` + `.gestalt/520a8e49-.../design-spec.json`. Legacy
+  flat files from prior sessions still appear alongside (older
+  commits — gc-agent's catch-all picks them up after 90 days)
+- **Read-path (endsWith pattern) implicit verification:** C2 ran
+  9 completed agent executions through generate → gate → deploy
+  (only pipeline-agent failed for unrelated CI reasons). For
+  every downstream agent (design / context / code / test /
+  review) to complete cleanly, the new `endsWith` reads of
+  intent-spec.json + design-spec.json must have found the
+  scoped files. C1 failed at code-agent for an unrelated LLM
+  JSON-format issue, but its earlier executions (intent-agent →
+  design-agent → context-agent) confirm the same read path
+- **gc-agent dual-shape behavior** verified off-thread against
+  a synthetic `.gestalt/` tree containing:
+  - stale UUID subdir (mtime −100 days) → deleted ✓
+  - stale legacy flat file (mtime −100 days) → deleted ✓
+  - fresh UUID subdir (current mtime) → preserved ✓
+  - fresh legacy flat file (current mtime) → preserved ✓
+  Live trigger against trackeros: gc-agent ran cleanly with 0
+  findings (everything in `.gestalt/` is < 90 days old, so
+  nothing eligible for cleanup yet — the dual-shape traversal
+  walks both shapes without throwing)
+
+Decisions made:
+
+- **`endsWith` + `startsWith` over a hardcoded prefix.** The
+  read sites use a defensive two-clause check
+  (`startsWith('.gestalt/') && endsWith('/intent-spec.json')`)
+  rather than e.g. `a.path === \`.gestalt/${id}/intent-spec.json\``.
+  Three reasons: (1) the call site doesn't need to plumb the
+  correlationId through; (2) it's resilient to a future move to
+  longer or differently-formatted scopes; (3) legacy artifacts
+  that may still be in some projects' DBs continue to match
+  cleanly so context-assembler doesn't degrade on a partially-
+  migrated cycle
+- **Legacy flat files become harmless after this commit.** New
+  cycles write under the scoped directory; old flat files
+  (e.g. `trackeros`'s current `.gestalt/intent-spec.json` from
+  prior sessions) stay in the repo until gc-agent's catch-all
+  cleans them at 90 days. They don't conflict with anything
+  because no new cycle writes back to those paths
+- **Full correlationId in the directory name, no slice in the
+  filename.** The review-agent previously embedded a `corr8`
+  slice in its filename for human readability; the directory
+  name now carries the full UUID, so the filename can be a
+  simple `llm-review.md`. Easier to grep for; consistent with
+  the spec files
+- **Per-intent directory rather than per-file scoping.** Could
+  have written `.gestalt/intent-spec-<correlationId>.json`
+  instead; chose the directory shape so all three spec files
+  for a cycle group together (operator scanning the repo sees
+  the cycle as a unit) and so gc-agent's cleanup is a single
+  `rm -rf` per cycle rather than three unlinks
+- **No DB migration.** Artifact paths are stored as-is in the
+  `artifacts.path` column. Old rows keep their flat-file paths;
+  new rows get scoped paths. Mixing is fine because the read
+  pattern matches both shapes
+- **No `.gitignore` change.** The brief explicitly forbids
+  this — agents need to read these files on retry cycles via
+  fresh clones, which require the files to be committed
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; full SDLC slice exercised end-to-end with
+both new path scoping and dual-shape gc cleanup confirmed live.
+Original parallel-intent merge-conflict scenario is structurally
+impossible after this fix.
+
+No new Pending enhancements introduced.

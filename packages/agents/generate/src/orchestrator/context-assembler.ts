@@ -43,7 +43,7 @@ export async function assembleContext(
 
   // Extract IntentSpec from prior artifacts if intent-agent has run
   const intentSpecArtifact = priorArtifacts.find(
-    (a) => a.path === '.gestalt/intent-spec.json',
+    (a) => a.path.startsWith('.gestalt/') && a.path.endsWith('/intent-spec.json'),
   );
 
   const parsedSpec = intentSpecArtifact

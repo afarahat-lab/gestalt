@@ -11,7 +11,7 @@ export function buildLintConfigPrompt(ctx: ContextSnapshot, _attempt: number): s
 
 ## New domain changes
 
-${ctx.priorArtifacts.find((a) => a.path === '.gestalt/design-spec.json')?.content ?? '{}'}
+${ctx.priorArtifacts.find((a) => a.path.startsWith('.gestalt/') && a.path.endsWith('/design-spec.json'))?.content ?? '{}'}
 
 ## Current architecture
 

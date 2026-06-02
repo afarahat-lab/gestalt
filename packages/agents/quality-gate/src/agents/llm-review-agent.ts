@@ -145,7 +145,7 @@ export class ReviewAgent extends BaseLLMAgent {
       id: crypto.randomUUID(),
       correlationId: task.correlationId,
       type: 'design',
-      path: `.gestalt/llm-review-${task.correlationId.slice(0, 8)}.md`,
+      path: `.gestalt/${task.correlationId}/llm-review.md`,
       content: renderReviewMarkdown(review),
       producedBy: 'review-agent',
       createdAt: new Date(),

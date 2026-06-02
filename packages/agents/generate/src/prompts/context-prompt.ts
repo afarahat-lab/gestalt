@@ -11,7 +11,9 @@ export function buildContextPrompt(ctx: ContextSnapshot, attempt: number): strin
     ? `\n\nIMPORTANT: Retry attempt ${attempt}. Return pure JSON only.\n`
     : '';
 
-  const designArtifact = ctx.priorArtifacts.find((a) => a.path === '.gestalt/design-spec.json');
+  const designArtifact = ctx.priorArtifacts.find(
+    (a) => a.path.startsWith('.gestalt/') && a.path.endsWith('/design-spec.json'),
+  );
   const designSpec = designArtifact ? designArtifact.content : '{}';
 
   const body = `Your job is to update context files to reflect domain model changes.

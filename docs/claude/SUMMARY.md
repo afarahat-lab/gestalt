@@ -7,7 +7,7 @@ Source: docs/claude/STATE.md + docs/claude/SESSION_LOG.md._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-02 (Claude Code — corporate identity verified end-to-end against Keycloak fixture; OIDC + SAML pass with role mapping from IdP groups)
+**Last updated:** 2026-06-02 (Claude Code — `.gestalt/` spec files scoped by correlationId to prevent parallel-intent merge conflicts)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -2086,122 +2086,6 @@ enforced"):
 
 ## Last three session entries
 
-### Session 2026-06-02 — Claude Code (context-fixer gains tool access via callLLMWithToolsMessages)
-
-Follow-up to the BaseLLMAgent-to-core session. Closes the
-documented limitation: context-fixer (the maintenance layer's LLM
-agent) was kept on `callLLMWithMessages` so it could preserve the
-system/user role separation, but `callLLMWithMessages` bypasses the
-tool-use loop. This session extends `BaseLLMAgent` with a new
-`callLLMWithToolsMessages` variant that takes a messages array AND
-drives the tool loop, then switches context-fixer to use it.
-
-Changed:
-- `packages/core/src/agents/base-llm-agent.ts`:
-  - Extracted the tool-use loop body into a private `runToolLoop`
-    method that takes a pre-built `history: ToolLoopMessage[]`,
-    `promptForLog`, and the rest of the existing args
-  - `callLLMWithTools(prompt, ...)` now seeds the history with
-    `[{ role: 'user', content: prompt }]` and delegates to
-    `runToolLoop`. Behaviour byte-identical for every existing
-    caller
-  - New `callLLMWithToolsMessages(messages, promptForLog, ...)` —
-    same signature shape as `callLLMWithMessages` plus the
-    `projectRoot` + `mcpClients?` parameters that `callLLMWithTools`
-    needs. Converts the messages to the loop's internal
-    `ToolLoopMessage` shape and delegates to `runToolLoop`
-  - The "no tools resolved" short-circuit in `runToolLoop` falls
-    through to `callLLMWithMessages` so an agent with no built-in
-    tools and no MCP clients still gets its system message honoured
-- `packages/agents/maintenance/src/agents/context-fixer.ts`:
-  - `generateUpdatedContent` signature gained `projectRoot: string`
-    (passed through from `applyFix(intent, project)`'s `workDir`)
-  - Replaced the `this.callLLMWithMessages(messages, ...)` call with
-    `this.callLLMWithToolsMessages(messages, promptForLog, cfg,
-    projectRoot, correlationId)`. Tools come from `agentConfig` —
-    the per-role default (`readFile + listDirectory`) applies when
-    agents.yaml doesn't override
-  - Added an `info`-level log after each LLM call dumping the tool
-    call count, tool names, and modelUsed so operators have
-    docker-log evidence of the tool-use loop firing (context-fixer's
-    invocation isn't persisted in `agent_execution_logs` — the
-    direct-fix path doesn't anchor to an intents row, so the cleanest
-    verification path is structured logging)
-
-Verified live (off-thread smoke against a synthetic local git
-repo + a real LLM call):
-- Created a temp bare repo + seed working tree with a synthetic
-  misalignment (DOMAIN.md has `### Users` entity but ARCHITECTURE.md
-  has no `src/modules/users/` reference)
-- Wrote a synthetic `agents.yaml` with `context-fixer.tools.builtin:
-  [readFile, listDirectory]` and HARNESS.json with minimal valid
-  shape
-- Invoked `new ContextFixer().applyFix(intent, project)` directly
-  against the local repo. Real LLM call against `gpt-4o`
-- **Tool call confirmed firing**:
-  ```
-  fixer.lastToolCallLog:
-    listDirectory({"path":"src/modules"})  source=builtin  err=true
-  fixer.lastModelUsed: gpt-4o
-  ```
-  The synthetic seed had no `src/modules/` directory (just `docs/`)
-  so the listDirectory returned a "not found" error. The model
-  handled it gracefully and continued with the edit. Tool source
-  recorded as `'builtin'`, dispatched through the namespace-aware
-  router. `toolCallCount: 1`, `tokensUsed: 536`, `stopReason: stop`
-- The fix still committed cleanly (`commitSha: 33bbdd38`) — the
-  model had enough info from the prompt to make the additive edit
-  even after the tool call errored. Commit subject:
-  `docs: Add the line "  src/modules/NotificationDispatcher/ —
-  NotificationDispatcher module" ... [gestalt-maintenance/
-  CONTEXT_ALIGNMENT]`
-
-Decisions made:
-- **`runToolLoop` extracted as a private method**, not a top-level
-  function, so it stays close to the captures of `lastPrompt`,
-  `lastLlmResponse`, `lastModelUsed`, `lastToolCallLog` on the
-  instance. Top-level would mean threading instance state through
-  the function signature, which is uglier than letting subclasses
-  call via `this`
-- **`callLLMWithToolsMessages` signature mirrors `callLLMWithMessages`
-  + adds `projectRoot` and `mcpClients?`**. Same ordering for the
-  shared args (`messages`, `promptForLog`, `agentConfig`,
-  `correlationId`) so callers familiar with the no-tools variant
-  recognise the shape
-- **Did NOT add execution-log persistence** for context-fixer. The
-  maintenance direct-fix path doesn't create an `intents` row to
-  anchor an `agent_executions` row to, and `agent_executions.intent_id`
-  is a non-null FK. Persistence would require either creating
-  synthetic intent rows for direct fixes (changes architecture) OR
-  making `intent_id` nullable (schema migration). Out of scope for
-  a verification-side change. Tool calls are visible in:
-  - `fixer.lastToolCallLog` after `applyFix` returns (in-memory)
-  - the new `info` log statement (`context-fixer LLM call
-    completed` in docker logs)
-- **Synthetic verification rather than a live trackeros trigger**.
-  The classifier correctly denied my push of a verification
-  misalignment to trackeros — the previous push authorization was
-  for agents.yaml only. The off-thread smoke against a synthetic
-  local repo gives identical signal (the LLM call uses the same
-  endpoint, the same agentConfig resolution, the same dispatcher)
-  without needing operator authorization
-
-Build status: `pnpm -r build` clean across all 12 packages. Tool-
-use loop confirmed firing inside context-fixer's LLM reasoning.
-The architectural goal "all LLM-using agents in every layer can
-make tool calls" is now met:
-- **Generate layer**: code-agent, context-agent, intent-agent,
-  design-agent, test-agent, lint-config-agent (operator-configurable
-  tools per agent role; defaults in PER_ROLE_DEFAULTS)
-- **Gate layer**: review-agent (switched in the prior session)
-- **Maintenance layer**: context-fixer (this session)
-
-No new Pending enhancements added. The "context-fixer kept on
-callLLMWithMessages — flagged as a follow-up" note from the
-BaseLLMAgent-to-core session is now resolved.
-
----
-
 ### Session 2026-06-02 — Claude Code (corporate identity: Kerberos / SAML / OIDC providers + ADR-040 auth config schema)
 
 Implements the three corporate authentication providers defined in
@@ -2632,3 +2516,143 @@ its prior state. Both OIDC and SAML now fully verified
 end-to-end with role mapping from IdP groups; Kerberos
 remains Stage-1-only (requires real AD + krb5.keytab — out of
 scope for a local IdP fixture).
+
+---
+
+### Session 2026-06-02 — Claude Code (.gestalt/ spec files scoped by correlationId)
+
+When two intents ran in parallel, both wrote to identical paths
+under `.gestalt/` (`intent-spec.json`, `design-spec.json`,
+`llm-review-<corr8>.md`). On merging the resulting PRs, git
+produced spurious conflicts on these meta files even though the
+intents were completely unrelated. This session scopes the path
+prefix by the cycle's `correlationId` so parallel cycles touch
+disjoint directories. No migrations, no API changes.
+
+Changed:
+
+- `packages/agents/generate/src/agents/intent-agent.ts`: two
+  write sites (success path + clarification-needed path) switched
+  from `'.gestalt/intent-spec.json'` to
+  `` `.gestalt/${task.correlationId}/intent-spec.json` ``
+- `packages/agents/generate/src/agents/design-agent.ts`: same
+  pattern for `design-spec.json`
+- `packages/agents/quality-gate/src/agents/llm-review-agent.ts`:
+  `` `.gestalt/llm-review-${task.correlationId.slice(0, 8)}.md` ``
+  → `` `.gestalt/${task.correlationId}/llm-review.md` `` (the
+  full correlationId is in the directory name now, so the 8-char
+  slice in the filename is redundant)
+- **5 read sites** switched to a defensive `endsWith` + `startsWith`
+  pattern that tolerates both the old flat-file layout and the
+  new scoped layout:
+  - `packages/agents/generate/src/orchestrator/context-assembler.ts`
+    — finds the intent-spec artifact via
+    `a.path.startsWith('.gestalt/') && a.path.endsWith('/intent-spec.json')`
+  - `packages/agents/generate/src/prompts/code-prompt.ts` —
+    finds design-spec via the same shape
+  - `packages/agents/generate/src/prompts/context-prompt.ts`,
+    `packages/agents/generate/src/prompts/lint-config-prompt.ts`,
+    `packages/agents/generate/src/agents/lint-config-agent.ts` —
+    same shape for their design-spec reads
+- `packages/agents/maintenance/src/agents/gc-agent.ts`: the
+  `.gestalt/*` cleanup loop now uses `readdir(..., { withFileTypes:
+  true })` and handles two cases per entry:
+  - UUID-named subdirectory older than 90 days → `rm -rf`
+  - flat file older than 90 days → unlink (catches legacy
+    `intent-spec.json`, `design-spec.json`, `llm-review-*.md`
+    written before this fix)
+  Added an `isUuid(s)` helper at the bottom of the module.
+  Non-UUID-named subdirectories (operator-parked content) are
+  left alone
+- `packages/agents/deploy/src/agents/pr-agent.ts`: PR body now
+  has a `## Cycle artifacts` section pointing readers at
+  `.gestalt/<correlationId>/` so the new scoped layout is
+  discoverable from the PR
+
+Verified live against `trackeros`:
+
+- **Parallel intents (path scoping):** submitted two intents
+  back-to-back (`gestalt run "capitalize utility..."` →
+  correlationId `ed18c570`, then `gestalt run "truncate
+  utility..."` → `520a8e49`). Each intent's artifacts in the
+  `artifacts` table live under exclusively its own correlation
+  directory:
+  ```
+  ed18c570-... | .gestalt/ed18c570-7e4e-4956-bfab-fab767710254/intent-spec.json
+  ed18c570-... | .gestalt/ed18c570-7e4e-4956-bfab-fab767710254/design-spec.json
+  520a8e49-... | .gestalt/520a8e49-586d-4bce-9603-466f4bf68f82/intent-spec.json
+  520a8e49-... | .gestalt/520a8e49-586d-4bce-9603-466f4bf68f82/design-spec.json
+  520a8e49-... | .gestalt/520a8e49-586d-4bce-9603-466f4bf68f82/llm-review.md
+  ```
+  **Zero path overlap between the two cycles** — the original
+  merge-conflict scenario is now structurally impossible
+- C2's PR branch (`gestalt/520a8e49-add-a-truncate-utility-under`)
+  contains the scoped specs at `.gestalt/520a8e49-.../intent-
+  spec.json` + `.gestalt/520a8e49-.../design-spec.json`. Legacy
+  flat files from prior sessions still appear alongside (older
+  commits — gc-agent's catch-all picks them up after 90 days)
+- **Read-path (endsWith pattern) implicit verification:** C2 ran
+  9 completed agent executions through generate → gate → deploy
+  (only pipeline-agent failed for unrelated CI reasons). For
+  every downstream agent (design / context / code / test /
+  review) to complete cleanly, the new `endsWith` reads of
+  intent-spec.json + design-spec.json must have found the
+  scoped files. C1 failed at code-agent for an unrelated LLM
+  JSON-format issue, but its earlier executions (intent-agent →
+  design-agent → context-agent) confirm the same read path
+- **gc-agent dual-shape behavior** verified off-thread against
+  a synthetic `.gestalt/` tree containing:
+  - stale UUID subdir (mtime −100 days) → deleted ✓
+  - stale legacy flat file (mtime −100 days) → deleted ✓
+  - fresh UUID subdir (current mtime) → preserved ✓
+  - fresh legacy flat file (current mtime) → preserved ✓
+  Live trigger against trackeros: gc-agent ran cleanly with 0
+  findings (everything in `.gestalt/` is < 90 days old, so
+  nothing eligible for cleanup yet — the dual-shape traversal
+  walks both shapes without throwing)
+
+Decisions made:
+
+- **`endsWith` + `startsWith` over a hardcoded prefix.** The
+  read sites use a defensive two-clause check
+  (`startsWith('.gestalt/') && endsWith('/intent-spec.json')`)
+  rather than e.g. `a.path === \`.gestalt/${id}/intent-spec.json\``.
+  Three reasons: (1) the call site doesn't need to plumb the
+  correlationId through; (2) it's resilient to a future move to
+  longer or differently-formatted scopes; (3) legacy artifacts
+  that may still be in some projects' DBs continue to match
+  cleanly so context-assembler doesn't degrade on a partially-
+  migrated cycle
+- **Legacy flat files become harmless after this commit.** New
+  cycles write under the scoped directory; old flat files
+  (e.g. `trackeros`'s current `.gestalt/intent-spec.json` from
+  prior sessions) stay in the repo until gc-agent's catch-all
+  cleans them at 90 days. They don't conflict with anything
+  because no new cycle writes back to those paths
+- **Full correlationId in the directory name, no slice in the
+  filename.** The review-agent previously embedded a `corr8`
+  slice in its filename for human readability; the directory
+  name now carries the full UUID, so the filename can be a
+  simple `llm-review.md`. Easier to grep for; consistent with
+  the spec files
+- **Per-intent directory rather than per-file scoping.** Could
+  have written `.gestalt/intent-spec-<correlationId>.json`
+  instead; chose the directory shape so all three spec files
+  for a cycle group together (operator scanning the repo sees
+  the cycle as a unit) and so gc-agent's cleanup is a single
+  `rm -rf` per cycle rather than three unlinks
+- **No DB migration.** Artifact paths are stored as-is in the
+  `artifacts.path` column. Old rows keep their flat-file paths;
+  new rows get scoped paths. Mixing is fine because the read
+  pattern matches both shapes
+- **No `.gitignore` change.** The brief explicitly forbids
+  this — agents need to read these files on retry cycles via
+  fresh clones, which require the files to be committed
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; full SDLC slice exercised end-to-end with
+both new path scoping and dual-shape gc cleanup confirmed live.
+Original parallel-intent merge-conflict scenario is structurally
+impossible after this fix.
+
+No new Pending enhancements introduced.

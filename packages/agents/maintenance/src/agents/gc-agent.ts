@@ -117,19 +117,31 @@ export async function runGCAgent(input: MaintenanceAgentInput): Promise<Maintena
       );
     }
 
-    // 2. Delete `.gestalt/*` spec files older than 90 days, then commit.
+    // 2. Delete stale `.gestalt/` entries older than 90 days.
+    //
+    // After the parallel-intent merge-conflict fix (2026-06), specs
+    // live under `.gestalt/<correlationId>/{intent,design,llm-review}.*`.
+    // Earlier cycles wrote flat files (`.gestalt/intent-spec.json`,
+    // `.gestalt/llm-review-<corr8>.md`). This handles both shapes:
+    //   - UUID-named subdirectory → rm -rf when its mtime is past the cutoff
+    //   - flat file at the top level → delete when past the cutoff (legacy)
     const specCutoffMs = Date.now() - SPEC_STALE_DAYS * MS_PER_DAY;
     const gestaltDir = join(workDir, '.gestalt');
     const deletedSpecs: string[] = [];
     try {
-      const entries = await readdir(gestaltDir);
-      for (const name of entries) {
-        const path = join(gestaltDir, name);
+      const entries = await readdir(gestaltDir, { withFileTypes: true });
+      for (const entry of entries) {
+        const path = join(gestaltDir, entry.name);
         const info = await stat(path).catch(() => null);
-        if (!info || !info.isFile()) continue;
+        if (!info) continue;
         if (info.mtimeMs >= specCutoffMs) continue;
-        await rm(path).catch(() => undefined);
-        deletedSpecs.push(`.gestalt/${name}`);
+        if (entry.isDirectory() && isUuid(entry.name)) {
+          await rm(path, { recursive: true, force: true }).catch(() => undefined);
+          deletedSpecs.push(`.gestalt/${entry.name}/`);
+        } else if (entry.isFile()) {
+          await rm(path).catch(() => undefined);
+          deletedSpecs.push(`.gestalt/${entry.name}`);
+        }
       }
     } catch {
       // No .gestalt directory — nothing to do.
@@ -164,4 +176,14 @@ export async function runGCAgent(input: MaintenanceAgentInput): Promise<Maintena
   } finally {
     await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
   }
+}
+
+/**
+ * RFC 4122 v4 UUID match. Used by the `.gestalt/` cleanup loop to
+ * distinguish per-correlationId spec directories from anything else
+ * an operator may have parked under `.gestalt/` (the platform owns
+ * the directory but is permissive about its contents).
+ */
+function isUuid(s: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(s);
 }

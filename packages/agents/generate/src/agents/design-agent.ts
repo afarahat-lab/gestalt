@@ -34,7 +34,7 @@ export class DesignAgent extends BaseLLMAgent {
               id: crypto.randomUUID(),
               correlationId: task.correlationId,
               type: 'design',
-              path: '.gestalt/design-spec.json',
+              path: `.gestalt/${task.correlationId}/design-spec.json`,
               content: JSON.stringify(design, null, 2),
               producedBy: 'design-agent',
               createdAt: new Date(),

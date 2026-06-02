@@ -118,7 +118,7 @@ export function buildCodePrompt(
 
   // ── 3. Design-agent output ─────────────────────────────────────────
   const designSpec = ctx.priorArtifacts.find(
-    (a) => a.path === '.gestalt/design-spec.json',
+    (a) => a.path.startsWith('.gestalt/') && a.path.endsWith('/design-spec.json'),
   );
   const designSection = designSpec
     ? `## Design specification\n\n` +

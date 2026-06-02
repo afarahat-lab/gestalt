@@ -22,7 +22,7 @@ export class LintConfigAgent extends BaseLLMAgent {
     const startedAt = task.startedAt ?? Date.now();
 
     const designArtifact = task.contextSnapshot.priorArtifacts.find(
-      (a) => a.path === '.gestalt/design-spec.json',
+      (a) => a.path.startsWith('.gestalt/') && a.path.endsWith('/design-spec.json'),
     );
 
     if (!designArtifact) {
