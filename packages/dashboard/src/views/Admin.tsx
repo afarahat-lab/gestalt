@@ -221,11 +221,24 @@ function ExpandedUser(props: {
     api.listProjects().then((r) => setProjects(r.data)).catch(() => {});
   }, [api]);
 
-  if (props.detail === 'loading' || !props.detail) {
+  // React Rules of Hooks — useMemo must run on every render, NOT
+  // be conditionally skipped behind an early-return loading branch.
+  // Putting `useMemo` after `if (loading) return ...` caused the
+  // hook-count to change between renders (zero on the loading-only
+  // first render, one once detail arrived) and React unmounted the
+  // whole component tree, which surfaced as a black screen when an
+  // operator clicked a user row.
+  const isLoaded = props.detail !== 'loading' && props.detail !== undefined;
+  const memberships = isLoaded ? (props.detail as UserDetail).memberships : [];
+  const memberMap = useMemo(
+    () => new Map(memberships.map((m) => [m.projectId, m])),
+    [memberships],
+  );
+
+  if (!isLoaded) {
     return <div style={styles.muted}>Loading memberships...</div>;
   }
-  const d = props.detail;
-  const memberMap = useMemo(() => new Map(d.memberships.map((m) => [m.projectId, m])), [d.memberships]);
+  const d = props.detail as UserDetail;
   const availableProjects = projects.filter((p) => !memberMap.has(p.id));
 
   async function changeRole(projectId: string, role: ProjectRole) {

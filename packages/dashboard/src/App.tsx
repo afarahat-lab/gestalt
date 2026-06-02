@@ -1,5 +1,6 @@
 import React, { useMemo } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { ApiProvider } from './hooks/useApi';
 import { ProjectProvider } from './context/ProjectContext';
 import { CurrentUserProvider, useCurrentUser } from './context/CurrentUserContext';
@@ -41,8 +42,14 @@ export default function App() {
       {/* basename mirrors Vite's `base: '/app/'`. Every `navigate(...)`
           and `<Link to=...>` is now interpreted relative to /app, so
           `/intents/:id` inside the SPA resolves to /app/intents/:id in
-          the URL bar — distinct from the API's /intents/:id. */}
+          the URL bar — distinct from the API's /intents/:id.
+
+          ErrorBoundary catches any uncaught render exception (e.g. a
+          React-rules-of-hooks violation in a child view) and renders
+          a recovery panel instead of letting React unmount the whole
+          tree to a black screen. */}
       <BrowserRouter basename="/app">
+        <ErrorBoundary>
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route
@@ -79,6 +86,7 @@ export default function App() {
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
+        </ErrorBoundary>
       </BrowserRouter>
     </ApiProvider>
   );
