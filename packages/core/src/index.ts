@@ -35,6 +35,9 @@ export {
 export {
   applyAgentConfig, buildPersona, buildExtensionsBlock,
 } from './agents/agent-config-helpers';
+export {
+  extractJsonObject, parseLlmJson,
+} from './agents/json-extract';
 export type {
   AgentConfig, AgentLlmConfig, AgentToolConfig, AgentsYaml,
   CustomAgentDefinition, CustomAgentNode,

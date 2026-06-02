@@ -8,7 +8,7 @@
 import type { AgentTask, AgentResult } from '../types';
 import { buildContextPrompt } from '../prompts/context-prompt';
 import { applyAgentConfig } from '../prompts/agent-config-helpers';
-import { createHarnessEngine } from '@gestalt/core';
+import { createHarnessEngine, extractJsonObject } from '@gestalt/core';
 import { BaseLLMAgent } from './base-llm-agent';
 
 const MAX_INTERNAL_RETRIES = 2;
@@ -110,7 +110,6 @@ export class ContextAgent extends BaseLLMAgent {
 }
 
 function parseContextUpdates(raw: string): Array<{ path: string; content: string }> {
-  const clean = raw.replace(/```json|```/g, '').trim();
-  const parsed = JSON.parse(clean) as { updates?: Array<{ path: string; content: string }> };
+  const parsed = JSON.parse(extractJsonObject(raw)) as { updates?: Array<{ path: string; content: string }> };
   return parsed.updates ?? [];
 }

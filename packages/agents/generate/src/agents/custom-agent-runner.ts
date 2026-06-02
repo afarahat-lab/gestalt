@@ -19,7 +19,7 @@
  * (ADR-013) — custom agents contribute typed signals only.
  */
 
-import { getLLMClient } from '@gestalt/core';
+import { getLLMClient, extractJsonObject } from '@gestalt/core';
 import type {
   ContextSnapshot, CustomAgentDefinition, CustomAgentFinding,
   CustomAgentResult, GeneratedArtifact, Principle,
@@ -145,19 +145,13 @@ interface ParsedResponse {
 }
 
 function safeParseResponse(raw: string): ParsedResponse {
-  // Strip markdown fences and any surrounding prose, then extract the
-  // outermost JSON object. Matches the same defensive pattern the
-  // llm-review-agent uses.
-  const clean = raw.replace(/```json|```/g, '').trim();
-  const start = clean.indexOf('{');
-  const end = clean.lastIndexOf('}');
-  const body = start >= 0 && end > start ? clean.slice(start, end + 1) : clean;
+  // Strip markdown fences + locate the first balanced JSON object via
+  // the shared `extractJsonObject` helper (`@gestalt/core`). Falls
+  // through to a passing summary on parse failure so a misbehaved
+  // LLM doesn't block the cycle.
   try {
-    return JSON.parse(body) as ParsedResponse;
+    return JSON.parse(extractJsonObject(raw)) as ParsedResponse;
   } catch {
-    // The LLM returned prose, not JSON — treat as a passing run with
-    // the prose folded into `summary` so the operator still sees
-    // something useful in the execution log.
     return {
       passed: true,
       findings: [],

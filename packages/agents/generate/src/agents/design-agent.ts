@@ -8,6 +8,7 @@ import type { AgentTask, AgentResult, DesignArtifact } from '../types';
 import { buildDesignPrompt } from '../prompts/design-prompt';
 import { applyAgentConfig } from '../prompts/agent-config-helpers';
 import { BaseLLMAgent } from './base-llm-agent';
+import { extractJsonObject } from '@gestalt/core';
 
 const MAX_INTERNAL_RETRIES = 2;
 
@@ -71,8 +72,7 @@ export class DesignAgent extends BaseLLMAgent {
 }
 
 function parseDesignArtifact(raw: string, correlationId: string): DesignArtifact {
-  const clean = raw.replace(/```json|```/g, '').trim();
-  const parsed = JSON.parse(clean) as Partial<DesignArtifact>;
+  const parsed = JSON.parse(extractJsonObject(raw)) as Partial<DesignArtifact>;
   return {
     correlationId,
     domainChanges: parsed.domainChanges ?? [],

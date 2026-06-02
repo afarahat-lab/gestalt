@@ -13,6 +13,7 @@ import type { AgentTask, AgentResult, GeneratedArtifact } from '../types';
 import { buildCodePrompt } from '../prompts/code-prompt';
 import { applyAgentConfig } from '../prompts/agent-config-helpers';
 import { BaseLLMAgent } from './base-llm-agent';
+import { extractJsonObject } from '@gestalt/core';
 
 const MAX_INTERNAL_RETRIES = 2;
 
@@ -89,8 +90,7 @@ export class CodeAgent extends BaseLLMAgent {
 }
 
 function parseCodeFiles(raw: string, correlationId: string): GeneratedArtifact[] {
-  const clean = raw.replace(/```json|```/g, '').trim();
-  const parsed = JSON.parse(clean) as { files?: Array<{ path: string; content: string }> };
+  const parsed = JSON.parse(extractJsonObject(raw)) as { files?: Array<{ path: string; content: string }> };
   return (parsed.files ?? []).map((f) => ({
     id: crypto.randomUUID(),
     correlationId,

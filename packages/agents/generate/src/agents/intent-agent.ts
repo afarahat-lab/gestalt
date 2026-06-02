@@ -20,6 +20,7 @@ import type {
 import { buildIntentPrompt } from '../prompts/intent-prompt';
 import { applyAgentConfig } from '../prompts/agent-config-helpers';
 import { BaseLLMAgent } from './base-llm-agent';
+import { extractJsonObject } from '@gestalt/core';
 
 const MAX_INTERNAL_RETRIES = 2;
 
@@ -156,8 +157,7 @@ function parseIntentSpec(
   correlationId: string,
   rawIntentText: string,
 ): IntentSpec {
-  const clean = raw.replace(/```json|```/g, '').trim();
-  const parsed = JSON.parse(clean) as Partial<IntentSpec>;
+  const parsed = JSON.parse(extractJsonObject(raw)) as Partial<IntentSpec>;
 
   return {
     id: crypto.randomUUID(),

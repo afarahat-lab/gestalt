@@ -28,7 +28,7 @@ import { readFile } from 'fs/promises';
 import { join } from 'path';
 import type { ArtifactRef, GateAgentResult, GateSignal, GateTask } from '../types';
 import type { Artifact, ConstraintRule, SignalSeverity } from '@gestalt/core';
-import { loadAgentConfig, BaseLLMAgent } from '@gestalt/core';
+import { loadAgentConfig, BaseLLMAgent, extractJsonObject } from '@gestalt/core';
 import type { AgentConfig } from '@gestalt/core';
 import type { AgentResult } from '@gestalt/agents-generate';
 
@@ -323,12 +323,7 @@ ${extensions}`;
 }
 
 function parseReview(raw: string): LLMReview {
-  const clean = raw.replace(/```json|```/g, '').trim();
-  // Some models wrap the JSON in surrounding prose. Find the outermost {...}.
-  const start = clean.indexOf('{');
-  const end = clean.lastIndexOf('}');
-  const body = start >= 0 && end > start ? clean.slice(start, end + 1) : clean;
-  const parsed = JSON.parse(body) as Partial<LLMReview>;
+  const parsed = JSON.parse(extractJsonObject(raw)) as Partial<LLMReview>;
   return {
     summary: typeof parsed.summary === 'string' ? parsed.summary : '',
     overallVerdict: parsed.overallVerdict ?? 'pass',

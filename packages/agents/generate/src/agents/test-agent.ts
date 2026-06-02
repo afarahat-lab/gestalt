@@ -9,6 +9,7 @@ import type { AgentTask, AgentResult, GeneratedArtifact } from '../types';
 import { buildTestPrompt } from '../prompts/test-prompt';
 import { applyAgentConfig } from '../prompts/agent-config-helpers';
 import { BaseLLMAgent } from './base-llm-agent';
+import { extractJsonObject } from '@gestalt/core';
 
 const MAX_INTERNAL_RETRIES = 2;
 
@@ -84,8 +85,7 @@ export class TestAgent extends BaseLLMAgent {
 }
 
 function parseTestFiles(raw: string, correlationId: string): GeneratedArtifact[] {
-  const clean = raw.replace(/```json|```/g, '').trim();
-  const parsed = JSON.parse(clean) as { files?: Array<{ path: string; content: string }> };
+  const parsed = JSON.parse(extractJsonObject(raw)) as { files?: Array<{ path: string; content: string }> };
   return (parsed.files ?? []).map((f) => ({
     id: crypto.randomUUID(),
     correlationId,
