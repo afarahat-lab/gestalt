@@ -25,6 +25,15 @@ services:
     restart: unless-stopped
     volumes:
       - projects_data:/app/projects
+      # ADR-040 — optional corporate identity config + keytab. Omit
+      # these mounts for local-only deployments; the server starts
+      # cleanly without auth.config.json (local fallback per
+      # ADR-025). For production:
+      #   - mount auth.config.json with mode 0600, owned by root
+      #   - mount krb5.keytab with mode 0600 (Kerberos provider)
+      # Uncomment the lines below after creating the host-side files.
+      # - ./auth.config.json:/etc/gestalt/auth.config.json:ro
+      # - ./krb5.keytab:/etc/gestalt/krb5.keytab:ro
 
   postgres:
     image: postgres:15-alpine

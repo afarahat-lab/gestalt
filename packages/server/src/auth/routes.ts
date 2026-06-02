@@ -21,8 +21,41 @@ import type { FastifyInstance } from 'fastify';
 import { getRepositories, createContextLogger } from '@gestalt/core';
 import { AuthenticationError, type AuthManager } from './auth-manager';
 import type { IncomingRequest, OutgoingResponse, PlatformUser } from './types';
+import type { SamlProvider } from './providers/saml';
+import type { OidcProvider } from './providers/oidc';
+import type { WindowsKerberosProvider } from './providers/kerberos';
 
 const log = createContextLogger({ module: 'auth:routes' });
+
+/**
+ * The dashboard's login view uses this to decide which provider
+ * buttons to render. Public — exposes only the provider list (no
+ * config secrets). Always includes `local` when local auth is
+ * enabled per ADR-025 policy.
+ */
+async function buildProviderList(authManager: AuthManager): Promise<string[]> {
+  return authManager.getEnabledProviders().map((p) => p.type);
+}
+
+/**
+ * Wraps the `Fastify` request shape into the auth module's typed
+ * `IncomingRequest` / `OutgoingResponse` so providers can stay
+ * Fastify-agnostic.
+ */
+function toIncoming(request: { headers: Record<string, unknown>; query: unknown; body: unknown; url: string; method: string }): IncomingRequest {
+  return {
+    headers: request.headers as Record<string, string | string[] | undefined>,
+    query: (request.query ?? {}) as Record<string, string | undefined>,
+    body: request.body,
+    url: request.url,
+    method: request.method,
+  };
+}
+
+const noopOutgoing: OutgoingResponse = {
+  redirect: () => undefined,
+  setCookie: () => undefined,
+};
 
 /**
  * Registers all auth routes on the Fastify instance.
@@ -32,33 +65,131 @@ export async function registerAuthRoutes(
   authManager: AuthManager,
 ): Promise<void> {
 
-  // SAML flow
-  app.get('/auth/saml/login', async (_req, _reply) => {
-    throw new Error('GET /auth/saml/login not yet implemented');
-    // Phase 2: redirect to IdP with SAMLRequest
+  // ─── Provider discovery (dashboard login renderer uses this) ──
+  app.get('/auth/providers', async (_req, reply) => {
+    const providers = await buildProviderList(authManager);
+    return reply.send({ providers });
   });
 
-  app.post('/auth/saml/callback', async (_req, _reply) => {
-    throw new Error('POST /auth/saml/callback not yet implemented');
-    // Phase 2: validate assertion, create session, redirect to dashboard
+  // ─── Kerberos / SPNEGO ─────────────────────────────────────────
+  // GET /auth/kerberos
+  //   no Authorization header → 401 WWW-Authenticate: Negotiate
+  //   Authorization: Negotiate <token> → validate, issue JWT
+  app.get('/auth/kerberos', async (request, reply) => {
+    const provider = authManager.getProvider<WindowsKerberosProvider>('windows-kerberos');
+    if (!provider) {
+      return reply.code(404).send({ error: 'Kerberos provider not configured' });
+    }
+    const authHeader = request.headers['authorization'];
+    if (typeof authHeader !== 'string' || !authHeader.toLowerCase().startsWith('negotiate ')) {
+      reply.header('WWW-Authenticate', 'Negotiate');
+      return reply.code(401).send({ error: 'Kerberos negotiation required' });
+    }
+    try {
+      const incoming = toIncoming(request);
+      const { users } = getRepositories();
+      const identity = await provider.authenticate(incoming, noopOutgoing);
+      if (!identity) return reply.code(401).send({ error: 'Kerberos authentication failed' });
+      const token = await authManager.createSessionFromIdentity(
+        identity,
+        async (u) => users.upsert(u) as Promise<PlatformUser>,
+      );
+      return reply.send({ token });
+    } catch (err) {
+      if (err instanceof AuthenticationError) {
+        return reply.code(err.code === 'PROVIDER_ERROR' ? 500 : 401).send({ error: err.message, code: err.code });
+      }
+      log.error({ err }, 'Kerberos auth error');
+      return reply.code(500).send({ error: 'Kerberos authentication failed' });
+    }
+  });
+
+  // ─── SAML 2.0 ──────────────────────────────────────────────────
+  app.get<{ Querystring: { relay?: string } }>(
+    '/auth/saml/login',
+    async (request, reply) => {
+      const provider = authManager.getProvider<SamlProvider>('saml');
+      if (!provider) return reply.code(404).send({ error: 'SAML provider not configured' });
+      try {
+        const url = await provider.getLoginUrl(request.query.relay);
+        return reply.redirect(url);
+      } catch (err) {
+        log.error({ err }, 'SAML login URL generation failed');
+        return reply.code(500).send({ error: 'SAML login URL generation failed' });
+      }
+    },
+  );
+
+  app.post('/auth/saml/callback', async (request, reply) => {
+    const provider = authManager.getProvider<SamlProvider>('saml');
+    if (!provider) return reply.code(404).send({ error: 'SAML provider not configured' });
+    try {
+      const incoming = toIncoming(request);
+      const { users } = getRepositories();
+      const identity = await provider.authenticate(incoming, noopOutgoing);
+      if (!identity) return reply.code(401).send({ error: 'SAML assertion missing' });
+      const token = await authManager.createSessionFromIdentity(
+        identity,
+        async (u) => users.upsert(u) as Promise<PlatformUser>,
+      );
+      // The dashboard SPA picks the token out of the URL on load and
+      // stores it in localStorage. The 5-minute JWT TTL guards
+      // against the token surviving in browser history beyond a
+      // single navigation.
+      const relay = (request.body as Record<string, string> | null)?.['RelayState'] ?? '/app/';
+      return reply.redirect(`${relay}?token=${encodeURIComponent(token)}`);
+    } catch (err) {
+      if (err instanceof AuthenticationError) {
+        return reply.code(401).send({ error: err.message, code: err.code });
+      }
+      log.error({ err }, 'SAML callback failed');
+      return reply.code(500).send({ error: 'SAML callback failed' });
+    }
   });
 
   app.get('/auth/saml/metadata', async (_req, reply) => {
-    // Phase 2: generate and return SP metadata XML
-    // IT uses this to configure the IdP
+    const provider = authManager.getProvider<SamlProvider>('saml');
+    if (!provider) return reply.code(404).send({ error: 'SAML provider not configured' });
     reply.type('application/xml');
-    throw new Error('GET /auth/saml/metadata not yet implemented');
+    return reply.send(provider.getMetadata());
   });
 
-  // OIDC flow
-  app.get('/auth/oidc/login', async (_req, _reply) => {
-    throw new Error('GET /auth/oidc/login not yet implemented');
-    // Phase 2: redirect to OIDC provider with authorization request
+  // ─── OIDC ──────────────────────────────────────────────────────
+  app.get('/auth/oidc/login', async (_request, reply) => {
+    const provider = authManager.getProvider<OidcProvider>('oidc');
+    if (!provider) return reply.code(404).send({ error: 'OIDC provider not configured' });
+    try {
+      const { url } = provider.getLoginUrl();
+      return reply.redirect(url);
+    } catch (err) {
+      if (err instanceof AuthenticationError) {
+        return reply.code(500).send({ error: err.message, code: err.code });
+      }
+      log.error({ err }, 'OIDC login URL generation failed');
+      return reply.code(500).send({ error: 'OIDC login URL generation failed' });
+    }
   });
 
-  app.get('/auth/oidc/callback', async (_req, _reply) => {
-    throw new Error('GET /auth/oidc/callback not yet implemented');
-    // Phase 2: exchange code for tokens, validate, create session
+  app.get('/auth/oidc/callback', async (request, reply) => {
+    const provider = authManager.getProvider<OidcProvider>('oidc');
+    if (!provider) return reply.code(404).send({ error: 'OIDC provider not configured' });
+    try {
+      const incoming = toIncoming(request);
+      const { users } = getRepositories();
+      const identity = await provider.authenticate(incoming, noopOutgoing);
+      if (!identity) return reply.code(401).send({ error: 'OIDC callback missing code or state' });
+      const token = await authManager.createSessionFromIdentity(
+        identity,
+        async (u) => users.upsert(u) as Promise<PlatformUser>,
+      );
+      return reply.redirect(`/app/?token=${encodeURIComponent(token)}`);
+    } catch (err) {
+      if (err instanceof AuthenticationError) {
+        return reply.code(401).send({ error: err.message, code: err.code });
+      }
+      log.error({ err }, 'OIDC callback failed');
+      return reply.code(500).send({ error: 'OIDC callback failed' });
+    }
   });
 
   // Local fallback login

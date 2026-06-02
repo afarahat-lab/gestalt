@@ -120,6 +120,30 @@ export class AuthManager {
   getEnabledProviders(): AuthProvider[] {
     return this.providers;
   }
+
+  /**
+   * Looks up the typed provider by its `type` string. The route
+   * layer uses this to call provider-specific entry points
+   * (`SamlProvider.getLoginUrl`, `SamlProvider.getMetadata`,
+   * `OidcProvider.getLoginUrl`) without leaking provider classes
+   * out of the auth module. Returns `null` when the provider
+   * isn't configured.
+   */
+  getProvider<T extends AuthProvider = AuthProvider>(type: AuthProvider['type']): T | null {
+    return (this.providers.find((p) => p.type === type) as T | undefined) ?? null;
+  }
+
+  /**
+   * Convenience for the route layer to upsert a user after a
+   * provider-driven flow (SAML / OIDC callback handlers). Wraps
+   * `createSession` so the route can stay generic over provider.
+   */
+  async createSessionFromIdentity(
+    identity: VerifiedIdentity,
+    upsertUser: (user: Omit<PlatformUser, 'id' | 'createdAt' | 'deactivatedAt'>) => Promise<PlatformUser>,
+  ): Promise<string> {
+    return this.createSession(identity, upsertUser);
+  }
 }
 
 // ─── Auth errors ──────────────────────────────────────────────────────────────
@@ -169,7 +193,13 @@ export async function createAuthManager(
       }
       case 'oidc': {
         const { OidcProvider } = await import('./providers/oidc.js');
-        manager.registerProvider(new OidcProvider(providerConfig));
+        const oidc = new OidcProvider(providerConfig);
+        // Issuer discovery is a one-time network call. Failure is
+        // logged inside `init()` but doesn't prevent the server from
+        // starting — the provider's `authenticate` reports the error
+        // on the first real request.
+        await oidc.init();
+        manager.registerProvider(oidc);
         break;
       }
       case 'local': {

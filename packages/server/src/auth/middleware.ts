@@ -18,6 +18,8 @@ const log = createContextLogger({ module: 'auth-middleware' });
 const PUBLIC_ROUTES = new Set([
   'GET /health',
   'GET /',  // 302-redirects to /app/ — convenience for `gestalt dashboard` users
+  'GET /auth/providers',  // ADR-040 — login renderer needs to know which providers are available
+  'GET /auth/kerberos',   // ADR-040 — issues the 401 + Negotiate challenge OR validates the token
   'GET /auth/saml/metadata',
   'GET /auth/saml/login',
   'POST /auth/saml/callback',

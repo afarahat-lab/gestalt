@@ -940,3 +940,110 @@ Two SDK transports are supported via URL scheme:
 - **Tokens via `tokenFrom: 'harness'` are visible in the project
   repo.** Documented in `harness-config.md` so operators choose
   `env:VAR_NAME` for anything sensitive.
+
+---
+
+## ADR-040 — Corporate identity configuration schema
+
+**Date:** 2026-06
+**Status:** Accepted
+
+### Context
+
+ADR-024 defines the identity contract (every provider produces a
+`VerifiedIdentity` the AuthManager maps to a `PlatformUser` via
+role mapping). The local provider already ships per ADR-025; the
+Kerberos / SAML / OIDC stubs in
+`packages/server/src/auth/providers/` need real implementations
+for the GCC/MENA enterprise market this platform targets.
+
+Sensitive credentials (SAML cert + signing keys, OIDC client
+secrets, Kerberos keytab path) should not live in the same file
+as application config — they have different lifecycles, different
+audit requirements, and different operators (corporate IT vs the
+application engineering team).
+
+### Decision
+
+Corporate identity is configured in a dedicated `auth.config.json`
+file that the server reads at startup from one of:
+1. `process.cwd()/auth.config.json` (dev / docker-compose with a
+   bind mount in the workdir)
+2. `/etc/gestalt/auth.config.json` (production — placed by IT into
+   the container via a volume mount)
+
+The file is **optional**. If absent, the server falls back to the
+existing `HARNESS.json` `identity` block (for back-compat with
+pre-040 deployments) and finally to the local-only default per
+ADR-025.
+
+Schema:
+
+```json
+{
+  "providers": {
+    "kerberos": {
+      "enabled": true,
+      "realm": "COMPANY.COM",
+      "serviceAccount": "HTTP/gestalt.company.com@COMPANY.COM",
+      "keytabPath": "/etc/gestalt/krb5.keytab"
+    },
+    "saml": {
+      "enabled": true,
+      "entryPoint": "https://adfs.company.com/adfs/ls/",
+      "issuer": "https://gestalt.company.com",
+      "cert": "MIIBkTC...",
+      "callbackUrl": "https://gestalt.company.com/auth/saml/callback",
+      "wantAssertionsSigned": true,
+      "identifierFormat": "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+      "attributeMapping": {
+        "email": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
+        "displayName": "http://schemas.microsoft.com/ws/2008/06/identity/claims/displayname",
+        "groups": "http://schemas.microsoft.com/ws/2008/06/identity/claims/groups"
+      }
+    },
+    "oidc": {
+      "enabled": true,
+      "issuer": "https://login.microsoftonline.com/<tenantId>/v2.0",
+      "clientId": "...",
+      "clientSecret": "...",
+      "redirectUri": "https://gestalt.company.com/auth/oidc/callback",
+      "scope": "openid profile email groups",
+      "groupsClaim": "groups"
+    }
+  },
+  "roleMapping": {
+    "platformAdmin": ["gestalt-admins", "domain-admins"],
+    "defaultRole": "user"
+  },
+  "sessionTtlMinutes": 480
+}
+```
+
+### Rationale
+
+- Separating auth config from application config (HARNESS.json,
+  .env) lets corporate IT manage identity independently of
+  application deployment.
+- Keeping the file path under `/etc/gestalt/` follows POSIX
+  convention for machine-wide system config — tighter filesystem
+  permissions, separately mountable in Docker.
+- The brief's friendly object-keyed shape (`providers.kerberos`,
+  `providers.saml`, …) is more ergonomic for IT to author than
+  the existing discriminated-union array shape. The loader
+  translates to the existing `IdentityConfig` so AuthManager and
+  the rest of the auth stack don't need to know about the new
+  source.
+
+### Consequences
+
+- Pre-040 deployments using `HARNESS.json` `identity` keep working
+  — the loader checks `auth.config.json` first and falls through.
+- Sensitive credentials are now confined to a single file the
+  operator can mount with `:ro` and `mode 0600`.
+- The `kerberos` npm package requires a native addon
+  (`krb5-dev` apk pkg on Alpine). The Dockerfile installs the
+  build dep; the provider dynamic-imports the package so a missing
+  native addon fails gracefully (provider skipped, server still
+  starts) — important for macOS dev where the addon may not
+  build.

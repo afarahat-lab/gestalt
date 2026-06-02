@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-02 (Claude Code — context-fixer switched to callLLMWithTools via new callLLMWithToolsMessages variant; live tool calls verified)
+**Last updated:** 2026-06-02 (Claude Code — corporate identity: Kerberos/SAML/OIDC providers implemented + auth.config.json schema per ADR-040)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 

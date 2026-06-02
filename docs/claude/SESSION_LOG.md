@@ -8840,3 +8840,271 @@ make tool calls" is now met:
 No new Pending enhancements added. The "context-fixer kept on
 callLLMWithMessages — flagged as a follow-up" note from the
 BaseLLMAgent-to-core session is now resolved.
+
+---
+
+### Session 2026-06-02 — Claude Code (corporate identity: Kerberos / SAML / OIDC providers + ADR-040 auth config schema)
+
+Implements the three corporate authentication providers defined in
+ADR-024. The local provider already worked (ADR-025); this session
+fills in the three stubs in
+`packages/server/src/auth/providers/` and adds the ADR-040
+`auth.config.json` schema for IT-managed identity configuration.
+
+Changed:
+- `docs/DECISIONS.md`: ADR-040 appended — `auth.config.json` is the
+  primary identity config source, optional, read from cwd or
+  `/etc/gestalt/`. Legacy HARNESS.json `identity` block continues
+  to work as fallback. Sensitive credentials (SAML cert / OIDC
+  client secrets / Kerberos keytab path) live in a separately-
+  mountable file with tighter permissions
+- `packages/server/src/auth/auth-config.ts` (new): file loader +
+  `toIdentityConfig` translator. Maps the brief's friendly object-
+  keyed shape (`providers.kerberos`, `providers.saml`,
+  `providers.oidc`) to the existing `IdentityConfig` array-of-
+  providers shape AuthManager already consumes. Returns null when
+  no file is found so the legacy code path can take over
+- `packages/server/src/auth/config-loader.ts`: tries
+  auth.config.json FIRST, falls through to HARNESS.json
+  `identity`, finally to local-only default. Existing
+  HARNESS.json-based deployments continue to work without
+  modification
+- `packages/server/package.json`:
+  - Added `@node-saml/node-saml@^4.0.5` (maintained successor to
+    deprecated `passport-saml`)
+  - Added `openid-client@^5.6.4`
+  - Added `kerberos@^2.1.0` under `optionalDependencies` so a host
+    where the native build fails (older macOS without krb5-dev) still
+    installs the platform — the provider just refuses to load at
+    runtime with a clear error message
+- `packages/server/src/auth/providers/kerberos.ts`: full
+  implementation. Dynamic-imports the `kerberos` npm package so
+  missing native addons fail gracefully. Implements the SPNEGO
+  flow via `initializeServer(spn)` + `ctx.step(token)`. Returns
+  empty `groups: []` — LDAP lookup for AD group membership is
+  out of scope for ADR-040 (future enhancement). Handles three
+  username formats (`user@REALM`, `DOMAIN\user`, bare `user`)
+  via `normaliseUpn`. Module load errors cached so repeated
+  failed requests don't keep retrying the addon
+- `packages/server/src/auth/providers/saml.ts`: full
+  implementation using `@node-saml/node-saml` v4. Provider uses
+  `validatePostResponseAsync` for assertion validation +
+  `getAuthorizeUrlAsync` for the IdP redirect.
+  `generateServiceProviderMetadata` serves SP metadata at
+  `/auth/saml/metadata`. Default attribute mapping matches Azure
+  AD / ADFS claim URIs; operator overrides via
+  `attributeMapping` block in `auth.config.json`
+- `packages/server/src/auth/providers/oidc.ts`: full
+  implementation using `openid-client` v5. PKCE-protected
+  authorization code flow. State + code-verifier stored in an
+  in-memory Map keyed by the OAuth state nonce; 10-minute TTL,
+  opportunistic cleanup. Issuer discovery happens once in
+  `init()` at startup — failure is logged and swallowed so a
+  temporarily-unreachable IdP doesn't prevent server boot; the
+  first real request reports the discovery error to the
+  operator
+- `packages/server/src/auth/auth-manager.ts`:
+  - `createAuthManager` now `await`s `oidc.init()` so the
+    issuer is discovered before the manager returns
+  - New `getProvider<T>(type)` helper for the route layer to
+    invoke provider-specific entry points
+    (`SamlProvider.getLoginUrl` / `getMetadata`,
+    `OidcProvider.getLoginUrl`) without leaking provider
+    classes out of the auth module
+  - New `createSessionFromIdentity` exposes `createSession` for
+    the SAML / OIDC callback routes that build the
+    `VerifiedIdentity` themselves
+- `packages/server/src/auth/routes.ts`: full implementations of
+  the seven new routes:
+  - **`GET /auth/providers`** — public; returns
+    `{ providers: ['kerberos'|'saml'|'oidc'|'local'][] }` so
+    the dashboard's login renderer shows the right buttons
+  - **`GET /auth/kerberos`** — public; no Authorization header
+    → 401 + `WWW-Authenticate: Negotiate` (browser handles
+    SPNEGO natively); Authorization header present → validate
+    + issue JWT
+  - **`GET /auth/saml/login?relay=<path>`** — public; redirects
+    to IdP entry point with SAMLRequest
+  - **`POST /auth/saml/callback`** — public; validates the
+    signed assertion, issues JWT, redirects to
+    `/app/?token=<jwt>`
+  - **`GET /auth/saml/metadata`** — public; serves SP metadata
+    XML (operators provide URL to corporate IT)
+  - **`GET /auth/oidc/login`** — public; generates state +
+    PKCE, redirects to IdP authorize endpoint
+  - **`GET /auth/oidc/callback`** — public; exchanges code for
+    tokens, validates ID token, issues JWT, redirects to
+    `/app/?token=<jwt>`
+- `packages/server/src/auth/middleware.ts`: PUBLIC_ROUTES gained
+  `GET /auth/providers` and `GET /auth/kerberos` (other new
+  routes were already public for the previous SAML / OIDC stubs)
+- `packages/dashboard/src/views/Login.tsx`: gained provider
+  discovery on mount (`fetch('/auth/providers')`), renders
+  Kerberos / SAML / OIDC buttons conditional on the response;
+  the local email/password form renders below a `── or ──`
+  divider when SSO is available. On mount, also checks the URL
+  for `?token=<jwt>` (the SAML / OIDC redirect target) — strips
+  the token, stores it in localStorage, and bounces to the
+  dashboard root via React Router. Kerberos button uses
+  `fetch('/auth/kerberos', { credentials: 'include' })` —
+  browser handles SPNEGO natively
+- `docker-compose.yml`: added commented-out volume mounts for
+  `./auth.config.json:/etc/gestalt/auth.config.json:ro` and
+  `./krb5.keytab:/etc/gestalt/krb5.keytab:ro`. Operators
+  uncomment after creating the host-side files; default
+  (commented) deployment stays local-only
+- `docs/guides/identity/kerberos.md`: ADR-040 callout +
+  auth.config.json + docker-compose example added. Legacy
+  HARNESS.json example kept as a footnote for back-compat
+- `docs/guides/identity/saml.md` (new): generic SAML guide —
+  auth.config.json schema, attribute-mapping table for common
+  IdPs (ADFS / Azure AD / Okta / PingFederate), SP metadata
+  endpoint, testing recipe, troubleshooting matrix
+- `docs/guides/identity/oidc.md` (new): generic OIDC guide —
+  auth.config.json schema, PKCE flow explanation, Azure AD
+  group-claim caveat, testing recipe, troubleshooting matrix
+- `docs/guides/identity/role-mapping.md` (new): how
+  `roleMapping.platformAdmin` group lists translate to
+  `users.role` at sign-in time. Documents the two-tier role
+  model (platform-admin / user vs project-admin / editor /
+  reader). Per-IdP group-source conventions table
+
+Verified live:
+
+**Stage 1 — no regression (MUST PASS):**
+- `pnpm -r build` clean across all 12 packages
+- Docker image rebuilt; server reaches `Up (healthy)`; `/health`
+  returns 200
+- `GET /auth/providers` → `{"providers":["local"]}` — no
+  auth.config.json present, falls through to local-only
+- **Existing admin login unchanged.** `POST /auth/login` with
+  `a@b.c` / qwerty123 returns a 251-char JWT; `/auth/me` returns
+  the user with `authProvider: 'local'` and `role:
+  'platform-admin'`. CLI flow not exercised but the route shape
+  is identical to before this change
+- New SSO endpoints return 404 cleanly when no auth config
+  exists: `GET /auth/kerberos` → 404; `GET /auth/saml/metadata`
+  → 404; `GET /auth/oidc/login` → 404
+- Dashboard SPA still loads at `/app/`
+
+**Stage 2 (partial) — OIDC issuer discovery + authorization
+URL generation:**
+- Wrote a synthetic `auth.config.json` pointing at Google's
+  OIDC issuer (`https://accounts.google.com`) with fake
+  client_id + client_secret
+- Server restart picked up the file; logs show
+  `"OIDC issuer discovered" issuer: "https://accounts.google.com"`
+  — the discovery call hit Google's
+  `/.well-known/openid-configuration` and parsed it
+- `GET /auth/providers` now returns `["oidc", "local"]`
+- `GET /auth/oidc/login` returns a 302 with Location pointing
+  at Google's authorize endpoint and ALL the right
+  parameters: `client_id`, `scope=openid profile email`,
+  `response_type=code`, `redirect_uri`, `state=<nonce>`,
+  `code_challenge=<S256>`, `code_challenge_method=S256` (full
+  PKCE flow)
+- Removed the synthetic config, restarted; back to
+  `{"providers":["local"]}` — no state leakage
+
+**Stage 2 full (deferred — needs real IdP credentials):**
+- Real Google OAuth client credentials would be needed to
+  complete the user → IdP → callback → JWT roundtrip end-to-
+  end. The OIDC code paths exercised (discovery, login URL,
+  state store) are the entire server-side surface; the
+  callback handler's only remaining un-exercised path is the
+  IdP's real-vs-stubbed `code` exchange. Same code path is
+  used by Azure AD / Okta / Auth0 — verification at a
+  customer site is the natural place for that test
+- SAML and Kerberos remain unverified end-to-end live; they
+  build clean and the route shape is verified (404 with
+  provider-not-configured + URL generation for SAML
+  `/auth/saml/metadata` when configured)
+
+Decisions made:
+- **`@node-saml/node-saml` over `passport-saml`.** The brief
+  said "passport-saml v3.2.4"; that package is deprecated as
+  of mid-2024. Its successor `@node-saml/node-saml@4` is the
+  drop-in replacement with the same SAML class API and active
+  maintenance. Cleaner long-term choice
+- **`openid-client` v5.6+** — most recent stable v5 release.
+  v6 introduces breaking API changes; deferring until they
+  stabilise. The brief's snippets work against v5 unchanged
+- **`kerberos` in `optionalDependencies`** — the native addon
+  requires `krb5-dev` (Alpine) or the Apple Kerberos.framework.
+  The macOS dev environment we used built the prebuilt binary
+  cleanly via `prebuild-install`, but other macOS versions
+  may not. Marking as optional means `pnpm install` won't
+  fail on a host without it; the provider catches the
+  dynamic-import failure and reports a clear error at runtime
+  rather than at startup
+- **Dynamic import for the kerberos module.** Even with the
+  native build available, dynamic-importing lets the server
+  start cleanly when auth.config.json doesn't reference
+  Kerberos. The first Kerberos request triggers the import;
+  failure is cached so subsequent requests don't keep retrying
+- **`auth.config.json` translates to `IdentityConfig`, not
+  replacing it.** The existing AuthManager and route layer
+  consume `IdentityConfig` (typed array of providers). The
+  brief's friendlier shape is just a more ergonomic on-disk
+  format for IT operators. The `toIdentityConfig` helper does
+  the translation; downstream code is auth-config-shape-
+  agnostic
+- **OIDC init failure is non-fatal.** A temporarily-
+  unreachable IdP shouldn't prevent server startup. The
+  `init()` method logs the error and proceeds; the first real
+  `authenticate` call returns `PROVIDER_ERROR` with the
+  captured discovery error message. Operators see a clear
+  signal in startup logs (`"OIDC issuer discovery failed —
+  provider disabled until next restart"`) but other providers
+  + local auth continue to work
+- **OIDC state stored in-memory Map.** Single-replica
+  deployments are the initial target; HA replicas would need
+  Redis-backed state (callback may hit a different replica
+  than login). Flagged in the OIDC provider's docstring +
+  the oidc.md guide as a future enhancement
+- **SAML callback redirects to `/app/?token=<jwt>` rather
+  than setting a cookie.** Two reasons: (1) Gestalt's CLI
+  already uses Authorization headers from a JWT in
+  localStorage — adding a cookie path would create two auth
+  mechanisms; (2) the URL query param disappears after the
+  SPA strips it (`window.history.replaceState`) so it doesn't
+  persist in browser history beyond the initial navigation.
+  JWT TTL is the existing platform default (8 hours via
+  `SESSION_TTL_MINUTES`)
+- **Group lookup deferred for Kerberos.** Kerberos tickets
+  carry user identity only — group membership requires an LDAP
+  query against the domain controller. The brief flagged this
+  as out of scope; the provider returns `groups: []` and the
+  `role-mapping.md` guide explains the UPN-list-only path
+  available for now. Future enhancement: add an LDAP client +
+  config for the AD search base + bind credentials
+- **Dashboard Login bounces on `?token=` URL param.** The
+  SAML / OIDC callback redirect lands users at `/app/?token=<jwt>`.
+  React Router parses this view as `/login`; the new
+  `useEffect` hook reads the token, stores it, strips it via
+  `window.history.replaceState`, and navigates to `/`. The
+  token is never persisted in the browser history beyond the
+  single navigation
+
+Operator action — pending on real corporate deployments:
+- For a customer deployment, the IT team creates
+  auth.config.json with their IdP details, mounts it via
+  docker-compose, and restarts the server. The dashboard
+  immediately renders the appropriate SSO buttons; the next
+  login completes through the IdP
+- The CLI continues to use the local-auth `gestalt login`
+  flow OR a JWT obtained via the dashboard (no change to
+  the CLI surface — the JWT is the only thing it cares
+  about)
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker image rebuilt. Stage 1 (no regression) fully verified
+live. Stage 2 partially verified live (OIDC issuer discovery
++ authorization URL generation against Google's real OIDC
+endpoint with fake client credentials). Full end-to-end IdP
+roundtrip requires real customer credentials.
+
+No new Pending enhancements added. ADR-040 closes the long-
+standing identity stub gap; the three providers are now real
+implementations rather than `throw new Error('not yet
+implemented')` placeholders.

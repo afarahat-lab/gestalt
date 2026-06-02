@@ -6,6 +6,14 @@ open the dashboard and are authenticated automatically — no login screen.
 
 **Audience:** Active Directory administrator + Gestalt server administrator
 
+> **ADR-040 update (2026-06).** New deployments configure identity
+> in a dedicated `auth.config.json` mounted at `/etc/gestalt/`.
+> The earlier HARNESS.json `identity` block continues to work for
+> back-compat but is no longer the recommended path. See the
+> auth.config.json example below; see also
+> [role-mapping.md](./role-mapping.md) for AD group → platform role
+> configuration.
+
 ---
 
 ## How it works
@@ -204,28 +212,63 @@ In Active Directory Users and Computers:
 
 ---
 
-## Step 7 — Update HARNESS.json
+## Step 7 — Create auth.config.json (ADR-040)
+
+Mount `auth.config.json` at `/etc/gestalt/auth.config.json` via
+docker-compose. The container also needs the keytab + the
+`KRB5_KTNAME` env var:
 
 ```json
-"identity": {
-  "providers": [
-    {
-      "type": "windows-kerberos",
+{
+  "providers": {
+    "kerberos": {
       "enabled": true,
-      "spn": "HTTP/gestalt.company.com",
       "realm": "COMPANY.COM",
-      "kdcHostname": "dc01.company.com"
+      "serviceAccount": "HTTP/gestalt.company.com@COMPANY.COM",
+      "keytabPath": "/etc/gestalt/krb5.keytab"
     }
-  ],
-  "roleMapping": [
-    { "idpGroup": "Gestalt-Admins",    "platformRole": "admin" },
-    { "idpGroup": "Gestalt-Operators", "platformRole": "operator" },
-    { "idpGroup": "Gestalt-Viewers",   "platformRole": "viewer" }
-  ],
-  "defaultRole": null,
+  },
+  "roleMapping": {
+    "platformAdmin": ["Gestalt-Admins"],
+    "defaultRole": "user"
+  },
   "sessionTtlMinutes": 480
 }
 ```
+
+```yaml
+# docker-compose.yml — uncomment the volume mounts the platform ships:
+services:
+  server:
+    volumes:
+      - ./auth.config.json:/etc/gestalt/auth.config.json:ro
+      - ./krb5.keytab:/etc/gestalt/krb5.keytab:ro
+    environment:
+      - KRB5_KTNAME=/etc/gestalt/krb5.keytab
+```
+
+> **Legacy HARNESS.json path** (continues to work for back-compat —
+> the loader reads `auth.config.json` first, falls through to
+> HARNESS.json `identity` only if no auth-config file is found):
+>
+> ```json
+> "identity": {
+>   "providers": [
+>     {
+>       "type": "windows-kerberos",
+>       "enabled": true,
+>       "spn": "HTTP/gestalt.company.com",
+>       "realm": "COMPANY.COM",
+>       "kdcHostname": "dc01.company.com"
+>     }
+>   ],
+>   "roleMapping": [
+>     { "idpGroup": "Gestalt-Admins", "platformRole": "platform-admin" }
+>   ],
+>   "defaultRole": "user",
+>   "sessionTtlMinutes": 480
+> }
+> ```
 
 ---
 
