@@ -11,6 +11,7 @@ export type {
   Artifact, ArtifactType,
   UserRole, ProjectRole,
   ToolDefinition, ToolCall, ToolResult, BuiltInToolName, ToolCallLogEntry,
+  HarnessPipelineConfig,
   Result,
 } from './types';
 export { ok, err } from './types';

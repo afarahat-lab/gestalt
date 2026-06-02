@@ -533,7 +533,12 @@ export type DeploymentEventType =
   | 'pipeline-passed'
   | 'pipeline-failed'
   | 'promoted-staging'
-  | 'promoted-production';
+  | 'promoted-production'
+  // auto-merge support: written by promotion-agent AFTER staging
+  // promotion succeeds when HARNESS.json has `pipeline.autoMerge:
+  // true`. The DB enum gains this value via migration 013
+  // (`ADD VALUE IF NOT EXISTS 'auto-merged'`).
+  | 'auto-merged';
 
 export interface DeploymentEventRecord {
   id: string;

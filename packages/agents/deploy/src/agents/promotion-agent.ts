@@ -25,8 +25,12 @@ import { tmpdir } from 'os';
 import { simpleGit } from 'simple-git';
 import {
   getRepositories, createContextLogger, emitLiveEvent,
+  createHarnessEngine,
 } from '@gestalt/core';
-import type { PlatformSignal, SignalType, DeploymentEventType } from '@gestalt/core';
+import type {
+  PlatformSignal, SignalType, DeploymentEventType,
+  HarnessPipelineConfig,
+} from '@gestalt/core';
 import { resolvePipelineAdapter } from '../adapters/resolver';
 import { authenticatedGitUrl } from './util';
 
@@ -37,6 +41,17 @@ export interface PromotionAgentInput {
   intentId: string;
   projectId: string;
   targetEnvironment: 'staging' | 'production';
+  /**
+   * PR opened by pr-agent earlier in the cycle. Required for auto-merge
+   * to run; absent → auto-merge silently skips (which is the same
+   * behaviour as `autoMerge: false`).
+   */
+  prNumber?: number;
+  /**
+   * Intent text used as the merge commit subject when auto-merge fires.
+   * Falls back to a generic subject when absent.
+   */
+  intentText?: string;
 }
 
 export type PromotionAgentOutcome =
@@ -141,6 +156,21 @@ export async function runPromotionAgent(input: PromotionAgentInput): Promise<Pro
       'Environment promotion complete',
     );
 
+    // Auto-merge — fires only after staging promotion succeeds, never
+    // before CI passes and never on the production-promotion leg. We
+    // catch every throw locally: a failed merge logs a warning and
+    // leaves the PR open for manual review; the intent still reaches
+    // `deployed`. The point is to avoid a GitHub API blip blocking a
+    // successful deployment.
+    if (input.targetEnvironment === 'staging') {
+      await maybeAutoMerge({
+        workDir,
+        adapter,
+        input,
+        deploymentEvents,
+      });
+    }
+
     return {
       outcome: {
         kind: 'promoted',
@@ -151,5 +181,109 @@ export async function runPromotionAgent(input: PromotionAgentInput): Promise<Pro
     };
   } finally {
     await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * After staging promotion, read `HARNESS.json` `pipeline.autoMerge` from
+ * the cloned project. When true (and we have a `prNumber`), call
+ * `adapter.mergePullRequest` and persist an `auto-merged` deployment
+ * event. Non-fatal — every failure path logs + emits SSE but does NOT
+ * throw, so the production-promotion dispatch continues and the intent
+ * still reaches `deployed`.
+ */
+async function maybeAutoMerge(args: {
+  workDir: string;
+  adapter: { type: string; mergePullRequest: (params: {
+    projectId: string;
+    prNumber: number;
+    mergeMethod?: 'merge' | 'squash' | 'rebase';
+    commitTitle?: string;
+    commitMessage?: string;
+  }) => Promise<{ merged: boolean; sha: string }> };
+  input: PromotionAgentInput;
+  deploymentEvents: ReturnType<typeof getRepositories>['deploymentEvents'];
+}): Promise<void> {
+  const { workDir, adapter, input, deploymentEvents } = args;
+
+  // Read HARNESS.json from the cloned tree to find autoMerge config.
+  // Parse failure is non-fatal — treat as autoMerge: false.
+  let pipelineConfig: HarnessPipelineConfig | undefined;
+  try {
+    const harnessConfig = await createHarnessEngine(workDir).loadHarnessConfig();
+    pipelineConfig = harnessConfig.pipeline;
+  } catch (err) {
+    log.warn(
+      { err, correlationId: input.correlationId },
+      'Auto-merge skipped — could not read HARNESS.json from clone',
+    );
+    return;
+  }
+
+  const autoMerge = pipelineConfig?.autoMerge ?? false;
+  if (!autoMerge) return;
+  if (input.prNumber === undefined) {
+    log.warn(
+      { correlationId: input.correlationId },
+      'Auto-merge enabled but no prNumber in payload — skipping (legacy in-flight job?)',
+    );
+    return;
+  }
+
+  const mergeMethod = pipelineConfig?.mergeMethod ?? 'squash';
+  const commitTitle = input.intentText
+    ? `${input.intentText.split('\n')[0]?.slice(0, 72)} [gestalt ${input.correlationId.slice(0, 8)}]`
+    : `Auto-merge [gestalt ${input.correlationId.slice(0, 8)}]`;
+
+  try {
+    const mergeResult = await adapter.mergePullRequest({
+      projectId: input.projectId,
+      prNumber: input.prNumber,
+      mergeMethod,
+      commitTitle,
+    });
+
+    await deploymentEvents.append({
+      correlationId: input.correlationId,
+      intentId: input.intentId,
+      eventType: 'auto-merged' satisfies DeploymentEventType,
+      environment: null,
+      prUrl: null,
+      prNumber: input.prNumber,
+      runId: null,
+      deploymentUrl: null,
+      metadata: { sha: mergeResult.sha, mergeMethod, adapter: adapter.type },
+    });
+
+    emitLiveEvent('deployment.updated', input.correlationId, {
+      intentId: input.intentId,
+      status: 'auto-merged',
+      sha: mergeResult.sha,
+      prNumber: input.prNumber,
+      mergeMethod,
+    });
+
+    log.info(
+      {
+        correlationId: input.correlationId,
+        sha: mergeResult.sha,
+        prNumber: input.prNumber,
+        mergeMethod,
+      },
+      'PR auto-merged after staging promotion',
+    );
+  } catch (err) {
+    // Auto-merge failure is non-fatal. The PR stays open; intent
+    // continues to production.
+    log.warn(
+      { err, correlationId: input.correlationId, prNumber: input.prNumber },
+      'Auto-merge failed — PR left open for manual review',
+    );
+    emitLiveEvent('deployment.updated', input.correlationId, {
+      intentId: input.intentId,
+      status: 'auto-merge-failed',
+      prNumber: input.prNumber,
+      reason: err instanceof Error ? err.message : String(err),
+    });
   }
 }

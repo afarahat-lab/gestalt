@@ -139,8 +139,28 @@ projects
   .command('set-adapter <name> <adapter>')
   .description('Switch a project\'s pipeline adapter (noop | github-actions). Commits HARNESS.json.')
   .option('--server <url>', 'Server URL (one-shot override for this invocation)')
-  .action(async (name: string, adapter: string, opts: { server?: string }) => {
-    await setAdapterCommand(name, adapter, { server: opts.server }).catch(fatalError);
+  .option(
+    '--auto-merge',
+    'Enable auto-merge of the PR after staging promotion succeeds.',
+  )
+  .option(
+    '--no-auto-merge',
+    'Explicitly disable auto-merge (overrides any --auto-merge in the same invocation).',
+  )
+  .option(
+    '--merge-method <method>',
+    'Merge method when auto-merge fires: squash (default) | merge | rebase.',
+  )
+  .action(async (
+    name: string,
+    adapter: string,
+    opts: { server?: string; autoMerge?: boolean; mergeMethod?: string },
+  ) => {
+    await setAdapterCommand(name, adapter, {
+      server: opts.server,
+      autoMerge: opts.autoMerge,
+      mergeMethod: opts.mergeMethod,
+    }).catch(fatalError);
   });
 
 // gestalt maintenance

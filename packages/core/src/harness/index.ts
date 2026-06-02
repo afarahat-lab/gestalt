@@ -14,7 +14,7 @@
 import { readFile, access } from 'fs/promises';
 import { join } from 'path';
 import { parse as parseYaml } from 'yaml';
-import type { SignalType } from '../types';
+import type { SignalType, HarnessPipelineConfig } from '../types';
 import { createContextLogger } from '../logger/index';
 
 const log = createContextLogger({ module: 'harness' });
@@ -84,7 +84,15 @@ export interface HarnessConfig {
     rules: ConstraintRule[];
   };
   identity?: Record<string, unknown>;
-  pipeline?: Record<string, unknown>;
+  /**
+   * Pipeline config (ADR-033). Reads as the typed
+   * `HarnessPipelineConfig` so callers can read `pipeline.autoMerge`
+   * and `pipeline.mergeMethod` without `as`-casting through
+   * `Record<string, unknown>`. Legacy projects with only
+   * `pipeline.adapter` continue to satisfy this shape (the new fields
+   * are optional).
+   */
+  pipeline?: HarnessPipelineConfig;
   maintenance?: Record<string, unknown>;
   /**
    * Project-level MCP server credentials (ADR-039). Referenced from

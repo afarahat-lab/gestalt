@@ -8,9 +8,12 @@ import type { DeploymentSummary, DeploymentEvent, DeploymentEventType } from '..
 
 /**
  * Deployments view — every intent that's reached the deploy layer for
- * the current project, rendered as a four-node pipeline timeline.
+ * the current project, rendered as a four-node pipeline timeline. A
+ * fifth `Merged ✓` node is appended ONLY for cycles where auto-merge
+ * fired (presence of an `auto-merged` deployment_events row); for
+ * manual-merge projects the timeline stays at four nodes.
  *
- *   ●─PR────●─Pipeline──●─Staging────●─Production
+ *   ●─PR────●─Pipeline──●─Staging────●─Production──[●─Merged]?
  *
  * Each node is filled when its corresponding `deployment_events` row
  * exists for the cycle. Pipeline-failed flips the Pipeline node red
@@ -21,16 +24,29 @@ import type { DeploymentSummary, DeploymentEvent, DeploymentEventType } from '..
 const INTENT_TRUNCATE = 65;
 
 /**
- * Which deployment_events row "fills" each of the four nodes. PR opens
+ * Which deployment_events row "fills" each base node. PR opens
  * → node 1. Pipeline finishes → node 2 (failed → red; running → in-progress).
  * promoted-staging → node 3. promoted-production → node 4.
+ * `auto-merged` (node 5) is conditional — see `hasAutoMerge` below.
  */
 const NODE_FILL_EVENT: Record<number, DeploymentEventType> = {
   0: 'pr-opened',
   1: 'pipeline-passed',
   2: 'promoted-staging',
   3: 'promoted-production',
+  4: 'auto-merged',
 };
+
+/**
+ * Whether to render the 5th `Merged ✓` node. We use event presence as
+ * the canonical signal: the `auto-merged` row is written only when
+ * `HARNESS.json` `pipeline.autoMerge === true` AND the merge call
+ * succeeded. Manual-merge projects never produce one, so they stay at
+ * 4 nodes — exactly the brief's contract.
+ */
+function hasAutoMerge(events: DeploymentEvent[]): boolean {
+  return events.some((e) => e.eventType === 'auto-merged');
+}
 
 type NodeState = 'filled' | 'in-progress' | 'failed' | 'empty';
 
@@ -170,16 +186,33 @@ function DeploymentRow({ deployment }: { deployment: DeploymentSummary }) {
               ↗ View deployment
             </ExternalLink>
           )}
+          {(() => {
+            const merge = mergeCommitInfo(deployment);
+            if (!merge) return null;
+            const shortSha = merge.sha.slice(0, 7);
+            return merge.url ? (
+              <ExternalLink href={merge.url}>
+                ↗ View commit {shortSha}
+              </ExternalLink>
+            ) : (
+              <span style={{ ...extLink, cursor: 'default' }}>commit {shortSha}</span>
+            );
+          })()}
         </div>
       </div>
     </Card>
   );
 }
 
-const NODE_LABELS = ['PR', 'Pipeline', 'Staging', 'Production'];
+const BASE_NODE_LABELS = ['PR', 'Pipeline', 'Staging', 'Production'];
+const MERGED_NODE_LABEL = 'Merged';
 
 function PipelineTimeline({ deployment }: { deployment: DeploymentSummary }) {
-  const nodes = NODE_LABELS.map((label, i) => ({
+  const showMerged = hasAutoMerge(deployment.events);
+  const labels = showMerged
+    ? [...BASE_NODE_LABELS, MERGED_NODE_LABEL]
+    : BASE_NODE_LABELS;
+  const nodes = labels.map((label, i) => ({
     label,
     ...classifyNode(i, deployment.events),
   }));
@@ -235,11 +268,42 @@ function statusLabel(state: NodeState, label: string): string {
     if (label === 'PR') return 'opened';
     if (label === 'Pipeline') return 'passed';
     if (label === 'Staging') return 'promoted';
+    if (label === 'Merged') return 'merged ✓';
     return 'deployed';
   }
   if (state === 'in-progress') return 'running';
   if (state === 'failed') return 'failed';
   return 'pending';
+}
+
+/**
+ * Pull the GitHub `<owner>/<repo>` from the cycle's `pr-opened` URL so
+ * the dashboard can link to the merge commit. Returns null for projects
+ * not hosted on github.com (the URL pattern wouldn't match) — the
+ * commit link is suppressed in that case but the 5th node still
+ * renders.
+ */
+function parseGitHubOwnerRepo(prUrl: string | null): { owner: string; repo: string } | null {
+  if (!prUrl) return null;
+  try {
+    const u = new URL(prUrl);
+    if (!u.hostname.endsWith('github.com')) return null;
+    const parts = u.pathname.replace(/^\/+/, '').split('/');
+    if (parts.length < 2) return null;
+    return { owner: parts[0]!, repo: parts[1]! };
+  } catch {
+    return null;
+  }
+}
+
+function mergeCommitInfo(deployment: DeploymentSummary): { sha: string; url: string | null } | null {
+  const event = deployment.events.find((e) => e.eventType === 'auto-merged');
+  if (!event) return null;
+  const sha = typeof event.metadata['sha'] === 'string' ? (event.metadata['sha'] as string) : null;
+  if (!sha) return null;
+  const repo = parseGitHubOwnerRepo(deployment.prUrl);
+  const url = repo ? `https://github.com/${repo.owner}/${repo.repo}/commit/${sha}` : null;
+  return { sha, url };
 }
 
 const NODE_COLOR: Record<NodeState, string> = {

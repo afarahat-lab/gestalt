@@ -9413,3 +9413,322 @@ Original parallel-intent merge-conflict scenario is structurally
 impossible after this fix.
 
 No new Pending enhancements introduced.
+
+---
+
+### Session 2026-06-02 — Claude Code (auto-merge support: HARNESS.json pipeline.autoMerge + PipelineAdapter.mergePullRequest, migration 013)
+
+Closes the long-standing "PR stays open after deploy" UX gap when the
+operator wants the platform to land work on `main` automatically.
+After staging promotion succeeds — but BEFORE production promotion is
+dispatched — the promotion-agent checks `HARNESS.json`
+`pipeline.autoMerge`; when true, it calls
+`adapter.mergePullRequest()`, writes an `auto-merged` row to
+`deployment_events`, and continues to production. Failure is
+non-fatal: a 405/409/other adapter error logs a warning, emits a
+`deployment.updated` SSE event with `status: 'auto-merge-failed'`,
+and leaves the PR open for manual merge — the intent still reaches
+`deployed`. `autoMerge: false` is the default; existing projects are
+unaffected without opt-in.
+
+Changed:
+- `packages/agents/deploy/src/adapters/pipeline-adapter.ts`: added
+  `mergePullRequest(params)` to the `PipelineAdapter` interface
+  (`projectId`, `prNumber`, optional `mergeMethod` defaulting to
+  `'squash'`, optional `commitTitle` + `commitMessage`). Returns
+  `{ merged: boolean; sha: string }`. JSDoc documents the
+  non-fatal-at-orchestrator-boundary semantics
+- `packages/agents/deploy/src/adapters/github-actions-adapter.ts`:
+  implements `mergePullRequest` via `PUT /repos/{owner}/{repo}/pulls/
+  {pull_number}/merge`. Maps GitHub's 405 → "PR is not mergeable —
+  check CI status and conflicts"; 409 → "PR head was modified —
+  cannot merge safely". Reuses the existing `throwIfAuthError`
+  helper. `commit_title` / `commit_message` only forwarded when
+  non-empty (GitHub treats `undefined` as "use default"; `null`
+  would clear the value)
+- `packages/agents/deploy/src/adapters/noop-pipeline-adapter.ts`:
+  no-op `mergePullRequest` returning
+  `{ merged: true, sha: 'noop-merge-sha' }`
+- `packages/core/src/types.ts`: new `HarnessPipelineConfig` typed
+  interface (`adapter`, optional `autoMerge`, optional `mergeMethod`
+  union of `'merge' | 'squash' | 'rebase'`). Re-exported from
+  `@gestalt/core/index.ts` so the agents-deploy + server + CLI can
+  use the same typed shape
+- `packages/core/src/harness/index.ts`: `HarnessConfig.pipeline`
+  retyped from `Record<string, unknown>` to `HarnessPipelineConfig`
+  so promotion-agent can read `harnessConfig.pipeline?.autoMerge`
+  without casting. JSDoc explains the back-compat (legacy projects
+  with only `pipeline.adapter` satisfy the new shape; the other
+  fields are optional)
+- `packages/core/src/repository/index.ts`: `DeploymentEventType`
+  union extended with `'auto-merged'` (written by promotion-agent
+  on successful merge; not written on failure — the SSE
+  `auto-merge-failed` event is the only failure surface)
+- `packages/adapters/postgres/src/migrations/013_auto_merge.sql`
+  (new): `ALTER TYPE deployment_event_type ADD VALUE IF NOT EXISTS
+  'auto-merged';`. Idempotent — safe to re-run; safe on fresh
+  installs. Pure schema only, no `schema_migrations` writes
+- `packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`:
+  - `DeployPromotionPayload` gained optional `prNumber?: number` +
+    `intentText?: string`. Optional because legacy in-flight BullMQ
+    jobs queued before this feature shipped do not carry them; the
+    promotion-agent treats a missing `prNumber` the same as
+    `autoMerge: false`
+  - `DeployPipelinePayload` gained optional `intentText?: string`
+    so it survives the pr → pipeline → promotion chain
+  - PR → pipeline dispatch site forwards `payload.intentText` (the
+    intent text the gate passed when it dispatched
+    `deploy:pr`)
+  - Pipeline → staging dispatch site forwards `payload.prNumber`
+    (from `DeployPipelinePayload`) + `payload.intentText`
+  - Staging → production dispatch site forwards the same fields
+    (no longer load-bearing because auto-merge fires inside
+    staging, but kept for shape uniformity + observability)
+  - `runPromotionAgent` call site threads `payload.prNumber`
+    + `payload.intentText` into the agent input
+- `packages/agents/deploy/src/agents/promotion-agent.ts`:
+  - `PromotionAgentInput` extended with optional `prNumber` +
+    `intentText`
+  - New `maybeAutoMerge(args)` helper invoked AFTER the
+    `promoted-staging` event is written and BEFORE returning a
+    successful outcome. Only fires when
+    `targetEnvironment === 'staging'` — the production-promotion
+    leg never auto-merges
+  - Reads `HARNESS.json` via `createHarnessEngine(workDir)
+    .loadHarnessConfig()` against the same clone the staging
+    promotion used. Parse failure → log warn + treat as
+    `autoMerge: false` (non-fatal)
+  - Commit subject built as `<first line of intentText, ≤72 chars>
+    [gestalt <corr8>]`; falls back to `Auto-merge [gestalt
+    <corr8>]` when `intentText` is absent
+  - Success: append `auto-merged` deployment event with
+    `metadata: { sha, mergeMethod, adapter }` and `prNumber`;
+    emit `deployment.updated` SSE with `status: 'auto-merged'`
+  - Failure: catch + log warn; emit `deployment.updated` SSE
+    with `status: 'auto-merge-failed'` + `reason` (the error
+    message). Does NOT re-throw — production-promotion
+    dispatch continues, intent still reaches `deployed`
+- `packages/server/src/routes/projects.ts`:
+  - `UpdateConfigBody.pipeline` accepts `adapter?`, `autoMerge?`,
+    `mergeMethod?`. Validation: `autoMerge` must be boolean if
+    present; `mergeMethod` must be one of `squash|merge|rebase`.
+    Error codes `INVALID_AUTO_MERGE` / `INVALID_MERGE_METHOD`
+  - Handler now patches only the fields the operator actually
+    supplied (vs. each field's current value), builds
+    `changedFields: string[]`, returns `no-change` when nothing
+    changed. Commit subject is
+    `chore: update pipeline <changedFields.join(', ')> [gestalt]`
+  - Audit `metadata` now carries `changedFields` array +
+    `previousValues` + `newValues` objects (per-field
+    previous/new), matching the multi-field shape
+- `packages/cli/src/api/client.ts`: `updateProjectConfig` widened to
+  accept `pipeline.autoMerge` + `pipeline.mergeMethod`; response
+  shape now includes `autoMerge` + `mergeMethod` so the CLI can
+  echo confirmation
+- `packages/cli/src/commands/projects.ts`: `setAdapterCommand`
+  signature gained `SetAdapterOptions` with `autoMerge?: boolean` +
+  `mergeMethod?: string`. Validates `mergeMethod` against the
+  3-value whitelist client-side before the network round-trip.
+  Patches only the supplied fields. Update-description echoes the
+  patched fields back to the operator
+- `packages/cli/src/index.ts`: `gestalt projects set-adapter`
+  registered with `--auto-merge` + `--no-auto-merge` (boolean
+  pair) + `--merge-method <method>` options. `--no-auto-merge`
+  was added on the second pass after the first probe revealed
+  Commander does NOT auto-generate the negative flag from
+  `--auto-merge` alone
+- `packages/dashboard/src/types.ts`: `DeploymentEventType` union
+  extended with `'auto-merged'`
+- `packages/dashboard/src/views/Deployments.tsx`:
+  - New `hasAutoMerge(events)` helper — per-row event-presence
+    check
+  - `PipelineTimeline` renders 5 nodes when `hasAutoMerge` is true,
+    4 nodes otherwise. Brief's contract: "show fifth node only
+    when `autoMerge: true` in HARNESS.json" — event-presence is
+    the canonical signal because the `auto-merged` row only ever
+    lands when autoMerge is true AND the merge call succeeded.
+    Failed auto-merge → 4 nodes + a footer SSE banner could be
+    added later (not in this scope)
+  - `statusLabel` extended with the `Merged → 'merged ✓'` case
+  - New `mergeCommitInfo(deployment)` extracts the SHA from the
+    `auto-merged` event's `metadata.sha` + builds a
+    `https://github.com/<owner>/<repo>/commit/<sha>` link if the
+    PR URL was on github.com. Non-GitHub hosts get a plain
+    `commit <shortSha>` chip
+  - Footer row gained a "↗ View commit <sha7>" external link
+    after the "↗ View deployment" link when the auto-merged
+    event is present
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`:
+  `pipeline` block now ships with `autoMerge: false` +
+  `mergeMethod: 'squash'`. New `gestalt init` projects get the
+  defaults out of the box; operators opt in via
+  `gestalt projects set-adapter <name> <adapter> --auto-merge`
+- `docs/reference/harness-config.md`: `pipeline` section gains a
+  per-field table (`adapter`, `autoMerge`, `mergeMethod`) and a
+  multi-paragraph "Auto-merge semantics" block documenting:
+  - When the merge fires (after staging promote, before
+    production-promote dispatch)
+  - Non-fatal failure semantics (PR stays open, intent still
+    reaches `deployed`)
+  - Commit-subject format
+  - What lands in `deployment_events` (the `auto-merged` row +
+    `metadata.sha` / `metadata.mergeMethod`)
+  - CLI setting via `gestalt projects set-adapter`
+
+Verified live:
+- `pnpm -r build` clean across all 12 packages
+- Docker server image rebuilt; reaches `Up (healthy)`. Migration
+  013 applied cleanly:
+  ```
+  INFO: Applying migration  version: "013_auto_merge"
+  INFO: Migration applied   version: "013_auto_merge"
+  ```
+- Direct enum probe confirms the new value:
+  ```
+  SELECT unnest(enum_range(NULL::deployment_event_type));
+  → pr-opened / pipeline-triggered / pipeline-passed /
+    pipeline-failed / promoted-staging / promoted-production /
+    auto-merged
+  ```
+- **Stage 1 (no-regression)**: submitted intent
+  `53dfc2d4-...` ("Add a trimStart utility ...") against
+  `trackeros` BEFORE flipping autoMerge. Intent reached
+  `deployed` in ~46 s through real GitHub Actions. 5
+  `deployment_events` rows (`pr-opened`, `pipeline-triggered`,
+  `pipeline-passed`, `promoted-staging`, `promoted-production`).
+  **No `auto-merged` row** — PR stays open for manual review.
+  Existing behaviour fully preserved
+- **CLI Stage 2 setup**:
+  `gestalt projects set-adapter trackeros github-actions
+  --auto-merge --merge-method squash` succeeded. HARNESS.json
+  in `trackeros/main` now has
+  `{ adapter: "github-actions", autoMerge: true,
+  mergeMethod: "squash" }`. Commit `cbc53805` pushed by the
+  Gestalt Platform identity; commit subject
+  `chore: update pipeline autoMerge, mergeMethod [gestalt]`.
+  Audit row written with `changedFields: ["autoMerge",
+  "mergeMethod"]` + previous/new values per field
+- **Stage 2 (auto-merge live)**: submitted intent
+  `8b3fcc4a-...` ("Add a trimEnd utility ..."). Intent reached
+  `deployed` in ~28 s. `deployment_events` for the cycle has
+  **6 rows in the correct order**:
+  ```
+  pr-opened           PR #26    20:57:35
+  pipeline-triggered  PR #26    20:57:41
+  pipeline-passed     PR #26    20:57:57
+  promoted-staging              20:57:59
+  auto-merged         PR #26    20:58:01   ← merge between staging + production
+  promoted-production           20:58:03
+  ```
+- The `auto-merged` row's `metadata` is
+  `{"sha":"b7a61ae91164145c36ec1fd0b1bbffbc3fcd056d",
+  "adapter":"github-actions","mergeMethod":"squash"}` —
+  the real GitHub merge commit SHA from a real squash-merge
+- Re-cloning `trackeros/main` confirms `b7a61ae9` is the
+  current HEAD, commit subject is
+  `Add a trimEnd utility at src/shared/utils/trim-end/trimEnd.ts
+  that trims [gestalt 8b3fcc4a]` — exactly the format
+  `maybeAutoMerge` builds (first line of `intentText` truncated
+  to 72 chars + `[gestalt <corr8>]`). `src/shared/utils/trim-end/
+  trimEnd.ts` + `__tests__/` directory are present on `main`,
+  proving the squash-merge actually landed
+- **Cleanup**: `gestalt projects set-adapter trackeros
+  github-actions --no-auto-merge` flipped autoMerge back to false
+  (commit `9719bc34`). `--no-auto-merge` had to be registered as
+  its own commander option after probing — Commander does NOT
+  auto-generate the negative flag from `--auto-merge` alone
+
+Decisions made:
+- **5th timeline node is event-presence-driven, not
+  config-driven.** The dashboard doesn't load HARNESS.json
+  directly — it has the deployment events. An `auto-merged` row
+  exists if and only if HARNESS.json had `autoMerge: true` AND
+  the merge succeeded. Manual-merge projects never produce the
+  row, so they stay at 4 nodes — exactly the brief's contract
+  expressed via a smaller, server-API-free signal
+- **`maybeAutoMerge` runs in the staging branch only.** The
+  brief's pseudocode put the autoMerge check generally "after
+  staging promotion completes successfully and before
+  dispatching the production promotion". I scoped it inside
+  `runPromotionAgent` itself rather than the orchestrator
+  because: (1) the agent already has the cloned workDir for
+  reading HARNESS.json; (2) the agent already has the resolved
+  adapter; (3) keeping the auto-merge invariant in the agent
+  matches the ADR-034 pattern (production-requires-staging is
+  also enforced in the agent, never in the orchestrator);
+  (4) the orchestrator's dispatch logic stays simple
+- **Commit subject sources `intentText.split('\n')[0].slice(0,72)`.**
+  GitHub's UI truncates long PR titles but stores them
+  in full. Using just the first line + a 72-char cap matches
+  conventional-commits subject limits and pairs nicely with the
+  squash-merge commit body (which carries the full PR
+  description). `[gestalt <corr8>]` trailer matches the format
+  the gate's `dispatchDeployPR` already uses for the original
+  PR title — the merge commit reads as a continuation, not a
+  rewrite
+- **`prNumber` made optional on `DeployPromotionPayload`** rather
+  than required. In-flight BullMQ jobs queued before this commit
+  ships do not carry it. A missing `prNumber` is treated the
+  same as `autoMerge: false` — the agent logs a warning and
+  skips, never throws. Forward-compat: every new dispatch
+  includes it
+- **Failed auto-merge does NOT write a `deployment_events` row.**
+  The brief said "Auto-merge failure is non-fatal — log warning
+  and leave the PR open". `deployment_events` is append-only
+  semantics for "what happened to this cycle's deployment".
+  A failed merge means nothing landed; the PR is in the same
+  state as before the call. The SSE `auto-merge-failed` event
+  is the live signal; the operator's path forward is manual
+  GitHub UI. A future migration could add a `merge-failed`
+  event type if we want it in the audit trail
+- **Server route extended to multi-field patch.** The CLI
+  brief's verification flow combines `--auto-merge` AND
+  `--merge-method squash` in one invocation. The pre-existing
+  route only accepted `adapter`; extending it to handle three
+  fields atomically (one commit, one push) means the operator's
+  config change is observable as a single audit row +
+  single commit. Per-field-only patches would mean three round-
+  trips for the brief's setup flow
+- **`--no-auto-merge` added on second pass.** Initial
+  registration with just `--auto-merge` produced
+  `error: unknown option '--no-auto-merge'`. Commander does
+  NOT auto-generate the negative form unless the option is
+  registered with a leading `--no-X` pattern. Added both
+  options explicitly with paired help text. `autoMerge`
+  resolves correctly on the parsed options object in both
+  cases (true with `--auto-merge`, false with
+  `--no-auto-merge`, undefined when omitted)
+- **`mergeMethod` validation client-side AND server-side.**
+  Mirrors the existing `adapter` whitelist pattern. CLI fails
+  fast on typos; the server re-validates in case the route is
+  reached from somewhere other than the CLI
+- **No interventions table or alert UX for failed merge.**
+  An auto-merge failure surfaces via:
+  (1) SSE `deployment.updated { status: 'auto-merge-failed' }`
+      — caught by the dashboard's live event subscription
+  (2) server logs (`log.warn` with the error message + PR
+      number + correlationId)
+  Operator's action: open the PR on GitHub and merge manually.
+  No dashboard-side modal for the failure is in scope here —
+  this is the brief's deliberate "non-fatal" contract
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt; migration 013 applied. Full Stage 1 + 2
+verification against the real `trackeros` GitHub repo:
+- Stage 1: no `auto-merged` row, PR stays open (verified
+  end-to-end against a real PAT-driven CI run)
+- Stage 2: `auto-merged` row written with real merge SHA;
+  HEAD of `trackeros/main` advanced to the merge commit;
+  squashed-utility code visible on `main` immediately after
+  the cycle reached `deployed`
+
+Operator action — trackeros restored to baseline:
+- `trackeros/HARNESS.json` was flipped to `autoMerge: true`
+  during Stage 2 verification, then back to `autoMerge: false`
+  via `gestalt projects set-adapter trackeros github-actions
+  --no-auto-merge` at the end of the session. Current state
+  matches what every freshly-initialised project ships with
+  (after `gestalt init`)
+
+No new Pending enhancements introduced.
+

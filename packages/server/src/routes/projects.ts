@@ -56,11 +56,16 @@ interface InitHarnessBody {
 interface UpdateConfigBody {
   pipeline?: {
     adapter?: string;
+    autoMerge?: boolean;
+    mergeMethod?: string;
   };
 }
 
 const VALID_PIPELINE_ADAPTERS = ['noop', 'github-actions'] as const;
 type ValidPipelineAdapter = typeof VALID_PIPELINE_ADAPTERS[number];
+
+const VALID_MERGE_METHODS = ['squash', 'merge', 'rebase'] as const;
+type ValidMergeMethod = typeof VALID_MERGE_METHODS[number];
 
 /**
  * Returns a public view of a project record — strips anything that should
@@ -335,18 +340,42 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
 
       const body = request.body ?? ({} as UpdateConfigBody);
       const requestedAdapter = body.pipeline?.adapter;
-      if (!requestedAdapter) {
+      const requestedAutoMerge = body.pipeline?.autoMerge;
+      const requestedMergeMethod = body.pipeline?.mergeMethod;
+      if (
+        requestedAdapter === undefined
+        && requestedAutoMerge === undefined
+        && requestedMergeMethod === undefined
+      ) {
         return reply.code(400).send({
-          error: 'No supported config field provided. Currently `pipeline.adapter` is the only field supported.',
+          error:
+            'No supported config field provided. Settable fields: ' +
+            '`pipeline.adapter`, `pipeline.autoMerge`, `pipeline.mergeMethod`.',
         });
       }
-      if (!VALID_PIPELINE_ADAPTERS.includes(requestedAdapter as ValidPipelineAdapter)) {
+      if (requestedAdapter !== undefined
+          && !VALID_PIPELINE_ADAPTERS.includes(requestedAdapter as ValidPipelineAdapter)) {
         return reply.code(400).send({
           error: `Unsupported pipeline adapter '${requestedAdapter}'. Valid values: ${VALID_PIPELINE_ADAPTERS.join(', ')}`,
           code: 'INVALID_PIPELINE_ADAPTER',
         });
       }
-      const newAdapter = requestedAdapter as ValidPipelineAdapter;
+      if (requestedAutoMerge !== undefined && typeof requestedAutoMerge !== 'boolean') {
+        return reply.code(400).send({
+          error: '`pipeline.autoMerge` must be a boolean',
+          code: 'INVALID_AUTO_MERGE',
+        });
+      }
+      if (requestedMergeMethod !== undefined
+          && !VALID_MERGE_METHODS.includes(requestedMergeMethod as ValidMergeMethod)) {
+        return reply.code(400).send({
+          error: `Unsupported merge method '${requestedMergeMethod}'. Valid values: ${VALID_MERGE_METHODS.join(', ')}`,
+          code: 'INVALID_MERGE_METHOD',
+        });
+      }
+      const newAdapter = requestedAdapter as ValidPipelineAdapter | undefined;
+      const newAutoMerge = requestedAutoMerge;
+      const newMergeMethod = requestedMergeMethod as ValidMergeMethod | undefined;
 
       const { projects, audit } = getRepositories();
       const project = await projects.findById(request.params.id);
@@ -386,13 +415,39 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
 
         const currentPipeline = (parsed['pipeline'] as Record<string, unknown> | undefined) ?? {};
         const previousAdapter = currentPipeline['adapter'];
-        if (previousAdapter === newAdapter) {
+        const previousAutoMerge = currentPipeline['autoMerge'];
+        const previousMergeMethod = currentPipeline['mergeMethod'];
+
+        // Build the patched pipeline by overlaying only the fields the
+        // operator actually provided. Skip fields whose new value
+        // matches the current value so a no-op change does not produce
+        // a commit.
+        const patched: Record<string, unknown> = { ...currentPipeline };
+        const changedFields: string[] = [];
+        if (newAdapter !== undefined && newAdapter !== previousAdapter) {
+          patched['adapter'] = newAdapter;
+          changedFields.push('adapter');
+        }
+        if (newAutoMerge !== undefined && newAutoMerge !== previousAutoMerge) {
+          patched['autoMerge'] = newAutoMerge;
+          changedFields.push('autoMerge');
+        }
+        if (newMergeMethod !== undefined && newMergeMethod !== previousMergeMethod) {
+          patched['mergeMethod'] = newMergeMethod;
+          changedFields.push('mergeMethod');
+        }
+
+        if (changedFields.length === 0) {
           return reply.send({
-            data: { updated: false, reason: 'no-change', adapter: newAdapter },
+            data: {
+              updated: false,
+              reason: 'no-change',
+              adapter: (newAdapter ?? previousAdapter) ?? null,
+            },
           });
         }
-        parsed['pipeline'] = { ...currentPipeline, adapter: newAdapter };
 
+        parsed['pipeline'] = patched;
         await writeFile(harnessPath, JSON.stringify(parsed, null, 2) + '\n', 'utf8');
 
         await repo.addConfig('user.name', 'Gestalt Platform');
@@ -404,11 +459,16 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
           // File-on-disk identical to working tree even after the
           // mutation — defensive guard, should be unreachable.
           return reply.send({
-            data: { updated: false, reason: 'no-diff', adapter: newAdapter },
+            data: {
+              updated: false,
+              reason: 'no-diff',
+              adapter: (newAdapter ?? previousAdapter) ?? null,
+            },
           });
         }
 
-        const commit = await repo.commit(`chore: update pipeline adapter to ${newAdapter} [gestalt]`);
+        const commitSubject = `chore: update pipeline ${changedFields.join(', ')} [gestalt]`;
+        const commit = await repo.commit(commitSubject);
         await repo.push('origin', project.defaultBranch);
 
         await audit.append({
@@ -418,21 +478,42 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
           entityId: project.id,
           correlationId: request.correlationId,
           metadata: {
-            field: 'pipeline.adapter',
-            previousValue: previousAdapter ?? null,
-            newValue: newAdapter,
+            field: 'pipeline',
+            changedFields,
+            previousValues: {
+              adapter: previousAdapter ?? null,
+              autoMerge: previousAutoMerge ?? null,
+              mergeMethod: previousMergeMethod ?? null,
+            },
+            newValues: {
+              adapter: newAdapter ?? null,
+              autoMerge: newAutoMerge ?? null,
+              mergeMethod: newMergeMethod ?? null,
+            },
             commitSha: commit.commit,
             ip: request.ip,
           },
         });
 
         log.info(
-          { projectId: project.id, adapter: newAdapter, commitSha: commit.commit },
+          {
+            projectId: project.id,
+            adapter: patched['adapter'],
+            autoMerge: patched['autoMerge'],
+            mergeMethod: patched['mergeMethod'],
+            commitSha: commit.commit,
+          },
           'Project config updated',
         );
 
         return reply.send({
-          data: { updated: true, adapter: newAdapter, commitSha: commit.commit },
+          data: {
+            updated: true,
+            adapter: patched['adapter'] ?? null,
+            autoMerge: patched['autoMerge'] ?? null,
+            mergeMethod: patched['mergeMethod'] ?? null,
+            commitSha: commit.commit,
+          },
         });
       } catch (err) {
         log.error({ err, projectId: project.id }, 'Project config update failed');

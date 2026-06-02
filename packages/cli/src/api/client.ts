@@ -267,9 +267,22 @@ export class GestaltApiClient {
 
   async updateProjectConfig(
     projectId: string,
-    config: { pipeline?: { adapter?: string } },
+    config: {
+      pipeline?: {
+        adapter?: string;
+        autoMerge?: boolean;
+        mergeMethod?: 'merge' | 'squash' | 'rebase';
+      };
+    },
   ): Promise<{
-    data: { updated: boolean; adapter?: string; commitSha?: string; reason?: string };
+    data: {
+      updated: boolean;
+      adapter?: string | null;
+      autoMerge?: boolean | null;
+      mergeMethod?: string | null;
+      commitSha?: string;
+      reason?: string;
+    };
   }> {
     return this.post(`/projects/${projectId}/config`, config);
   }

@@ -56,12 +56,35 @@ interface DeployPipelinePayload {
   branch: string;
   prUrl: string;
   prNumber: number;
+  /**
+   * Threaded forward to the promotion-agent so it can build the
+   * auto-merge commit subject without re-loading the intent. Optional
+   * for compat with legacy in-flight queue jobs.
+   */
+  intentText?: string;
 }
 
 interface DeployPromotionPayload {
   intentId: string;
   projectId: string;
   targetEnvironment: 'staging' | 'production';
+  /**
+   * PR opened by pr-agent for this cycle. Threaded through
+   * pipeline-agent so the promotion-agent can call
+   * `adapter.mergePullRequest` when `HARNESS.json`
+   * `pipeline.autoMerge === true`. Optional because legacy in-flight
+   * BullMQ jobs queued before the auto-merge feature shipped do not
+   * carry it; the promotion-agent treats a missing `prNumber` the
+   * same as `autoMerge: false`.
+   */
+  prNumber?: number;
+  /**
+   * Intent text used as the merge commit subject when auto-merge fires
+   * (`<intentText> [gestalt <corr8>]`). Optional for the same
+   * legacy-payload reason as `prNumber`; falls back to a generic
+   * subject when absent.
+   */
+  intentText?: string;
 }
 
 type DeployPayload = DeployPRPayload | DeployPipelinePayload | DeployPromotionPayload;
@@ -122,6 +145,8 @@ async function handleDeployTask(
           branch: result.branch,
           prUrl: result.prUrl,
           prNumber: result.prNumber,
+          // Forward for the eventual auto-merge commit subject.
+          intentText: payload.intentText,
         } satisfies DeployPipelinePayload,
         createdAt: new Date(),
         expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),
@@ -151,7 +176,9 @@ async function handleDeployTask(
         await transitionIntent(payload.intentId, correlationId, 'failed');
         return buildTaskResult(message, 'failed', startedAt);
       }
-      // Pass → dispatch staging promotion.
+      // Pass → dispatch staging promotion. prNumber + intentText are
+      // forwarded so the promotion-agent can call mergePullRequest()
+      // when HARNESS.json has pipeline.autoMerge === true.
       await dispatch({
         id: crypto.randomUUID(),
         correlationId,
@@ -163,6 +190,8 @@ async function handleDeployTask(
           intentId: payload.intentId,
           projectId: payload.projectId,
           targetEnvironment: 'staging',
+          prNumber: payload.prNumber,
+          intentText: payload.intentText,
         } satisfies DeployPromotionPayload,
         createdAt: new Date(),
         expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),
@@ -182,6 +211,8 @@ async function handleDeployTask(
           intentId: payload.intentId,
           projectId: payload.projectId,
           targetEnvironment: payload.targetEnvironment,
+          prNumber: payload.prNumber,
+          intentText: payload.intentText,
         }),
         (r) => r.signals,
         childLog,
@@ -192,7 +223,11 @@ async function handleDeployTask(
         return buildTaskResult(message, 'failed', startedAt);
       }
       if (payload.targetEnvironment === 'staging') {
-        // Chain to production.
+        // Chain to production. prNumber + intentText are no longer
+        // strictly needed here (the auto-merge fires inside the staging
+        // promotion, not production) — but threading them keeps the
+        // payload shape uniform and means the production agent can
+        // still emit deployment events with prNumber populated.
         await dispatch({
           id: crypto.randomUUID(),
           correlationId,
@@ -204,6 +239,8 @@ async function handleDeployTask(
             intentId: payload.intentId,
             projectId: payload.projectId,
             targetEnvironment: 'production',
+            prNumber: payload.prNumber,
+            intentText: payload.intentText,
           } satisfies DeployPromotionPayload,
           createdAt: new Date(),
           expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),

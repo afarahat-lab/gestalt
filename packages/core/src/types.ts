@@ -173,6 +173,28 @@ export type UserRole = 'platform-admin' | 'user';
 // project-admin > editor > reader.
 export type ProjectRole = 'project-admin' | 'editor' | 'reader';
 
+// ─── Pipeline config (ADR-033) ───────────────────────────────────────────────
+
+/**
+ * Project-level pipeline configuration. Lives under `pipeline` in
+ * `HARNESS.json`. The `adapter` field is consumed by
+ * `resolvePipelineAdapter()`; the `autoMerge` + `mergeMethod` fields
+ * are consulted by the promotion-agent AFTER staging promotion
+ * succeeds — never before CI passes.
+ *
+ * Defaults:
+ *   - `autoMerge`   : false  (PR stays open for human review)
+ *   - `mergeMethod` : 'squash' (one commit per intent cycle)
+ *
+ * `autoMerge: false` means existing projects are unaffected.
+ * Operators opt in via `gestalt projects set-adapter ... --auto-merge`.
+ */
+export interface HarnessPipelineConfig {
+  adapter: string;
+  autoMerge?: boolean;
+  mergeMethod?: 'merge' | 'squash' | 'rebase';
+}
+
 // ─── Tool use (ADR-038) ──────────────────────────────────────────────────────
 //
 // `BaseLLMAgent.callLLMWithTools` drives the loop: LLM emits tool calls,

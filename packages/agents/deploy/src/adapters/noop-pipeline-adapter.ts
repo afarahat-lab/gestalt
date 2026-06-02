@@ -83,6 +83,10 @@ export class NoOpPipelineAdapter implements PipelineAdapter {
       deploymentUrl: `noop://deployment/${params.environment}/${params.correlationId.slice(0, 8)}`,
     };
   }
+
+  async mergePullRequest(): Promise<{ merged: boolean; sha: string }> {
+    return { merged: true, sha: 'noop-merge-sha' };
+  }
 }
 
 function hashString(s: string): number {

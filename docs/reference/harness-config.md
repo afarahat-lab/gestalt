@@ -166,6 +166,8 @@ CI/CD pipeline configuration.
 ```json
 "pipeline": {
   "adapter": "github-actions | azure-devops | gitlab-ci | jenkins",
+  "autoMerge": false,
+  "mergeMethod": "squash",
   "triggerConfig": {
     "organization": "${AZDO_ORG}",
     "project": "${AZDO_PROJECT}",
@@ -180,6 +182,32 @@ CI/CD pipeline configuration.
   }
 }
 ```
+
+| Field | Description |
+|---|---|
+| `adapter` | Resolves to a concrete `PipelineAdapter` (`noop` is the fallback). |
+| `autoMerge` | When `true`, the promotion-agent calls `adapter.mergePullRequest` AFTER staging promotion succeeds and BEFORE the production promotion is dispatched. Default: `false` — PR stays open for human review. |
+| `mergeMethod` | One of `squash` (default), `merge`, `rebase`. Ignored unless `autoMerge: true`. |
+
+**Auto-merge semantics:**
+
+- Fires only after staging promotion writes its `promoted-staging`
+  event. CI must have passed; the production-promotion leg has not
+  started yet.
+- Failure is non-fatal — a 405 ("not mergeable"), a 409 ("head was
+  modified"), or any other adapter error is caught, logged, and emits a
+  `deployment.updated` SSE event with `status: 'auto-merge-failed'`.
+  The PR stays open for manual merge; the intent still reaches
+  `deployed` because production promotion fires regardless.
+- The merge commit subject is
+  `<first line of intentText, ≤72 chars> [gestalt <corr8>]`. A
+  successful merge writes an `auto-merged` row to `deployment_events`
+  with `metadata.sha` (the merge commit SHA) and
+  `metadata.mergeMethod`.
+- Set via CLI: `gestalt projects set-adapter <name> <adapter>
+  --auto-merge --merge-method squash`. Stored in `HARNESS.json` and
+  committed to the project repo like every other pipeline-config
+  change.
 
 ---
 

@@ -111,7 +111,10 @@ export type DeploymentEventType =
   | 'pipeline-passed'
   | 'pipeline-failed'
   | 'promoted-staging'
-  | 'promoted-production';
+  | 'promoted-production'
+  // Written by promotion-agent after staging when HARNESS.json has
+  // `pipeline.autoMerge: true`. Drives the 5th timeline node.
+  | 'auto-merged';
 
 export interface DeploymentEvent {
   id: string;

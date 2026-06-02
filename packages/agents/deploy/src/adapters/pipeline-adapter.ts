@@ -57,6 +57,29 @@ export interface PipelineAdapter {
     correlationId: string;
     environment: 'staging' | 'production';
   }): Promise<{ deploymentUrl?: string }>;
+
+  /**
+   * Merge an open pull request on the project's host (GitHub, etc.).
+   * Called by the promotion-agent ONLY when `HARNESS.json`
+   * `pipeline.autoMerge === true` and staging promotion has succeeded —
+   * never during the gate or before CI passes. Defaults `mergeMethod`
+   * to `'squash'` so the project history records one commit per intent
+   * cycle.
+   *
+   * Failure semantics: throwing here is non-fatal at the orchestrator
+   * boundary — the PR stays open for manual review and the intent still
+   * proceeds to production. The promotion-agent catches the throw and
+   * emits a `deployment.updated` SSE event with `status:
+   * 'auto-merge-failed'` so the dashboard can surface it.
+   */
+  mergePullRequest(params: {
+    projectId: string;
+    prNumber: number;
+    /** `'squash' | 'merge' | 'rebase'`. Default: `'squash'`. */
+    mergeMethod?: 'merge' | 'squash' | 'rebase';
+    commitTitle?: string;
+    commitMessage?: string;
+  }): Promise<{ merged: boolean; sha: string }>;
 }
 
 export type PipelineAdapterType =

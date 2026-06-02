@@ -187,6 +187,49 @@ export class GitHubActionsAdapter implements PipelineAdapter {
     return { status: 'failed' };
   }
 
+  async mergePullRequest(params: {
+    projectId: string;
+    prNumber: number;
+    mergeMethod?: 'merge' | 'squash' | 'rebase';
+    commitTitle?: string;
+    commitMessage?: string;
+  }): Promise<{ merged: boolean; sha: string }> {
+    // PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge — GitHub's
+    // typed merge endpoint. PAT needs the `repo` scope (no `workflow`
+    // requirement). owner + repo are instance-cached from constructor;
+    // there is no per-call repo lookup.
+    const res = await this.fetch(
+      `${GITHUB_API}/repos/${this.owner}/${this.repo}/pulls/${params.prNumber}/merge`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({
+          merge_method: params.mergeMethod ?? 'squash',
+          // GitHub treats undefined fields as "use default" — explicit
+          // null would clear the value, which is not what we want.
+          ...(params.commitTitle ? { commit_title: params.commitTitle } : {}),
+          ...(params.commitMessage ? { commit_message: params.commitMessage } : {}),
+        }),
+      },
+    );
+    if (res.status === 405) {
+      // PR not mergeable — CI may not have finished or there are
+      // conflicts. Non-fatal at the orchestrator boundary.
+      throw new Error('PR is not mergeable — check CI status and conflicts');
+    }
+    if (res.status === 409) {
+      // Head branch advanced after the PR was opened. Refusing the
+      // merge is correct — the operator can rebase and try again.
+      throw new Error('PR head was modified — cannot merge safely');
+    }
+    if (!res.ok) {
+      const body = await res.text();
+      this.throwIfAuthError(res.status, body, 'mergePullRequest', 'repo');
+      throw new Error(`GitHub merge failed (${res.status}): ${body}`);
+    }
+    const data = await res.json() as { sha: string; merged: boolean };
+    return { merged: data.merged, sha: data.sha };
+  }
+
   async promoteToEnvironment(params: {
     correlationId: string;
     environment: 'staging' | 'production';

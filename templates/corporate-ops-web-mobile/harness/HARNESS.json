@@ -49,7 +49,9 @@
     ]
   },
   "pipeline": {
-    "adapter": "noop"
+    "adapter": "noop",
+    "autoMerge": false,
+    "mergeMethod": "squash"
   },
   "maintenance": {
     "driftCheck":     { "enabled": true, "scheduleUtc": "0 2 * * *" },

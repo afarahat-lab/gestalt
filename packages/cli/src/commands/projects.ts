@@ -72,15 +72,36 @@ export async function projectsListCommand(options: { server?: string } = {}): Pr
 }
 
 const VALID_PIPELINE_ADAPTERS = ['noop', 'github-actions'] as const;
+const VALID_MERGE_METHODS = ['squash', 'merge', 'rebase'] as const;
+
+export interface SetAdapterOptions {
+  server?: string;
+  /**
+   * `true` → opt the project into auto-merge after staging promotion.
+   * `false` → explicitly disable (operator passed `--no-auto-merge`).
+   * `undefined` → flag omitted, leave the current setting alone.
+   * Commander expands `--auto-merge`/`--no-auto-merge` to this shape
+   * when the option is registered as a boolean.
+   */
+  autoMerge?: boolean;
+  mergeMethod?: string;
+}
 
 export async function setAdapterCommand(
   name: string,
   adapter: string,
-  options: { server?: string } = {},
+  options: SetAdapterOptions = {},
 ): Promise<void> {
   if (!VALID_PIPELINE_ADAPTERS.includes(adapter as typeof VALID_PIPELINE_ADAPTERS[number])) {
     console.log(c.error(
       `Unsupported pipeline adapter '${adapter}'. Valid values: ${VALID_PIPELINE_ADAPTERS.join(', ')}`,
+    ));
+    process.exit(1);
+  }
+  if (options.mergeMethod !== undefined
+      && !VALID_MERGE_METHODS.includes(options.mergeMethod as typeof VALID_MERGE_METHODS[number])) {
+    console.log(c.error(
+      `Unsupported merge method '${options.mergeMethod}'. Valid values: ${VALID_MERGE_METHODS.join(', ')}`,
     ));
     process.exit(1);
   }
@@ -102,19 +123,41 @@ export async function setAdapterCommand(
       process.exit(1);
     }
 
+    const pipelinePatch: {
+      adapter: string;
+      autoMerge?: boolean;
+      mergeMethod?: 'merge' | 'squash' | 'rebase';
+    } = { adapter };
+    if (options.autoMerge !== undefined) pipelinePatch.autoMerge = options.autoMerge;
+    if (options.mergeMethod !== undefined) {
+      pipelinePatch.mergeMethod = options.mergeMethod as 'merge' | 'squash' | 'rebase';
+    }
+
+    const updateDescription = [
+      `adapter → ${adapter}`,
+      options.autoMerge !== undefined ? `autoMerge → ${options.autoMerge}` : null,
+      options.mergeMethod !== undefined ? `mergeMethod → ${options.mergeMethod}` : null,
+    ].filter(Boolean).join(', ');
+
     blank();
-    console.log(c.dim(`Updating ${match.name} pipeline.adapter → ${adapter} ...`));
-    const result = await client.updateProjectConfig(match.id, { pipeline: { adapter } });
+    console.log(c.dim(`Updating ${match.name} pipeline.${updateDescription} ...`));
+    const result = await client.updateProjectConfig(match.id, { pipeline: pipelinePatch });
     blank();
     if (result.data.updated) {
       console.log(c.success(`✓ Pipeline adapter set to ${result.data.adapter}`));
+      if (result.data.autoMerge !== undefined && result.data.autoMerge !== null) {
+        console.log(c.dim(`  autoMerge: ${result.data.autoMerge}`));
+      }
+      if (result.data.mergeMethod) {
+        console.log(c.dim(`  mergeMethod: ${result.data.mergeMethod}`));
+      }
       if (result.data.commitSha) {
         console.log(c.dim(`  commit: ${result.data.commitSha.slice(0, 8)}`));
       }
-      console.log(c.dim('  Next intent cycle will use the new adapter.'));
+      console.log(c.dim('  Next intent cycle will use the new pipeline config.'));
       console.log(c.dim('  Run `git pull` in your local project to receive the HARNESS.json update.'));
     } else {
-      console.log(c.dim(`No change — adapter already set to ${adapter}.`));
+      console.log(c.dim(`No change — pipeline config already matches request.`));
     }
     blank();
   } catch (err) {
