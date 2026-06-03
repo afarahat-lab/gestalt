@@ -36,6 +36,30 @@ import { authenticatedGitUrl } from './util';
 
 const log = createContextLogger({ module: 'promotion-agent' });
 
+/**
+ * Hint object promotion-agent reads on self-healing recovery
+ * dispatches (Option B). Unknown keys silently ignored. The
+ * `retryProductionOnly` hint is consumed at the loop's
+ * `buildRetryDispatch` step (it picks `targetEnvironment:
+ * 'production'`); the others are logged on the agent for
+ * audit visibility.
+ */
+export interface PromotionAgentSelfHealingHints {
+  /**
+   * The platform doesn't verify staging deployments today (no
+   * health-check wiring), so this hint is logged but not acted
+   * on. Kept on the interface so a future verifyStagingDeployment
+   * step can read it without an interface change.
+   */
+  skipStagingVerification?: boolean;
+  /**
+   * Drives the loop's `buildRetryDispatch` to set
+   * `targetEnvironment: 'production'` directly. Read for logging
+   * here so the recovery path is visible in the agent's logs.
+   */
+  retryProductionOnly?: boolean;
+}
+
 export interface PromotionAgentInput {
   correlationId: string;
   intentId: string;
@@ -52,6 +76,14 @@ export interface PromotionAgentInput {
    * Falls back to a generic subject when absent.
    */
   intentText?: string;
+  /**
+   * Self-healing hint object (Option B). Present only on retry
+   * dispatches the loop produced. Fresh promotion cycles pass
+   * undefined and behaviour is unchanged.
+   */
+  selfHealingHints?: PromotionAgentSelfHealingHints;
+  /** Diagnosis string for inline logging on the recovery path. */
+  selfHealingDiagnosis?: string;
 }
 
 export type PromotionAgentOutcome =
@@ -65,6 +97,24 @@ export interface PromotionAgentResult {
 
 export async function runPromotionAgent(input: PromotionAgentInput): Promise<PromotionAgentResult> {
   const { projects, deploymentEvents } = getRepositories();
+
+  // Self-healing recovery (Option B) — log applied hints. The
+  // `retryProductionOnly` hint is consumed at dispatch (the loop's
+  // buildRetryDispatch sets targetEnvironment: 'production'
+  // directly); we surface it here so the audit trail shows it
+  // applied. Unknown keys silently ignored — forward-compat.
+  const hints = (input.selfHealingHints ?? {}) as PromotionAgentSelfHealingHints;
+  if (input.selfHealingHints && Object.keys(input.selfHealingHints).length > 0) {
+    log.info(
+      {
+        correlationId: input.correlationId,
+        targetEnvironment: input.targetEnvironment,
+        hints: Object.keys(hints),
+        diagnosis: input.selfHealingDiagnosis ?? null,
+      },
+      'Self-healing recovery — promoting with hint context',
+    );
+  }
 
   // ADR-034 enforcement: production requires a prior successful staging
   // PromotionEvent for the same correlationId. Unconditional, no override.

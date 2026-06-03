@@ -60,6 +60,20 @@ export interface SelfHealingContext {
   constraintRules?: string;
 }
 
+/**
+ * Queue the loop dispatches the retry on. Lets the diagnostician
+ * route a deploy-layer failure to deploy:pr / deploy:pipeline /
+ * deploy:promote directly instead of re-running the whole generate
+ * cycle. `'none'` is the explicit "I cannot fix this automatically"
+ * marker — semantically equivalent to `shouldRetry: false`.
+ */
+export type SelfHealingRetryTaskType =
+  | 'generate:intent'
+  | 'deploy:pr'
+  | 'deploy:pipeline'
+  | 'deploy:promote'
+  | 'none';
+
 export interface SelfHealingDiagnosis {
   diagnosis: string;
   rootCause: string;
@@ -72,6 +86,25 @@ export interface SelfHealingDiagnosis {
   skipAgents?: string[];
   /** Files identified as root cause — surfaced in the code-prompt resume section. */
   focusFiles?: string[];
+  /**
+   * The queue the loop should dispatch the retry on. Lets the
+   * diagnostician route a deploy-layer failure straight back to
+   * pr-agent / pipeline-agent / promotion-agent instead of forcing
+   * a full generate cycle. `'none'` ⇒ treat as `shouldRetry: false`.
+   * Defaults to `'generate:intent'` on parse failure so legacy
+   * diagnoses still produce a working retry.
+   */
+  retryTaskType: SelfHealingRetryTaskType;
+  /**
+   * Free-form hints the diagnostician wants the target agent to
+   * apply on the retry. Examples:
+   *   pr-agent      — { unshallow, forceWithLease, rebaseBranch, skipArtifactRewrite }
+   *   pipeline-agent — { extendTimeout, skipTrigger }
+   *   promotion-agent — { skipStagingVerification, retryProductionOnly }
+   * Agents apply ONLY hints they recognise; unknown hints are
+   * silently ignored so future diagnoses are forward-compatible.
+   */
+  retryPayloadHints: Record<string, unknown>;
 }
 
 const CONFIDENCE_RANK: Record<'high' | 'medium' | 'low', number> = {
@@ -171,7 +204,70 @@ export class SelfHealingAgent extends BaseLLMAgent {
         : '',
       ctx.constraintRules ? `## Constraints\n${ctx.constraintRules}` : '',
       ctx.goldenPrinciples ? `## Golden principles\n${ctx.goldenPrinciples}` : '',
-      `## Your task
+      `## Available retry task types
+
+Choose the appropriate retryTaskType based on the failure:
+
+- "generate:intent"  — the generated CODE was wrong. Re-run the
+  full generate cycle with the fix. Use for: gate failures,
+  test failures, lint violations, wrong logic.
+
+- "deploy:pr"        — the CODE is fine but the GIT PUSH failed.
+  Retry only the push/commit step. Use for: non-fast-forward errors,
+  push rejected, authentication errors, merge conflicts.
+
+- "deploy:pipeline"  — the code and PR are fine but CI didn't run
+  or timed out. Re-trigger CI only. Use for: pipeline timeout,
+  CI not triggered, transient CI infra error.
+
+- "deploy:promote"   — staging promotion failed but code is fine.
+  Retry promotion. Use for: staging gate errors, promotion API errors.
+
+- "none"             — cannot retry automatically. Set when
+  shouldRetry is false.
+
+Also include retryPayloadHints — a JSON object with hints for the
+target agent. Common hints:
+- { "unshallow": true }           — fetch full history before push
+- { "forceWithLease": true }      — use --force-with-lease on push
+- { "skipArtifactRewrite": true } — don't re-write files, just push
+- { "extendTimeout": true }       — wait longer for CI to complete
+- { "rebaseBranch": true }        — rebase on default branch before push
+
+## Known failure patterns — use these as reference
+
+GIT PUSH FAILURES → retryTaskType: "deploy:pr"
+  "non-fast-forward" | "rejected" | "failed to push":
+    hints: { "unshallow": true, "forceWithLease": true }
+  "conflict" | "merge conflict":
+    hints: { "unshallow": true, "rebaseBranch": true, "forceWithLease": true }
+  "authentication failed" | "403" | "permission denied":
+    shouldRetry: false  (credentials issue — cannot fix with code)
+
+CI/PIPELINE FAILURES → retryTaskType: "deploy:pipeline"
+  "timeout" | "timed out":
+    hints: { "extendTimeout": true }
+  "did not trigger" | "workflow not found":
+    hints: {}  (just re-trigger)
+  test failures in CI output:
+    retryTaskType: "generate:intent"  (code needs fixing)
+    hints: {}
+
+PROMOTION FAILURES → retryTaskType: "deploy:promote"
+  "staging gate failed":
+    hints: {}
+  "production already deployed":
+    hints: { "skipStagingVerification": true, "retryProductionOnly": true }
+
+CODE/GATE FAILURES → retryTaskType: "generate:intent"
+  Any TypeScript error, lint violation, test failure, constraint violation:
+    hints: {}  (generate cycle handles these)
+
+INFRASTRUCTURE FAILURES → shouldRetry: false
+  "ECONNREFUSED" | "ETIMEDOUT" | "pnpm: command not found":
+    shouldRetry: false, confidence: "low", retryTaskType: "none"
+
+## Your task
 Return ONLY a JSON object — no preamble, no markdown fences:
 {
   "diagnosis": "What went wrong",
@@ -181,10 +277,12 @@ Return ONLY a JSON object — no preamble, no markdown fences:
   "confidence": "high|medium|low",
   "shouldRetry": true|false,
   "skipAgents": ["agent-roles whose output is fine and can be skipped"],
-  "focusFiles": ["specific files that need regenerating"]
+  "focusFiles": ["specific files that need regenerating"],
+  "retryTaskType": "generate:intent|deploy:pr|deploy:pipeline|deploy:promote|none",
+  "retryPayloadHints": { /* hint object — see above */ }
 }
 
-Set shouldRetry=false and confidence=low when:
+Set shouldRetry=false and retryTaskType="none" when:
 - The failure is infrastructure/credentials — code cannot fix it
 - You cannot determine the root cause from available context
 - The same error has clearly appeared multiple times without progress`,
@@ -212,6 +310,22 @@ Set shouldRetry=false and confidence=low when:
         focusFiles: Array.isArray(parsed.focusFiles)
           ? parsed.focusFiles.filter((s): s is string => typeof s === 'string')
           : [],
+        // Default to 'generate:intent' on parse — preserves the
+        // pre-Option-B behaviour for older diagnoses that don't
+        // emit the new field. Explicit 'none' means
+        // shouldRetry=false (caller treats them identically).
+        retryTaskType: isRetryTaskType(parsed.retryTaskType)
+          ? parsed.retryTaskType
+          : 'generate:intent',
+        // Defensive: only accept a plain object. Future hints
+        // added by newer diagnoses pass through; agents apply
+        // only what they recognise.
+        retryPayloadHints:
+          parsed.retryPayloadHints !== null &&
+          typeof parsed.retryPayloadHints === 'object' &&
+          !Array.isArray(parsed.retryPayloadHints)
+            ? (parsed.retryPayloadHints as Record<string, unknown>)
+            : {},
       };
     } catch (err) {
       log.warn({ err }, 'SelfHealingAgent JSON parse failed — returning safe-default');
@@ -254,6 +368,16 @@ function isConfidence(value: unknown): value is 'high' | 'medium' | 'low' {
   return value === 'high' || value === 'medium' || value === 'low';
 }
 
+function isRetryTaskType(value: unknown): value is SelfHealingRetryTaskType {
+  return (
+    value === 'generate:intent' ||
+    value === 'deploy:pr' ||
+    value === 'deploy:pipeline' ||
+    value === 'deploy:promote' ||
+    value === 'none'
+  );
+}
+
 function safeDefaultDiagnosis(reason: string): SelfHealingDiagnosis {
   return {
     diagnosis: `Could not produce a diagnosis — ${reason}`,
@@ -263,5 +387,8 @@ function safeDefaultDiagnosis(reason: string): SelfHealingDiagnosis {
     shouldRetry: false,
     skipAgents: [],
     focusFiles: [],
+    // Safe-default: cannot retry automatically.
+    retryTaskType: 'none',
+    retryPayloadHints: {},
   };
 }

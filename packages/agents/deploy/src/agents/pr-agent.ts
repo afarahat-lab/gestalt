@@ -27,6 +27,23 @@ import { execCommand } from './exec';
 
 const log = createContextLogger({ module: 'pr-agent' });
 
+/**
+ * Hint object pr-agent reads on the self-healing recovery path
+ * (Option B). Each field is independently optional; unknown keys
+ * are silently ignored so newer LLM diagnoses can ship additional
+ * hints without an old worker crashing.
+ */
+export interface PRAgentSelfHealingHints {
+  /** Run `git fetch --unshallow` on the remote branch before any push. */
+  unshallow?: boolean;
+  /** Push with `--force-with-lease` instead of fast-forward. */
+  forceWithLease?: boolean;
+  /** Skip the artifact rewrite + lockfile sync — push whatever's on the branch. */
+  skipArtifactRewrite?: boolean;
+  /** Rebase the resume branch on `defaultBranch` before pushing. */
+  rebaseBranch?: boolean;
+}
+
 export interface PRAgentInput {
   correlationId: string;
   intentId: string;
@@ -45,6 +62,18 @@ export interface PRAgentInput {
   resumeOnBranch?: string;
   prNumber?: number | null;
   prUrl?: string | null;
+  /**
+   * Self-healing hint object (Option B — migration 020 amendment).
+   * Forwarded from `payload.selfHealingHints`. Only consulted on
+   * the resume path (where `resumeOnBranch` is set); fresh cycles
+   * ignore it. Agents apply only the hints they recognise.
+   */
+  selfHealingHints?: PRAgentSelfHealingHints;
+  /**
+   * The diagnostician's diagnosis string. Logged on the resume
+   * path so operators can see why the loop dispatched here.
+   */
+  selfHealingDiagnosis?: string;
 }
 
 export interface PRAgentResult {
@@ -88,17 +117,68 @@ export async function runPRAgent(input: PRAgentInput): Promise<PRAgentResult> {
     //     the orchestrator forwards the existing PR coordinates.
     let branch: string;
     const isResume = Boolean(input.resumeOnBranch);
+    // Self-healing hints — read once at the top of the resume
+    // branch. Forward-compatible: only the keys this agent knows
+    // about have effect; unknown keys are silently ignored. Fresh
+    // cycles never look at this object.
+    const hints = (input.selfHealingHints ?? {}) as PRAgentSelfHealingHints;
+    const appliedHints: string[] = [];
     if (isResume) {
       branch = input.resumeOnBranch!;
       log.info(
-        { correlationId: input.correlationId, branch, prNumber: input.prNumber ?? null },
-        'Resuming on existing branch (pipeline-feedback flow)',
+        {
+          correlationId: input.correlationId,
+          branch,
+          prNumber: input.prNumber ?? null,
+          hints: Object.keys(hints),
+          diagnosis: input.selfHealingDiagnosis ?? null,
+        },
+        'Resuming on existing branch (pipeline-feedback or self-healing flow)',
       );
+
+      // Hint: unshallow the local clone so any subsequent
+      // force-with-lease / rebase can see the full history.
+      // Best-effort — on a fresh clone the fetch with --unshallow
+      // typically completes in <1s, but a non-shallow repo
+      // returns "fatal: --unshallow on a complete repository
+      // does not make sense" which we swallow cleanly.
+      if (hints.unshallow) {
+        try {
+          await repo.fetch(['origin', branch, '--unshallow']);
+          appliedHints.push('unshallow');
+        } catch (unshErr) {
+          log.warn(
+            { err: unshErr instanceof Error ? unshErr.message : String(unshErr) },
+            'unshallow hint failed — continuing (non-fatal)',
+          );
+        }
+      }
+
       // Fetch + checkout the remote branch. simple-git's checkout
       // resolves remote refs by name, so this works even though the
       // shallow clone didn't include it as a local branch.
       await repo.fetch('origin', branch);
       await repo.checkout(['-B', branch, `origin/${branch}`]);
+
+      // Hint: rebase on default branch before pushing. The aborts
+      // pattern matches the brief — try the rebase; if it fails
+      // (merge conflict the LLM couldn't anticipate), abort and
+      // continue without rebasing. Push will still attempt; if
+      // it's a non-ff and forceWithLease isn't set, the push
+      // failure will trigger the LLM recovery path.
+      if (hints.rebaseBranch) {
+        try {
+          await repo.fetch(['origin', project.defaultBranch]);
+          await repo.rebase([`origin/${project.defaultBranch}`]);
+          appliedHints.push('rebaseBranch');
+        } catch (rebErr) {
+          await repo.rebase(['--abort']).catch(() => undefined);
+          log.warn(
+            { err: rebErr instanceof Error ? rebErr.message : String(rebErr) },
+            'rebase hint failed — continuing without rebase',
+          );
+        }
+      }
     } else {
       try {
         await repo.checkout(project.defaultBranch);
@@ -109,29 +189,39 @@ export async function runPRAgent(input: PRAgentInput): Promise<PRAgentResult> {
       await repo.checkoutLocalBranch(branch);
     }
 
-    // Write every artifact at its declared path. mkdir -p the dirname
-    // each time — the path may be several levels deep.
-    for (const artifact of input.artifacts) {
-      const full = join(workDir, artifact.path);
-      await mkdir(dirname(full), { recursive: true });
-      await writeFile(full, artifact.content, 'utf8');
-    }
+    // Hint: skip artifact rewrite + lockfile sync entirely. Used
+    // when the diagnosis is "the code is fine, the push failed" —
+    // we just need to (re-)push whatever's already on the branch
+    // tip. Fresh cycles always write artifacts; the hint is only
+    // checked on the resume branch.
+    const skipRewrite = isResume && Boolean(hints.skipArtifactRewrite);
+    if (skipRewrite) {
+      appliedHints.push('skipArtifactRewrite');
+    } else {
+      // Write every artifact at its declared path. mkdir -p the dirname
+      // each time — the path may be several levels deep.
+      for (const artifact of input.artifacts) {
+        const full = join(workDir, artifact.path);
+        await mkdir(dirname(full), { recursive: true });
+        await writeFile(full, artifact.content, 'utf8');
+      }
 
-    // Sync the lockfile against the freshly-written package.json so the
-    // CI's `pnpm install --frozen-lockfile` step passes. Three cases:
-    //
-    //   1. Fresh project — code-agent scaffolded package.json; this run
-    //      creates pnpm-lock.yaml for the first time.
-    //   2. Dependency update — package.json gained/lost an entry; this
-    //      run rewrites the lockfile to match.
-    //   3. No package.json yet — skip (the dispatched intent was
-    //      something else; first `gestalt run` will scaffold one).
-    //
-    // Failure is non-fatal: pr-agent commits whatever lockfile state
-    // exists and pushes the PR. The dispatched CI run will surface a
-    // real lockfile mismatch (if any) — better there than blocking the
-    // PR from existing.
-    await maybeSyncLockfile(workDir, input.correlationId);
+      // Sync the lockfile against the freshly-written package.json so the
+      // CI's `pnpm install --frozen-lockfile` step passes. Three cases:
+      //
+      //   1. Fresh project — code-agent scaffolded package.json; this run
+      //      creates pnpm-lock.yaml for the first time.
+      //   2. Dependency update — package.json gained/lost an entry; this
+      //      run rewrites the lockfile to match.
+      //   3. No package.json yet — skip (the dispatched intent was
+      //      something else; first `gestalt run` will scaffold one).
+      //
+      // Failure is non-fatal: pr-agent commits whatever lockfile state
+      // exists and pushes the PR. The dispatched CI run will surface a
+      // real lockfile mismatch (if any) — better there than blocking the
+      // PR from existing.
+      await maybeSyncLockfile(workDir, input.correlationId);
+    }
 
     await repo.addConfig('user.name', 'Gestalt Platform');
     await repo.addConfig('user.email', 'platform@gestalt.local');
@@ -140,7 +230,7 @@ export async function runPRAgent(input: PRAgentInput): Promise<PRAgentResult> {
     const status = await repo.status();
     const subject = isResume ? fixCommitMessageFor(input) : commitMessageFor(input);
     let commitSha: string;
-    if (status.files.length === 0) {
+    if (status.files.length === 0 && !skipRewrite) {
       // No diff vs the branch tip. For a fresh cycle this means the
       // artifact set was already on main (e.g. an upstream direct-push);
       // we synthesise an empty commit so the PR isn't blank. For a
@@ -150,11 +240,51 @@ export async function runPRAgent(input: PRAgentInput): Promise<PRAgentResult> {
       // diff, but we want a visible "we tried" entry in git log).
       const commit = await repo.commit(subject, undefined, { '--allow-empty': null });
       commitSha = commit.commit;
-    } else {
+    } else if (status.files.length > 0) {
       const commit = await repo.commit(subject);
       commitSha = commit.commit;
+    } else {
+      // skipRewrite path with no diff — nothing new to commit;
+      // resolve commitSha from current HEAD so the push still
+      // works against a known tip.
+      commitSha = (await repo.revparse(['HEAD'])).trim();
     }
-    await repo.push('origin', branch, ['--set-upstream']);
+
+    // Push: regular fast-forward by default; `--force-with-lease`
+    // when hinted (typically paired with `unshallow` for the
+    // non-fast-forward / rejected push pattern).
+    const pushArgs = hints.forceWithLease
+      ? ['--force-with-lease', '--set-upstream']
+      : ['--set-upstream'];
+    if (hints.forceWithLease) appliedHints.push('forceWithLease');
+
+    try {
+      await repo.push('origin', branch, pushArgs);
+    } catch (pushErr) {
+      // Hint-driven recovery exhausted. Hand off to the self-healing
+      // loop with the NEW error context — it may diagnose a
+      // different fix (e.g. previous hints were wrong) and dispatch
+      // a different queue, OR escalate to a human alert. We rethrow
+      // here so the deploy-orchestrator's catch block invokes its
+      // own self-healing wrapper with the full deploy context
+      // (signals, artifacts, intent attempt count).
+      log.warn(
+        {
+          correlationId: input.correlationId,
+          err: pushErr instanceof Error ? pushErr.message : String(pushErr),
+          appliedHints,
+        },
+        'Push failed after applying self-healing hints — handing back to orchestrator for re-diagnosis',
+      );
+      throw pushErr;
+    }
+
+    if (appliedHints.length > 0) {
+      log.info(
+        { correlationId: input.correlationId, appliedHints, branch },
+        'Self-healing hints applied successfully on resume push',
+      );
+    }
 
     if (isResume) {
       return resumePushResult({

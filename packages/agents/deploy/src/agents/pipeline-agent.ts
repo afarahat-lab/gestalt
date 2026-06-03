@@ -28,6 +28,24 @@ const log = createContextLogger({ module: 'pipeline-agent' });
 const POLL_INTERVAL_MS = 15_000;
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 
+/**
+ * Hint object pipeline-agent reads on self-healing recovery
+ * dispatches (Option B). Unknown keys silently ignored.
+ */
+export interface PipelineAgentSelfHealingHints {
+  /** Double the polling window — useful when CI was just slow. */
+  extendTimeout?: boolean;
+  /**
+   * Don't re-trigger the pipeline; re-poll the existing run instead.
+   * Requires `runId` on the hint object (the original run to resume
+   * polling). When `runId` is absent OR the runId can't be resolved,
+   * the agent falls back to triggering a fresh run.
+   */
+  skipTrigger?: boolean;
+  /** Required when `skipTrigger: true` — the run to resume polling. */
+  runId?: string;
+}
+
 export interface PipelineAgentInput {
   correlationId: string;
   intentId: string;
@@ -42,6 +60,14 @@ export interface PipelineAgentInput {
    */
   intentText?: string;
   timeoutMs?: number;
+  /**
+   * Self-healing hint object (Option B). Present only on retry
+   * dispatches the loop produced. Fresh `deploy:pipeline` cycles
+   * pass undefined and the agent behaviour is unchanged.
+   */
+  selfHealingHints?: PipelineAgentSelfHealingHints;
+  /** Diagnosis string for inline logging on the recovery path. */
+  selfHealingDiagnosis?: string;
 }
 
 export type PipelineAgentOutcome =
@@ -56,7 +82,20 @@ export interface PipelineAgentResult {
 }
 
 export async function runPipelineAgent(input: PipelineAgentInput): Promise<PipelineAgentResult> {
-  const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const baseTimeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  // Self-healing hints (Option B). Read once at the top so the
+  // recovery path can log which hints applied even if a hint's
+  // effect is conditional (e.g. skipTrigger requires runId).
+  const hints = (input.selfHealingHints ?? {}) as PipelineAgentSelfHealingHints;
+  const appliedHints: string[] = [];
+
+  // Hint: extendTimeout doubles the polling window. Worst case
+  // ~20 minutes for the default 10-minute timeout — still bounded.
+  const timeoutMs = hints.extendTimeout
+    ? baseTimeoutMs * 2
+    : baseTimeoutMs;
+  if (hints.extendTimeout) appliedHints.push('extendTimeout');
+
   const { projects, deploymentEvents } = getRepositories();
   const project = await projects.findById(input.projectId);
   if (!project) throw new Error(`Project ${input.projectId} not found`);
@@ -80,35 +119,56 @@ export async function runPipelineAgent(input: PipelineAgentInput): Promise<Pipel
       correlationId: input.correlationId,
     });
 
-    const { runId } = await adapter.triggerPipeline({
-      projectId: project.id,
-      branch: input.branch,
-      correlationId: input.correlationId,
-    });
+    // Hint: skipTrigger re-polls an existing run. Requires the
+    // hint object to carry the runId — otherwise we fall back to
+    // a fresh trigger (the hint is silently ignored, matching the
+    // forward-compatible contract).
+    let runId: string;
+    if (hints.skipTrigger && hints.runId) {
+      runId = hints.runId;
+      appliedHints.push('skipTrigger');
+      log.info(
+        { correlationId: input.correlationId, runId, adapter: adapter.type },
+        'Skip trigger hint — re-polling existing run',
+      );
+    } else {
+      const triggered = await adapter.triggerPipeline({
+        projectId: project.id,
+        branch: input.branch,
+        correlationId: input.correlationId,
+      });
+      runId = triggered.runId;
 
-    await deploymentEvents.append({
-      correlationId: input.correlationId,
-      intentId: input.intentId,
-      eventType: 'pipeline-triggered',
-      environment: null,
-      prUrl: input.prUrl,
-      prNumber: input.prNumber,
-      runId,
-      deploymentUrl: null,
-      metadata: { branch: input.branch, adapter: adapter.type },
-    });
-    emitLiveEvent('deployment.updated', input.correlationId, {
-      intentId: input.intentId,
-      status: 'pipeline-triggered',
-      runId,
-      branch: input.branch,
-      adapter: adapter.type,
-    });
+      await deploymentEvents.append({
+        correlationId: input.correlationId,
+        intentId: input.intentId,
+        eventType: 'pipeline-triggered',
+        environment: null,
+        prUrl: input.prUrl,
+        prNumber: input.prNumber,
+        runId,
+        deploymentUrl: null,
+        metadata: { branch: input.branch, adapter: adapter.type },
+      });
+      emitLiveEvent('deployment.updated', input.correlationId, {
+        intentId: input.intentId,
+        status: 'pipeline-triggered',
+        runId,
+        branch: input.branch,
+        adapter: adapter.type,
+      });
 
-    log.info(
-      { correlationId: input.correlationId, runId, adapter: adapter.type },
-      'Pipeline triggered — polling for terminal status',
-    );
+      log.info(
+        {
+          correlationId: input.correlationId,
+          runId,
+          adapter: adapter.type,
+          appliedHints,
+          diagnosis: input.selfHealingDiagnosis ?? null,
+        },
+        'Pipeline triggered — polling for terminal status',
+      );
+    }
 
     const startedAt = Date.now();
     let lastStatus = 'running';

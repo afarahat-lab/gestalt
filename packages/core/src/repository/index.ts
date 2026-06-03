@@ -123,6 +123,22 @@ export interface ResumeContext {
    * `intents.text` column is preserved as the historical record.
    */
   updatedIntentText?: string;
+  /**
+   * The queue the most recent diagnosis chose to dispatch the
+   * retry on. One of `generate:intent | deploy:pr | deploy:pipeline
+   * | deploy:promote | none`. Persisted so the dashboard's attempt-
+   * history view can show "the platform retried deploy:pr"
+   * vs "the platform retried generate:intent". Optional — older
+   * resume contexts (pre-Option-B) don't have this field.
+   */
+  retryTaskType?: string;
+  /**
+   * Hint object the loop forwarded on the retry dispatch. The
+   * target agent reads these and adapts its behaviour (unshallow
+   * before push, extend pipeline timeout, etc.). Optional —
+   * agents handle absence the same as `{}`.
+   */
+  retryPayloadHints?: Record<string, unknown>;
 }
 
 export interface IntentRepository extends BaseRepository {

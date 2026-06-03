@@ -1096,37 +1096,23 @@ async function attemptSelfHealingForGenerate(
       signals,
     );
 
+    // Option B (migration 020 amendment): the loop owns both the
+    // dispatch AND the intent status transition. We just decide
+    // whether the caller should transition to `failed` based on
+    // the result flags.
     if (result.shouldRetry && !result.escalated && result.diagnosis) {
-      // Caller MUST NOT transition to failed — we dispatched a retry.
-      await dispatch({
-        id: crypto.randomUUID(),
-        correlationId,
-        type: 'generate:intent',
-        sourceAgent: 'self-healing-agent',
-        targetAgent: 'intent-agent',
-        priority: 'normal',
-        payload: {
-          intentId,
-          projectId: intent.projectId,
-          text: result.diagnosis.updatedIntentText ?? intent.text,
-          resumeOnBranch: intent.branchName ?? undefined,
-          prNumber: intent.prNumber ?? undefined,
-          prUrl: intent.prUrl ?? undefined,
-          source: 'self-healing',
+      childLog.info(
+        {
+          confidence: result.diagnosis.confidence,
+          retryTaskType: result.diagnosis.retryTaskType,
+          hintKeys: Object.keys(result.diagnosis.retryPayloadHints ?? {}),
         },
-        createdAt: new Date(),
-        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-      }, queueConfigFromEnv());
-      // Bring the intent back to `generating` for the retry leg —
-      // the worker will pick it up momentarily.
-      await transitionIntent(intentId, correlationId, 'generating').catch(() => {});
-      childLog.info({ confidence: result.diagnosis.confidence }, 'Self-healing dispatched retry');
+        'Custom-agent self-healing dispatched retry (loop)',
+      );
       return { retryDispatched: true };
     }
 
     if (result.escalated && result.autoResolved) {
-      // Auto-resolver already transitioned the intent to `generating`
-      // and dispatched a fresh cycle. Caller must NOT override.
       childLog.info('Self-healing auto-resolved escalated alert');
       return { retryDispatched: true };
     }
@@ -1194,28 +1180,18 @@ async function attemptSelfHealingForCustomAgent(args: {
       signals,
     );
 
+    // Option B (migration 020 amendment): the loop owns the
+    // dispatch + transitionIntent now. Caller just decides whether
+    // to transition to failed based on the result flags.
     if (healing.shouldRetry && !healing.escalated && healing.diagnosis) {
-      await dispatch({
-        id: crypto.randomUUID(),
-        correlationId,
-        type: 'generate:intent',
-        sourceAgent: 'self-healing-agent',
-        targetAgent: 'intent-agent',
-        priority: 'normal',
-        payload: {
-          intentId,
-          projectId: intent.projectId,
-          text: healing.diagnosis.updatedIntentText ?? intent.text,
-          resumeOnBranch: intent.branchName ?? undefined,
-          prNumber: intent.prNumber ?? undefined,
-          prUrl: intent.prUrl ?? undefined,
-          source: 'self-healing',
+      childLog.info(
+        {
+          agentName: defName,
+          retryTaskType: healing.diagnosis.retryTaskType,
+          hintKeys: Object.keys(healing.diagnosis.retryPayloadHints ?? {}),
         },
-        createdAt: new Date(),
-        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-      }, queueConfigFromEnv());
-      await transitionIntent(intentId, correlationId, 'generating').catch(() => {});
-      childLog.info({ agentName: defName }, 'Custom-agent self-healing dispatched retry');
+        'Custom-agent self-healing dispatched retry (loop)',
+      );
       return { retryDispatched: true };
     }
 

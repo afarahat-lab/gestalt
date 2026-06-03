@@ -37,22 +37,59 @@ import type {
   FailureType,
 } from '@gestalt/core';
 import { runPRAgent } from '../agents/pr-agent';
+import type { PRAgentSelfHealingHints } from '../agents/pr-agent';
 import { runPipelineAgent } from '../agents/pipeline-agent';
+import type { PipelineAgentSelfHealingHints } from '../agents/pipeline-agent';
 import { runPromotionAgent } from '../agents/promotion-agent';
+import type { PromotionAgentSelfHealingHints } from '../agents/promotion-agent';
 import { PipelineAdapterAuthError } from '../adapters/pipeline-adapter';
 
 const log = createContextLogger({ module: 'deploy-orchestrator' });
 
 // ─── Task payload shapes ─────────────────────────────────────────────────────
 
-interface DeployPRPayload {
+/**
+ * Shared self-healing payload fields (Option B). Present ONLY on
+ * retry dispatches the loop produced — fresh cycles never carry
+ * them. Target agents read `selfHealingHints` and apply only the
+ * keys they recognise; unknown hints are silently ignored so a
+ * future diagnosis adding a new hint doesn't crash old workers.
+ */
+interface SelfHealingDispatchFields {
+  /**
+   * Dispatch source. `'self-healing'` ⇒ retry from the loop's
+   * regular path. `'auto-resolved'` ⇒ retry from the
+   * auto-resolver inside `escalateToHuman`. Both flow through the
+   * same agent code paths; the source field is for the audit
+   * trail + dashboard "Attempt history" rendering only.
+   */
+  source?: 'self-healing' | 'auto-resolved' | 'operator-resume' | 'pipeline-feedback' | 'human' | 'maintenance-agent';
+  /** Hint object the diagnostician emitted. Optional. */
+  selfHealingHints?: Record<string, unknown>;
+  /** Short diagnosis string for inline logging. Optional. */
+  selfHealingDiagnosis?: string;
+}
+
+interface DeployPRPayload extends SelfHealingDispatchFields {
   intentId: string;
   projectId: string;
   intentText: string;
   artifacts: Array<{ id?: string; type?: string; path: string; content: string }>;
+  /**
+   * Set by the self-healing loop on `deploy:pr` retry dispatches.
+   * pr-agent's recovery path reads this AND `selfHealingHints`
+   * to decide whether to push to the existing branch (with
+   * --force-with-lease, --unshallow etc.) instead of writing a
+   * fresh branch. Same field the pipeline-feedback resume flow
+   * already uses on `generate:intent` retries.
+   */
+  resumeOnBranch?: string;
+  branch?: string;
+  prNumber?: number;
+  prUrl?: string;
 }
 
-interface DeployPipelinePayload {
+interface DeployPipelinePayload extends SelfHealingDispatchFields {
   intentId: string;
   projectId: string;
   branch: string;
@@ -66,7 +103,7 @@ interface DeployPipelinePayload {
   intentText?: string;
 }
 
-interface DeployPromotionPayload {
+interface DeployPromotionPayload extends SelfHealingDispatchFields {
   intentId: string;
   projectId: string;
   targetEnvironment: 'staging' | 'production';
@@ -80,6 +117,8 @@ interface DeployPromotionPayload {
    * same as `autoMerge: false`.
    */
   prNumber?: number;
+  /** Optional branch — only present on self-healing retry dispatches. */
+  branch?: string;
   /**
    * Intent text used as the merge commit subject when auto-merge fires
    * (`<intentText> [gestalt <corr8>]`). Optional for the same
@@ -129,6 +168,15 @@ async function handleDeployTask(
           projectId: payload.projectId,
           intentText: payload.intentText,
           artifacts: payload.artifacts.map((a) => ({ path: a.path, content: a.content })),
+          // Self-healing retry forwarding (Option B). All four
+          // fields are optional and present only on dispatches
+          // the loop produced; fresh `deploy:pr` cycles pass
+          // them as undefined and pr-agent ignores them.
+          resumeOnBranch: payload.resumeOnBranch,
+          prNumber: payload.prNumber,
+          prUrl: payload.prUrl,
+          selfHealingHints: payload.selfHealingHints as PRAgentSelfHealingHints | undefined,
+          selfHealingDiagnosis: payload.selfHealingDiagnosis,
         }),
         [],
         childLog,
@@ -171,6 +219,11 @@ async function handleDeployTask(
           prUrl: payload.prUrl,
           prNumber: payload.prNumber,
           intentText: payload.intentText,
+          // Self-healing recovery — forward hints + diagnosis.
+          // Fresh cycles pass undefined; pipeline-agent skips
+          // the hint code paths unchanged.
+          selfHealingHints: payload.selfHealingHints as PipelineAgentSelfHealingHints | undefined,
+          selfHealingDiagnosis: payload.selfHealingDiagnosis,
         }),
         (r) => r.signals,
         childLog,
@@ -242,6 +295,9 @@ async function handleDeployTask(
           targetEnvironment: payload.targetEnvironment,
           prNumber: payload.prNumber,
           intentText: payload.intentText,
+          // Self-healing recovery — forward hints + diagnosis.
+          selfHealingHints: payload.selfHealingHints as PromotionAgentSelfHealingHints | undefined,
+          selfHealingDiagnosis: payload.selfHealingDiagnosis,
         }),
         (r) => r.signals,
         childLog,
@@ -562,28 +618,21 @@ async function attemptSelfHealingForDeploy(args: {
       signals,
     );
 
+    // Option B (migration 020 amendment): loop owns dispatch +
+    // transitionIntent. The dispatched queue varies per
+    // diagnosis: pipeline-failed often routes to deploy:pr
+    // (push retry with hints) or deploy:pipeline (re-trigger
+    // CI) instead of always going back to generate:intent.
     if (result.shouldRetry && !result.escalated && result.diagnosis) {
-      await dispatch({
-        id: crypto.randomUUID(),
-        correlationId,
-        type: 'generate:intent',
-        sourceAgent: 'self-healing-agent',
-        targetAgent: 'intent-agent',
-        priority: 'normal',
-        payload: {
-          intentId,
-          projectId: intent.projectId,
-          text: result.diagnosis.updatedIntentText ?? intent.text,
-          resumeOnBranch: intent.branchName ?? undefined,
-          prNumber: intent.prNumber ?? undefined,
-          prUrl: intent.prUrl ?? undefined,
-          source: 'self-healing',
+      childLog.info(
+        {
+          failureType,
+          retryTaskType: result.diagnosis.retryTaskType,
+          confidence: result.diagnosis.confidence,
+          hintKeys: Object.keys(result.diagnosis.retryPayloadHints ?? {}),
         },
-        createdAt: new Date(),
-        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-      }, queueConfigFromEnv());
-      await transitionIntent(intentId, correlationId, 'generating').catch(() => {});
-      childLog.info({ failureType, confidence: result.diagnosis.confidence }, 'Deploy self-healing dispatched retry');
+        'Deploy self-healing dispatched retry (loop)',
+      );
       return { retryDispatched: true };
     }
 

@@ -33,6 +33,7 @@ import {
   SelfHealingAgent,
   type SelfHealingContext,
   type SelfHealingDiagnosis,
+  type SelfHealingRetryTaskType,
 } from './self-healing-agent';
 import type {
   PlatformSignal, AgentRole,
@@ -204,19 +205,27 @@ async function runSelfHealingLoopUnsafe(
     config.confidenceThreshold,
   );
 
-  if (!diagnosis.shouldRetry) {
+  // 'none' is the LLM's "I can't fix this" marker — semantically
+  // identical to shouldRetry: false. The two checks are equivalent
+  // after the LLM's confidence-threshold downgrade, but we honour
+  // both independently in case a future prompt change separates
+  // them (e.g. shouldRetry: true with retryTaskType: 'none' meaning
+  // "I think this is fixable but I don't know which queue").
+  if (!diagnosis.shouldRetry || diagnosis.retryTaskType === 'none') {
     const autoResolved = await escalateToHuman(
       payload,
       context,
       signals,
-      `Diagnosis: ${diagnosis.diagnosis}. Confidence: ${diagnosis.confidence}`,
+      `Diagnosis: ${diagnosis.diagnosis}. Confidence: ${diagnosis.confidence}. retryTaskType: ${diagnosis.retryTaskType}`,
     );
     return { shouldRetry: false, diagnosis, escalated: true, autoResolved };
   }
 
   // High-confidence retry: persist the resume context + bump the
-  // attempt counter. The next dispatch leg reads
-  // `intent.lastResumeContext` to populate the prompt.
+  // attempt counter, then dispatch the right queue. The next
+  // dispatch leg reads `intent.lastResumeContext` to populate the
+  // prompt (autoHealed branch) AND `selfHealingHints` on its
+  // payload to adapt its scripted behaviour (deploy agents only).
   // skipAgents is only applied at high confidence — clear at lower.
   const effectiveSkipAgents =
     diagnosis.confidence === 'high' ? diagnosis.skipAgents ?? [] : [];
@@ -240,10 +249,29 @@ async function runSelfHealingLoopUnsafe(
     skipAgents: effectiveSkipAgents,
     focusFiles: diagnosis.focusFiles ?? [],
     updatedIntentText: diagnosis.updatedIntentText,
+    retryTaskType: diagnosis.retryTaskType,
+    retryPayloadHints: diagnosis.retryPayloadHints,
   };
 
   await repos.intents.saveResumeContext(payload.intentId, resumeContext);
   await repos.intents.incrementAttemptCount(payload.intentId);
+
+  // Dispatch the retry on the queue the diagnostician chose.
+  // Same `source: 'self-healing'` regardless of target queue so the
+  // dashboard's attempt-history can recognise auto-driven cycles.
+  await dispatch(
+    buildRetryDispatch(diagnosis.retryTaskType, payload, diagnosis, 'self-healing'),
+    getQueueConfig(),
+  );
+  // Transition the intent back to `generating` so the dashboard's
+  // intent feed reflects the retry-in-flight state immediately.
+  // Best-effort — a failed transition shouldn't roll back the
+  // dispatch we just queued.
+  try {
+    await repos.intents.updateStatus(payload.intentId, 'generating');
+  } catch (err) {
+    log.warn({ err, intentId: payload.intentId }, 'Self-healing status transition failed — dispatch already queued');
+  }
 
   log.info(
     {
@@ -251,13 +279,122 @@ async function runSelfHealingLoopUnsafe(
       failureType: payload.failureType,
       attemptNumber: currentAttempt,
       confidence: diagnosis.confidence,
+      retryTaskType: diagnosis.retryTaskType,
+      hintKeys: Object.keys(diagnosis.retryPayloadHints),
       skippedAgents: effectiveSkipAgents.length,
       focusFiles: (diagnosis.focusFiles ?? []).length,
     },
-    'Self-healing retry authorised — caller should dispatch',
+    'Self-healing retry dispatched',
   );
 
   return { shouldRetry: true, diagnosis, escalated: false, autoResolved: false };
+}
+
+/**
+ * Builds a typed `TaskMessage` for the retry dispatch. The payload
+ * shape varies by target queue (only `generate:intent` cares about
+ * `text` + `updatedIntentText`; deploy queues care about `branch` +
+ * `prNumber`). `selfHealingHints` is forwarded on every payload so
+ * target agents can read+apply known hints. `source` flips between
+ * 'self-healing' (regular retry) and 'auto-resolved' (alert auto-
+ * resolution).
+ */
+function buildRetryDispatch(
+  taskType: SelfHealingRetryTaskType,
+  payload: SelfHealingLoopPayload,
+  diagnosis: SelfHealingDiagnosis,
+  source: 'self-healing' | 'auto-resolved',
+): {
+  id: string;
+  correlationId: string;
+  type: 'generate:intent' | 'deploy:pr' | 'deploy:pipeline' | 'deploy:promotion';
+  sourceAgent: 'self-healing-agent';
+  targetAgent: 'orchestrator';
+  priority: 'normal';
+  payload: Record<string, unknown>;
+  createdAt: Date;
+  expiresAt: Date;
+} {
+  const basePayload: Record<string, unknown> = {
+    intentId: payload.intentId,
+    projectId: payload.projectId,
+    intentText: payload.intentText,
+    source,
+    selfHealingHints: diagnosis.retryPayloadHints,
+    selfHealingDiagnosis: diagnosis.diagnosis,
+  };
+
+  let messagePayload: Record<string, unknown>;
+  let resolvedType: 'generate:intent' | 'deploy:pr' | 'deploy:pipeline' | 'deploy:promotion';
+
+  if (taskType === 'generate:intent') {
+    resolvedType = 'generate:intent';
+    messagePayload = {
+      ...basePayload,
+      text: diagnosis.updatedIntentText ?? payload.intentText,
+      resumeOnBranch: payload.branchName ?? undefined,
+      prNumber: payload.prNumber ?? undefined,
+      prUrl: payload.prUrl ?? undefined,
+    };
+  } else if (taskType === 'deploy:pr') {
+    resolvedType = 'deploy:pr';
+    messagePayload = {
+      ...basePayload,
+      resumeOnBranch: payload.branchName ?? undefined,
+      branch: payload.branchName ?? undefined,
+      prNumber: payload.prNumber ?? undefined,
+      prUrl: payload.prUrl ?? undefined,
+      // Empty artifacts — pr-agent's recovery path reads
+      // `payload.selfHealingHints.skipArtifactRewrite` AND the
+      // existing branch state to decide what to push.
+      artifacts: [],
+    };
+  } else if (taskType === 'deploy:pipeline') {
+    resolvedType = 'deploy:pipeline';
+    messagePayload = {
+      ...basePayload,
+      branch: payload.branchName ?? undefined,
+      prNumber: payload.prNumber ?? undefined,
+      prUrl: payload.prUrl ?? undefined,
+    };
+  } else {
+    // 'deploy:promote' — the platform's queue name is
+    // 'deploy:promotion' (matches the existing promotion-agent
+    // dispatch). Both names refer to the same thing; this is the
+    // only place the LLM-facing alias diverges.
+    resolvedType = 'deploy:promotion';
+    // Hint: `retryProductionOnly` → dispatch the production
+    // promotion directly instead of redoing staging. Read here
+    // (NOT inside the agent) because the queue target — staging
+    // vs production — is set at dispatch time.
+    const retryProductionOnly = Boolean(
+      (diagnosis.retryPayloadHints as { retryProductionOnly?: unknown } | undefined)?.retryProductionOnly,
+    );
+    messagePayload = {
+      ...basePayload,
+      branch: payload.branchName ?? undefined,
+      prNumber: payload.prNumber ?? undefined,
+      // Default to staging; the LLM can flip to production-only
+      // via the hint when the diagnosis says staging is already
+      // good. ADR-034 still enforces "no production without a
+      // confirmed staging promotion" in the agent — if there's
+      // no staging row, the agent surfaces a GOLDEN_PRINCIPLE_BREACH
+      // and the dispatch is rejected regardless of the hint.
+      targetEnvironment: retryProductionOnly ? 'production' : 'staging',
+    };
+  }
+
+  return {
+    id: crypto.randomUUID(),
+    correlationId: payload.correlationId,
+    type: resolvedType,
+    sourceAgent: 'self-healing-agent',
+    targetAgent: 'orchestrator',
+    priority: 'normal',
+    payload: messagePayload,
+    createdAt: new Date(),
+    expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+  };
 }
 
 /**
@@ -403,6 +540,16 @@ async function attemptAutoResolveAlert(
       return false;
     }
 
+    // Treat 'none' as no-retry — auto-resolve only fires when the
+    // LLM picks a concrete target queue.
+    if (diagnosis.retryTaskType === 'none') {
+      log.info(
+        { alertId, correlationId: payload.correlationId },
+        'Auto-resolve diagnosis returned retryTaskType=none — alert remains open',
+      );
+      return false;
+    }
+
     const resumeContext: ResumeContext = {
       operatorFeedback: `[Auto-resolved] ${diagnosis.suggestedFix}`,
       failureType: payload.failureType,
@@ -422,6 +569,8 @@ async function attemptAutoResolveAlert(
       skipAgents: diagnosis.skipAgents ?? [],
       focusFiles: diagnosis.focusFiles ?? [],
       updatedIntentText: diagnosis.updatedIntentText,
+      retryTaskType: diagnosis.retryTaskType,
+      retryPayloadHints: diagnosis.retryPayloadHints,
     };
 
     await repos.intents.saveResumeContext(payload.intentId, resumeContext);
@@ -432,25 +581,7 @@ async function attemptAutoResolveAlert(
     await repos.intents.updateStatus(payload.intentId, 'generating');
 
     await dispatch(
-      {
-        id: crypto.randomUUID(),
-        correlationId: payload.correlationId,
-        type: 'generate:intent',
-        sourceAgent: 'self-healing-agent',
-        targetAgent: 'intent-agent',
-        priority: 'normal',
-        payload: {
-          intentId: payload.intentId,
-          projectId: payload.projectId,
-          text: diagnosis.updatedIntentText ?? payload.intentText,
-          resumeOnBranch: payload.branchName ?? undefined,
-          prNumber: payload.prNumber ?? undefined,
-          prUrl: payload.prUrl ?? undefined,
-          source: 'auto-resolved',
-        } as Record<string, unknown>,
-        createdAt: new Date(),
-        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-      },
+      buildRetryDispatch(diagnosis.retryTaskType, payload, diagnosis, 'auto-resolved'),
       getQueueConfig(),
     );
 

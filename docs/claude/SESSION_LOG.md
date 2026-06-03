@@ -13224,3 +13224,342 @@ Pending follow-ups: none introduced. Possible future iteration:
   chain. The data is there (each cycle's
   `last_resume_context` JSONB) but a dedicated history-fetch
   endpoint is a future enhancement
+
+---
+
+### Session 2026-06-04 — Claude Code (Hybrid LLM recovery for scripted deploy agents — Option B)
+
+Builds on yesterday's autonomous self-healing loop (migration 020).
+Each scripted deploy agent (pr-agent / pipeline-agent /
+promotion-agent) keeps its deterministic happy path unchanged but
+gains a hint-driven recovery path. The `SelfHealingAgent` now picks
+the retry QUEUE (not always `generate:intent`) AND emits
+`retryPayloadHints` that the target agent reads to adapt its
+behaviour. If the adapted retry also fails, the deploy-orchestrator
+catch wrapper hands back to `runSelfHealingLoop` with the new error
+context for a fresh diagnosis.
+
+Changed:
+
+- `packages/core/src/agents/self-healing-agent.ts`:
+  - New `SelfHealingRetryTaskType` union — five values:
+    `generate:intent`, `deploy:pr`, `deploy:pipeline`,
+    `deploy:promote`, `none`. Exported for typing
+  - `SelfHealingDiagnosis` gained `retryTaskType` + `retryPayloadHints`
+    — `retryPayloadHints` is `Record<string, unknown>` (free-form;
+    each target agent reads only the keys it recognises)
+  - Diagnosis prompt rewrite — two new sections injected before
+    "Your task":
+    - "Available retry task types" describing each queue's
+      semantics with examples
+    - "Known failure patterns" with explicit mappings:
+      git-push → deploy:pr (unshallow + forceWithLease for non-ff;
+      add rebaseBranch for merge conflict; shouldRetry:false for
+      403/auth);
+      CI/pipeline → deploy:pipeline (extendTimeout for timeout;
+      empty hints for "didn't trigger";
+      test failures → flip to generate:intent);
+      promotion → deploy:promote (skipStagingVerification +
+      retryProductionOnly for already-deployed);
+      code/gate → generate:intent;
+      infrastructure → shouldRetry:false, retryTaskType:none
+  - `parseDiagnosis` defensive defaults — `retryTaskType` falls
+    back to `'generate:intent'` when missing/unknown (preserves
+    pre-Option-B behaviour for legacy diagnoses); `retryPayloadHints`
+    rejects arrays/non-objects and defaults to `{}`. `isRetryTaskType`
+    type guard added
+  - `safeDefaultDiagnosis` returns `retryTaskType: 'none'` +
+    `retryPayloadHints: {}` — used on LLM-call failure AND
+    JSON-parse failure
+
+- `packages/core/src/agents/self-healing-loop.ts`:
+  - New `buildRetryDispatch(taskType, payload, diagnosis, source)`
+    helper builds a per-queue typed `TaskMessage`. Per-queue
+    payload shape:
+    - `generate:intent` — `text` (diagnosis.updatedIntentText ?? payload.intentText)
+      + `resumeOnBranch` + `prNumber` + `prUrl`
+    - `deploy:pr` — `resumeOnBranch` + `branch` + `prNumber` +
+      `prUrl` + empty `artifacts: []` (pr-agent's resume path
+      reads `skipArtifactRewrite` to decide what to push)
+    - `deploy:pipeline` — `branch` + `prNumber` + `prUrl`
+    - `deploy:promotion` — `branch` + `prNumber` +
+      `targetEnvironment: 'staging' | 'production'`
+      (`retryProductionOnly` hint flips to production at dispatch
+      time, NOT inside the agent — the queue target is set here)
+  - All payloads carry shared base: `intentId`, `projectId`,
+    `intentText`, `source: 'self-healing' | 'auto-resolved'`,
+    `selfHealingHints`, `selfHealingDiagnosis`. `selfHealingHints`
+    forwarded verbatim from `diagnosis.retryPayloadHints`
+  - `runSelfHealingLoopUnsafe` rewritten: now treats both
+    `!shouldRetry` and `retryTaskType === 'none'` as escalation
+    triggers (semantically identical post-confidence-downgrade).
+    On retry-authorised path: `saveResumeContext` with
+    `retryTaskType` + `retryPayloadHints` written through, then
+    `dispatch(buildRetryDispatch(...), getQueueConfig())` ,
+    then best-effort `intents.updateStatus(... 'generating')`.
+    Loop owns BOTH the dispatch AND the transition — orchestrator
+    callers no longer need to do either
+  - `attemptAutoResolveAlert` uses the same `buildRetryDispatch`
+    helper with `source: 'auto-resolved'`. Treats `retryTaskType:
+    'none'` as no-retry (alert stays open)
+  - `SelfHealingResult.autoResolved` semantics unchanged
+
+- `packages/core/src/repository/index.ts`:
+  - `ResumeContext` gained optional `retryTaskType?: string` +
+    `retryPayloadHints?: Record<string, unknown>`. Allows
+    pre-Option-B resume contexts to read fine (fields absent →
+    same as old behaviour)
+
+- Orchestrator helpers simplified — drop duplicate dispatch +
+  transitionIntent code, just branch on the loop's result flags:
+  - `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+    `attemptSelfHealingForGenerate` + `attemptSelfHealingForCustomAgent`
+    both shrank — read `result.shouldRetry` (loop dispatched +
+    transitioned) → return retryDispatched:true; check
+    `escalated && autoResolved` → same. The `dispatch + transitionIntent`
+    blocks deleted (~30 lines each). Log lines kept + extended with
+    `retryTaskType` + `hintKeys` so the audit trail shows which
+    queue the loop chose
+  - `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
+    `attemptSelfHealingForGate` same simplification — drops the
+    inline `dispatch + transitionIntent` block. Log adds
+    `retryTaskType` + `hintKeys`
+  - `packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`:
+    `attemptSelfHealingForDeploy` same simplification. Log adds
+    `failureType` + `retryTaskType` + `hintKeys`
+
+- `packages/agents/deploy/src/agents/pr-agent.ts`:
+  - New `PRAgentSelfHealingHints` interface — `unshallow?`,
+    `forceWithLease?`, `skipArtifactRewrite?`, `rebaseBranch?`
+  - `PRAgentInput` gained `selfHealingHints` + `selfHealingDiagnosis`
+  - Resume path reads hints + builds an `appliedHints: string[]`
+    log scratchpad:
+    - `unshallow`: `repo.fetch(['origin', branch, '--unshallow'])`
+      wrapped in try/catch — fails on a complete repo (`"fatal:
+      --unshallow on a complete repository does not make sense"`)
+      with WARN log + continue, success appends to appliedHints
+    - `rebaseBranch`: `fetch defaultBranch + rebase origin/defaultBranch`
+      wrapped in try/catch; on rebase failure runs `repo.rebase
+      (['--abort'])` then WARN-and-continue (matches the brief's
+      "rebase failed — continuing without rebase" semantics)
+    - `skipArtifactRewrite`: skips both the artifact write loop AND
+      the lockfile sync — pushes whatever's on the branch tip
+    - `forceWithLease`: push uses `['--force-with-lease',
+      '--set-upstream']` instead of `['--set-upstream']`
+  - Empty-commit + no-rewrite handling: when `skipRewrite` is
+    true and there's no diff, resolves `commitSha` from
+    `git rev-parse HEAD` (no synthetic empty commit — the branch
+    tip IS the commit we want to push). When skipRewrite is
+    false with no diff, the legacy synthetic-empty-commit path
+    runs
+  - Push failure RETHROWS (with WARN log naming
+    `appliedHints` + the new error message) — the deploy-
+    orchestrator's catch block then invokes its own self-healing
+    wrapper with the fresh error context for a re-diagnosis.
+    `appliedHints` is logged on every successful resume push too
+    so operators can audit what worked
+
+- `packages/agents/deploy/src/agents/pipeline-agent.ts`:
+  - New `PipelineAgentSelfHealingHints` interface — `extendTimeout?`,
+    `skipTrigger?`, `runId?`
+  - `PipelineAgentInput` gained `selfHealingHints` +
+    `selfHealingDiagnosis`
+  - `extendTimeout` doubles `timeoutMs` (default 10m → 20m)
+  - `skipTrigger` re-polls existing `runId` instead of calling
+    `adapter.triggerPipeline`. Requires `runId` on the hint
+    object — when absent, falls back to fresh trigger silently
+    (forward-compat: future hints that imply skipTrigger but
+    forget runId still produce a working cycle)
+  - Both happy path AND recovery path log `appliedHints` +
+    `diagnosis` so the audit trail is symmetric
+
+- `packages/agents/deploy/src/agents/promotion-agent.ts`:
+  - New `PromotionAgentSelfHealingHints` interface —
+    `skipStagingVerification?`, `retryProductionOnly?`
+  - `PromotionAgentInput` gained `selfHealingHints` +
+    `selfHealingDiagnosis`
+  - Agent body logs hints when present (the actual effect of
+    `retryProductionOnly` is consumed at the loop's
+    `buildRetryDispatch` step — promotion-agent runs with
+    whichever targetEnvironment was dispatched).
+    `skipStagingVerification` is logged but unused today (no
+    staging verifier exists) — forward-compat for when one ships
+
+- `packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`:
+  - All three payload interfaces extended via shared
+    `SelfHealingDispatchFields` — `source`, `selfHealingHints`,
+    `selfHealingDiagnosis`. Plus `DeployPRPayload` gained the
+    pipeline-feedback-style `resumeOnBranch` + `branch` +
+    `prNumber` + `prUrl` fields (already present on Pipeline +
+    Promotion). Source union widened to include
+    `'self-healing'` + `'auto-resolved'` + `'operator-resume'`
+    + `'pipeline-feedback'` + `'human'` + `'maintenance-agent'`
+  - All three agent dispatch sites forward
+    `selfHealingHints` + `selfHealingDiagnosis` from the payload.
+    pr-agent additionally forwards `resumeOnBranch` + `prNumber`
+    + `prUrl` (the pipeline-feedback resume fields)
+  - Imports added: `PRAgentSelfHealingHints`,
+    `PipelineAgentSelfHealingHints`, `PromotionAgentSelfHealingHints`
+
+Live verified end-to-end:
+
+- `pnpm -r build` clean across all 12 packages
+- `docker compose up -d --build server` healthy; queue config
+  pinned at boot
+- **`parseDiagnosis` 6-invariant matrix** via direct node-eval
+  inside the container (no DB / LLM):
+  1. Full diagnosis with retryTaskType=`deploy:pr` + hints
+     `{unshallow, forceWithLease}` → parsed correctly with both
+     fields present
+  2. Legacy diagnosis (no retryTaskType) → defaults to
+     `generate:intent` (backward-compat preserved)
+  3. `retryTaskType: 'none'` → recognised, paired with
+     `shouldRetry: false`
+  4. Unknown `retryTaskType: 'deploy:rocket'` → falls back to
+     `generate:intent` (defensive). Hints survive verbatim
+  5. Malformed `retryPayloadHints` (array `["not","an","object"]`)
+     → defaults to `{}`
+  6. Garbage JSON ("not json at all") → safe-default with
+     `retryTaskType: 'none'`, `shouldRetry: false`
+- **Scenario 1 live** (synthetic non-fast-forward diagnosis):
+  Stubbed `SelfHealingAgent.prototype.diagnose` to return a
+  diagnosis with `retryTaskType: 'deploy:pr'` +
+  `retryPayloadHints: {unshallow:true, forceWithLease:true}`.
+  Seeded an intent in `deploying` status with branch info.
+  Called `runSelfHealingLoop` directly:
+  - Server log: `Self-healing retry dispatched
+    retryTaskType=deploy:pr hintKeys=[unshallow, forceWithLease]
+    attemptNumber=1 confidence=high`
+  - pr-agent picked up the dispatch with `taskType: deploy:pr`,
+    `source: self-healing` — NOT `generate:intent`. Log:
+    `Resuming on existing branch (pipeline-feedback or
+    self-healing flow) hints=[unshallow, forceWithLease]`
+  - pr-agent took the hint-driven recovery path. Push failed
+    because the synthetic branch wasn't on the real GitHub
+    repo (`fatal: couldn't find remote ref
+    gestalt/verify-hybrid-recovery`) — pr-agent rethrew and
+    deploy-orchestrator's catch wrapper invoked another
+    self-healing diagnosis with the new error context (visible
+    in logs)
+  - DB after: `last_resume_context.retryTaskType = "deploy:pr"`,
+    `last_resume_context.retryPayloadHints = {unshallow: true,
+    forceWithLease: true}`, `last_resume_context.autoHealed = true`,
+    `attempt_count = 1` (escalated after the secondary failure
+    because trackeros's retry budget was already 1)
+- **Scenario 4 live** (happy path, fresh trivial intent):
+  - Submitted `Add a noop utility under src/shared/utils/noop`.
+    First cycle: intent-agent → design-agent → context-agent →
+    code-agent → test-agent → constraint-agent → review-agent →
+    **pr-agent (completed) → pipeline-agent (failed)**.
+  - `agent_executions` confirms the first deploy:pr ran
+    `status: completed` with NO `Resuming on existing branch`
+    log line, NO `hints:` log entry, NO `selfHealingHints` —
+    happy path executed unchanged
+  - pipeline-agent failed on trackeros's broken CI (pre-existing
+    unrelated issue, documented in prior sessions). This
+    triggered the deploy-orchestrator's self-healing catch
+    wrapper, which called `runSelfHealingLoop`. The LLM
+    correctly diagnosed the CI failure as a code problem and
+    returned `retryTaskType: 'generate:intent'` (visible in
+    server log: `Self-healing retry dispatched
+    retryTaskType=generate:intent`). The loop dispatched the
+    full generate cycle (a new intent-agent run started ~54s
+    after submission). **This is the LLM choosing the right
+    queue, NOT a hardcoded map** — proves Option B's dynamic
+    routing works in production
+- Cleanup: both synthetic intents + associated execution rows /
+  signals / artifacts / alerts removed at session end
+
+Decisions made:
+
+- **Loop dispatches + transitionIntent — orchestrator helpers
+  read result flags only.** The prior session's orchestrator
+  helpers duplicated the dispatch + transition code per layer
+  (generate / gate / deploy / custom-agent). With dynamic
+  routing each helper would need to know all four queue
+  payload shapes — exactly the kind of duplication
+  Option B exists to avoid. Centralising into `buildRetryDispatch`
+  inside the loop means every layer benefits from a future
+  retryTaskType addition without an N-way edit. Trade-off:
+  the loop now needs `getQueueConfig()` at runtime which
+  was already pinned at boot (yesterday's session). The
+  orchestrator helpers shrank by ~30 lines each
+- **`retryTaskType: 'none'` as semantically equivalent to
+  `shouldRetry: false`.** The brief allowed for both. Treating
+  them identically in the loop means the LLM can express
+  the no-retry decision through either field — useful when
+  it's confident the failure is infrastructure-only.
+  Documented in the loop's branch logic with a comment
+- **Hints are forward-compatible by design.** Every agent
+  reads hints via `const hints = (input.selfHealingHints ??
+  {}) as TypedHintsInterface;`. The cast is intentional —
+  unknown keys aren't on the typed interface so TypeScript
+  ignores them, but runtime access via `hints.knownKey` works.
+  If a future diagnosis adds `{ rocketBoost: true }` and an
+  old worker reads `hints.unshallow`, the new hint is
+  silently ignored — no crash, no logged error. New hints
+  are FREE to add; only the diagnosis prompt + the agent
+  that should react to them need updating
+- **Push failure RETHROWS to the orchestrator.** Brief's
+  pseudocode used `handlePushFailure` to call
+  `runSelfHealingLoop` inline from inside pr-agent. I chose
+  to rethrow instead because:
+  1. The deploy-orchestrator already has a catch block that
+     calls `runSelfHealingLoop` with full context (intent
+     attempt count, prior signals, prior artifacts —
+     pr-agent only has the artifacts it was about to push)
+  2. The orchestrator's wrapper sets `failureType:
+     'deploy-error'` correctly; pr-agent calling
+     `runSelfHealingLoop` would need to thread the right
+     failureType itself
+  3. Centralising one catch path per orchestrator level
+     means the budget check + escalation flow live in one
+     place per layer — easier to reason about
+  Result: same behaviour as the brief (failed retry triggers
+  re-diagnosis with new error context) via a slightly
+  different wiring. pr-agent's log message names this
+  ("handing back to orchestrator for re-diagnosis")
+- **`retryProductionOnly` consumed at dispatch site, NOT in
+  agent.** The hint flips `targetEnvironment` at the
+  `buildRetryDispatch` step inside the loop. promotion-agent
+  itself runs with whichever environment got dispatched. This
+  keeps the agent code path single-purpose (one promotion
+  per call); the queue routing is the loop's job. ADR-034
+  still enforces "no production without confirmed staging
+  promotion" in the agent body regardless of the hint — the
+  hint can't bypass that invariant
+- **`skipTrigger` requires `runId` on the hint object.**
+  Without it, pipeline-agent can't know which run to poll.
+  Brief's pseudocode assumed runId was always available;
+  I made it explicit on the hint so future diagnoses can opt
+  in correctly. Forward-compat: a diagnosis that sets
+  `{skipTrigger: true}` without `runId` falls back to a fresh
+  trigger — the hint is effectively a no-op rather than a
+  crash
+- **No new migration.** All hint data flows through BullMQ
+  payload (transient). The persisted state — `retryTaskType` +
+  `retryPayloadHints` — lives inside the existing
+  `intents.last_resume_context` JSONB column from migration
+  020. The ResumeContext type just gained two optional
+  fields; old rows without them read fine
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker server image rebuilt. Scenario 1 (non-fast-forward
+push dispatched to `deploy:pr` with hints, NOT a generate
+cycle) verified live end-to-end. Scenario 4 (happy path —
+zero hint logs / zero `Resuming on existing branch` lines
+for the FIRST deploy:pr call) verified live. parseDiagnosis
+6-invariant matrix verified inside the container against
+the production-built bundle.
+
+Pending follow-ups: none introduced. Possible future
+iteration:
+- Auto-resolved + self-healed alerts could surface the
+  `retryTaskType` choice in the dashboard's attempt-history
+  panel (data is in `last_resume_context.retryTaskType`)
+- A targeted intent that deterministically fails with a
+  pipeline-failed CI on a CLEAN project would prove
+  Scenario 1's end-to-end flow without the trackeros CI
+  pre-existing-issue noise
+- `verifyStagingDeployment` step in promotion-agent for the
+  `skipStagingVerification` hint to have a real effect

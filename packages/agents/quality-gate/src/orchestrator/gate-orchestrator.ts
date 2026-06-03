@@ -701,31 +701,19 @@ async function attemptSelfHealingForGate(args: {
       signals,
     );
 
+    // Option B (migration 020 amendment): loop owns dispatch +
+    // transitionIntent. The dispatched queue may be
+    // generate:intent (code fix), deploy:pr (push retry), etc. —
+    // whatever the diagnostician chose.
     if (result.shouldRetry && !result.escalated && result.diagnosis) {
-      // Dispatch a fresh generate cycle. The next cycle's
-      // context-assembler will read intent.lastResumeContext and
-      // populate the prompt's resume section automatically.
-      await dispatch({
-        id: crypto.randomUUID(),
-        correlationId,
-        type: 'generate:intent',
-        sourceAgent: 'self-healing-agent',
-        targetAgent: 'intent-agent',
-        priority: 'normal',
-        payload: {
-          intentId,
-          projectId: intent.projectId,
-          text: result.diagnosis.updatedIntentText ?? intent.text,
-          resumeOnBranch: intent.branchName ?? undefined,
-          prNumber: intent.prNumber ?? undefined,
-          prUrl: intent.prUrl ?? undefined,
-          source: 'self-healing',
+      childLog.info(
+        {
+          retryTaskType: result.diagnosis.retryTaskType,
+          confidence: result.diagnosis.confidence,
+          hintKeys: Object.keys(result.diagnosis.retryPayloadHints ?? {}),
         },
-        createdAt: new Date(),
-        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-      }, { redisUrl: process.env['REDIS_URL'] ?? 'redis://localhost:6379' });
-      await transitionIntent(intentId, correlationId, 'generating').catch(() => {});
-      childLog.info({ confidence: result.diagnosis.confidence }, 'Gate self-healing dispatched retry');
+        'Gate self-healing dispatched retry (loop)',
+      );
       return { retryDispatched: true };
     }
 
