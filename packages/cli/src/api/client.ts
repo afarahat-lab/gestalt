@@ -223,6 +223,21 @@ export interface ProjectConfigAgentsYaml {
   customAgents?: ProjectConfigCustomAgent[];
 }
 
+// ─── Platform LLM registry (Session 3, migration 014) ────────────────────────
+
+export interface PlatformLLM {
+  id: string;
+  name: string;
+  provider: string;
+  modelString: string;
+  baseUrl: string;
+  apiKeyEnv: string;
+  isDefault: boolean;
+  description: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 // ─── Deployments (ADR-033 / ADR-034) ─────────────────────────────────────────
 
 export type DeploymentEventType =
@@ -381,6 +396,43 @@ export class GestaltApiClient {
     return this.post(`/projects/${projectId}/init-harness`, { projectDescription });
   }
 
+  // ─── Platform LLM registry (Session 3) ────────────────────────────────────
+
+  async listPlatformLlms(): Promise<{ data: PlatformLLM[] }> {
+    return this.get('/platform/llms');
+  }
+
+  async createPlatformLlm(body: {
+    name: string;
+    provider: string;
+    modelString: string;
+    baseUrl: string;
+    apiKeyEnv: string;
+    isDefault?: boolean;
+    description?: string | null;
+  }): Promise<{ data: PlatformLLM }> {
+    return this.post('/platform/llms', body);
+  }
+
+  async updatePlatformLlm(
+    id: string,
+    body: Partial<{
+      name: string; provider: string; modelString: string;
+      baseUrl: string; apiKeyEnv: string; isDefault: boolean;
+      description: string | null;
+    }>,
+  ): Promise<{ data: PlatformLLM }> {
+    return this.patch(`/platform/llms/${id}`, body);
+  }
+
+  async deletePlatformLlm(id: string): Promise<void> {
+    await this.delete(`/platform/llms/${id}`);
+  }
+
+  async testPlatformLlm(id: string): Promise<{ data: { ok: boolean; latencyMs: number; error?: string } }> {
+    return this.post(`/platform/llms/${id}/test`, {});
+  }
+
   // ─── Project config (config-as-code, Approach A) ──────────────────────────
 
   async getProjectConfig(projectId: string): Promise<{ data: {
@@ -411,11 +463,21 @@ export class GestaltApiClient {
     return this.patch(`/projects/${projectId}/config/custom-agents`, { customAgents });
   }
 
+  /**
+   * Tools-only patch — REMOVED in Session 3 as a separate endpoint.
+   * Tool assignment is now part of agent config. This helper rewraps
+   * the legacy shape into the new agents endpoint so the deprecated
+   * `gestalt project config set-tools` keeps working.
+   */
   async patchToolsConfig(
     projectId: string,
     tools: Record<string, { builtin?: string[]; mcp?: Array<{ name: string; url: string; tokenFrom: string }> }>,
   ): Promise<{ data: { agents: Record<string, EditableAgentConfig>; custom_agents?: ProjectConfigCustomAgent[] } }> {
-    return this.patch(`/projects/${projectId}/config/tools`, { tools });
+    const agentsPatch: Record<string, Partial<EditableAgentConfig>> = {};
+    for (const [role, cfg] of Object.entries(tools)) {
+      agentsPatch[role] = { tools: cfg };
+    }
+    return this.patch(`/projects/${projectId}/config/agents`, { agents: agentsPatch });
   }
 
   async updateProjectConfig(

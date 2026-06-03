@@ -22,6 +22,11 @@
  *   gestalt project config set-tools <role>
  *   gestalt project config set-pipeline                      — replaces set-adapter
  *   gestalt project members list / add / remove / role
+ *   gestalt platform llms list                              — registered LLMs
+ *   gestalt platform llms add                               — interactive add
+ *   gestalt platform llms set-default <name>
+ *   gestalt platform llms remove <name>
+ *   gestalt platform llms test <name>                       — reachability check
  *   gestalt run "<intent>" [--server <url>] [--priority critical|high|normal|low]
  *   gestalt intent list [--project <name>] [--status <s>] [--limit 20]
  *   gestalt intent show <id> [--watch]                — execution-flow graph
@@ -84,6 +89,11 @@ import {
   projectMembersListCommand, projectMembersAddCommand,
   projectMembersRemoveCommand, projectMembersRoleCommand,
 } from './commands/project-config';
+import {
+  platformLlmsListCommand, platformLlmsAddCommand,
+  platformLlmsSetDefaultCommand, platformLlmsRemoveCommand,
+  platformLlmsTestCommand,
+} from './commands/platform-config';
 import {
   usersListCommand, usersAddCommand, usersRoleCommand, usersDeactivateCommand,
   usersAssignCommand, usersUnassignCommand, usersMembersCommand,
@@ -225,27 +235,35 @@ projectConfig
 
 projectConfig
   .command('set-agent <agentRole>')
-  .description('Patch one framework agent in agents.yaml (commits to the project repo)')
+  .description('Patch one framework agent in agents.yaml (persona, LLM tuning, prompt extensions, tools). Commits to the project repo.')
   .option('--server <url>', 'Server URL (one-shot override for this invocation)')
   .option('--project <name>', 'Project name (defaults to current project)')
-  .option('--model <model>', "LLM model override (use '~' or omit to clear)")
+  .option('--model <model>', "LLM model override (accepts a registered platform LLM name or a raw model string; use '~' or omit to clear)")
   .option('--temperature <float>', 'LLM temperature (0..2)')
   .option('--max-tokens <int>', 'LLM max tokens (positive integer)')
   .option('--role <text>', 'Persona role line')
   .option('--goal <text>', 'Persona goal line')
   .option('--add-extension <text>', 'Append a prompt extension')
   .option('--remove-extension <index>', 'Remove the prompt extension at the given 0-based index')
+  .option('--builtin <list>', 'Comma-separated list of built-in tools (readFile,listDirectory,searchFiles,getFileTree). Replaces the current set.')
+  .option('--add-mcp <name>', 'Add an MCP server. Pair with --mcp-url and --token-from.')
+  .option('--mcp-url <url>', 'URL for the MCP server being added')
+  .option('--token-from <source>', 'project_credential | harness | env:VAR_NAME', 'project_credential')
+  .option('--remove-mcp <name>', 'Remove an MCP server by name from this agent')
   .action(async (agentRole: string, opts: {
     server?: string; project?: string;
     model?: string; temperature?: string; maxTokens?: string;
     role?: string; goal?: string;
     addExtension?: string; removeExtension?: string;
+    builtin?: string; addMcp?: string; mcpUrl?: string; tokenFrom?: string; removeMcp?: string;
   }) => {
     await projectConfigSetAgentCommand(agentRole, {
       server: opts.server, project: opts.project,
       model: opts.model, temperature: opts.temperature, maxTokens: opts.maxTokens,
       role: opts.role, goal: opts.goal,
       addExtension: opts.addExtension, removeExtension: opts.removeExtension,
+      builtin: opts.builtin, addMcp: opts.addMcp, mcpUrl: opts.mcpUrl,
+      tokenFrom: opts.tokenFrom, removeMcp: opts.removeMcp,
     }).catch(fatalError);
   });
 
@@ -269,7 +287,7 @@ projectConfig
 
 projectConfig
   .command('set-tools <agentRole>')
-  .description('Set built-in tool + MCP server assignments for one framework agent (commits to the project repo)')
+  .description('DEPRECATED — alias for `set-agent` (Session 3). Tool assignment is now part of agent config; this command still works but consider using `gestalt project config set-agent` directly.')
   .option('--server <url>', 'Server URL (one-shot override for this invocation)')
   .option('--project <name>', 'Project name (defaults to current project)')
   .option('--builtin <list>', 'Comma-separated list of built-in tools (readFile,listDirectory,searchFiles,getFileTree)')
@@ -550,6 +568,56 @@ users
   .option('--server <url>', 'Server URL (one-shot override for this invocation)')
   .action(async (projectName: string, opts: { server?: string }) => {
     await usersMembersCommand(projectName, { server: opts.server }).catch(fatalError);
+  });
+
+// gestalt platform — platform-admin only (LLM registry today; future
+// home for other platform-level config).
+const platform = program
+  .command('platform')
+  .description('Platform-admin commands — LLM registry, future platform-wide settings');
+
+const platformLlms = platform
+  .command('llms')
+  .description('Manage the platform LLM registry (migration 014). The actual API key VALUE lives only in the server\'s env vars — never persisted.');
+
+platformLlms
+  .command('list')
+  .description('Table of registered LLMs (name, provider, model, base URL, env var)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (opts: { server?: string }) => {
+    await platformLlmsListCommand({ server: opts.server }).catch(fatalError);
+  });
+
+platformLlms
+  .command('add')
+  .description('Interactively register a new platform LLM. Prompts for name, provider, model string, base URL, env var name, description, default toggle.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (opts: { server?: string }) => {
+    await platformLlmsAddCommand({ server: opts.server }).catch(fatalError);
+  });
+
+platformLlms
+  .command('set-default <name>')
+  .description('Promote a named LLM to the platform default (atomically clears the existing default)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (name: string, opts: { server?: string }) => {
+    await platformLlmsSetDefaultCommand(name, { server: opts.server }).catch(fatalError);
+  });
+
+platformLlms
+  .command('remove <name>')
+  .description('Remove a registered LLM. Refuses if it\'s the last LLM or the current default.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (name: string, opts: { server?: string }) => {
+    await platformLlmsRemoveCommand(name, { server: opts.server }).catch(fatalError);
+  });
+
+platformLlms
+  .command('test <name>')
+  .description('Send a one-token `hello` completion to verify the LLM is reachable. Reports latency.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (name: string, opts: { server?: string }) => {
+    await platformLlmsTestCommand(name, { server: opts.server }).catch(fatalError);
   });
 
 // gestalt run

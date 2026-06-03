@@ -1,7 +1,13 @@
 /**
  * ProjectSettings — six-tab admin surface for per-project configuration.
  *
- *   /app/projects/:id/settings/(members|agents|custom-agents|tools|pipeline|llms)
+ *   /app/projects/:id/settings/(members|agents|custom-agents|pipeline|llms)
+ *
+ * Session 3: the standalone Tools tab is gone — tool assignment is
+ * now part of the Agents tab (one Save call commits everything for
+ * an agent). The model field in the Agents tab is a dropdown sourced
+ * from the platform LLM registry (`/platform/llms`) plus a "Custom
+ * model string..." escape hatch.
  *
  * Every config write goes through the new `/projects/:id/config/*`
  * endpoints which clone the project repo, edit the relevant file,
@@ -26,7 +32,7 @@ import { useProject } from '../context/ProjectContext';
 import { PageHeader, Card, EmptyState, LoadingSpinner } from '../components/shared/PageHeader';
 import type {
   ProjectConfigResponse, EditableAgentConfig, ProjectConfigCustomAgent,
-  ProjectMember, UserSummary, ProjectRole,
+  ProjectMember, UserSummary, ProjectRole, PlatformLLM,
 } from '../types';
 import { ApiError } from '../api/client';
 
@@ -37,7 +43,6 @@ const TABS = [
   { id: 'members',       label: 'Members' },
   { id: 'agents',        label: 'Agents' },
   { id: 'custom-agents', label: 'Custom agents' },
-  { id: 'tools',         label: 'Tools' },
   { id: 'pipeline',      label: 'Pipeline' },
   { id: 'llms',          label: 'LLMs' },
 ] as const;
@@ -143,7 +148,6 @@ export function ProjectSettings() {
             {tab === 'members'       && <MembersTab projectId={projectId} />}
             {tab === 'agents'        && <AgentsTab projectId={projectId} config={config} onSaved={loadConfig} />}
             {tab === 'custom-agents' && <CustomAgentsTab projectId={projectId} config={config} onSaved={loadConfig} />}
-            {tab === 'tools'         && <ToolsTab projectId={projectId} config={config} onSaved={loadConfig} />}
             {tab === 'pipeline'      && <PipelineTab projectId={projectId} config={config} onSaved={loadConfig} />}
             {tab === 'llms'          && <LlmsTab config={config} onJumpToAgents={() => setTab('agents')} />}
           </>
@@ -341,8 +345,24 @@ function AgentsTab(props: AgentsTabProps) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  // Platform LLM registry — populates the model dropdown for every
+  // agent. Fetched once on mount; the dashboard refreshes when the
+  // operator returns to the tab. `null` while loading so we can show
+  // a placeholder option.
+  const [llms, setLlms] = useState<PlatformLLM[] | null>(null);
+  // Per-agent toggle: when true, the operator typed a model string
+  // that isn't in the registry (the "Custom model string..." escape
+  // hatch in the dropdown).
+  const [customModelOpen, setCustomModelOpen] = useState<Record<string, boolean>>({});
 
   useEffect(() => { setDraft(deepCloneAgents(props.config.agents.agents ?? {})); }, [props.config]);
+  useEffect(() => {
+    let cancelled = false;
+    api.listPlatformLlms()
+      .then((r) => { if (!cancelled) setLlms(r.data); })
+      .catch(() => { if (!cancelled) setLlms([]); });
+    return () => { cancelled = true; };
+  }, [api]);
 
   function updateAgent(role: string, partial: Partial<EditableAgentConfig>) {
     setDraft((prev) => ({ ...prev, [role]: { ...prev[role], ...partial } as EditableAgentConfig }));
@@ -371,10 +391,47 @@ function AgentsTab(props: AgentsTabProps) {
     });
   }
 
+  // ── Tools handlers (Session 3 — merged from the ex-Tools tab) ──
+  function toggleBuiltin(role: string, tool: BuiltinTool) {
+    setDraft((prev) => {
+      const cur = prev[role];
+      const existing = cur.tools?.builtin ?? [];
+      const next = existing.includes(tool)
+        ? existing.filter((t) => t !== tool)
+        : [...existing, tool];
+      return {
+        ...prev,
+        [role]: { ...cur, tools: { ...(cur.tools ?? {}), builtin: next } },
+      };
+    });
+  }
+  function addMcp(role: string) {
+    const name = window.prompt('MCP server name (e.g. github):');
+    if (!name) return;
+    const url = window.prompt('MCP server URL:');
+    if (!url) return;
+    const tokenFrom = window.prompt('Token source (project_credential | harness | env:VAR_NAME):', 'project_credential');
+    if (!tokenFrom) return;
+    setDraft((prev) => {
+      const cur = prev[role];
+      const mcp = [...(cur.tools?.mcp ?? []), { name, url, tokenFrom }];
+      return { ...prev, [role]: { ...cur, tools: { ...(cur.tools ?? {}), mcp } } };
+    });
+  }
+  function removeMcp(role: string, name: string) {
+    setDraft((prev) => {
+      const cur = prev[role];
+      const mcp = (cur.tools?.mcp ?? []).filter((m) => m.name !== name);
+      return { ...prev, [role]: { ...cur, tools: { ...(cur.tools ?? {}), mcp } } };
+    });
+  }
+
   async function handleSave() {
     setSaving(true); setError(null); setSuccess(null);
     try {
       // Only send agents whose JSON differs from the current config.
+      // The diff includes tools — one Save covers everything for an
+      // agent (the Tools tab is gone; tool assignment is agent config).
       const patch: Record<string, Partial<EditableAgentConfig>> = {};
       const current = props.config.agents.agents ?? {};
       for (const [role, cfg] of Object.entries(draft)) {
@@ -384,6 +441,7 @@ function AgentsTab(props: AgentsTabProps) {
             goal: cfg.goal,
             llm: cfg.llm,
             promptExtensions: cfg.promptExtensions ?? cfg.prompt_extensions ?? [],
+            ...(cfg.tools ? { tools: cfg.tools } : {}),
           };
         }
       }
@@ -430,10 +488,15 @@ function AgentsTab(props: AgentsTabProps) {
                   onChange={(e) => updateAgent(role, { goal: e.target.value })} />
               </FieldRow>
               <FieldRow label="Model">
-                <input style={styles.input}
-                  placeholder="~ (platform default)"
-                  value={cfg.llm.model ?? ''}
-                  onChange={(e) => updateAgent(role, { llm: { ...cfg.llm, model: e.target.value || undefined } })} />
+                <ModelDropdown
+                  llms={llms}
+                  value={cfg.llm.model ?? null}
+                  customOpen={!!customModelOpen[role]}
+                  onChange={(value, asCustom) => {
+                    updateAgent(role, { llm: { ...cfg.llm, model: value ?? undefined } });
+                    setCustomModelOpen((prev) => ({ ...prev, [role]: asCustom }));
+                  }}
+                />
               </FieldRow>
               <div style={{ display: 'flex', gap: '12px' }}>
                 <FieldRow label="Temperature">
@@ -461,6 +524,43 @@ function AgentsTab(props: AgentsTabProps) {
                   ))}
                 </ul>
                 <button style={styles.linkBtn} onClick={() => addExtension(role)}>+ Add extension</button>
+              </div>
+
+              {/* Tools section — moved here from the ex-Tools tab
+                  (Session 3). Tool assignment IS agent config; one
+                  Save commits everything for an agent. */}
+              <div style={{ marginTop: '14px', paddingTop: '10px', borderTop: '1px dashed var(--border)' }}>
+                <label style={styles.label}>Tools</label>
+                <div style={{ marginTop: '6px' }}>
+                  <span style={{ fontSize: '11px', color: 'var(--text-dim)', marginRight: '8px' }}>Built-in:</span>
+                  {BUILTIN_TOOLS.map((tool) => (
+                    <label key={tool} style={{ ...styles.checkboxLabel, display: 'inline-flex', marginRight: '12px' }}>
+                      <input type="checkbox"
+                        checked={(cfg.tools?.builtin ?? []).includes(tool)}
+                        onChange={() => toggleBuiltin(role, tool)} />
+                      {tool}
+                    </label>
+                  ))}
+                </div>
+                <div style={{ marginTop: '8px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span style={{ fontSize: '11px', color: 'var(--text-dim)' }}>MCP servers:</span>
+                    <button style={styles.linkBtn} onClick={() => addMcp(role)}>+ Add MCP server</button>
+                  </div>
+                  <ul style={{ listStyle: 'none', padding: 0, margin: '4px 0' }}>
+                    {(cfg.tools?.mcp ?? []).map((m) => (
+                      <li key={m.name} style={{ display: 'flex', gap: '6px', alignItems: 'center', padding: '3px 0', fontSize: '12px' }}>
+                        <span style={{ fontFamily: 'var(--font-mono)' }}>{m.name}</span>
+                        <span style={{ color: 'var(--text-dim)' }}>{m.url}</span>
+                        <span style={{ color: 'var(--text-dim)', fontSize: '11px' }}>({m.tokenFrom ?? m.token_from})</span>
+                        <button style={styles.iconBtn} onClick={() => removeMcp(role, m.name)}>×</button>
+                      </li>
+                    ))}
+                    {(cfg.tools?.mcp ?? []).length === 0 && (
+                      <li style={{ color: 'var(--text-dim)', fontSize: '11px' }}>(no MCP servers)</li>
+                    )}
+                  </ul>
+                </div>
               </div>
             </div>
           ))}
@@ -668,127 +768,6 @@ function CustomAgentModal(props: {
   );
 }
 
-// ─── Tools tab ───────────────────────────────────────────────────────────────
-
-function ToolsTab(props: AgentsTabProps) {
-  const api = useDashboardApi();
-  const editable = Object.keys(props.config.agents.agents ?? {});
-  const [draft, setDraft] = useState<Record<string, { builtin?: string[]; mcp?: Array<{ name: string; url: string; tokenFrom: string }> }>>(() => {
-    const out: Record<string, { builtin?: string[]; mcp?: Array<{ name: string; url: string; tokenFrom: string }> }> = {};
-    for (const [role, cfg] of Object.entries(props.config.agents.agents ?? {})) {
-      out[role] = {
-        builtin: [...(cfg.tools?.builtin ?? [])],
-        mcp: (cfg.tools?.mcp ?? []).map((m) => ({
-          name: m.name,
-          url: m.url,
-          tokenFrom: m.tokenFrom ?? m.token_from ?? 'project_credential',
-        })),
-      };
-    }
-    return out;
-  });
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState<string | null>(null);
-
-  function toggleBuiltin(role: string, tool: BuiltinTool) {
-    setDraft((prev) => {
-      const cur = prev[role] ?? { builtin: [] };
-      const has = (cur.builtin ?? []).includes(tool);
-      const next = has
-        ? (cur.builtin ?? []).filter((t) => t !== tool)
-        : [...(cur.builtin ?? []), tool];
-      return { ...prev, [role]: { ...cur, builtin: next } };
-    });
-  }
-  function addMcp(role: string) {
-    const name = window.prompt('MCP server name (e.g. github):');
-    if (!name) return;
-    const url = window.prompt('MCP server URL:');
-    if (!url) return;
-    const tokenFrom = window.prompt('Token source (project_credential | harness | env:VAR_NAME):', 'project_credential');
-    if (!tokenFrom) return;
-    setDraft((prev) => {
-      const cur = prev[role] ?? {};
-      const next = [...(cur.mcp ?? []), { name, url, tokenFrom }];
-      return { ...prev, [role]: { ...cur, mcp: next } };
-    });
-  }
-  function removeMcp(role: string, name: string) {
-    setDraft((prev) => {
-      const cur = prev[role] ?? {};
-      return { ...prev, [role]: { ...cur, mcp: (cur.mcp ?? []).filter((m) => m.name !== name) } };
-    });
-  }
-
-  async function handleSave() {
-    setSaving(true); setError(null); setSuccess(null);
-    try {
-      await api.patchToolsConfig(props.projectId, draft);
-      setSuccess('Tool assignments saved — committed to repo');
-      props.onSaved();
-    } catch (err) {
-      setError(err instanceof ApiError ? extractErrorMessage(err) : String(err));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <Card>
-      <div style={styles.cardBody}>
-        <div style={styles.cardHeader}>
-          <h3 style={styles.cardTitle}>Tool assignments</h3>
-          <button style={styles.primaryBtn} onClick={() => void handleSave()} disabled={saving}>
-            {saving ? 'Saving...' : 'Save changes'}
-          </button>
-        </div>
-        {success && <div style={styles.successBanner}>{success}</div>}
-        {error && <div style={styles.errorBanner}>{error}</div>}
-        {editable.length === 0 && (
-          <p style={{ color: 'var(--text-dim)' }}>No agents to configure.</p>
-        )}
-        {editable.map((role) => (
-          <div key={role} style={styles.agentBlock}>
-            <h4 style={styles.agentTitle}>{role}</h4>
-            <div>
-              <label style={styles.label}>Built-in tools</label>
-              <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', marginTop: '4px' }}>
-                {BUILTIN_TOOLS.map((tool) => (
-                  <label key={tool} style={styles.checkboxLabel}>
-                    <input type="checkbox"
-                      checked={(draft[role]?.builtin ?? []).includes(tool)}
-                      onChange={() => toggleBuiltin(role, tool)} />
-                    {tool}
-                  </label>
-                ))}
-              </div>
-            </div>
-            <div style={{ marginTop: '10px' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <label style={styles.label}>MCP servers</label>
-                <button style={styles.linkBtn} onClick={() => addMcp(role)}>+ Add MCP server</button>
-              </div>
-              <ul style={{ listStyle: 'none', padding: 0, margin: '4px 0' }}>
-                {(draft[role]?.mcp ?? []).map((m) => (
-                  <li key={m.name} style={{ display: 'flex', gap: '8px', alignItems: 'center', padding: '4px 0' }}>
-                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: '12px' }}>{m.name}</span>
-                    <span style={{ color: 'var(--text-dim)', fontSize: '12px' }}>{m.url}</span>
-                    <span style={{ color: 'var(--text-dim)', fontSize: '11px' }}>({m.tokenFrom})</span>
-                    <button style={styles.iconBtn} onClick={() => removeMcp(role, m.name)}>×</button>
-                  </li>
-                ))}
-                {(draft[role]?.mcp ?? []).length === 0 && (
-                  <li style={{ color: 'var(--text-dim)', fontSize: '12px' }}>(no MCP servers)</li>
-                )}
-              </ul>
-            </div>
-          </div>
-        ))}
-      </div>
-    </Card>
-  );
-}
 
 // ─── Pipeline tab ────────────────────────────────────────────────────────────
 
@@ -900,6 +879,72 @@ function LlmsTab(props: { config: ProjectConfigResponse; onJumpToAgents: () => v
 }
 
 // ─── Helpers + styles ────────────────────────────────────────────────────────
+
+/**
+ * Model selector — `<select>` sourced from the platform LLM registry
+ * (Session 3). When the operator picks "Custom model string..." the
+ * dropdown collapses and a free-text input appears so they can
+ * supply an unregistered model name. Selecting "~ Platform default"
+ * clears the override (the agent will use whatever LLM is registered
+ * as default at run time).
+ */
+function ModelDropdown(props: {
+  llms: PlatformLLM[] | null;
+  value: string | null;
+  customOpen: boolean;
+  onChange: (value: string | null, asCustom: boolean) => void;
+}) {
+  const { llms, value, customOpen, onChange } = props;
+  if (llms === null) {
+    return <input style={styles.input} value={value ?? ''} placeholder="Loading LLMs..." readOnly />;
+  }
+  const knownModel = llms.find((l) => l.modelString === value);
+  const defaultLabel = (() => {
+    const d = llms.find((l) => l.isDefault);
+    return d ? `~ Platform default (${d.modelString})` : '~ Platform default';
+  })();
+
+  if (customOpen || (value && !knownModel)) {
+    // Custom-string mode: free-text input with a "Back to dropdown"
+    // affordance.
+    return (
+      <div style={{ display: 'flex', gap: '6px' }}>
+        <input
+          style={{ ...styles.input, flex: 1 }}
+          value={value ?? ''}
+          placeholder="Custom model string (e.g. claude-3-5-sonnet-20241022)"
+          onChange={(e) => onChange(e.target.value || null, true)}
+        />
+        <button
+          style={styles.linkBtn}
+          onClick={() => onChange(null, false)}
+        >Back to list</button>
+      </div>
+    );
+  }
+
+  const selectValue = value ?? '__default__';
+  return (
+    <select
+      style={styles.input}
+      value={selectValue}
+      onChange={(e) => {
+        const v = e.target.value;
+        if (v === '__default__') return onChange(null, false);
+        if (v === '__custom__') return onChange('', true);
+        onChange(v, false);
+      }}
+    >
+      <option value="__default__">{defaultLabel}</option>
+      {llms.map((l) => (
+        <option key={l.id} value={l.modelString}>
+          {l.name}{l.provider !== 'custom' ? ` (${l.provider})` : ''}
+        </option>
+      ))}
+      <option value="__custom__">Custom model string…</option>
+    </select>
+  );
+}
 
 function FieldRow(props: { label: string; children: React.ReactNode }) {
   return (

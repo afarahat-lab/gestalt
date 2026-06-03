@@ -74,7 +74,7 @@
  */
 
 import {
-  getLLMClient,
+  getLLMClientForModel,
 } from '../llm/index';
 import {
   FILE_TOOL_DEFINITIONS, executeFileTool,
@@ -186,7 +186,11 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
     correlationId: string,
     promptForLog: string,
   ): Promise<string> {
-    const client = getLLMClient(agentConfig.llm.model);
+    // Routes through the platform LLM registry (migration 014) so a
+    // per-agent `model` override picks up the registered baseUrl +
+    // apiKeyEnv. Falls back to the legacy `getLLMClient(model)` path
+    // when the registry has no matching row.
+    const client = await getLLMClientForModel(agentConfig.llm.model);
     this.lastModelUsed = client.getModel();
     this.lastPrompt = promptForLog;
     const result = await client.complete({
@@ -312,7 +316,8 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
       for (const c of mcpClients) mcpByPrefix.set(`${c.serverName}__`, c);
     }
 
-    const client = getLLMClient(agentConfig.llm.model);
+    // Registry-aware client resolution (Session 3).
+    const client = await getLLMClientForModel(agentConfig.llm.model);
     this.lastModelUsed = client.getModel();
     this.lastPrompt = promptForLog;
 

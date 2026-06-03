@@ -136,6 +136,14 @@ export interface SetAgentOptions extends BaseOptions {
   goal?: string;
   addExtension?: string;
   removeExtension?: string;
+  // Tools — merged into the agent's tools block. Session 3 absorbed
+  // the standalone set-tools surface into set-agent because tool
+  // assignment IS agent config.
+  builtin?: string;          // comma-separated list of built-in tools
+  addMcp?: string;            // MCP server name to add (pair with --mcp-url)
+  mcpUrl?: string;            // URL for the MCP server being added
+  tokenFrom?: string;         // tokenFrom source for the MCP entry
+  removeMcp?: string;         // MCP server name to remove
 }
 
 export async function projectConfigSetAgentCommand(
@@ -208,8 +216,73 @@ export async function projectConfigSetAgentCommand(
     patch.promptExtensions = next;
   }
 
+  // Tools — built-in toggles + MCP add/remove. The server expects the
+  // WHOLE tools block (any field omitted is "no change"), so we read
+  // the current tools, apply incremental changes, then send the
+  // result as a single patch.tools.
+  if (
+    options.builtin !== undefined
+    || options.addMcp !== undefined
+    || options.removeMcp !== undefined
+  ) {
+    const existingBuiltin = current?.tools?.builtin ?? [];
+    const existingMcp = (current?.tools?.mcp ?? []).map((m) => ({
+      name: m.name,
+      url: m.url,
+      tokenFrom: m.tokenFrom ?? m.token_from ?? 'project_credential',
+    }));
+    const nextTools: { builtin: string[]; mcp: Array<{ name: string; url: string; tokenFrom: string }> } = {
+      builtin: [...existingBuiltin],
+      mcp: [...existingMcp],
+    };
+
+    if (options.builtin !== undefined) {
+      const tools = options.builtin.split(',').map((s) => s.trim()).filter(Boolean);
+      for (const t of tools) {
+        if (!VALID_BUILTIN_TOOLS.has(t)) {
+          console.log(c.error(`Unknown built-in tool '${t}'. Valid: ${[...VALID_BUILTIN_TOOLS].join(', ')}`));
+          process.exit(1);
+        }
+      }
+      nextTools.builtin = tools;
+    }
+
+    if (options.addMcp) {
+      if (!options.mcpUrl) {
+        console.log(c.error('--add-mcp <name> requires --mcp-url <url>'));
+        process.exit(1);
+      }
+      const tokenFrom = options.tokenFrom ?? 'project_credential';
+      if (
+        tokenFrom !== 'project_credential'
+        && tokenFrom !== 'harness'
+        && !tokenFrom.startsWith('env:')
+      ) {
+        console.log(c.error(`--token-from must be 'project_credential' | 'harness' | 'env:VAR_NAME'`));
+        process.exit(1);
+      }
+      if (nextTools.mcp.some((m) => m.name === options.addMcp)) {
+        console.log(c.error(`MCP server '${options.addMcp}' already configured for this agent`));
+        process.exit(1);
+      }
+      nextTools.mcp.push({ name: options.addMcp, url: options.mcpUrl, tokenFrom });
+    }
+    if (options.removeMcp) {
+      if (!nextTools.mcp.some((m) => m.name === options.removeMcp)) {
+        console.log(c.error(`No MCP server named '${options.removeMcp}' on this agent`));
+        process.exit(1);
+      }
+      nextTools.mcp = nextTools.mcp.filter((m) => m.name !== options.removeMcp);
+    }
+
+    patch.tools = nextTools;
+  }
+
   if (Object.keys(patch).length === 0) {
-    console.log(c.error('No changes supplied. Use --model / --temperature / --max-tokens / --role / --goal / --add-extension / --remove-extension'));
+    console.log(c.error(
+      'No changes supplied. Use --model / --temperature / --max-tokens / --role / --goal / ' +
+      '--add-extension / --remove-extension / --builtin / --add-mcp / --remove-mcp',
+    ));
     process.exit(1);
   }
 
@@ -316,7 +389,7 @@ export async function projectConfigRemoveCustomAgentCommand(
   }
 }
 
-// ─── config set-tools ────────────────────────────────────────────────────────
+// ─── config set-tools (deprecated — alias for set-agent) ────────────────────
 
 export interface SetToolsOptions extends BaseOptions {
   builtin?: string;
@@ -326,95 +399,26 @@ export interface SetToolsOptions extends BaseOptions {
   removeMcp?: string;
 }
 
+/**
+ * Session 3 — `gestalt project config set-tools` is now a thin alias
+ * over `set-agent`. Tool assignment IS agent config; the dashboard's
+ * standalone Tools tab merged into the Agents tab and the server's
+ * `/config/tools` endpoint was removed. The interface is preserved
+ * so existing scripts keep working.
+ */
 export async function projectConfigSetToolsCommand(
   agentRole: string,
   options: SetToolsOptions = {},
 ): Promise<void> {
-  if (!VALID_AGENT_ROLES.has(agentRole)) {
-    console.log(c.error(`Unknown agent '${agentRole}'. Valid: ${[...VALID_AGENT_ROLES].join(', ')}`));
-    process.exit(1);
-  }
-  const ctx = await openClient(options);
-  if (!ctx) return;
-  const { client, projectId, serverUrl } = ctx;
-
-  // Read current to merge MCP add/remove additively.
-  let current: EditableAgentConfig | undefined;
-  try {
-    const res = await client.getProjectConfig(projectId);
-    current = res.data.agents.agents?.[agentRole];
-  } catch (err) {
-    handleErr(err, serverUrl, 'Failed to read current tool config');
-    return;
-  }
-
-  const patch: { builtin?: string[]; mcp?: Array<{ name: string; url: string; tokenFrom: string }> } = {};
-
-  if (options.builtin !== undefined) {
-    const tools = options.builtin
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
-    for (const t of tools) {
-      if (!VALID_BUILTIN_TOOLS.has(t)) {
-        console.log(c.error(`Unknown built-in tool '${t}'. Valid: ${[...VALID_BUILTIN_TOOLS].join(', ')}`));
-        process.exit(1);
-      }
-    }
-    patch.builtin = tools;
-  }
-
-  const existingMcp = (current?.tools?.mcp ?? []).map((m) => ({
-    name: m.name,
-    url: m.url,
-    tokenFrom: m.tokenFrom ?? m.token_from ?? 'project_credential',
-  }));
-
-  if (options.addMcp) {
-    if (!options.mcpUrl) {
-      console.log(c.error('--add-mcp <name> requires --mcp-url <url>'));
-      process.exit(1);
-    }
-    const tokenFrom = options.tokenFrom ?? 'project_credential';
-    if (
-      tokenFrom !== 'project_credential'
-      && tokenFrom !== 'harness'
-      && !tokenFrom.startsWith('env:')
-    ) {
-      console.log(c.error(`--token-from must be 'project_credential' | 'harness' | 'env:VAR_NAME'`));
-      process.exit(1);
-    }
-    if (existingMcp.some((m) => m.name === options.addMcp)) {
-      console.log(c.error(`MCP server '${options.addMcp}' already configured for this agent`));
-      process.exit(1);
-    }
-    patch.mcp = [...existingMcp, { name: options.addMcp, url: options.mcpUrl, tokenFrom }];
-  }
-  if (options.removeMcp) {
-    if (!existingMcp.some((m) => m.name === options.removeMcp)) {
-      console.log(c.error(`No MCP server named '${options.removeMcp}' on this agent`));
-      process.exit(1);
-    }
-    patch.mcp = existingMcp.filter((m) => m.name !== options.removeMcp);
-  }
-  if (!patch.mcp && !options.addMcp && !options.removeMcp && existingMcp.length > 0 && options.builtin !== undefined) {
-    // Preserve existing MCP entries when only --builtin changes.
-    patch.mcp = existingMcp;
-  }
-
-  if (Object.keys(patch).length === 0) {
-    console.log(c.error('No tool changes supplied. Use --builtin <a,b,c> / --add-mcp <name> --mcp-url <url> / --remove-mcp <name>'));
-    process.exit(1);
-  }
-
-  try {
-    await client.patchToolsConfig(projectId, { [agentRole]: patch });
-    blank();
-    console.log(c.success(`✓ ${agentRole} tools updated and committed`));
-    blank();
-  } catch (err) {
-    handleErr(err, serverUrl, `Failed to update tools for ${agentRole}`);
-  }
+  await projectConfigSetAgentCommand(agentRole, {
+    server: options.server,
+    project: options.project,
+    builtin: options.builtin,
+    addMcp: options.addMcp,
+    mcpUrl: options.mcpUrl,
+    tokenFrom: options.tokenFrom,
+    removeMcp: options.removeMcp,
+  });
 }
 
 // ─── config set-pipeline ─────────────────────────────────────────────────────

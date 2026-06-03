@@ -293,60 +293,18 @@ export async function registerProjectConfigRoutes(app: FastifyInstance): Promise
     },
   );
 
-  // PATCH /projects/:id/config/tools — update the `tools` block per
-  // agent. Partial — only the supplied agents are touched.
-  app.patch<{
-    Params: { id: string };
-    Body: { tools?: Record<string, unknown> };
-  }>(
-    '/projects/:id/config/tools',
-    async (request, reply) => {
-      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
-      if (!await checkProjectMembership(reply, request.user.id, request.user.role, request.params.id, 'project-admin')) return;
-
-      const body = request.body ?? {};
-      const validation = validateToolsPatch(body.tools ?? {});
-      if (!validation.ok) {
-        return reply.code(400).send({ error: validation.error, code: validation.code });
-      }
-
-      const { projects, audit } = getRepositories();
-      const project = await projects.findById(request.params.id);
-      if (!project) return reply.code(404).send({ error: 'Project not found' });
-      const token = await projects.getCredential(project.id);
-      if (!token) {
-        return reply.code(400).send({ error: 'Project has no Git credential on file', code: 'NO_CREDENTIAL' });
-      }
-
-      try {
-        const result = await applyToolsPatch(project, token, validation.patch);
-        await audit.append({
-          actor: request.user.id,
-          action: 'project.config-updated',
-          entityType: 'projects',
-          entityId: project.id,
-          correlationId: request.correlationId,
-          metadata: {
-            section: 'tools',
-            agentRoles: Object.keys(validation.patch),
-            commitSha: result.commitSha,
-            ip: request.ip,
-          },
-        });
-        log.info(
-          { projectId: project.id, roles: Object.keys(validation.patch), commitSha: result.commitSha },
-          'Tools config updated',
-        );
-        return reply.send({ data: { agents: filterEditableAgents(result.agents.agents ?? {}), custom_agents: result.agents.custom_agents } });
-      } catch (err) {
-        log.error({ err, projectId: project.id }, 'Tools config update failed');
-        return reply.code(500).send({
-          error: 'Failed to update tools config',
-          details: err instanceof Error ? err.message : String(err),
-        });
-      }
-    },
-  );
+  // PATCH /projects/:id/config/tools — REMOVED (Session 3).
+  //
+  // Tool assignment is now part of agent config — the dashboard's
+  // Tools tab merged into the Agents tab so a single Save call (one
+  // commit) covers per-agent role/goal/llm/promptExtensions/tools.
+  // Clients sending tool changes should now use:
+  //
+  //   PATCH /projects/:id/config/agents
+  //     { agents: { '<role>': { tools: { builtin, mcp } } } }
+  //
+  // The legacy CLI `gestalt project config set-tools` is kept as a
+  // thin alias that internally targets the agents endpoint.
 }
 
 // ─── Read helpers (shallow clone) ────────────────────────────────────────────
@@ -545,6 +503,18 @@ function validateAgentsPatch(
       patch.promptExtensions = r['promptExtensions'];
     }
 
+    // Tools field — merged into the agent's `tools:` block in
+    // agents.yaml. Validation mirrors the standalone `/tools` route
+    // (which is now removed — tool assignment IS agent config).
+    if (r['tools'] !== undefined) {
+      if (!r['tools'] || typeof r['tools'] !== 'object') {
+        return { ok: false, code: 'INVALID_TOOLS', error: `'tools' must be an object for ${role}` };
+      }
+      const toolsValidation = validateToolFields(r['tools'] as Record<string, unknown>, role);
+      if (!toolsValidation.ok) return toolsValidation;
+      patch.tools = toolsValidation.patch;
+    }
+
     if (Object.keys(patch).length > 0) out[role] = patch;
   }
   if (Object.keys(out).length === 0) {
@@ -612,74 +582,68 @@ function validateCustomAgentsPatch(raw: unknown): ValidationResult<CustomAgentDe
   return { ok: true, patch: out };
 }
 
-function validateToolsPatch(input: Record<string, unknown>): ValidationResult<Record<string, AgentToolConfig>> {
-  const out: Record<string, AgentToolConfig> = {};
-  for (const [role, raw] of Object.entries(input)) {
-    if (!EDITABLE_FRAMEWORK_AGENTS.has(role)) {
-      return { ok: false, code: 'UNKNOWN_AGENT_ROLE', error: `Cannot set tools for non-editable agent '${role}'` };
-    }
-    if (!raw || typeof raw !== 'object') continue;
-    const r = raw as Record<string, unknown>;
-    const cfg: AgentToolConfig = {};
+/**
+ * Per-role tool validation. Shared between the agents-patch route
+ * (where tools are merged into the same commit as the rest of the
+ * agent config) and the deprecated tools-only route (kept for
+ * legacy CLI/dashboard callers). The error codes / messages match
+ * what the standalone `/tools` route used to return.
+ */
+function validateToolFields(r: Record<string, unknown>, role: string): ValidationResult<AgentToolConfig> {
+  const cfg: AgentToolConfig = {};
 
-    if (r['builtin'] !== undefined) {
-      if (!Array.isArray(r['builtin'])) {
-        return { ok: false, code: 'INVALID_BUILTIN_TOOLS', error: `tools.builtin must be an array for ${role}` };
-      }
-      const builtin: BuiltInToolName[] = [];
-      for (const t of r['builtin']) {
-        if (typeof t !== 'string') {
-          return { ok: false, code: 'INVALID_BUILTIN_TOOLS', error: `tools.builtin entries must be strings for ${role}` };
-        }
-        if (!VALID_BUILTIN_TOOLS.has(t as BuiltInToolName)) {
-          return { ok: false, code: 'INVALID_BUILTIN_TOOLS', error: `Unknown built-in tool '${t}' for ${role}. Valid: ${[...VALID_BUILTIN_TOOLS].join(', ')}` };
-        }
-        builtin.push(t as BuiltInToolName);
-      }
-      cfg.builtin = builtin;
+  if (r['builtin'] !== undefined) {
+    if (!Array.isArray(r['builtin'])) {
+      return { ok: false, code: 'INVALID_BUILTIN_TOOLS', error: `tools.builtin must be an array for ${role}` };
     }
-
-    if (r['mcp'] !== undefined) {
-      if (!Array.isArray(r['mcp'])) {
-        return { ok: false, code: 'INVALID_MCP', error: `tools.mcp must be an array for ${role}` };
+    const builtin: BuiltInToolName[] = [];
+    for (const t of r['builtin']) {
+      if (typeof t !== 'string') {
+        return { ok: false, code: 'INVALID_BUILTIN_TOOLS', error: `tools.builtin entries must be strings for ${role}` };
       }
-      const mcp: McpServerConfig[] = [];
-      const seen = new Set<string>();
-      for (const item of r['mcp']) {
-        if (!item || typeof item !== 'object') {
-          return { ok: false, code: 'INVALID_MCP', error: `tools.mcp entries must be objects for ${role}` };
-        }
-        const m = item as Record<string, unknown>;
-        const name = typeof m['name'] === 'string' ? m['name'].trim() : '';
-        const url = typeof m['url'] === 'string' ? m['url'].trim() : '';
-        const tokenFromRaw =
-          typeof m['tokenFrom'] === 'string' ? m['tokenFrom']
-          : typeof m['token_from'] === 'string' ? m['token_from']
-          : '';
-        if (!name || !url || !tokenFromRaw) {
-          return { ok: false, code: 'INVALID_MCP', error: `MCP entry requires name, url, tokenFrom for ${role}` };
-        }
-        if (seen.has(name)) {
-          return { ok: false, code: 'INVALID_MCP', error: `Duplicate MCP server name '${name}' for ${role}` };
-        }
-        seen.add(name);
-        if (
-          !VALID_MCP_TOKEN_SOURCES.includes(tokenFromRaw as 'harness' | 'project_credential')
-          && !tokenFromRaw.startsWith('env:')
-        ) {
-          return { ok: false, code: 'INVALID_MCP', error: `Invalid tokenFrom '${tokenFromRaw}' for ${role}. Valid: harness | project_credential | env:VAR_NAME` };
-        }
-        mcp.push({ name, url, tokenFrom: tokenFromRaw as McpServerConfig['tokenFrom'] });
+      if (!VALID_BUILTIN_TOOLS.has(t as BuiltInToolName)) {
+        return { ok: false, code: 'INVALID_BUILTIN_TOOLS', error: `Unknown built-in tool '${t}' for ${role}. Valid: ${[...VALID_BUILTIN_TOOLS].join(', ')}` };
       }
-      cfg.mcp = mcp;
+      builtin.push(t as BuiltInToolName);
     }
-
-    out[role] = cfg;
+    cfg.builtin = builtin;
   }
-  if (Object.keys(out).length === 0) {
-    return { ok: false, code: 'EMPTY_PATCH', error: 'No tool updates supplied' };
+
+  if (r['mcp'] !== undefined) {
+    if (!Array.isArray(r['mcp'])) {
+      return { ok: false, code: 'INVALID_MCP', error: `tools.mcp must be an array for ${role}` };
+    }
+    const mcp: McpServerConfig[] = [];
+    const seen = new Set<string>();
+    for (const item of r['mcp']) {
+      if (!item || typeof item !== 'object') {
+        return { ok: false, code: 'INVALID_MCP', error: `tools.mcp entries must be objects for ${role}` };
+      }
+      const m = item as Record<string, unknown>;
+      const name = typeof m['name'] === 'string' ? m['name'].trim() : '';
+      const url = typeof m['url'] === 'string' ? m['url'].trim() : '';
+      const tokenFromRaw =
+        typeof m['tokenFrom'] === 'string' ? m['tokenFrom']
+        : typeof m['token_from'] === 'string' ? m['token_from']
+        : '';
+      if (!name || !url || !tokenFromRaw) {
+        return { ok: false, code: 'INVALID_MCP', error: `MCP entry requires name, url, tokenFrom for ${role}` };
+      }
+      if (seen.has(name)) {
+        return { ok: false, code: 'INVALID_MCP', error: `Duplicate MCP server name '${name}' for ${role}` };
+      }
+      seen.add(name);
+      if (
+        !VALID_MCP_TOKEN_SOURCES.includes(tokenFromRaw as 'harness' | 'project_credential')
+        && !tokenFromRaw.startsWith('env:')
+      ) {
+        return { ok: false, code: 'INVALID_MCP', error: `Invalid tokenFrom '${tokenFromRaw}' for ${role}. Valid: harness | project_credential | env:VAR_NAME` };
+      }
+      mcp.push({ name, url, tokenFrom: tokenFromRaw as McpServerConfig['tokenFrom'] });
+    }
+    cfg.mcp = mcp;
   }
-  return { ok: true, patch: out };
+  return { ok: true, patch: cfg };
 }
 
 // ─── Apply helpers — exported so projects.ts POST /:id/config can
@@ -751,12 +715,18 @@ async function applyAgentsPatch(
             llm: {},
             promptExtensions: [],
           } as AgentConfig;
+          // Tools merge: a fields.tools FULLY REPLACES the existing
+          // tools block (the dashboard sends the whole intended
+          // toolset; partial-merge would be ambiguous about removed
+          // entries). Omitting `tools` keeps the existing block
+          // unchanged.
+          const nextTools = fields.tools !== undefined ? fields.tools : existing.tools;
           agents[role] = {
             role: fields.role ?? existing.role,
             goal: fields.goal ?? existing.goal,
             llm: { ...existing.llm, ...(fields.llm ?? {}) },
             promptExtensions: fields.promptExtensions ?? existing.promptExtensions,
-            ...(existing.tools ? { tools: existing.tools } : {}),
+            ...(nextTools ? { tools: nextTools } : {}),
           };
         }
         return { ...current, agents };
@@ -801,38 +771,6 @@ async function applyCustomAgentsPatch(
         // to 400 INVALID_CUSTOM_AGENT_SCHEDULE.
         throw new Error(err instanceof Error ? err.message : String(err));
       }
-      const yamlPath = join(workDir, 'agents.yaml');
-      await writeFile(yamlPath, stringifyAgentsYaml(merged), 'utf8');
-      return { touchedFiles: ['agents.yaml'], payload: merged };
-    },
-  );
-  return { agents: result.payload ?? agentsOut, commitSha: result.commitSha };
-}
-
-async function applyToolsPatch(
-  project: ProjectRecord,
-  token: string,
-  patch: Record<string, AgentToolConfig>,
-): Promise<{ agents: AgentsYaml; commitSha: string | null }> {
-  let agentsOut: AgentsYaml = {};
-  const subject = 'chore: update tools [gestalt-admin]';
-  const result = await withWorkingClone<AgentsYaml>(
-    project, token, subject,
-    async (workDir) => {
-      const merged = await mergeAgentsYaml(workDir, (current) => {
-        const agents = { ...(current.agents ?? {}) };
-        for (const [role, cfg] of Object.entries(patch)) {
-          const existing = agents[role] ?? {
-            role: '',
-            goal: '',
-            llm: {},
-            promptExtensions: [],
-          } as AgentConfig;
-          agents[role] = { ...existing, tools: cfg };
-        }
-        return { ...current, agents };
-      });
-      agentsOut = merged;
       const yamlPath = join(workDir, 'agents.yaml');
       await writeFile(yamlPath, stringifyAgentsYaml(merged), 'utf8');
       return { touchedFiles: ['agents.yaml'], payload: merged };

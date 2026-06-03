@@ -19,7 +19,7 @@
  * (ADR-013) — custom agents contribute typed signals only.
  */
 
-import { getLLMClient, extractJsonObject } from '@gestalt/core';
+import { getLLMClientForModel, extractJsonObject } from '@gestalt/core';
 import type {
   ContextSnapshot, CustomAgentDefinition, CustomAgentFinding,
   CustomAgentResult, GeneratedArtifact, Principle,
@@ -51,7 +51,10 @@ export async function runCustomAgent(
 
   let modelUsed: string | null = null;
   try {
-    const client = getLLMClient(definition.llm.model);
+    // Registry-aware (Session 3) — picks up the per-LLM baseUrl +
+    // apiKeyEnv when the custom agent's `model` matches a registered
+    // platform LLM.
+    const client = await getLLMClientForModel(definition.llm.model);
     modelUsed = client.getModel();
     const result = await client.complete({
       messages: [{ role: 'user', content: prompt }],

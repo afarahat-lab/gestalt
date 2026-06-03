@@ -13,7 +13,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { simpleGit } from 'simple-git';
 import {
-  createWorker, dispatch, getRepositories, getLLMClient,
+  createWorker, dispatch, getRepositories,
   createContextLogger, emitLiveEvent, QUEUE_NAMES,
   McpClient, resolveMcpClients, createHarnessEngine,
   BaseOrchestrator,
@@ -575,7 +575,9 @@ async function drivePlan(
           };
 
           // Per-agent LLM routing happens inside BaseLLMAgent.callLLM
-          // via `getLLMClient(agentConfig.llm.model)`. The agent
+          // via `getLLMClientForModel(agentConfig.llm.model)`, which
+          // consults the platform LLM registry (migration 014) for
+          // per-LLM baseUrl + apiKeyEnv resolution. The agent
           // captures lastModelUsed on its instance after each call;
           // we read it back after `run()` returns to persist into
           // `agent_execution_logs.model_used`.

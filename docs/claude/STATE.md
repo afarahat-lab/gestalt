@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-03 (Claude Code — Project admin UI + CLI: `gestalt project` parent (config show / set-agent / add-custom-agent / set-tools / set-pipeline / members CRUD) + dashboard ProjectSettings six-tab view + `RequireProjectAdmin` guard. Tightened membership routes to project-admin minimum)
+**Last updated:** 2026-06-03 (Claude Code — Platform LLM registry (migration 014): `platform_llms` table + `GET/POST/PATCH/DELETE/test /platform/llms`; first-boot seed from .env; `getLLMClientForModel` consults the registry; `gestalt platform llms list/add/set-default/remove/test`; dashboard Admin gains "LLMs" tab. Tools tab dropped from Project Settings — tool assignment now per-agent inside the Agents tab; model field becomes a registry-sourced dropdown with a custom-string escape hatch)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -22,12 +22,12 @@ the historical record of how the state evolved._
   are summarised in the "Session log" entries dated 2026-05-29 / 30
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
-- All thirteen migrations apply on startup: `001_initial`, `002_local_auth`,
+- All fourteen migrations apply on startup: `001_initial`, `002_local_auth`,
   `003_projects`, `004_deployments`, `005_maintenance`,
   `006_intent_clarification`, `007_execution_logs`,
   `008_finding_attempts`, `009_execution_log_model`,
   `010_user_management`, `011_interventions`, `012_tool_calls`,
-  `013_auto_merge`
+  `013_auto_merge`, `014_llm_registry`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
 - **Dashboard SPA reachable in the browser, deep-linkable, no path
@@ -853,6 +853,141 @@ the historical record of how the state evolved._
   + `previousValues` / `newValues` per field
 - `gestalt run` queues intent → orchestrator picks up → clones project
   repo fresh per cycle → runs generate loop against cloned harness files
+- **Platform LLM Registry (Session 3, 2026-06-03 — migration 014).**
+  Platform-admin manages a registered list of LLM endpoints; every
+  agent's `model` override resolves through it for per-LLM
+  `baseUrl` + `apiKeyEnv` routing. No new agent model surface — the
+  existing `agents.yaml` `llm.model` field is still operator-typed
+  text, the registry just gives it real routing semantics. The
+  actual API key VALUE is NEVER persisted (the registry stores the
+  env var NAME; the server reads `process.env[apiKeyEnv]` at LLM
+  call time).
+  - **`platform_llms` table** (migration 014) — `id`, `name`
+    (unique), `provider`, `model_string`, `base_url`,
+    `api_key_env`, `is_default`, `description`, timestamps. A
+    partial unique index `WHERE is_default = TRUE` enforces
+    "at most one default" at the DB layer; the application
+    `PlatformLLMRepository.setDefault` clears the existing
+    default inside a single transaction so the index is never
+    seen with two TRUE rows
+  - **`PlatformLLMRepository` in `@gestalt/core`** with `list`,
+    `findById`, `findByName`, `findDefault`, `findByModelString`,
+    `create`, `update`, `delete`, `setDefault`, `count`. The
+    postgres impl uses `db.begin` for all mutations that touch
+    `is_default`. Oracle / mssql get the standard throw-stubs
+  - **First-boot seed.** `server.ts` step 4b: if `platformLlms.count()
+    === 0`, insert one row from the loaded `.env` LLM config
+    (`name: 'Platform default'`, `apiKeyEnv: 'LLM_API_KEY'`,
+    `isDefault: true`). Provider auto-detected from `baseUrl`
+    (`api.openai.com` → `openai`, `openai.azure.com` →
+    `azure-openai`, `api.anthropic.com` → `anthropic`,
+    `localhost:11434` → `ollama`, else `custom`). Verified live
+    on `docker-compose down -v && up -d --build`: migration 014
+    applied; one row seeded; subsequent boots log
+    `platform_llms already seeded — skipping`
+  - **`getLLMClientForModel(modelString?)`** in
+    `@gestalt/core/llm`. Lookup order: `undefined` → the platform
+    default via `getLLMClient()`; otherwise consult the registry
+    via an injected resolver; match → fresh `LLMClient` keyed
+    `${modelString}|${baseUrl}` so two registrations for the
+    same model name against different endpoints get distinct
+    clients; no match → fall back to `getLLMClient(modelString)`
+    (legacy behaviour). The resolver is wired via
+    `setLLMRegistryResolver` at server boot (`server.ts` step
+    4b); tests that don't wire it transparently fall back to
+    the pre-registry behaviour
+  - **`BaseLLMAgent.callLLMWithMessages` + `callLLMWithTools`**
+    now route through `getLLMClientForModel` (was
+    `getLLMClient`). `custom-agent-runner` updated to match.
+    No behaviour change for agents whose model isn't registered;
+    agents with a registered model now use the registry's
+    `baseUrl` + the env-resolved API key
+  - **New routes in `packages/server/src/routes/platform-config.ts`:**
+    - `GET /platform/llms` — any authenticated user (agents +
+      project-admin dashboard need it). Returns the records
+      including `apiKeyEnv` (env var NAME). The KEY value
+      never appears
+    - `POST /platform/llms` — platform-admin (`requireRole('admin')`).
+      Validates: provider in `{openai|azure-openai|anthropic|ollama|custom}`,
+      `name` unique, all required fields present.
+      `isDefault: true` clears the existing default
+      atomically. Audit row `platform.llm-added`
+    - `PATCH /platform/llms/:id` — same auth. Partial update;
+      rename collision → 409 `NAME_TAKEN`. Audit row
+      `platform.llm-updated` with `changedFields` +
+      `previousValues` + `newValues`
+    - `DELETE /platform/llms/:id` — same auth. Refuses on the
+      default → 400 `CANNOT_DELETE_DEFAULT_LLM`; refuses on the
+      last row → 400 `LAST_LLM`. Audit row
+      `platform.llm-deleted`. All three guards verified live
+      against the seeded registry
+    - `POST /platform/llms/:id/test` — same auth. Sends a one-
+      token `hello` completion to the registered endpoint using
+      `process.env[apiKeyEnv]`; returns
+      `{ ok: bool, latencyMs: number, error?: string }`. If
+      `apiKeyEnv` is empty in the server env, returns
+      `ok: false` with an actionable message. Verified live
+      reaching OpenAI (2253ms RTT)
+  - **CLI `gestalt platform llms`** (new parent + 5
+    subcommands; platform-admin only):
+    - `list` — table with name / provider / model / base URL
+      / env var. Default row prefixed `★`
+    - `add` — interactive: name / provider / model string /
+      base URL (provider-preset prefill) / env var / description
+      / set-as-default
+    - `set-default <name>` — resolves by name + flips
+    - `remove <name>` — `y/N` confirm + delete
+    - `test <name>` — calls the test endpoint; prints latency
+      or actionable failure message. Verified live end-to-end
+  - **Dashboard Admin** gains a third "LLMs" tab alongside
+    Users + Projects. Table with per-row buttons Test / Edit /
+    Set default / × (delete). Add/Edit modal: name, provider
+    select (auto-fills baseUrl from `PROVIDER_PRESETS`), model
+    string, base URL, `apiKeyEnv` (with a permanent reminder
+    that the actual key VALUE lives only in the server env),
+    description, default checkbox. Test results render inline
+    next to the row (`✓ 142ms` green or `✗ <error>` red)
+  - **Project Settings (existing) reworked** — model field in
+    the Agents tab is now a `<select>` populated from the
+    registry via `GET /platform/llms`. Options:
+    `~ Platform default (<modelString>)` first; then every
+    registered LLM as `<name> (<provider>)`; then a final
+    `Custom model string…` escape hatch. Picking custom
+    collapses the dropdown to a free-text input with a "Back
+    to list" button. The legacy free-text input remains
+    available via the escape hatch for unregistered models
+- **Tools tab merged into Agents tab (Session 3 — UX).** The
+  standalone Tools tab is gone from `/app/projects/:id/settings`;
+  tool assignment IS agent config. Each agent's expanded card
+  now has a Tools section (built-in checkboxes + MCP server
+  list) right after the prompt-extensions UI. One Save commits
+  everything for an agent: role / goal / model / temperature /
+  max tokens / promptExtensions / tools — one diff, one PATCH,
+  one Git commit
+  - **Server change**: `PATCH /projects/:id/config/agents` now
+    accepts an optional `tools: AgentToolConfig` per agent
+    alongside the existing fields. The validator's
+    `validateToolFields` helper is shared between the agents-
+    patch route (where tools are inline) and any future
+    caller. `applyAgentsPatch` merges `tools` into the
+    agents.yaml output as a full replace per agent
+  - **`PATCH /projects/:id/config/tools` REMOVED.** The
+    standalone route is gone; the dashboard's Tools tab is
+    gone with it. The legacy CLI `gestalt project config
+    set-tools` is now a thin alias that internally calls
+    `set-agent` with the same flags so existing scripts keep
+    working (description marked DEPRECATED)
+  - **CLI `gestalt project config set-agent` gained
+    `--builtin`/`--add-mcp`/`--mcp-url`/`--token-from`/`--remove-mcp`**
+    flags (moved from `set-tools`). The single command now
+    covers persona, LLM tuning, prompt extensions, AND
+    tools — one CLI call, one commit
+  - The dashboard API client's `patchToolsConfig` is kept
+    only as a back-compat wrapper that rewraps the legacy
+    `{tools: ...}` payload into a `{agents: {role: {tools:
+    ...}}}` shape and POSTs to the agents endpoint. No
+    client code uses it after Session 3 — preserved for
+    third-party integrations
 - **Project admin UI + CLI (Session 2, 2026-06-03 — config-as-code).**
   A "Project settings" surface on both the dashboard and the CLI for
   project-admin-driven configuration. Every config write goes through

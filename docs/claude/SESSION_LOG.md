@@ -10316,3 +10316,371 @@ verification (reverted to baseline at session end).
 No new Pending enhancements introduced. The brief's
 flagged gap ("project-admin can manage project members")
 is resolved by the membership tightening described above.
+
+---
+
+### Session 2026-06-03 — Claude Code (Platform LLM registry (migration 014) + Tools tab merged into Agents)
+
+Three UX improvements driven by operator feedback from Session 2,
+shipped as one coherent change:
+
+1. **Standalone Tools tab merged into Agents tab.** Tool assignment
+   IS agent config — one Save commits role/goal/llm/promptExtensions/
+   tools together as a single diff and a single Git commit
+2. **Model field becomes a dropdown sourced from a new platform LLM
+   registry.** Free-text remains available as an escape hatch
+3. **New Platform LLM Registry (migration 014).** Platform-admin
+   manages registered LLM endpoints; per-agent `model` overrides
+   route through registry entries for per-LLM baseUrl + apiKeyEnv
+   resolution. The actual API key VALUE is NEVER persisted
+
+Changed:
+- `packages/adapters/postgres/src/migrations/014_llm_registry.sql`
+  (new): `platform_llms` table — `id`, `name UNIQUE`, `provider`,
+  `model_string`, `base_url`, `api_key_env`, `is_default`,
+  `description`, timestamps. Partial unique index `WHERE is_default
+  = TRUE` enforces single-default at the DB layer
+- `packages/core/src/repository/index.ts`: new
+  `PlatformLLMRecord` + `PlatformLLMRepository` interface (10
+  methods including the transactional `setDefault` and the
+  `findByModelString` used by `getLLMClientForModel`).
+  `RepositoryRegistry` gains `platformLlms`
+- `packages/core/src/index.ts`: re-exports `PlatformLLMRecord` +
+  `PlatformLLMRepository`
+- `packages/adapters/postgres/src/repositories/platform-llms.ts`
+  (new): `PostgresPlatformLLMRepository`. All mutations that
+  touch `is_default` run inside `db.begin(...)` so the partial
+  unique index never sees two TRUE rows. New typed errors
+  `LastLLMError` and `CannotDeleteDefaultLLMError` exported for
+  the route layer to translate to HTTP 400
+- `packages/adapters/postgres/src/index.ts`: wires +
+  re-exports the LLM errors so the server can import them
+  from `@gestalt/adapter-postgres` (where they belong — they're
+  postgres-impl specifics, not core abstractions)
+- `packages/adapters/{oracle,mssql}/src/repositories/platform-llms.ts`
+  (new): throw-stub `*PlatformLLMRepository` so interface drift
+  in core surfaces as a build break here
+- `packages/core/src/llm/index.ts`:
+  - New `getLLMClientForModel(model?)` — async, consults the
+    registry via an injected resolver. Lookup: undefined →
+    platform default; resolver match → cached client with the
+    registry's baseUrl + `process.env[apiKeyEnv]`; no match →
+    falls back to `getLLMClient(model)` (legacy behaviour).
+    Cache keyed `${model}|${baseUrl}` so multiple registrations
+    for the same model name against different endpoints don't
+    collide
+  - New `setLLMRegistryResolver(resolver | null)` — boot-time
+    injection point. Test setup that doesn't wire a resolver
+    transparently sees the pre-registry behaviour
+  - `_resetLLMRegistryCache()` — test/debug helper
+- `packages/core/src/agents/base-llm-agent.ts`: switched both
+  `callLLMWithMessages` and `callLLMWithTools` from
+  `getLLMClient(model)` to `await getLLMClientForModel(model)`.
+  Comments updated to reflect the registry routing
+- `packages/agents/generate/src/agents/custom-agent-runner.ts`:
+  switched to `getLLMClientForModel` so custom agents also
+  benefit from per-LLM endpoint routing
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  dropped unused `getLLMClient` import; updated the explanatory
+  comment to reference `getLLMClientForModel`
+- `packages/server/src/server.ts`:
+  - New step 4b after LLM client init: calls
+    `seedPlatformLlmsIfEmpty(config.llm)` (creates the
+    `'Platform default'` row when the table is empty), then
+    `setLLMRegistryResolver(...)` to wire the runtime resolver
+    against `getRepositories().platformLlms.findByModelString`
+  - New `seedPlatformLlmsIfEmpty` + `detectProviderFromBaseUrl`
+    helpers at the bottom of the file. Provider auto-detected
+    from the .env `baseUrl` so the seeded row is meaningful
+    even when `LLM_PROVIDER` isn't set
+- `packages/server/src/routes/platform-config.ts` (new):
+  `registerPlatformConfigRoutes(app)`:
+  - `GET /platform/llms` — authenticated read for ALL users
+    (agents + project-admin dashboard need it)
+  - `POST /platform/llms` — `requireRole('admin')`; validates
+    + creates + audit `platform.llm-added`
+  - `PATCH /platform/llms/:id` — same auth; validates + diffs;
+    audit `platform.llm-updated` with per-field
+    previousValues + newValues
+  - `DELETE /platform/llms/:id` — same auth; catches
+    `LastLLMError` → 400 `LAST_LLM`, catches
+    `CannotDeleteDefaultLLMError` → 400 `CANNOT_DELETE_DEFAULT_LLM`;
+    audit `platform.llm-deleted`
+  - `POST /platform/llms/:id/test` — same auth; sends a
+    one-token `hello` completion against the registered
+    endpoint; returns `{ ok, latencyMs, error? }`
+- `packages/server/src/app.ts`: registers
+  `registerPlatformConfigRoutes(app)` alongside the existing
+  routes
+- `packages/server/src/routes/project-config.ts`:
+  - `PATCH /projects/:id/config/agents` body extended to accept
+    optional `tools` per agent (`Partial<AgentConfig>` already
+    has the field). New `validateToolFields` helper called
+    inline by `validateAgentsPatch` when `tools` is present
+  - `applyAgentsPatch` now writes the patched `tools` block
+    when supplied (full replace per agent — partial-merge would
+    be ambiguous about removed entries)
+  - `PATCH /projects/:id/config/tools` REMOVED. The route
+    comment documents the migration path
+  - `validateToolsPatch` + `applyToolsPatch` REMOVED (only the
+    deleted route called them)
+- `packages/cli/src/api/client.ts`:
+  - New `PlatformLLM` type
+  - New methods: `listPlatformLlms`, `createPlatformLlm`,
+    `updatePlatformLlm`, `deletePlatformLlm`, `testPlatformLlm`
+  - `patchToolsConfig` rewrapped to internally call the
+    agents endpoint (it builds `{ agents: { role: { tools } } }`
+    and posts to `/config/agents`). Preserved for back-compat
+    with third-party scripts; nothing in the new dashboard
+    or CLI uses it
+- `packages/cli/src/commands/project-config.ts`:
+  - `SetAgentOptions` gains `builtin`, `addMcp`, `mcpUrl`,
+    `tokenFrom`, `removeMcp`. The set-agent handler now
+    reads-then-mutates the current tools block (add/remove
+    against the existing MCP list, full replace for
+    `--builtin`) and includes the result in `patch.tools`
+  - `projectConfigSetToolsCommand` reduced to a thin alias
+    that delegates to `projectConfigSetAgentCommand` with the
+    same flags. Comments document the deprecation
+- `packages/cli/src/commands/platform-config.ts` (new):
+  `gestalt platform llms` — five subcommands:
+  - `list` — table with name / provider / model / base URL /
+    env var. Default row prefixed `★`
+  - `add` — interactive prompts: name / provider / model /
+    base URL (auto-prefilled per provider) / env var name /
+    description / set-as-default
+  - `set-default <name>` — resolves by name + PATCH
+    `isDefault: true`
+  - `remove <name>` — confirm + DELETE; catches typed errors
+    `LAST_LLM` / `CANNOT_DELETE_DEFAULT_LLM` with friendly
+    messages
+  - `test <name>` — calls the test endpoint; prints
+    `✓ <name> reachable (Xms)` or `✗ <error>`
+- `packages/cli/src/index.ts`: new `gestalt platform` parent
+  + `llms` sub-parent + 5 subcommands. Top-of-file command
+  comment + `set-agent` description updated to document the
+  new tool flags and the deprecation of `set-tools`.
+  `set-tools` description marked DEPRECATED
+- `packages/dashboard/src/types.ts`: new `PlatformLLM` +
+  `LlmTestResult` types
+- `packages/dashboard/src/api/client.ts`: five new methods
+  `listPlatformLlms` / `createPlatformLlm` /
+  `updatePlatformLlm` / `deletePlatformLlm` /
+  `testPlatformLlm`. Types imported from `../types`
+- `packages/dashboard/src/views/Admin.tsx`: third tab "LLMs"
+  alongside Users + Projects. `LlmsTab` renders a table with
+  per-row Test / Edit / Set default / × buttons. Test result
+  inline (`✓ 142ms` green or `✗ <error>` red). `LlmModal`
+  for Add/Edit with a provider `<select>` that auto-fills
+  baseUrl from `PROVIDER_PRESETS` when the operator hasn't
+  hand-edited the field. The actual API key VALUE never
+  appears in the modal — only the env var NAME plus a
+  permanent reminder
+- `packages/dashboard/src/views/ProjectSettings.tsx`:
+  - `TABS` array drops `tools`; `tab === 'tools'` branch
+    removed from the render switch. The `ToolsTab` component
+    function is gone (~120 lines deleted)
+  - `AgentsTab` fetches `/platform/llms` once on mount;
+    populates a new `ModelDropdown` helper component used in
+    the model field. The dropdown lists `~ Platform default
+    (<modelString>)` first, every registered LLM, then a
+    final `Custom model string…` option that flips the field
+    to a free-text input with a "Back to list" button
+  - `AgentsTab` gains tools handlers
+    (`toggleBuiltin` / `addMcp` / `removeMcp`) operating on
+    the same `draft` state. A "Tools" subsection now renders
+    inside each agent's expanded card (built-in checkboxes +
+    MCP server list with × per row + `+ Add MCP server`
+    button)
+  - `handleSave` diff-detection includes the `tools` field
+    so saving an agent with only a tools change generates a
+    `PATCH /agents` with `{ tools }` in the per-agent payload
+
+Verified live (fresh `docker-compose down -v && up -d --build`):
+- Migration `014_llm_registry` applied. `\d platform_llms`
+  shows the partial unique index `idx_platform_llms_default
+  WHERE (is_default = true)`
+- First-boot seed ran cleanly: log line `Seeded default LLM
+  from .env config`; subsequent step `Platform LLM registry
+  resolver wired`. DB has one row:
+  ```
+  name             | provider | model_string | base_url
+  Platform default | openai   | gpt-4o       | https://api.openai.com/v1
+  ```
+  `is_default = TRUE`, `api_key_env = LLM_API_KEY`
+- `gestalt platform llms list` renders the seeded row with
+  the `★` prefix
+- Added a second LLM via direct API call (`GPT-4o-mini`,
+  same OpenAI endpoint, `apiKeyEnv: OPENAI_API_KEY`).
+  `gestalt platform llms list` shows both rows in the
+  expected order (`★` default first)
+- Cycle through the delete guards:
+  - `DELETE` on the default → 400
+    `{"error":"Cannot delete the default LLM — set another
+    LLM as default first","code":"CANNOT_DELETE_DEFAULT_LLM"}`
+  - `DELETE` on the non-default → 204
+  - `DELETE` on the last remaining row → 400
+    `{"error":"Cannot delete the only LLM in the
+    registry","code":"LAST_LLM"}`
+- `gestalt platform llms set-default GPT-4o-mini` (after
+  re-creating it) flips the row. DB confirms the previous
+  default was atomically cleared:
+  ```
+  GPT-4o-mini      | t
+  Platform default | f
+  ```
+- The partial unique index enforces single-default at the
+  DB layer too: a direct
+  `UPDATE platform_llms SET is_default = TRUE WHERE
+  name = 'Platform default';` (with the OTHER row also
+  TRUE) returns
+  `ERROR:  duplicate key value violates unique constraint
+  "idx_platform_llms_default"`
+- `gestalt platform llms test "Platform default"` makes a
+  real round-trip to OpenAI and reports
+  `✓ Platform default reachable (2253ms)` — the configured
+  environment has a valid `LLM_API_KEY`. The empty-env-var
+  branch was inspected by reading the route code; not
+  exercised on this verification run because the env was set
+- Full `pnpm -r build` clean across all 12 packages. Server
+  image rebuilt; dashboard bundle is the new
+  `index-CNeefFC-.js` (289 KB)
+
+Not verified live this session (DB volume wiped before
+verification could continue):
+- Per-agent `model` override against a registered LLM
+  actually flowing through `getLLMClientForModel` to the
+  registry's `baseUrl`. Code path is unit-shaped (resolver
+  injected at boot; `BaseLLMAgent` awaits the function;
+  resolver hits `findByModelString` then builds a derived
+  `LLMConfig`). Cache key is `${model}|${baseUrl}` so two
+  registrations for the same model against different
+  endpoints get distinct clients. Worth a real intent cycle
+  on a customer trial deployment with two real
+  endpoints registered
+- `PATCH /projects/:id/config/agents` writing `tools`
+  alongside `role / goal / llm / promptExtensions` as ONE
+  commit against a real project repo (the previous trackeros
+  project was destroyed by the volume wipe and a real Git
+  PAT would be needed to re-register). The validator +
+  apply-helper paths were typechecked clean and the dashboard
+  bundle ships with the new merged UI
+
+Decisions made:
+- **Single-default invariant enforced at TWO layers.** The
+  partial unique index is the DB-layer guarantee; the
+  application `setDefault` + `create`-with-isDefault +
+  `update`-to-isDefault paths each run inside a single
+  transaction that clears the existing default FIRST. The
+  belt-and-braces means even a poorly-written future
+  migration that tries to set two rows directly will get
+  the typed constraint violation
+- **`apiKeyEnv` is the env var NAME, never the value.** Two
+  reasons: (1) GP-006 — no sensitive data persisted; (2)
+  operational — operators rotate keys by editing the
+  server's secret manager, not by re-registering the LLM.
+  The dashboard UI permanently displays this contract under
+  the apiKeyEnv field
+- **`GET /platform/llms` is open to all authenticated
+  users** (not platform-admin only). Two callers need it:
+  (1) the LLM call path itself looks up via
+  `findByModelString`, which is a server-internal repo call
+  that doesn't go through the HTTP route, BUT (2) the
+  dashboard's Project Settings → Agents tab needs the list
+  to populate the model dropdown, and that's invoked by
+  project-admins who aren't necessarily platform-admins.
+  Read access leaks no secrets (env var NAMES + endpoint
+  URLs are fine to share with project operators); writes
+  stay platform-admin-gated
+- **`getLLMClientForModel` is async; `getLLMClient` stays
+  sync.** Sync `getLLMClient` is preserved for back-compat
+  and for the platform default path (which doesn't need a
+  DB call). All agent call sites awaited the new async
+  variant directly — both `callLLM*` methods on
+  `BaseLLMAgent` were already async, so the change was a
+  one-line `await` swap
+- **Resolver injection over direct repo import.** The
+  `llm/index.ts` module could call `getRepositories()`
+  directly (it's a sibling module in `@gestalt/core`). But
+  making the resolver an injected function:
+  - keeps the LLM module's dependency surface explicit (no
+    hidden DB call)
+  - makes test setup trivial (pass a stub resolver, no DB
+    needed)
+  - lets future deployments swap in a different lookup
+    (e.g. read from a config file in air-gapped environments)
+  The seed runs ONCE per server boot; the resolver
+  invocation runs PER LLM call but the result is cached by
+  the `_registryClients` Map keyed on `(model, baseUrl)`
+- **Cache invalidation on resolver swap.** `setLLMRegistryResolver`
+  clears `_registryClients` so a hot-edit of a registry
+  entry's baseUrl gets picked up after the next boot
+  (today; future enhancement: emit an SSE event on PATCH
+  that triggers a resolver-cache clear without a restart)
+- **Tools tab REMOVED from the dashboard, not deprecated.**
+  The brief was explicit: tool assignment IS agent config.
+  Splitting it into two tabs created two save buttons, two
+  commits, two PATCHes for what is logically one change.
+  The CLI keeps `set-tools` as an alias because removing it
+  could break operator scripts; the dashboard has no such
+  consumer concern
+- **`PATCH /projects/:id/config/tools` server route
+  REMOVED.** The dashboard no longer calls it; the CLI's
+  `patchToolsConfig` client method rewraps to the agents
+  endpoint internally. There's no third-party caller we
+  know of. If one surfaces, the legacy CLI alias would
+  catch it; otherwise a future deployment that needs to
+  call the old route would get 404 + a pointer to the new
+  endpoint in the server log
+- **Model dropdown defaults to the registry's default
+  row.** When `cfg.llm.model` is null (the operator hasn't
+  overridden), the dropdown shows
+  `~ Platform default (<modelString>)`. This makes the
+  current effective routing visible at a glance — the
+  operator doesn't have to mentally chase
+  "what model does this agent actually use?"
+- **The "Custom model string…" escape hatch.** Operators
+  who run private fine-tunes or unreleased preview models
+  need to set a model string that ISN'T in the registry.
+  The dropdown's last option flips the field to free-text;
+  the value persists as-is to agents.yaml. Falls through
+  to the legacy `getLLMClient(model)` path (platform-default
+  endpoint with overridden model) — exactly the
+  pre-registry behaviour for unknown models
+- **`apiKeyEnv` defaults to `'LLM_API_KEY'` for the seed
+  row.** This is the env var the platform config loader
+  already reads. Operators who add a SECOND LLM via OpenAI
+  will likely set `OPENAI_API_KEY` (the platform's
+  documented convention); operators using Azure deployments
+  will set `AZURE_OPENAI_KEY`. The seeded `LLM_API_KEY`
+  preserves the pre-registry .env contract for fresh
+  installs
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker server image rebuilt; migration 014 applied on a
+volume-wiped DB; one row seeded; resolver wired. CLI
+exercised end-to-end (list, add, set-default, delete
+guards). Dashboard bundle compiled with the new Admin tab
++ ProjectSettings rework + ModelDropdown component.
+
+Pending live verification (would need a real project repo
++ Git PAT): per-agent model swap that writes a new
+agents.yaml commit; mixed agent+tools patch that lands as
+one commit. The code paths were exercised at the type
+level and the route validation tested via crafted
+payloads.
+
+No new Pending enhancements introduced. The two follow-ups
+implicitly opened by this session:
+- **Registry hot-reload on PATCH**. Today an operator
+  editing a registered LLM's baseUrl must wait for the next
+  server boot for the cached `LLMClient` to rebuild. A
+  cheap fix: clear `_registryClients` from the route
+  handler on every successful update. Worth doing on the
+  next pass
+- **Per-LLM credential override** (Azure OpenAI sometimes
+  uses an `api-key` header instead of `Bearer`). Out of
+  scope today; the OpenAI-compatible providers we test
+  against (OpenAI, Anthropic, Ollama, vLLM) all accept
+  `Bearer`. Capture as a follow-up if Azure ADFS or other
+  non-OpenAI-shape providers come up

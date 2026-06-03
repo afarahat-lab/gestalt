@@ -1,10 +1,14 @@
 /**
  * Admin view — platform-admin only.
  *
- * Two tabs:
+ * Three tabs:
  *   - Users: list / create / role-toggle / deactivate, plus inline
  *     per-user project memberships
  *   - Projects: per-project member list with role change + add/remove
+ *   - LLMs (Session 3): platform LLM registry — Add / Edit / Test /
+ *     Set default / Remove. The actual API key VALUE is never read
+ *     here; operators set `apiKeyEnv` and the server reads the env
+ *     at LLM call time
  *
  * Route guarded by `RequirePlatformAdmin` in App.tsx; the Admin nav
  * link in Layout is rendered only when `currentUser.role ===
@@ -17,9 +21,10 @@ import { useCurrentUser } from '../context/CurrentUserContext';
 import { ApiError } from '../api/client';
 import type {
   UserSummary, UserDetail, ProjectMember, ProjectSummary, UserRole, ProjectRole,
+  PlatformLLM, LlmTestResult,
 } from '../types';
 
-type Tab = 'users' | 'projects';
+type Tab = 'users' | 'projects' | 'llms';
 
 export function Admin() {
   const [tab, setTab] = useState<Tab>('users');
@@ -27,7 +32,7 @@ export function Admin() {
     <div style={styles.page}>
       <div style={styles.header}>
         <h1 style={styles.title}>Admin</h1>
-        <p style={styles.subtitle}>Platform users and project memberships</p>
+        <p style={styles.subtitle}>Platform users, project memberships, and LLM registry</p>
       </div>
       <div style={styles.tabs}>
         <button
@@ -38,8 +43,14 @@ export function Admin() {
           style={tab === 'projects' ? { ...styles.tab, ...styles.tabActive } : styles.tab}
           onClick={() => setTab('projects')}
         >Projects</button>
+        <button
+          style={tab === 'llms' ? { ...styles.tab, ...styles.tabActive } : styles.tab}
+          onClick={() => setTab('llms')}
+        >LLMs</button>
       </div>
-      {tab === 'users' ? <UsersTab /> : <ProjectsTab />}
+      {tab === 'users' && <UsersTab />}
+      {tab === 'projects' && <ProjectsTab />}
+      {tab === 'llms' && <LlmsTab />}
     </div>
   );
 }
@@ -572,6 +583,241 @@ function MembersList(props: { projectId: string; members: ProjectMember[]; onCha
   );
 }
 
+// ─── LLMs tab (Session 3) ────────────────────────────────────────────────────
+
+const VALID_PROVIDERS = ['openai', 'azure-openai', 'anthropic', 'ollama', 'custom'] as const;
+type ProviderId = typeof VALID_PROVIDERS[number];
+
+const PROVIDER_PRESETS: Record<ProviderId, string> = {
+  'openai':       'https://api.openai.com/v1',
+  'azure-openai': '',  // operator supplies the deployment URL
+  'anthropic':    'https://api.anthropic.com/v1',
+  'ollama':       'http://localhost:11434/v1',
+  'custom':       '',
+};
+
+function LlmsTab() {
+  const api = useDashboardApi();
+  const [llms, setLlms] = useState<PlatformLLM[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [editing, setEditing] = useState<PlatformLLM | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [testing, setTesting] = useState<string | null>(null);
+  const [testResult, setTestResult] = useState<Record<string, LlmTestResult>>({});
+
+  async function load() {
+    setLoading(true);
+    try {
+      const res = await api.listPlatformLlms();
+      setLlms(res.data);
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+  useEffect(() => { void load(); /* eslint-disable-next-line */ }, []);
+
+  async function handleSetDefault(llm: PlatformLLM) {
+    setError(null);
+    try {
+      await api.updatePlatformLlm(llm.id, { isDefault: true });
+      await load();
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    }
+  }
+  async function handleDelete(llm: PlatformLLM) {
+    if (!window.confirm(`Remove LLM '${llm.name}'?`)) return;
+    setError(null);
+    try {
+      await api.deletePlatformLlm(llm.id);
+      await load();
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    }
+  }
+  async function handleTest(llm: PlatformLLM) {
+    setTesting(llm.id);
+    setError(null);
+    try {
+      const res = await api.testPlatformLlm(llm.id);
+      setTestResult((prev) => ({ ...prev, [llm.id]: res.data }));
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally {
+      setTesting(null);
+    }
+  }
+
+  if (loading) return <p style={{ color: 'var(--text-dim)' }}>Loading LLMs...</p>;
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+        <h3 style={styles.cardTitle}>Platform LLMs ({llms.length})</h3>
+        <button style={styles.primaryBtn} onClick={() => { setCreating(true); setEditing(null); }}>+ Add LLM</button>
+      </div>
+      {error && <div style={styles.errorBanner}>{error}</div>}
+      <table style={styles.table}>
+        <thead>
+          <tr>
+            <th style={styles.th}>Name</th>
+            <th style={styles.th}>Provider</th>
+            <th style={styles.th}>Model</th>
+            <th style={styles.th}>Env var</th>
+            <th style={styles.th}>Default</th>
+            <th style={styles.th}>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {llms.map((l) => {
+            const r = testResult[l.id];
+            return (
+              <tr key={l.id}>
+                <td style={styles.td}>
+                  {l.name}
+                  {l.description && <div style={{ color: 'var(--text-dim)', fontSize: '11px' }}>{l.description}</div>}
+                </td>
+                <td style={styles.td}>{l.provider}</td>
+                <td style={styles.td} title={l.baseUrl}>{l.modelString}</td>
+                <td style={styles.td}><code>{l.apiKeyEnv}</code></td>
+                <td style={styles.td}>{l.isDefault ? '★' : ''}</td>
+                <td style={styles.td}>
+                  <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                    <button style={styles.linkBtn} onClick={() => void handleTest(l)} disabled={testing === l.id}>
+                      {testing === l.id ? 'Testing...' : 'Test'}
+                    </button>
+                    {r && (
+                      <span style={r.ok ? styles.testOk : styles.testFail}>
+                        {r.ok ? `✓ ${r.latencyMs}ms` : `✗ ${r.error?.slice(0, 30) ?? 'error'}`}
+                      </span>
+                    )}
+                    <button style={styles.linkBtn} onClick={() => { setEditing(l); setCreating(false); }}>Edit</button>
+                    {!l.isDefault && (
+                      <button style={styles.linkBtn} onClick={() => void handleSetDefault(l)}>★ Set default</button>
+                    )}
+                    {!l.isDefault && (
+                      <button style={styles.dangerBtn} onClick={() => void handleDelete(l)}>×</button>
+                    )}
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      {(creating || editing) && (
+        <LlmModal
+          existing={editing}
+          onClose={() => { setCreating(false); setEditing(null); }}
+          onSaved={() => { setCreating(false); setEditing(null); void load(); }}
+          onError={(e) => setError(e)}
+        />
+      )}
+    </div>
+  );
+}
+
+function LlmModal(props: {
+  existing: PlatformLLM | null;
+  onClose: () => void;
+  onSaved: () => void;
+  onError: (msg: string) => void;
+}) {
+  const api = useDashboardApi();
+  const [name, setName] = useState(props.existing?.name ?? '');
+  const [provider, setProvider] = useState<ProviderId>((props.existing?.provider as ProviderId) ?? 'openai');
+  const [modelString, setModelString] = useState(props.existing?.modelString ?? '');
+  const [baseUrl, setBaseUrl] = useState(props.existing?.baseUrl ?? PROVIDER_PRESETS[(props.existing?.provider as ProviderId) ?? 'openai']);
+  const [apiKeyEnv, setApiKeyEnv] = useState(props.existing?.apiKeyEnv ?? '');
+  const [description, setDescription] = useState(props.existing?.description ?? '');
+  const [isDefault, setIsDefault] = useState(props.existing?.isDefault ?? false);
+  const [saving, setSaving] = useState(false);
+
+  function handleProvider(p: ProviderId) {
+    setProvider(p);
+    // Only auto-fill if the baseUrl field is empty or matches the
+    // previous provider's preset — operators who hand-edited the URL
+    // shouldn't have it overwritten.
+    const previousPreset = PROVIDER_PRESETS[provider];
+    if (!baseUrl.trim() || baseUrl === previousPreset) {
+      setBaseUrl(PROVIDER_PRESETS[p] ?? '');
+    }
+  }
+
+  async function save() {
+    setSaving(true);
+    try {
+      if (props.existing) {
+        await api.updatePlatformLlm(props.existing.id, {
+          name, provider, modelString, baseUrl, apiKeyEnv,
+          isDefault, description: description || null,
+        });
+      } else {
+        await api.createPlatformLlm({
+          name, provider, modelString, baseUrl, apiKeyEnv,
+          isDefault, description: description || null,
+        });
+      }
+      props.onSaved();
+    } catch (err) {
+      props.onError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div style={styles.modalBackdrop} onClick={props.onClose}>
+      <div style={{ ...styles.modal, maxWidth: '560px' }} onClick={(e) => e.stopPropagation()}>
+        <h3 style={styles.cardTitle}>{props.existing ? `Edit ${props.existing.name}` : 'Add LLM'}</h3>
+        <label style={styles.label}>Name
+          <input style={styles.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="GPT-4o" />
+        </label>
+        <label style={styles.label}>Provider
+          <select style={styles.select} value={provider} onChange={(e) => handleProvider(e.target.value as ProviderId)}>
+            {VALID_PROVIDERS.map((p) => <option key={p} value={p}>{p}</option>)}
+          </select>
+        </label>
+        <label style={styles.label}>Model string
+          <input style={styles.input} value={modelString} onChange={(e) => setModelString(e.target.value)} placeholder="gpt-4o" />
+        </label>
+        <label style={styles.label}>Base URL
+          <input style={styles.input} value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder={PROVIDER_PRESETS[provider]} />
+        </label>
+        <label style={styles.label}>API key env var (NAME, not value)
+          <input style={styles.input} value={apiKeyEnv} onChange={(e) => setApiKeyEnv(e.target.value)} placeholder="OPENAI_API_KEY" />
+        </label>
+        <p style={{ color: 'var(--text-dim)', fontSize: '11px', margin: 0 }}>
+          The actual API key value lives only in the server's environment — it is never persisted in the registry.
+        </p>
+        <label style={styles.label}>Description (optional)
+          <input style={styles.input} value={description ?? ''} onChange={(e) => setDescription(e.target.value)} />
+        </label>
+        <label style={styles.checkboxLabel}>
+          <input type="checkbox" checked={isDefault} onChange={(e) => setIsDefault(e.target.checked)} />
+          Set as platform default
+        </label>
+        <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+          <button style={styles.linkBtn} onClick={props.onClose}>Cancel</button>
+          <button style={styles.primaryBtn} onClick={() => void save()} disabled={saving || !name.trim() || !modelString.trim() || !baseUrl.trim() || !apiKeyEnv.trim()}>
+            {saving ? 'Saving...' : (props.existing ? 'Update' : 'Add LLM')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function extractError(err: ApiError): string {
+  try {
+    const p = JSON.parse(err.message) as { error?: string };
+    return p.error ?? err.message;
+  } catch { return err.message; }
+}
+
 const styles: Record<string, React.CSSProperties> = {
   page: { padding: '28px 32px', maxWidth: '1100px' },
   header: { marginBottom: '20px' },
@@ -663,4 +909,30 @@ const styles: Record<string, React.CSSProperties> = {
     color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', outline: 'none',
   },
   radioRow: { display: 'flex', gap: '14px', marginTop: '4px', color: 'var(--text-primary)', fontSize: '13px' },
+  // Session 3 — LLMs tab additions
+  cardTitle: { margin: 0, fontSize: '14px', fontWeight: 500, color: 'var(--text-primary)' },
+  linkBtn: {
+    background: 'transparent', border: '1px solid var(--border)',
+    color: 'var(--text-secondary)', borderRadius: '4px', padding: '4px 10px',
+    fontFamily: 'var(--font-mono)', fontSize: '11px', cursor: 'pointer',
+  },
+  errorBanner: {
+    background: 'rgba(220,30,30,0.12)', color: 'var(--red)',
+    padding: '8px 12px', borderRadius: '4px', fontSize: '12px', marginBottom: '10px',
+  },
+  testOk: { color: 'var(--green)', fontSize: '11px', fontFamily: 'var(--font-mono)' },
+  testFail: { color: 'var(--red)', fontSize: '11px', fontFamily: 'var(--font-mono)' },
+  checkboxLabel: {
+    display: 'flex', gap: '6px', alignItems: 'center',
+    fontSize: '13px', fontFamily: 'var(--font-mono)', color: 'var(--text-primary)',
+  },
+  modalBackdrop: {
+    position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)',
+    display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50,
+  },
+  select: {
+    width: '100%', background: 'var(--bg-subtle)', border: '1px solid var(--border)',
+    borderRadius: '4px', padding: '6px 8px', fontFamily: 'var(--font-mono)', fontSize: '12px',
+    color: 'var(--text-primary)', marginTop: '4px',
+  },
 };

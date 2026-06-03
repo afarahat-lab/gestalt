@@ -412,3 +412,24 @@ export interface ProjectConfigResponse {
     customAgents?: ProjectConfigCustomAgent[];
   };
 }
+
+// ─── Platform LLM registry (Session 3, migration 014) ────────────────────────
+
+export interface PlatformLLM {
+  id: string;
+  name: string;
+  provider: string;
+  modelString: string;
+  baseUrl: string;
+  apiKeyEnv: string;
+  isDefault: boolean;
+  description: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LlmTestResult {
+  ok: boolean;
+  latencyMs: number;
+  error?: string;
+}

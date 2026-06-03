@@ -14,6 +14,7 @@ import type {
   UserSummary, UserDetail, MembershipSummary, ProjectMember,
   CreateUserParams, UserRole, ProjectRole,
   ProjectConfigResponse, EditableAgentConfig, ProjectConfigCustomAgent,
+  PlatformLLM, LlmTestResult,
 } from '../types';
 
 export class DashboardApiClient {
@@ -258,6 +259,43 @@ export class DashboardApiClient {
 
   async removeMember(projectId: string, userId: string): Promise<void> {
     await this.delete(`/projects/${projectId}/members/${userId}`);
+  }
+
+  // ─── Platform LLM registry (Session 3) ────────────────────────────────────
+
+  async listPlatformLlms(): Promise<{ data: PlatformLLM[] }> {
+    return this.get('/platform/llms');
+  }
+
+  async createPlatformLlm(body: {
+    name: string;
+    provider: string;
+    modelString: string;
+    baseUrl: string;
+    apiKeyEnv: string;
+    isDefault?: boolean;
+    description?: string | null;
+  }): Promise<{ data: PlatformLLM }> {
+    return this.post('/platform/llms', body);
+  }
+
+  async updatePlatformLlm(
+    id: string,
+    body: Partial<{
+      name: string; provider: string; modelString: string;
+      baseUrl: string; apiKeyEnv: string; isDefault: boolean;
+      description: string | null;
+    }>,
+  ): Promise<{ data: PlatformLLM }> {
+    return this.patch(`/platform/llms/${id}`, body);
+  }
+
+  async deletePlatformLlm(id: string): Promise<void> {
+    await this.delete(`/platform/llms/${id}`);
+  }
+
+  async testPlatformLlm(id: string): Promise<{ data: LlmTestResult }> {
+    return this.post(`/platform/llms/${id}/test`, {});
   }
 
   // ─── Project config (Approach A — config-as-code) ──────────────────────────

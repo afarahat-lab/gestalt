@@ -440,10 +440,138 @@ export function getLLMClient(model?: string): LLMClient {
 export function createLLMClient(config: LLMConfig): LLMClient {
   _defaultConfig = config;
   _clients.clear();
+  _registryClients.clear();
   const client = new LLMClient(config);
   _clients.set(config.model, client);
   log.info({ model: config.model, baseUrl: config.baseUrl }, 'LLM client initialised');
   return client;
+}
+
+// ─── Registry-aware factory (Session 3 — platform LLM registry) ──────────────
+
+/**
+ * Per-(model, baseUrl) cache for registry-backed clients. Keyed
+ * `${modelString}|${baseUrl}` because the same model name can be
+ * registered against multiple endpoints (e.g. `gpt-4o` against OpenAI
+ * direct vs. an Azure OpenAI deployment vs. a vLLM proxy) and each
+ * needs its own client.
+ */
+const _registryClients = new Map<string, LLMClient>();
+
+function registryCacheKey(model: string, baseUrl: string): string {
+  return `${model}|${baseUrl}`;
+}
+
+/**
+ * Returns the LLMClient for a model string, consulting the platform
+ * LLM registry (migration 014) when one is available.
+ *
+ * Resolution order:
+ *   1. `undefined` → platform default (delegates to `getLLMClient()`)
+ *   2. Lookup `modelString` in the registry via the resolver injected
+ *      by the server at boot. Match → fresh client using the
+ *      registered `baseUrl` + `process.env[apiKeyEnv]`. Cached on
+ *      `(model, baseUrl)` so the next call is fast
+ *   3. No match → fall back to `getLLMClient(modelString)`, which
+ *      reuses the platform-default endpoint with the override model
+ *      name (the legacy behaviour before the registry shipped)
+ *
+ * The resolver is injected via `setLLMRegistryResolver` to avoid a
+ * direct `getRepositories()` import here — keeps llm/index.ts free of
+ * sibling-module dependencies and makes test setup trivial (the test
+ * just passes its own resolver).
+ */
+export async function getLLMClientForModel(modelString?: string): Promise<LLMClient> {
+  if (!modelString) return getLLMClient();
+  if (!_registryResolver) {
+    // The resolver is wired at server boot. Tests that don't wire
+    // it can still use `getLLMClient(model)` directly.
+    return getLLMClient(modelString);
+  }
+  if (!_defaultConfig) {
+    throw new Error('LLM client not initialised. Call createLLMClient(config) first.');
+  }
+
+  let registered: RegistryEntry | null;
+  try {
+    registered = await _registryResolver(modelString);
+  } catch (err) {
+    log.warn(
+      { err: err instanceof Error ? err.message : String(err), modelString },
+      'LLM registry lookup failed — falling back to default endpoint',
+    );
+    return getLLMClient(modelString);
+  }
+
+  if (!registered) {
+    // Model not in the registry → operator wants an ad-hoc override
+    // against the platform-default endpoint. Same as before.
+    return getLLMClient(modelString);
+  }
+
+  const cacheKey = registryCacheKey(registered.modelString, registered.baseUrl);
+  const cached = _registryClients.get(cacheKey);
+  if (cached) return cached;
+
+  const apiKey = process.env[registered.apiKeyEnv] ?? '';
+  if (!apiKey) {
+    log.warn(
+      { modelString, apiKeyEnv: registered.apiKeyEnv },
+      'Registered LLM apiKeyEnv resolved to empty string — LLM calls will likely fail',
+    );
+  }
+  const overrideConfig: LLMConfig = {
+    ..._defaultConfig,
+    model: registered.modelString,
+    baseUrl: registered.baseUrl,
+    apiKey,
+  };
+  const client = new LLMClient(overrideConfig);
+  _registryClients.set(cacheKey, client);
+  log.info(
+    { model: registered.modelString, baseUrl: registered.baseUrl },
+    'LLM client created from registry entry',
+  );
+  return client;
+}
+
+/**
+ * Minimal shape the resolver returns — exactly what the registry
+ * stores. Defined locally so `llm/index.ts` doesn't import from
+ * `repository/index.ts` (sibling import would be fine for now but the
+ * narrower contract makes the dependency direction explicit).
+ */
+interface RegistryEntry {
+  modelString: string;
+  baseUrl: string;
+  apiKeyEnv: string;
+}
+
+type RegistryResolver = (modelString: string) => Promise<RegistryEntry | null>;
+
+let _registryResolver: RegistryResolver | null = null;
+
+/**
+ * Wires the platform-LLM lookup function. Called once at server boot
+ * after the database adapter is ready. Passing `null` disables the
+ * registry path (the function falls back to the legacy
+ * `getLLMClient(model)` behaviour).
+ */
+export function setLLMRegistryResolver(resolver: RegistryResolver | null): void {
+  _registryResolver = resolver;
+  // Invalidate the (model, baseUrl) cache so the next call rebuilds
+  // against the new resolver — important for test teardown and for
+  // operators who hot-edit a registry entry's baseUrl.
+  _registryClients.clear();
+}
+
+/**
+ * Test/debug only — clears every cached client. Production never
+ * calls this directly; `createLLMClient` already resets state when
+ * the default config changes.
+ */
+export function _resetLLMRegistryCache(): void {
+  _registryClients.clear();
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

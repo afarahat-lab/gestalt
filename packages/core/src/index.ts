@@ -59,7 +59,10 @@ export type {
   LLMToolCall, ToolLoopMessage,
   CompleteWithToolsRequest, CompleteWithToolsResponse,
 } from './llm/index';
-export { LLMClient, getLLMClient, createLLMClient } from './llm/index';
+export {
+  LLMClient, getLLMClient, createLLMClient,
+  getLLMClientForModel, setLLMRegistryResolver,
+} from './llm/index';
 
 // Queue
 export type { QueueName, TaskHandler } from './queue/index';
@@ -80,6 +83,7 @@ export type {
   AgentExecutionLogRecord,
   ProjectMembershipRecord,
   InterventionRecord, InterventionAction,
+  PlatformLLMRecord, PlatformLLMRepository,
   RepositoryRegistry,
   IntentRepository, AgentExecutionRepository,
   ArtifactRepository, SignalRepository,

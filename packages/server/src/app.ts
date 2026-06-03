@@ -33,6 +33,7 @@ import { registerUserRoutes } from './routes/users';
 import { registerMembershipRoutes } from './routes/memberships';
 import { registerInterventionRoutes } from './routes/interventions';
 import { registerProjectConfigRoutes } from './routes/project-config';
+import { registerPlatformConfigRoutes } from './routes/platform-config';
 import { correlationHook } from './middleware/correlation';
 import { auditHook } from './middleware/audit';
 import type { AuthManager } from './auth/auth-manager';
@@ -97,6 +98,7 @@ export async function createApp(
   await registerMembershipRoutes(app);
   await registerInterventionRoutes(app);
   await registerProjectConfigRoutes(app);
+  await registerPlatformConfigRoutes(app);
 
   // ─── Dashboard static files ────────────────────────────────────────────────
   //

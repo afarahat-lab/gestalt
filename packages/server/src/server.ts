@@ -15,7 +15,10 @@
  *   11. Register graceful shutdown
  */
 
-import { loadConfig, createLLMClient, setRepositories, createContextLogger } from '@gestalt/core';
+import {
+  loadConfig, createLLMClient, setRepositories, createContextLogger,
+  setLLMRegistryResolver, getRepositories,
+} from '@gestalt/core';
 import { createPostgresAdapter, closeDb } from '@gestalt/adapter-postgres';
 import { startOrchestratorWorker } from '@gestalt/agents-generate';
 import { startGateWorker } from '@gestalt/agents-quality-gate';
@@ -50,6 +53,26 @@ export async function startServer(): Promise<void> {
   // 4. LLM client
   createLLMClient(config.llm);
   log.info({ model: config.llm.model }, 'LLM client ready');
+
+  // 4b. Platform LLM registry (migration 014)
+  //
+  // Seed the registry from the loaded .env config on first boot so
+  // every Gestalt deployment starts with at least one default LLM.
+  // Operators then add additional LLMs via the Platform Admin UI or
+  // the `gestalt platform llms add` CLI.
+  await seedPlatformLlmsIfEmpty(config.llm);
+  // Wire the registry-aware client resolver so `getLLMClientForModel`
+  // (used inside BaseLLMAgent) can look up per-LLM baseUrl + apiKeyEnv.
+  setLLMRegistryResolver(async (modelString) => {
+    const match = await getRepositories().platformLlms.findByModelString(modelString);
+    if (!match) return null;
+    return {
+      modelString: match.modelString,
+      baseUrl: match.baseUrl,
+      apiKeyEnv: match.apiKeyEnv,
+    };
+  });
+  log.info('Platform LLM registry resolver wired');
 
   // 5. Auth manager
   const identityConfig = await loadIdentityConfig();
@@ -98,6 +121,53 @@ export async function startServer(): Promise<void> {
       process.exit(0);
     });
   }
+}
+
+/**
+ * First-boot seed for `platform_llms`. Idempotent: if the table
+ * already has rows, do nothing. Otherwise insert one row mirroring
+ * the loaded `.env` LLM config so the registry has at least one
+ * default before any agent runs.
+ *
+ * `apiKeyEnv` is recorded as the literal string `'LLM_API_KEY'` — the
+ * env-var name the platform's config loader already reads. The
+ * actual key VALUE stays in `process.env` and is never persisted.
+ */
+async function seedPlatformLlmsIfEmpty(
+  llmConfig: { model: string; baseUrl: string },
+): Promise<void> {
+  const repo = getRepositories().platformLlms;
+  const count = await repo.count();
+  if (count > 0) {
+    log.info({ count }, 'platform_llms already seeded — skipping');
+    return;
+  }
+  await repo.create({
+    name: 'Platform default',
+    provider: detectProviderFromBaseUrl(llmConfig.baseUrl),
+    modelString: llmConfig.model,
+    baseUrl: llmConfig.baseUrl,
+    apiKeyEnv: 'LLM_API_KEY',
+    isDefault: true,
+    description: 'Seeded from server .env config on first boot',
+  });
+  log.info(
+    { model: llmConfig.model, baseUrl: llmConfig.baseUrl },
+    'Seeded default LLM from .env config',
+  );
+}
+
+/**
+ * Best-effort provider detection from the baseUrl so the seeded row
+ * has a meaningful `provider` value (the registry's `provider` field
+ * is informational — actual routing is by `model_string`).
+ */
+function detectProviderFromBaseUrl(baseUrl: string): string {
+  if (baseUrl.includes('openai.azure.com')) return 'azure-openai';
+  if (baseUrl.includes('api.openai.com')) return 'openai';
+  if (baseUrl.includes('api.anthropic.com')) return 'anthropic';
+  if (baseUrl.includes('localhost:11434')) return 'ollama';
+  return 'custom';
 }
 
 // ─── Run ──────────────────────────────────────────────────────────────────────

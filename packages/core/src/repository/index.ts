@@ -337,6 +337,56 @@ export interface RepositoryRegistry {
   executionLogs: AgentExecutionLogRepository;
   memberships: ProjectMembershipRepository;
   interventions: InterventionRepository;
+  platformLlms: PlatformLLMRepository;
+}
+
+// ─── Platform LLM registry (migration 014) ───────────────────────────────────
+
+/**
+ * One LLM entry as managed by platform-admin. The API key VALUE is
+ * never persisted — `apiKeyEnv` is the NAME of the env var the server
+ * reads at LLM call time. This is a platform-level resource (not
+ * per-project) so the dashboard's project-settings dropdown can show
+ * the same options for every project.
+ *
+ * Single-default invariant: the partial unique index on `is_default`
+ * enforces "at most one default" at the DB layer; the application is
+ * responsible for ensuring "at least one default" (the server's
+ * first-boot seed creates one from the .env config).
+ */
+export interface PlatformLLMRecord {
+  id: string;
+  name: string;
+  provider: string;
+  modelString: string;
+  baseUrl: string;
+  apiKeyEnv: string;
+  isDefault: boolean;
+  description: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface PlatformLLMRepository extends BaseRepository {
+  list(): Promise<PlatformLLMRecord[]>;
+  findById(id: string): Promise<PlatformLLMRecord | null>;
+  findByName(name: string): Promise<PlatformLLMRecord | null>;
+  findDefault(): Promise<PlatformLLMRecord | null>;
+  /**
+   * Find by `modelString` — used by `getLLMClientForModel` to resolve
+   * per-agent overrides. Returns the FIRST match; uniqueness on
+   * model_string is NOT enforced at the DB layer because the same
+   * model name (e.g. `gpt-4o`) can be registered against multiple
+   * endpoints (OpenAI directly vs Azure OpenAI vs a vLLM proxy).
+   */
+  findByModelString(modelString: string): Promise<PlatformLLMRecord | null>;
+  create(llm: Omit<PlatformLLMRecord, 'id' | 'createdAt' | 'updatedAt'>): Promise<PlatformLLMRecord>;
+  update(id: string, updates: Partial<Omit<PlatformLLMRecord, 'id' | 'createdAt'>>): Promise<PlatformLLMRecord>;
+  /** Throws if id is unknown OR if it is the last LLM in the table. */
+  delete(id: string): Promise<void>;
+  /** Atomically clears the existing default + flips the named id to default. */
+  setDefault(id: string): Promise<PlatformLLMRecord>;
+  count(): Promise<number>;
 }
 
 // ─── Intervention repository (ADR-021) ───────────────────────────────────────

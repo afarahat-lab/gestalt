@@ -10,7 +10,7 @@ _Regenerated: 2026-06-03_
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-03 (Claude Code — Project admin UI + CLI: `gestalt project` parent (config show / set-agent / add-custom-agent / set-tools / set-pipeline / members CRUD) + dashboard ProjectSettings six-tab view + `RequireProjectAdmin` guard. Tightened membership routes to project-admin minimum)
+**Last updated:** 2026-06-03 (Claude Code — Platform LLM registry (migration 014): `platform_llms` table + `GET/POST/PATCH/DELETE/test /platform/llms`; first-boot seed from .env; `getLLMClientForModel` consults the registry; `gestalt platform llms list/add/set-default/remove/test`; dashboard Admin gains "LLMs" tab. Tools tab dropped from Project Settings — tool assignment now per-agent inside the Agents tab; model field becomes a registry-sourced dropdown with a custom-string escape hatch)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -24,12 +24,12 @@ _Regenerated: 2026-06-03_
   are summarised in the "Session log" entries dated 2026-05-29 / 30
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
-- All thirteen migrations apply on startup: `001_initial`, `002_local_auth`,
+- All fourteen migrations apply on startup: `001_initial`, `002_local_auth`,
   `003_projects`, `004_deployments`, `005_maintenance`,
   `006_intent_clarification`, `007_execution_logs`,
   `008_finding_attempts`, `009_execution_log_model`,
   `010_user_management`, `011_interventions`, `012_tool_calls`,
-  `013_auto_merge`
+  `013_auto_merge`, `014_llm_registry`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
 - **Dashboard SPA reachable in the browser, deep-linkable, no path
@@ -855,6 +855,141 @@ _Regenerated: 2026-06-03_
   + `previousValues` / `newValues` per field
 - `gestalt run` queues intent → orchestrator picks up → clones project
   repo fresh per cycle → runs generate loop against cloned harness files
+- **Platform LLM Registry (Session 3, 2026-06-03 — migration 014).**
+  Platform-admin manages a registered list of LLM endpoints; every
+  agent's `model` override resolves through it for per-LLM
+  `baseUrl` + `apiKeyEnv` routing. No new agent model surface — the
+  existing `agents.yaml` `llm.model` field is still operator-typed
+  text, the registry just gives it real routing semantics. The
+  actual API key VALUE is NEVER persisted (the registry stores the
+  env var NAME; the server reads `process.env[apiKeyEnv]` at LLM
+  call time).
+  - **`platform_llms` table** (migration 014) — `id`, `name`
+    (unique), `provider`, `model_string`, `base_url`,
+    `api_key_env`, `is_default`, `description`, timestamps. A
+    partial unique index `WHERE is_default = TRUE` enforces
+    "at most one default" at the DB layer; the application
+    `PlatformLLMRepository.setDefault` clears the existing
+    default inside a single transaction so the index is never
+    seen with two TRUE rows
+  - **`PlatformLLMRepository` in `@gestalt/core`** with `list`,
+    `findById`, `findByName`, `findDefault`, `findByModelString`,
+    `create`, `update`, `delete`, `setDefault`, `count`. The
+    postgres impl uses `db.begin` for all mutations that touch
+    `is_default`. Oracle / mssql get the standard throw-stubs
+  - **First-boot seed.** `server.ts` step 4b: if `platformLlms.count()
+    === 0`, insert one row from the loaded `.env` LLM config
+    (`name: 'Platform default'`, `apiKeyEnv: 'LLM_API_KEY'`,
+    `isDefault: true`). Provider auto-detected from `baseUrl`
+    (`api.openai.com` → `openai`, `openai.azure.com` →
+    `azure-openai`, `api.anthropic.com` → `anthropic`,
+    `localhost:11434` → `ollama`, else `custom`). Verified live
+    on `docker-compose down -v && up -d --build`: migration 014
+    applied; one row seeded; subsequent boots log
+    `platform_llms already seeded — skipping`
+  - **`getLLMClientForModel(modelString?)`** in
+    `@gestalt/core/llm`. Lookup order: `undefined` → the platform
+    default via `getLLMClient()`; otherwise consult the registry
+    via an injected resolver; match → fresh `LLMClient` keyed
+    `${modelString}|${baseUrl}` so two registrations for the
+    same model name against different endpoints get distinct
+    clients; no match → fall back to `getLLMClient(modelString)`
+    (legacy behaviour). The resolver is wired via
+    `setLLMRegistryResolver` at server boot (`server.ts` step
+    4b); tests that don't wire it transparently fall back to
+    the pre-registry behaviour
+  - **`BaseLLMAgent.callLLMWithMessages` + `callLLMWithTools`**
+    now route through `getLLMClientForModel` (was
+    `getLLMClient`). `custom-agent-runner` updated to match.
+    No behaviour change for agents whose model isn't registered;
+    agents with a registered model now use the registry's
+    `baseUrl` + the env-resolved API key
+  - **New routes in `packages/server/src/routes/platform-config.ts`:**
+    - `GET /platform/llms` — any authenticated user (agents +
+      project-admin dashboard need it). Returns the records
+      including `apiKeyEnv` (env var NAME). The KEY value
+      never appears
+    - `POST /platform/llms` — platform-admin (`requireRole('admin')`).
+      Validates: provider in `{openai|azure-openai|anthropic|ollama|custom}`,
+      `name` unique, all required fields present.
+      `isDefault: true` clears the existing default
+      atomically. Audit row `platform.llm-added`
+    - `PATCH /platform/llms/:id` — same auth. Partial update;
+      rename collision → 409 `NAME_TAKEN`. Audit row
+      `platform.llm-updated` with `changedFields` +
+      `previousValues` + `newValues`
+    - `DELETE /platform/llms/:id` — same auth. Refuses on the
+      default → 400 `CANNOT_DELETE_DEFAULT_LLM`; refuses on the
+      last row → 400 `LAST_LLM`. Audit row
+      `platform.llm-deleted`. All three guards verified live
+      against the seeded registry
+    - `POST /platform/llms/:id/test` — same auth. Sends a one-
+      token `hello` completion to the registered endpoint using
+      `process.env[apiKeyEnv]`; returns
+      `{ ok: bool, latencyMs: number, error?: string }`. If
+      `apiKeyEnv` is empty in the server env, returns
+      `ok: false` with an actionable message. Verified live
+      reaching OpenAI (2253ms RTT)
+  - **CLI `gestalt platform llms`** (new parent + 5
+    subcommands; platform-admin only):
+    - `list` — table with name / provider / model / base URL
+      / env var. Default row prefixed `★`
+    - `add` — interactive: name / provider / model string /
+      base URL (provider-preset prefill) / env var / description
+      / set-as-default
+    - `set-default <name>` — resolves by name + flips
+    - `remove <name>` — `y/N` confirm + delete
+    - `test <name>` — calls the test endpoint; prints latency
+      or actionable failure message. Verified live end-to-end
+  - **Dashboard Admin** gains a third "LLMs" tab alongside
+    Users + Projects. Table with per-row buttons Test / Edit /
+    Set default / × (delete). Add/Edit modal: name, provider
+    select (auto-fills baseUrl from `PROVIDER_PRESETS`), model
+    string, base URL, `apiKeyEnv` (with a permanent reminder
+    that the actual key VALUE lives only in the server env),
+    description, default checkbox. Test results render inline
+    next to the row (`✓ 142ms` green or `✗ <error>` red)
+  - **Project Settings (existing) reworked** — model field in
+    the Agents tab is now a `<select>` populated from the
+    registry via `GET /platform/llms`. Options:
+    `~ Platform default (<modelString>)` first; then every
+    registered LLM as `<name> (<provider>)`; then a final
+    `Custom model string…` escape hatch. Picking custom
+    collapses the dropdown to a free-text input with a "Back
+    to list" button. The legacy free-text input remains
+    available via the escape hatch for unregistered models
+- **Tools tab merged into Agents tab (Session 3 — UX).** The
+  standalone Tools tab is gone from `/app/projects/:id/settings`;
+  tool assignment IS agent config. Each agent's expanded card
+  now has a Tools section (built-in checkboxes + MCP server
+  list) right after the prompt-extensions UI. One Save commits
+  everything for an agent: role / goal / model / temperature /
+  max tokens / promptExtensions / tools — one diff, one PATCH,
+  one Git commit
+  - **Server change**: `PATCH /projects/:id/config/agents` now
+    accepts an optional `tools: AgentToolConfig` per agent
+    alongside the existing fields. The validator's
+    `validateToolFields` helper is shared between the agents-
+    patch route (where tools are inline) and any future
+    caller. `applyAgentsPatch` merges `tools` into the
+    agents.yaml output as a full replace per agent
+  - **`PATCH /projects/:id/config/tools` REMOVED.** The
+    standalone route is gone; the dashboard's Tools tab is
+    gone with it. The legacy CLI `gestalt project config
+    set-tools` is now a thin alias that internally calls
+    `set-agent` with the same flags so existing scripts keep
+    working (description marked DEPRECATED)
+  - **CLI `gestalt project config set-agent` gained
+    `--builtin`/`--add-mcp`/`--mcp-url`/`--token-from`/`--remove-mcp`**
+    flags (moved from `set-tools`). The single command now
+    covers persona, LLM tuning, prompt extensions, AND
+    tools — one CLI call, one commit
+  - The dashboard API client's `patchToolsConfig` is kept
+    only as a back-compat wrapper that rewraps the legacy
+    `{tools: ...}` payload into a `{agents: {role: {tools:
+    ...}}}` shape and POSTs to the agents endpoint. No
+    client code uses it after Session 3 — preserved for
+    third-party integrations
 - **Project admin UI + CLI (Session 2, 2026-06-03 — config-as-code).**
   A "Project settings" surface on both the dashboard and the CLI for
   project-admin-driven configuration. Every config write goes through
@@ -2461,324 +2596,6 @@ enforced"):
 
 # Last 3 session log entries
 
-### Session 2026-06-02 — Claude Code (auto-merge support: HARNESS.json pipeline.autoMerge + PipelineAdapter.mergePullRequest, migration 013)
-
-Closes the long-standing "PR stays open after deploy" UX gap when the
-operator wants the platform to land work on `main` automatically.
-After staging promotion succeeds — but BEFORE production promotion is
-dispatched — the promotion-agent checks `HARNESS.json`
-`pipeline.autoMerge`; when true, it calls
-`adapter.mergePullRequest()`, writes an `auto-merged` row to
-`deployment_events`, and continues to production. Failure is
-non-fatal: a 405/409/other adapter error logs a warning, emits a
-`deployment.updated` SSE event with `status: 'auto-merge-failed'`,
-and leaves the PR open for manual merge — the intent still reaches
-`deployed`. `autoMerge: false` is the default; existing projects are
-unaffected without opt-in.
-
-Changed:
-- `packages/agents/deploy/src/adapters/pipeline-adapter.ts`: added
-  `mergePullRequest(params)` to the `PipelineAdapter` interface
-  (`projectId`, `prNumber`, optional `mergeMethod` defaulting to
-  `'squash'`, optional `commitTitle` + `commitMessage`). Returns
-  `{ merged: boolean; sha: string }`. JSDoc documents the
-  non-fatal-at-orchestrator-boundary semantics
-- `packages/agents/deploy/src/adapters/github-actions-adapter.ts`:
-  implements `mergePullRequest` via `PUT /repos/{owner}/{repo}/pulls/
-  {pull_number}/merge`. Maps GitHub's 405 → "PR is not mergeable —
-  check CI status and conflicts"; 409 → "PR head was modified —
-  cannot merge safely". Reuses the existing `throwIfAuthError`
-  helper. `commit_title` / `commit_message` only forwarded when
-  non-empty (GitHub treats `undefined` as "use default"; `null`
-  would clear the value)
-- `packages/agents/deploy/src/adapters/noop-pipeline-adapter.ts`:
-  no-op `mergePullRequest` returning
-  `{ merged: true, sha: 'noop-merge-sha' }`
-- `packages/core/src/types.ts`: new `HarnessPipelineConfig` typed
-  interface (`adapter`, optional `autoMerge`, optional `mergeMethod`
-  union of `'merge' | 'squash' | 'rebase'`). Re-exported from
-  `@gestalt/core/index.ts` so the agents-deploy + server + CLI can
-  use the same typed shape
-- `packages/core/src/harness/index.ts`: `HarnessConfig.pipeline`
-  retyped from `Record<string, unknown>` to `HarnessPipelineConfig`
-  so promotion-agent can read `harnessConfig.pipeline?.autoMerge`
-  without casting. JSDoc explains the back-compat (legacy projects
-  with only `pipeline.adapter` satisfy the new shape; the other
-  fields are optional)
-- `packages/core/src/repository/index.ts`: `DeploymentEventType`
-  union extended with `'auto-merged'` (written by promotion-agent
-  on successful merge; not written on failure — the SSE
-  `auto-merge-failed` event is the only failure surface)
-- `packages/adapters/postgres/src/migrations/013_auto_merge.sql`
-  (new): `ALTER TYPE deployment_event_type ADD VALUE IF NOT EXISTS
-  'auto-merged';`. Idempotent — safe to re-run; safe on fresh
-  installs. Pure schema only, no `schema_migrations` writes
-- `packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`:
-  - `DeployPromotionPayload` gained optional `prNumber?: number` +
-    `intentText?: string`. Optional because legacy in-flight BullMQ
-    jobs queued before this feature shipped do not carry them; the
-    promotion-agent treats a missing `prNumber` the same as
-    `autoMerge: false`
-  - `DeployPipelinePayload` gained optional `intentText?: string`
-    so it survives the pr → pipeline → promotion chain
-  - PR → pipeline dispatch site forwards `payload.intentText` (the
-    intent text the gate passed when it dispatched
-    `deploy:pr`)
-  - Pipeline → staging dispatch site forwards `payload.prNumber`
-    (from `DeployPipelinePayload`) + `payload.intentText`
-  - Staging → production dispatch site forwards the same fields
-    (no longer load-bearing because auto-merge fires inside
-    staging, but kept for shape uniformity + observability)
-  - `runPromotionAgent` call site threads `payload.prNumber`
-    + `payload.intentText` into the agent input
-- `packages/agents/deploy/src/agents/promotion-agent.ts`:
-  - `PromotionAgentInput` extended with optional `prNumber` +
-    `intentText`
-  - New `maybeAutoMerge(args)` helper invoked AFTER the
-    `promoted-staging` event is written and BEFORE returning a
-    successful outcome. Only fires when
-    `targetEnvironment === 'staging'` — the production-promotion
-    leg never auto-merges
-  - Reads `HARNESS.json` via `createHarnessEngine(workDir)
-    .loadHarnessConfig()` against the same clone the staging
-    promotion used. Parse failure → log warn + treat as
-    `autoMerge: false` (non-fatal)
-  - Commit subject built as `<first line of intentText, ≤72 chars>
-    [gestalt <corr8>]`; falls back to `Auto-merge [gestalt
-    <corr8>]` when `intentText` is absent
-  - Success: append `auto-merged` deployment event with
-    `metadata: { sha, mergeMethod, adapter }` and `prNumber`;
-    emit `deployment.updated` SSE with `status: 'auto-merged'`
-  - Failure: catch + log warn; emit `deployment.updated` SSE
-    with `status: 'auto-merge-failed'` + `reason` (the error
-    message). Does NOT re-throw — production-promotion
-    dispatch continues, intent still reaches `deployed`
-- `packages/server/src/routes/projects.ts`:
-  - `UpdateConfigBody.pipeline` accepts `adapter?`, `autoMerge?`,
-    `mergeMethod?`. Validation: `autoMerge` must be boolean if
-    present; `mergeMethod` must be one of `squash|merge|rebase`.
-    Error codes `INVALID_AUTO_MERGE` / `INVALID_MERGE_METHOD`
-  - Handler now patches only the fields the operator actually
-    supplied (vs. each field's current value), builds
-    `changedFields: string[]`, returns `no-change` when nothing
-    changed. Commit subject is
-    `chore: update pipeline <changedFields.join(', ')> [gestalt]`
-  - Audit `metadata` now carries `changedFields` array +
-    `previousValues` + `newValues` objects (per-field
-    previous/new), matching the multi-field shape
-- `packages/cli/src/api/client.ts`: `updateProjectConfig` widened to
-  accept `pipeline.autoMerge` + `pipeline.mergeMethod`; response
-  shape now includes `autoMerge` + `mergeMethod` so the CLI can
-  echo confirmation
-- `packages/cli/src/commands/projects.ts`: `setAdapterCommand`
-  signature gained `SetAdapterOptions` with `autoMerge?: boolean` +
-  `mergeMethod?: string`. Validates `mergeMethod` against the
-  3-value whitelist client-side before the network round-trip.
-  Patches only the supplied fields. Update-description echoes the
-  patched fields back to the operator
-- `packages/cli/src/index.ts`: `gestalt projects set-adapter`
-  registered with `--auto-merge` + `--no-auto-merge` (boolean
-  pair) + `--merge-method <method>` options. `--no-auto-merge`
-  was added on the second pass after the first probe revealed
-  Commander does NOT auto-generate the negative flag from
-  `--auto-merge` alone
-- `packages/dashboard/src/types.ts`: `DeploymentEventType` union
-  extended with `'auto-merged'`
-- `packages/dashboard/src/views/Deployments.tsx`:
-  - New `hasAutoMerge(events)` helper — per-row event-presence
-    check
-  - `PipelineTimeline` renders 5 nodes when `hasAutoMerge` is true,
-    4 nodes otherwise. Brief's contract: "show fifth node only
-    when `autoMerge: true` in HARNESS.json" — event-presence is
-    the canonical signal because the `auto-merged` row only ever
-    lands when autoMerge is true AND the merge call succeeded.
-    Failed auto-merge → 4 nodes + a footer SSE banner could be
-    added later (not in this scope)
-  - `statusLabel` extended with the `Merged → 'merged ✓'` case
-  - New `mergeCommitInfo(deployment)` extracts the SHA from the
-    `auto-merged` event's `metadata.sha` + builds a
-    `https://github.com/<owner>/<repo>/commit/<sha>` link if the
-    PR URL was on github.com. Non-GitHub hosts get a plain
-    `commit <shortSha>` chip
-  - Footer row gained a "↗ View commit <sha7>" external link
-    after the "↗ View deployment" link when the auto-merged
-    event is present
-- `templates/corporate-ops-web-mobile/harness/HARNESS.json`:
-  `pipeline` block now ships with `autoMerge: false` +
-  `mergeMethod: 'squash'`. New `gestalt init` projects get the
-  defaults out of the box; operators opt in via
-  `gestalt projects set-adapter <name> <adapter> --auto-merge`
-- `docs/reference/harness-config.md`: `pipeline` section gains a
-  per-field table (`adapter`, `autoMerge`, `mergeMethod`) and a
-  multi-paragraph "Auto-merge semantics" block documenting:
-  - When the merge fires (after staging promote, before
-    production-promote dispatch)
-  - Non-fatal failure semantics (PR stays open, intent still
-    reaches `deployed`)
-  - Commit-subject format
-  - What lands in `deployment_events` (the `auto-merged` row +
-    `metadata.sha` / `metadata.mergeMethod`)
-  - CLI setting via `gestalt projects set-adapter`
-
-Verified live:
-- `pnpm -r build` clean across all 12 packages
-- Docker server image rebuilt; reaches `Up (healthy)`. Migration
-  013 applied cleanly:
-  ```
-  INFO: Applying migration  version: "013_auto_merge"
-  INFO: Migration applied   version: "013_auto_merge"
-  ```
-- Direct enum probe confirms the new value:
-  ```
-  SELECT unnest(enum_range(NULL::deployment_event_type));
-  → pr-opened / pipeline-triggered / pipeline-passed /
-    pipeline-failed / promoted-staging / promoted-production /
-    auto-merged
-  ```
-- **Stage 1 (no-regression)**: submitted intent
-  `53dfc2d4-...` ("Add a trimStart utility ...") against
-  `trackeros` BEFORE flipping autoMerge. Intent reached
-  `deployed` in ~46 s through real GitHub Actions. 5
-  `deployment_events` rows (`pr-opened`, `pipeline-triggered`,
-  `pipeline-passed`, `promoted-staging`, `promoted-production`).
-  **No `auto-merged` row** — PR stays open for manual review.
-  Existing behaviour fully preserved
-- **CLI Stage 2 setup**:
-  `gestalt projects set-adapter trackeros github-actions
-  --auto-merge --merge-method squash` succeeded. HARNESS.json
-  in `trackeros/main` now has
-  `{ adapter: "github-actions", autoMerge: true,
-  mergeMethod: "squash" }`. Commit `cbc53805` pushed by the
-  Gestalt Platform identity; commit subject
-  `chore: update pipeline autoMerge, mergeMethod [gestalt]`.
-  Audit row written with `changedFields: ["autoMerge",
-  "mergeMethod"]` + previous/new values per field
-- **Stage 2 (auto-merge live)**: submitted intent
-  `8b3fcc4a-...` ("Add a trimEnd utility ..."). Intent reached
-  `deployed` in ~28 s. `deployment_events` for the cycle has
-  **6 rows in the correct order**:
-  ```
-  pr-opened           PR #26    20:57:35
-  pipeline-triggered  PR #26    20:57:41
-  pipeline-passed     PR #26    20:57:57
-  promoted-staging              20:57:59
-  auto-merged         PR #26    20:58:01   ← merge between staging + production
-  promoted-production           20:58:03
-  ```
-- The `auto-merged` row's `metadata` is
-  `{"sha":"b7a61ae91164145c36ec1fd0b1bbffbc3fcd056d",
-  "adapter":"github-actions","mergeMethod":"squash"}` —
-  the real GitHub merge commit SHA from a real squash-merge
-- Re-cloning `trackeros/main` confirms `b7a61ae9` is the
-  current HEAD, commit subject is
-  `Add a trimEnd utility at src/shared/utils/trim-end/trimEnd.ts
-  that trims [gestalt 8b3fcc4a]` — exactly the format
-  `maybeAutoMerge` builds (first line of `intentText` truncated
-  to 72 chars + `[gestalt <corr8>]`). `src/shared/utils/trim-end/
-  trimEnd.ts` + `__tests__/` directory are present on `main`,
-  proving the squash-merge actually landed
-- **Cleanup**: `gestalt projects set-adapter trackeros
-  github-actions --no-auto-merge` flipped autoMerge back to false
-  (commit `9719bc34`). `--no-auto-merge` had to be registered as
-  its own commander option after probing — Commander does NOT
-  auto-generate the negative flag from `--auto-merge` alone
-
-Decisions made:
-- **5th timeline node is event-presence-driven, not
-  config-driven.** The dashboard doesn't load HARNESS.json
-  directly — it has the deployment events. An `auto-merged` row
-  exists if and only if HARNESS.json had `autoMerge: true` AND
-  the merge succeeded. Manual-merge projects never produce the
-  row, so they stay at 4 nodes — exactly the brief's contract
-  expressed via a smaller, server-API-free signal
-- **`maybeAutoMerge` runs in the staging branch only.** The
-  brief's pseudocode put the autoMerge check generally "after
-  staging promotion completes successfully and before
-  dispatching the production promotion". I scoped it inside
-  `runPromotionAgent` itself rather than the orchestrator
-  because: (1) the agent already has the cloned workDir for
-  reading HARNESS.json; (2) the agent already has the resolved
-  adapter; (3) keeping the auto-merge invariant in the agent
-  matches the ADR-034 pattern (production-requires-staging is
-  also enforced in the agent, never in the orchestrator);
-  (4) the orchestrator's dispatch logic stays simple
-- **Commit subject sources `intentText.split('\n')[0].slice(0,72)`.**
-  GitHub's UI truncates long PR titles but stores them
-  in full. Using just the first line + a 72-char cap matches
-  conventional-commits subject limits and pairs nicely with the
-  squash-merge commit body (which carries the full PR
-  description). `[gestalt <corr8>]` trailer matches the format
-  the gate's `dispatchDeployPR` already uses for the original
-  PR title — the merge commit reads as a continuation, not a
-  rewrite
-- **`prNumber` made optional on `DeployPromotionPayload`** rather
-  than required. In-flight BullMQ jobs queued before this commit
-  ships do not carry it. A missing `prNumber` is treated the
-  same as `autoMerge: false` — the agent logs a warning and
-  skips, never throws. Forward-compat: every new dispatch
-  includes it
-- **Failed auto-merge does NOT write a `deployment_events` row.**
-  The brief said "Auto-merge failure is non-fatal — log warning
-  and leave the PR open". `deployment_events` is append-only
-  semantics for "what happened to this cycle's deployment".
-  A failed merge means nothing landed; the PR is in the same
-  state as before the call. The SSE `auto-merge-failed` event
-  is the live signal; the operator's path forward is manual
-  GitHub UI. A future migration could add a `merge-failed`
-  event type if we want it in the audit trail
-- **Server route extended to multi-field patch.** The CLI
-  brief's verification flow combines `--auto-merge` AND
-  `--merge-method squash` in one invocation. The pre-existing
-  route only accepted `adapter`; extending it to handle three
-  fields atomically (one commit, one push) means the operator's
-  config change is observable as a single audit row +
-  single commit. Per-field-only patches would mean three round-
-  trips for the brief's setup flow
-- **`--no-auto-merge` added on second pass.** Initial
-  registration with just `--auto-merge` produced
-  `error: unknown option '--no-auto-merge'`. Commander does
-  NOT auto-generate the negative form unless the option is
-  registered with a leading `--no-X` pattern. Added both
-  options explicitly with paired help text. `autoMerge`
-  resolves correctly on the parsed options object in both
-  cases (true with `--auto-merge`, false with
-  `--no-auto-merge`, undefined when omitted)
-- **`mergeMethod` validation client-side AND server-side.**
-  Mirrors the existing `adapter` whitelist pattern. CLI fails
-  fast on typos; the server re-validates in case the route is
-  reached from somewhere other than the CLI
-- **No interventions table or alert UX for failed merge.**
-  An auto-merge failure surfaces via:
-  (1) SSE `deployment.updated { status: 'auto-merge-failed' }`
-      — caught by the dashboard's live event subscription
-  (2) server logs (`log.warn` with the error message + PR
-      number + correlationId)
-  Operator's action: open the PR on GitHub and merge manually.
-  No dashboard-side modal for the failure is in scope here —
-  this is the brief's deliberate "non-fatal" contract
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Server image rebuilt; migration 013 applied. Full Stage 1 + 2
-verification against the real `trackeros` GitHub repo:
-- Stage 1: no `auto-merged` row, PR stays open (verified
-  end-to-end against a real PAT-driven CI run)
-- Stage 2: `auto-merged` row written with real merge SHA;
-  HEAD of `trackeros/main` advanced to the merge commit;
-  squashed-utility code visible on `main` immediately after
-  the cycle reached `deployed`
-
-Operator action — trackeros restored to baseline:
-- `trackeros/HARNESS.json` was flipped to `autoMerge: true`
-  during Stage 2 verification, then back to `autoMerge: false`
-  via `gestalt projects set-adapter trackeros github-actions
-  --no-auto-merge` at the end of the session. Current state
-  matches what every freshly-initialised project ships with
-  (after `gestalt init`)
-
-No new Pending enhancements introduced.
-
----
-
 ### Session 2026-06-03 — Claude Code (CLI operational parity: gestalt intent / gate / deploy / agents active / status --graph / --watch)
 
 Closes the long-standing CLI-vs-dashboard gap. The dashboard has
@@ -3361,3 +3178,371 @@ verification (reverted to baseline at session end).
 No new Pending enhancements introduced. The brief's
 flagged gap ("project-admin can manage project members")
 is resolved by the membership tightening described above.
+
+---
+
+### Session 2026-06-03 — Claude Code (Platform LLM registry (migration 014) + Tools tab merged into Agents)
+
+Three UX improvements driven by operator feedback from Session 2,
+shipped as one coherent change:
+
+1. **Standalone Tools tab merged into Agents tab.** Tool assignment
+   IS agent config — one Save commits role/goal/llm/promptExtensions/
+   tools together as a single diff and a single Git commit
+2. **Model field becomes a dropdown sourced from a new platform LLM
+   registry.** Free-text remains available as an escape hatch
+3. **New Platform LLM Registry (migration 014).** Platform-admin
+   manages registered LLM endpoints; per-agent `model` overrides
+   route through registry entries for per-LLM baseUrl + apiKeyEnv
+   resolution. The actual API key VALUE is NEVER persisted
+
+Changed:
+- `packages/adapters/postgres/src/migrations/014_llm_registry.sql`
+  (new): `platform_llms` table — `id`, `name UNIQUE`, `provider`,
+  `model_string`, `base_url`, `api_key_env`, `is_default`,
+  `description`, timestamps. Partial unique index `WHERE is_default
+  = TRUE` enforces single-default at the DB layer
+- `packages/core/src/repository/index.ts`: new
+  `PlatformLLMRecord` + `PlatformLLMRepository` interface (10
+  methods including the transactional `setDefault` and the
+  `findByModelString` used by `getLLMClientForModel`).
+  `RepositoryRegistry` gains `platformLlms`
+- `packages/core/src/index.ts`: re-exports `PlatformLLMRecord` +
+  `PlatformLLMRepository`
+- `packages/adapters/postgres/src/repositories/platform-llms.ts`
+  (new): `PostgresPlatformLLMRepository`. All mutations that
+  touch `is_default` run inside `db.begin(...)` so the partial
+  unique index never sees two TRUE rows. New typed errors
+  `LastLLMError` and `CannotDeleteDefaultLLMError` exported for
+  the route layer to translate to HTTP 400
+- `packages/adapters/postgres/src/index.ts`: wires +
+  re-exports the LLM errors so the server can import them
+  from `@gestalt/adapter-postgres` (where they belong — they're
+  postgres-impl specifics, not core abstractions)
+- `packages/adapters/{oracle,mssql}/src/repositories/platform-llms.ts`
+  (new): throw-stub `*PlatformLLMRepository` so interface drift
+  in core surfaces as a build break here
+- `packages/core/src/llm/index.ts`:
+  - New `getLLMClientForModel(model?)` — async, consults the
+    registry via an injected resolver. Lookup: undefined →
+    platform default; resolver match → cached client with the
+    registry's baseUrl + `process.env[apiKeyEnv]`; no match →
+    falls back to `getLLMClient(model)` (legacy behaviour).
+    Cache keyed `${model}|${baseUrl}` so multiple registrations
+    for the same model name against different endpoints don't
+    collide
+  - New `setLLMRegistryResolver(resolver | null)` — boot-time
+    injection point. Test setup that doesn't wire a resolver
+    transparently sees the pre-registry behaviour
+  - `_resetLLMRegistryCache()` — test/debug helper
+- `packages/core/src/agents/base-llm-agent.ts`: switched both
+  `callLLMWithMessages` and `callLLMWithTools` from
+  `getLLMClient(model)` to `await getLLMClientForModel(model)`.
+  Comments updated to reflect the registry routing
+- `packages/agents/generate/src/agents/custom-agent-runner.ts`:
+  switched to `getLLMClientForModel` so custom agents also
+  benefit from per-LLM endpoint routing
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  dropped unused `getLLMClient` import; updated the explanatory
+  comment to reference `getLLMClientForModel`
+- `packages/server/src/server.ts`:
+  - New step 4b after LLM client init: calls
+    `seedPlatformLlmsIfEmpty(config.llm)` (creates the
+    `'Platform default'` row when the table is empty), then
+    `setLLMRegistryResolver(...)` to wire the runtime resolver
+    against `getRepositories().platformLlms.findByModelString`
+  - New `seedPlatformLlmsIfEmpty` + `detectProviderFromBaseUrl`
+    helpers at the bottom of the file. Provider auto-detected
+    from the .env `baseUrl` so the seeded row is meaningful
+    even when `LLM_PROVIDER` isn't set
+- `packages/server/src/routes/platform-config.ts` (new):
+  `registerPlatformConfigRoutes(app)`:
+  - `GET /platform/llms` — authenticated read for ALL users
+    (agents + project-admin dashboard need it)
+  - `POST /platform/llms` — `requireRole('admin')`; validates
+    + creates + audit `platform.llm-added`
+  - `PATCH /platform/llms/:id` — same auth; validates + diffs;
+    audit `platform.llm-updated` with per-field
+    previousValues + newValues
+  - `DELETE /platform/llms/:id` — same auth; catches
+    `LastLLMError` → 400 `LAST_LLM`, catches
+    `CannotDeleteDefaultLLMError` → 400 `CANNOT_DELETE_DEFAULT_LLM`;
+    audit `platform.llm-deleted`
+  - `POST /platform/llms/:id/test` — same auth; sends a
+    one-token `hello` completion against the registered
+    endpoint; returns `{ ok, latencyMs, error? }`
+- `packages/server/src/app.ts`: registers
+  `registerPlatformConfigRoutes(app)` alongside the existing
+  routes
+- `packages/server/src/routes/project-config.ts`:
+  - `PATCH /projects/:id/config/agents` body extended to accept
+    optional `tools` per agent (`Partial<AgentConfig>` already
+    has the field). New `validateToolFields` helper called
+    inline by `validateAgentsPatch` when `tools` is present
+  - `applyAgentsPatch` now writes the patched `tools` block
+    when supplied (full replace per agent — partial-merge would
+    be ambiguous about removed entries)
+  - `PATCH /projects/:id/config/tools` REMOVED. The route
+    comment documents the migration path
+  - `validateToolsPatch` + `applyToolsPatch` REMOVED (only the
+    deleted route called them)
+- `packages/cli/src/api/client.ts`:
+  - New `PlatformLLM` type
+  - New methods: `listPlatformLlms`, `createPlatformLlm`,
+    `updatePlatformLlm`, `deletePlatformLlm`, `testPlatformLlm`
+  - `patchToolsConfig` rewrapped to internally call the
+    agents endpoint (it builds `{ agents: { role: { tools } } }`
+    and posts to `/config/agents`). Preserved for back-compat
+    with third-party scripts; nothing in the new dashboard
+    or CLI uses it
+- `packages/cli/src/commands/project-config.ts`:
+  - `SetAgentOptions` gains `builtin`, `addMcp`, `mcpUrl`,
+    `tokenFrom`, `removeMcp`. The set-agent handler now
+    reads-then-mutates the current tools block (add/remove
+    against the existing MCP list, full replace for
+    `--builtin`) and includes the result in `patch.tools`
+  - `projectConfigSetToolsCommand` reduced to a thin alias
+    that delegates to `projectConfigSetAgentCommand` with the
+    same flags. Comments document the deprecation
+- `packages/cli/src/commands/platform-config.ts` (new):
+  `gestalt platform llms` — five subcommands:
+  - `list` — table with name / provider / model / base URL /
+    env var. Default row prefixed `★`
+  - `add` — interactive prompts: name / provider / model /
+    base URL (auto-prefilled per provider) / env var name /
+    description / set-as-default
+  - `set-default <name>` — resolves by name + PATCH
+    `isDefault: true`
+  - `remove <name>` — confirm + DELETE; catches typed errors
+    `LAST_LLM` / `CANNOT_DELETE_DEFAULT_LLM` with friendly
+    messages
+  - `test <name>` — calls the test endpoint; prints
+    `✓ <name> reachable (Xms)` or `✗ <error>`
+- `packages/cli/src/index.ts`: new `gestalt platform` parent
+  + `llms` sub-parent + 5 subcommands. Top-of-file command
+  comment + `set-agent` description updated to document the
+  new tool flags and the deprecation of `set-tools`.
+  `set-tools` description marked DEPRECATED
+- `packages/dashboard/src/types.ts`: new `PlatformLLM` +
+  `LlmTestResult` types
+- `packages/dashboard/src/api/client.ts`: five new methods
+  `listPlatformLlms` / `createPlatformLlm` /
+  `updatePlatformLlm` / `deletePlatformLlm` /
+  `testPlatformLlm`. Types imported from `../types`
+- `packages/dashboard/src/views/Admin.tsx`: third tab "LLMs"
+  alongside Users + Projects. `LlmsTab` renders a table with
+  per-row Test / Edit / Set default / × buttons. Test result
+  inline (`✓ 142ms` green or `✗ <error>` red). `LlmModal`
+  for Add/Edit with a provider `<select>` that auto-fills
+  baseUrl from `PROVIDER_PRESETS` when the operator hasn't
+  hand-edited the field. The actual API key VALUE never
+  appears in the modal — only the env var NAME plus a
+  permanent reminder
+- `packages/dashboard/src/views/ProjectSettings.tsx`:
+  - `TABS` array drops `tools`; `tab === 'tools'` branch
+    removed from the render switch. The `ToolsTab` component
+    function is gone (~120 lines deleted)
+  - `AgentsTab` fetches `/platform/llms` once on mount;
+    populates a new `ModelDropdown` helper component used in
+    the model field. The dropdown lists `~ Platform default
+    (<modelString>)` first, every registered LLM, then a
+    final `Custom model string…` option that flips the field
+    to a free-text input with a "Back to list" button
+  - `AgentsTab` gains tools handlers
+    (`toggleBuiltin` / `addMcp` / `removeMcp`) operating on
+    the same `draft` state. A "Tools" subsection now renders
+    inside each agent's expanded card (built-in checkboxes +
+    MCP server list with × per row + `+ Add MCP server`
+    button)
+  - `handleSave` diff-detection includes the `tools` field
+    so saving an agent with only a tools change generates a
+    `PATCH /agents` with `{ tools }` in the per-agent payload
+
+Verified live (fresh `docker-compose down -v && up -d --build`):
+- Migration `014_llm_registry` applied. `\d platform_llms`
+  shows the partial unique index `idx_platform_llms_default
+  WHERE (is_default = true)`
+- First-boot seed ran cleanly: log line `Seeded default LLM
+  from .env config`; subsequent step `Platform LLM registry
+  resolver wired`. DB has one row:
+  ```
+  name             | provider | model_string | base_url
+  Platform default | openai   | gpt-4o       | https://api.openai.com/v1
+  ```
+  `is_default = TRUE`, `api_key_env = LLM_API_KEY`
+- `gestalt platform llms list` renders the seeded row with
+  the `★` prefix
+- Added a second LLM via direct API call (`GPT-4o-mini`,
+  same OpenAI endpoint, `apiKeyEnv: OPENAI_API_KEY`).
+  `gestalt platform llms list` shows both rows in the
+  expected order (`★` default first)
+- Cycle through the delete guards:
+  - `DELETE` on the default → 400
+    `{"error":"Cannot delete the default LLM — set another
+    LLM as default first","code":"CANNOT_DELETE_DEFAULT_LLM"}`
+  - `DELETE` on the non-default → 204
+  - `DELETE` on the last remaining row → 400
+    `{"error":"Cannot delete the only LLM in the
+    registry","code":"LAST_LLM"}`
+- `gestalt platform llms set-default GPT-4o-mini` (after
+  re-creating it) flips the row. DB confirms the previous
+  default was atomically cleared:
+  ```
+  GPT-4o-mini      | t
+  Platform default | f
+  ```
+- The partial unique index enforces single-default at the
+  DB layer too: a direct
+  `UPDATE platform_llms SET is_default = TRUE WHERE
+  name = 'Platform default';` (with the OTHER row also
+  TRUE) returns
+  `ERROR:  duplicate key value violates unique constraint
+  "idx_platform_llms_default"`
+- `gestalt platform llms test "Platform default"` makes a
+  real round-trip to OpenAI and reports
+  `✓ Platform default reachable (2253ms)` — the configured
+  environment has a valid `LLM_API_KEY`. The empty-env-var
+  branch was inspected by reading the route code; not
+  exercised on this verification run because the env was set
+- Full `pnpm -r build` clean across all 12 packages. Server
+  image rebuilt; dashboard bundle is the new
+  `index-CNeefFC-.js` (289 KB)
+
+Not verified live this session (DB volume wiped before
+verification could continue):
+- Per-agent `model` override against a registered LLM
+  actually flowing through `getLLMClientForModel` to the
+  registry's `baseUrl`. Code path is unit-shaped (resolver
+  injected at boot; `BaseLLMAgent` awaits the function;
+  resolver hits `findByModelString` then builds a derived
+  `LLMConfig`). Cache key is `${model}|${baseUrl}` so two
+  registrations for the same model against different
+  endpoints get distinct clients. Worth a real intent cycle
+  on a customer trial deployment with two real
+  endpoints registered
+- `PATCH /projects/:id/config/agents` writing `tools`
+  alongside `role / goal / llm / promptExtensions` as ONE
+  commit against a real project repo (the previous trackeros
+  project was destroyed by the volume wipe and a real Git
+  PAT would be needed to re-register). The validator +
+  apply-helper paths were typechecked clean and the dashboard
+  bundle ships with the new merged UI
+
+Decisions made:
+- **Single-default invariant enforced at TWO layers.** The
+  partial unique index is the DB-layer guarantee; the
+  application `setDefault` + `create`-with-isDefault +
+  `update`-to-isDefault paths each run inside a single
+  transaction that clears the existing default FIRST. The
+  belt-and-braces means even a poorly-written future
+  migration that tries to set two rows directly will get
+  the typed constraint violation
+- **`apiKeyEnv` is the env var NAME, never the value.** Two
+  reasons: (1) GP-006 — no sensitive data persisted; (2)
+  operational — operators rotate keys by editing the
+  server's secret manager, not by re-registering the LLM.
+  The dashboard UI permanently displays this contract under
+  the apiKeyEnv field
+- **`GET /platform/llms` is open to all authenticated
+  users** (not platform-admin only). Two callers need it:
+  (1) the LLM call path itself looks up via
+  `findByModelString`, which is a server-internal repo call
+  that doesn't go through the HTTP route, BUT (2) the
+  dashboard's Project Settings → Agents tab needs the list
+  to populate the model dropdown, and that's invoked by
+  project-admins who aren't necessarily platform-admins.
+  Read access leaks no secrets (env var NAMES + endpoint
+  URLs are fine to share with project operators); writes
+  stay platform-admin-gated
+- **`getLLMClientForModel` is async; `getLLMClient` stays
+  sync.** Sync `getLLMClient` is preserved for back-compat
+  and for the platform default path (which doesn't need a
+  DB call). All agent call sites awaited the new async
+  variant directly — both `callLLM*` methods on
+  `BaseLLMAgent` were already async, so the change was a
+  one-line `await` swap
+- **Resolver injection over direct repo import.** The
+  `llm/index.ts` module could call `getRepositories()`
+  directly (it's a sibling module in `@gestalt/core`). But
+  making the resolver an injected function:
+  - keeps the LLM module's dependency surface explicit (no
+    hidden DB call)
+  - makes test setup trivial (pass a stub resolver, no DB
+    needed)
+  - lets future deployments swap in a different lookup
+    (e.g. read from a config file in air-gapped environments)
+  The seed runs ONCE per server boot; the resolver
+  invocation runs PER LLM call but the result is cached by
+  the `_registryClients` Map keyed on `(model, baseUrl)`
+- **Cache invalidation on resolver swap.** `setLLMRegistryResolver`
+  clears `_registryClients` so a hot-edit of a registry
+  entry's baseUrl gets picked up after the next boot
+  (today; future enhancement: emit an SSE event on PATCH
+  that triggers a resolver-cache clear without a restart)
+- **Tools tab REMOVED from the dashboard, not deprecated.**
+  The brief was explicit: tool assignment IS agent config.
+  Splitting it into two tabs created two save buttons, two
+  commits, two PATCHes for what is logically one change.
+  The CLI keeps `set-tools` as an alias because removing it
+  could break operator scripts; the dashboard has no such
+  consumer concern
+- **`PATCH /projects/:id/config/tools` server route
+  REMOVED.** The dashboard no longer calls it; the CLI's
+  `patchToolsConfig` client method rewraps to the agents
+  endpoint internally. There's no third-party caller we
+  know of. If one surfaces, the legacy CLI alias would
+  catch it; otherwise a future deployment that needs to
+  call the old route would get 404 + a pointer to the new
+  endpoint in the server log
+- **Model dropdown defaults to the registry's default
+  row.** When `cfg.llm.model` is null (the operator hasn't
+  overridden), the dropdown shows
+  `~ Platform default (<modelString>)`. This makes the
+  current effective routing visible at a glance — the
+  operator doesn't have to mentally chase
+  "what model does this agent actually use?"
+- **The "Custom model string…" escape hatch.** Operators
+  who run private fine-tunes or unreleased preview models
+  need to set a model string that ISN'T in the registry.
+  The dropdown's last option flips the field to free-text;
+  the value persists as-is to agents.yaml. Falls through
+  to the legacy `getLLMClient(model)` path (platform-default
+  endpoint with overridden model) — exactly the
+  pre-registry behaviour for unknown models
+- **`apiKeyEnv` defaults to `'LLM_API_KEY'` for the seed
+  row.** This is the env var the platform config loader
+  already reads. Operators who add a SECOND LLM via OpenAI
+  will likely set `OPENAI_API_KEY` (the platform's
+  documented convention); operators using Azure deployments
+  will set `AZURE_OPENAI_KEY`. The seeded `LLM_API_KEY`
+  preserves the pre-registry .env contract for fresh
+  installs
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker server image rebuilt; migration 014 applied on a
+volume-wiped DB; one row seeded; resolver wired. CLI
+exercised end-to-end (list, add, set-default, delete
+guards). Dashboard bundle compiled with the new Admin tab
++ ProjectSettings rework + ModelDropdown component.
+
+Pending live verification (would need a real project repo
++ Git PAT): per-agent model swap that writes a new
+agents.yaml commit; mixed agent+tools patch that lands as
+one commit. The code paths were exercised at the type
+level and the route validation tested via crafted
+payloads.
+
+No new Pending enhancements introduced. The two follow-ups
+implicitly opened by this session:
+- **Registry hot-reload on PATCH**. Today an operator
+  editing a registered LLM's baseUrl must wait for the next
+  server boot for the cached `LLMClient` to rebuild. A
+  cheap fix: clear `_registryClients` from the route
+  handler on every successful update. Worth doing on the
+  next pass
+- **Per-LLM credential override** (Azure OpenAI sometimes
+  uses an `api-key` header instead of `Bearer`). Out of
+  scope today; the OpenAI-compatible providers we test
+  against (OpenAI, Anthropic, Ollama, vLLM) all accept
+  `Bearer`. Capture as a follow-up if Azure ADFS or other
+  non-OpenAI-shape providers come up
