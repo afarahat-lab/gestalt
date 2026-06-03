@@ -13,6 +13,7 @@ import type {
   DeploymentSummary,
   UserSummary, UserDetail, MembershipSummary, ProjectMember,
   CreateUserParams, UserRole, ProjectRole,
+  ProjectConfigResponse, EditableAgentConfig, ProjectConfigCustomAgent,
 } from '../types';
 
 export class DashboardApiClient {
@@ -257,6 +258,40 @@ export class DashboardApiClient {
 
   async removeMember(projectId: string, userId: string): Promise<void> {
     await this.delete(`/projects/${projectId}/members/${userId}`);
+  }
+
+  // ─── Project config (Approach A — config-as-code) ──────────────────────────
+
+  async getProjectConfig(projectId: string): Promise<{ data: ProjectConfigResponse }> {
+    return this.get(`/projects/${projectId}/config`);
+  }
+
+  async patchPipelineConfig(
+    projectId: string,
+    patch: { adapter?: string; autoMerge?: boolean; mergeMethod?: 'merge' | 'squash' | 'rebase' },
+  ): Promise<{ data: Record<string, unknown> }> {
+    return this.patch(`/projects/${projectId}/config/pipeline`, patch);
+  }
+
+  async patchAgentsConfig(
+    projectId: string,
+    agents: Record<string, Partial<EditableAgentConfig>>,
+  ): Promise<{ data: { agents: Record<string, EditableAgentConfig>; custom_agents?: ProjectConfigCustomAgent[] } }> {
+    return this.patch(`/projects/${projectId}/config/agents`, { agents });
+  }
+
+  async patchCustomAgentsConfig(
+    projectId: string,
+    customAgents: ProjectConfigCustomAgent[],
+  ): Promise<{ data: { agents: Record<string, EditableAgentConfig>; custom_agents?: ProjectConfigCustomAgent[] } }> {
+    return this.patch(`/projects/${projectId}/config/custom-agents`, { customAgents });
+  }
+
+  async patchToolsConfig(
+    projectId: string,
+    tools: Record<string, { builtin?: string[]; mcp?: Array<{ name: string; url: string; tokenFrom: string }> }>,
+  ): Promise<{ data: { agents: Record<string, EditableAgentConfig>; custom_agents?: ProjectConfigCustomAgent[] } }> {
+    return this.patch(`/projects/${projectId}/config/tools`, { tools });
   }
 
   // ─── HTTP helpers ──────────────────────────────────────────────────────────

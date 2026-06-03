@@ -370,3 +370,45 @@ export interface CreateUserParams {
   password?: string;
   projectAssignments?: Array<{ projectId: string; role: ProjectRole }>;
 }
+
+// ─── Project config (config-as-code, Approach A) ──────────────────────────
+
+export interface EditableAgentLlm {
+  model?: string;
+  temperature?: number;
+  maxTokens?: number;
+  max_tokens?: number;
+}
+
+export interface EditableAgentTools {
+  builtin?: string[];
+  mcp?: Array<{ name: string; url: string; tokenFrom?: string; token_from?: string }>;
+}
+
+export interface EditableAgentConfig {
+  role: string;
+  goal: string;
+  llm: EditableAgentLlm;
+  promptExtensions?: string[];
+  prompt_extensions?: string[];
+  tools?: EditableAgentTools;
+}
+
+export interface ProjectConfigCustomAgent {
+  name: string;
+  role: string;
+  goal: string;
+  runsAfter?: string | null;
+  runs_after?: string | null;
+  llm: EditableAgentLlm;
+  prompt: string;
+}
+
+export interface ProjectConfigResponse {
+  harness: Record<string, unknown>;
+  agents: {
+    agents?: Record<string, EditableAgentConfig>;
+    custom_agents?: ProjectConfigCustomAgent[];
+    customAgents?: ProjectConfigCustomAgent[];
+  };
+}

@@ -430,6 +430,12 @@ gestalt agents validate <projectName>  # check agents.yaml parses + valid
 | `gestalt projects list` | As needed | List your registered projects |
 | `gestalt projects use <name>` | As needed | Switch the current project |
 | `gestalt projects set-adapter <name> <adapter>` | Once per CI swap | Switch pipeline adapter (`noop` ↔ `github-actions`) |
+| `gestalt project config show` | As needed | Show all six config sections (pipeline / agents / custom agents / tools / members / LLMs) |
+| `gestalt project config set-agent <role>` | As needed | Patch a framework agent's LLM / persona / prompt extensions |
+| `gestalt project config add-custom-agent` | As needed | Interactive — add a custom agent (commits to project repo) |
+| `gestalt project config set-tools <role>` | As needed | Toggle built-in tools or add/remove MCP servers per agent |
+| `gestalt project config set-pipeline` | As needed | Adapter / auto-merge / merge method (replaces `set-adapter`) |
+| `gestalt project members list / add / remove / role` | As needed | Manage members of the current project (project-admin) |
 | `gestalt run "<intent>"` | Daily | Submit work to agents |
 | `gestalt status` | Daily | Check platform and intent status |
 | `gestalt status --id <id> --graph [--watch]` | Daily | Execution-flow graph for an intent (live re-render with --watch) |

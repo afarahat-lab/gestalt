@@ -2,17 +2,21 @@
  * Project membership routes (migration 010).
  *
  *   GET    /projects/:id/members           — any project member or platform-admin
- *   POST   /projects/:id/members           — operator+ on project OR platform-admin
- *   PATCH  /projects/:id/members/:userId   — operator+ on project OR platform-admin
- *   DELETE /projects/:id/members/:userId   — operator+ on project OR platform-admin
+ *   POST   /projects/:id/members           — project-admin on project OR platform-admin
+ *   PATCH  /projects/:id/members/:userId   — project-admin on project OR platform-admin
+ *   DELETE /projects/:id/members/:userId   — project-admin on project OR platform-admin
  *
  * Constraints:
  *   - Cannot remove the last `project-admin` from a project
  *   - All mutations write an audit row (GP-002)
  *
- * `requireRole('operator')` already enforces the project-membership
- * leg for non-platform-admin users (it reads `params.id` because the
- * routerPath starts with `/projects/:id`).
+ * The three mutation routes use `checkProjectMembership(...,
+ * 'project-admin')` directly instead of the legacy
+ * `requireRole('operator')` preHandler. The brief was explicit:
+ * EDITORS should not be able to manage members — only project-admins
+ * (and platform-admins via the helper's early-return bypass). The
+ * GET handler keeps `requireRole('viewer')` so any project member
+ * can see who else is on the project.
  */
 
 import type { FastifyInstance } from 'fastify';
@@ -20,7 +24,7 @@ import {
   getRepositories, createContextLogger,
   type ProjectRole, type UserRecord, type ProjectMembershipRecord,
 } from '@gestalt/core';
-import { requireRole } from '../auth/middleware';
+import { requireRole, checkProjectMembership } from '../auth/middleware';
 
 const log = createContextLogger({ module: 'routes:memberships' });
 
@@ -88,10 +92,11 @@ export async function registerMembershipRoutes(app: FastifyInstance): Promise<vo
 
   app.post<{ Params: { id: string }; Body: AddMemberBody }>(
     '/projects/:id/members',
-    { preHandler: requireRole('operator') },
     async (request, reply) => {
       if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
       const projectId = request.params.id;
+      // project-admin minimum — editors no longer manage members
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, projectId, 'project-admin')) return;
       const body = request.body ?? ({} as AddMemberBody);
 
       if (!body.userId?.trim() || !body.role) {
@@ -147,10 +152,10 @@ export async function registerMembershipRoutes(app: FastifyInstance): Promise<vo
 
   app.patch<{ Params: { id: string; userId: string }; Body: UpdateMemberBody }>(
     '/projects/:id/members/:userId',
-    { preHandler: requireRole('operator') },
     async (request, reply) => {
       if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
       const { id: projectId, userId } = request.params;
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, projectId, 'project-admin')) return;
       const body = request.body ?? ({} as UpdateMemberBody);
 
       if (!VALID_PROJECT_ROLES.includes(body.role)) {
@@ -202,10 +207,10 @@ export async function registerMembershipRoutes(app: FastifyInstance): Promise<vo
 
   app.delete<{ Params: { id: string; userId: string } }>(
     '/projects/:id/members/:userId',
-    { preHandler: requireRole('operator') },
     async (request, reply) => {
       if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
       const { id: projectId, userId } = request.params;
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, projectId, 'project-admin')) return;
 
       const { projects, memberships, audit } = getRepositories();
       const project = await projects.findById(projectId);

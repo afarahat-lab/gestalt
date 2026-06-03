@@ -15,6 +15,8 @@ import { Deployments } from './views/Deployments';
 import { Maintenance } from './views/Maintenance';
 import { Alerts } from './views/Alerts';
 import { Admin } from './views/Admin';
+import { ProjectSettings } from './views/ProjectSettings';
+import { useProject } from './context/ProjectContext';
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const token = localStorage.getItem('gestalt_token');
@@ -27,6 +29,21 @@ function RequirePlatformAdmin({ children }: { children: React.ReactNode }) {
   if (loading) return null;
   if (!user || user.role !== 'platform-admin') return <Navigate to="/" replace />;
   return <>{children}</>;
+}
+
+/**
+ * Gate for `/projects/:id/settings`. Passes when the user is a
+ * platform-admin OR the current-project role is `project-admin`.
+ * Editors / readers — and anyone with no membership — bounce home.
+ */
+function RequireProjectAdmin({ children }: { children: React.ReactNode }) {
+  const { user, loading: userLoading } = useCurrentUser();
+  const { currentUserRole, loading: projectsLoading } = useProject();
+  if (userLoading || projectsLoading) return null;
+  if (!user) return <Navigate to="/" replace />;
+  if (user.role === 'platform-admin') return <>{children}</>;
+  if (currentUserRole === 'project-admin') return <>{children}</>;
+  return <Navigate to="/" replace />;
 }
 
 export default function App() {
@@ -81,6 +98,17 @@ export default function App() {
                 <RequirePlatformAdmin>
                   <Admin />
                 </RequirePlatformAdmin>
+              }
+            />
+            {/* Per-project settings — project-admin or platform-admin
+                only. The `:id` segment ensures deep links survive
+                project switching. */}
+            <Route
+              path="projects/:id/settings"
+              element={
+                <RequireProjectAdmin>
+                  <ProjectSettings />
+                </RequireProjectAdmin>
               }
             />
           </Route>

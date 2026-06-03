@@ -26,7 +26,8 @@ import React, {
 } from 'react';
 import { useDashboardApi } from '../hooks/useApi';
 import { ApiError } from '../api/client';
-import type { ProjectSummary } from '../types';
+import { useCurrentUser } from './CurrentUserContext';
+import type { ProjectSummary, ProjectRole } from '../types';
 
 const STORAGE_KEY = 'gestalt_project_id';
 
@@ -36,15 +37,26 @@ interface ProjectContextValue {
   currentProject: ProjectSummary | null;
   setCurrentProjectId: (id: string) => void;
   loading: boolean;
+  /**
+   * The signed-in user's role on the CURRENT project — `'project-admin'
+   * | 'editor' | 'reader'`, or `null` if they're not a member.
+   * Platform-admins also resolve to `null` because they bypass
+   * membership checks server-side; the dashboard's Settings link
+   * combines this with `currentUser.role === 'platform-admin'` to
+   * decide visibility. Refreshes when the project selection changes.
+   */
+  currentUserRole: ProjectRole | null;
 }
 
 const ProjectContext = createContext<ProjectContextValue | null>(null);
 
 export function ProjectProvider({ children }: { children: React.ReactNode }) {
   const api = useDashboardApi();
+  const { user: currentUser } = useCurrentUser();
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [currentProjectId, setCurrentProjectIdState] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [currentUserRole, setCurrentUserRole] = useState<ProjectRole | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -109,13 +121,37 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
     localStorage.setItem(STORAGE_KEY, id);
   }, []);
 
+  // Resolve the current user's role on the current project so the
+  // sidebar can show/hide the ⚙ Settings link without an extra
+  // round-trip per render. `listMembers` requires viewer-on-project
+  // membership; a 403 (non-member) maps to `null`. Refetches when
+  // either the user or the selected project changes.
+  useEffect(() => {
+    if (!currentUser || !currentProjectId) {
+      setCurrentUserRole(null);
+      return;
+    }
+    let cancelled = false;
+    api.listMembers(currentProjectId)
+      .then((res) => {
+        if (cancelled) return;
+        const match = res.data.find((m) => m.userId === currentUser.id);
+        setCurrentUserRole(match?.projectRole ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setCurrentUserRole(null);
+      });
+    return () => { cancelled = true; };
+  }, [api, currentProjectId, currentUser]);
+
   const value = useMemo<ProjectContextValue>(() => ({
     projects,
     currentProjectId,
     currentProject: projects.find((p) => p.id === currentProjectId) ?? null,
     setCurrentProjectId,
     loading,
-  }), [projects, currentProjectId, setCurrentProjectId, loading]);
+    currentUserRole,
+  }), [projects, currentProjectId, setCurrentProjectId, loading, currentUserRole]);
 
   return (
     <ProjectContext.Provider value={value}>

@@ -15,6 +15,13 @@
  *                                  [--auto-merge | --no-auto-merge]
  *                                  [--merge-method squash|merge|rebase]
  *                                  [--server <url>]
+ *   gestalt project config show                              — read all six sections
+ *   gestalt project config set-agent <role>                  — patch one agent
+ *   gestalt project config add-custom-agent                  — interactive add
+ *   gestalt project config remove-custom-agent <name>
+ *   gestalt project config set-tools <role>
+ *   gestalt project config set-pipeline                      — replaces set-adapter
+ *   gestalt project members list / add / remove / role
  *   gestalt run "<intent>" [--server <url>] [--priority critical|high|normal|low]
  *   gestalt intent list [--project <name>] [--status <s>] [--limit 20]
  *   gestalt intent show <id> [--watch]                — execution-flow graph
@@ -70,6 +77,13 @@ import {
 } from './commands/intent';
 import { gateShowCommand } from './commands/gate';
 import { deployListCommand, deployShowCommand } from './commands/deploy';
+import {
+  projectConfigShowCommand, projectConfigSetAgentCommand,
+  projectConfigAddCustomAgentCommand, projectConfigRemoveCustomAgentCommand,
+  projectConfigSetToolsCommand, projectConfigSetPipelineCommand,
+  projectMembersListCommand, projectMembersAddCommand,
+  projectMembersRemoveCommand, projectMembersRoleCommand,
+} from './commands/project-config';
 import {
   usersListCommand, usersAddCommand, usersRoleCommand, usersDeactivateCommand,
   usersAssignCommand, usersUnassignCommand, usersMembersCommand,
@@ -183,6 +197,156 @@ projects
       autoMerge: opts.autoMerge,
       mergeMethod: opts.mergeMethod,
     }).catch(fatalError);
+  });
+
+// gestalt project (singular) — per-project administration
+//
+// Coexists with `gestalt projects` (plural — for cross-project
+// listing / switching / set-adapter). Every write under `project`
+// goes through the config-as-code endpoints: clone → edit
+// HARNESS.json or agents.yaml → commit `chore: update <section>
+// [gestalt-admin]` → push. project-admin minimum (or platform-admin).
+const project = program
+  .command('project')
+  .description('Per-project administration — config (HARNESS.json / agents.yaml) and members');
+
+const projectConfig = project
+  .command('config')
+  .description('Read or patch the project\'s committed config (HARNESS.json + agents.yaml)');
+
+projectConfig
+  .command('show')
+  .description('Show all six config sections (pipeline / agents / custom agents / tools / members)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <name>', 'Project name (defaults to current project)')
+  .action(async (opts: { server?: string; project?: string }) => {
+    await projectConfigShowCommand({ server: opts.server, project: opts.project }).catch(fatalError);
+  });
+
+projectConfig
+  .command('set-agent <agentRole>')
+  .description('Patch one framework agent in agents.yaml (commits to the project repo)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <name>', 'Project name (defaults to current project)')
+  .option('--model <model>', "LLM model override (use '~' or omit to clear)")
+  .option('--temperature <float>', 'LLM temperature (0..2)')
+  .option('--max-tokens <int>', 'LLM max tokens (positive integer)')
+  .option('--role <text>', 'Persona role line')
+  .option('--goal <text>', 'Persona goal line')
+  .option('--add-extension <text>', 'Append a prompt extension')
+  .option('--remove-extension <index>', 'Remove the prompt extension at the given 0-based index')
+  .action(async (agentRole: string, opts: {
+    server?: string; project?: string;
+    model?: string; temperature?: string; maxTokens?: string;
+    role?: string; goal?: string;
+    addExtension?: string; removeExtension?: string;
+  }) => {
+    await projectConfigSetAgentCommand(agentRole, {
+      server: opts.server, project: opts.project,
+      model: opts.model, temperature: opts.temperature, maxTokens: opts.maxTokens,
+      role: opts.role, goal: opts.goal,
+      addExtension: opts.addExtension, removeExtension: opts.removeExtension,
+    }).catch(fatalError);
+  });
+
+projectConfig
+  .command('add-custom-agent')
+  .description('Interactively add a custom agent. Prompts for name / role / goal / runs_after / model; opens $EDITOR for the prompt body.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <name>', 'Project name (defaults to current project)')
+  .action(async (opts: { server?: string; project?: string }) => {
+    await projectConfigAddCustomAgentCommand({ server: opts.server, project: opts.project }).catch(fatalError);
+  });
+
+projectConfig
+  .command('remove-custom-agent <name>')
+  .description('Remove a custom agent by name (commits to the project repo)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <name>', 'Project name (defaults to current project)')
+  .action(async (name: string, opts: { server?: string; project?: string }) => {
+    await projectConfigRemoveCustomAgentCommand(name, { server: opts.server, project: opts.project }).catch(fatalError);
+  });
+
+projectConfig
+  .command('set-tools <agentRole>')
+  .description('Set built-in tool + MCP server assignments for one framework agent (commits to the project repo)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <name>', 'Project name (defaults to current project)')
+  .option('--builtin <list>', 'Comma-separated list of built-in tools (readFile,listDirectory,searchFiles,getFileTree)')
+  .option('--add-mcp <name>', 'Add an MCP server. Pair with --mcp-url and --token-from.')
+  .option('--mcp-url <url>', 'URL for the MCP server being added')
+  .option('--token-from <source>', 'project_credential | harness | env:VAR_NAME', 'project_credential')
+  .option('--remove-mcp <name>', 'Remove an MCP server by name')
+  .action(async (agentRole: string, opts: {
+    server?: string; project?: string;
+    builtin?: string; addMcp?: string; mcpUrl?: string; tokenFrom?: string; removeMcp?: string;
+  }) => {
+    await projectConfigSetToolsCommand(agentRole, {
+      server: opts.server, project: opts.project,
+      builtin: opts.builtin, addMcp: opts.addMcp, mcpUrl: opts.mcpUrl,
+      tokenFrom: opts.tokenFrom, removeMcp: opts.removeMcp,
+    }).catch(fatalError);
+  });
+
+projectConfig
+  .command('set-pipeline')
+  .description('Update the pipeline section of HARNESS.json (replaces gestalt projects set-adapter for new use)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <name>', 'Project name (defaults to current project)')
+  .option('--adapter <adapter>', 'CI/CD adapter: noop | github-actions')
+  .option('--auto-merge', 'Enable auto-merge of the PR after staging promotion')
+  .option('--no-auto-merge', 'Explicitly disable auto-merge')
+  .option('--merge-method <method>', 'Merge method: squash | merge | rebase')
+  .action(async (opts: {
+    server?: string; project?: string;
+    adapter?: string; autoMerge?: boolean; mergeMethod?: string;
+  }) => {
+    await projectConfigSetPipelineCommand({
+      server: opts.server, project: opts.project,
+      adapter: opts.adapter, autoMerge: opts.autoMerge, mergeMethod: opts.mergeMethod,
+    }).catch(fatalError);
+  });
+
+// gestalt project members
+const projectMembers = project
+  .command('members')
+  .description('Manage members of the current project (project-admin or platform-admin only)');
+
+projectMembers
+  .command('list')
+  .description('List members of the project with their roles')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <name>', 'Project name (defaults to current project)')
+  .action(async (opts: { server?: string; project?: string }) => {
+    await projectMembersListCommand({ server: opts.server, project: opts.project }).catch(fatalError);
+  });
+
+projectMembers
+  .command('add <email>')
+  .description('Add an existing platform user to the project with a role')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <name>', 'Project name (defaults to current project)')
+  .option('--role <role>', 'project-admin | editor | reader')
+  .action(async (email: string, opts: { server?: string; project?: string; role?: string }) => {
+    await projectMembersAddCommand(email, { server: opts.server, project: opts.project, role: opts.role }).catch(fatalError);
+  });
+
+projectMembers
+  .command('remove <email>')
+  .description('Remove a member from the project (refuses if they are the last project-admin)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <name>', 'Project name (defaults to current project)')
+  .action(async (email: string, opts: { server?: string; project?: string }) => {
+    await projectMembersRemoveCommand(email, { server: opts.server, project: opts.project }).catch(fatalError);
+  });
+
+projectMembers
+  .command('role <email> <role>')
+  .description('Change a member\'s project role (project-admin | editor | reader)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <name>', 'Project name (defaults to current project)')
+  .action(async (email: string, role: string, opts: { server?: string; project?: string }) => {
+    await projectMembersRoleCommand(email, role, { server: opts.server, project: opts.project }).catch(fatalError);
   });
 
 // gestalt maintenance

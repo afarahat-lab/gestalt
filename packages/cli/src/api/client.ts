@@ -182,6 +182,47 @@ export interface InterventionRecordDto {
   createdAt: string;
 }
 
+// ─── Project config (config-as-code) ────────────────────────────────────────
+
+export interface EditableAgentLlm {
+  model?: string;
+  temperature?: number;
+  maxTokens?: number;
+  /** Snake-case fallback emitted by `yaml.stringify` — readers should
+   *  accept either shape since the server normalises before commit. */
+  max_tokens?: number;
+}
+
+export interface EditableAgentTools {
+  builtin?: string[];
+  mcp?: Array<{ name: string; url: string; tokenFrom?: string; token_from?: string }>;
+}
+
+export interface EditableAgentConfig {
+  role: string;
+  goal: string;
+  llm: EditableAgentLlm;
+  promptExtensions?: string[];
+  prompt_extensions?: string[];
+  tools?: EditableAgentTools;
+}
+
+export interface ProjectConfigCustomAgent {
+  name: string;
+  role: string;
+  goal: string;
+  runsAfter?: string | null;
+  runs_after?: string | null;
+  llm: EditableAgentLlm;
+  prompt: string;
+}
+
+export interface ProjectConfigAgentsYaml {
+  agents?: Record<string, EditableAgentConfig>;
+  custom_agents?: ProjectConfigCustomAgent[];
+  customAgents?: ProjectConfigCustomAgent[];
+}
+
 // ─── Deployments (ADR-033 / ADR-034) ─────────────────────────────────────────
 
 export type DeploymentEventType =
@@ -338,6 +379,43 @@ export class GestaltApiClient {
     projectDescription: string,
   ): Promise<{ data: { committed: boolean; commitSha: string } }> {
     return this.post(`/projects/${projectId}/init-harness`, { projectDescription });
+  }
+
+  // ─── Project config (config-as-code, Approach A) ──────────────────────────
+
+  async getProjectConfig(projectId: string): Promise<{ data: {
+    harness: Record<string, unknown>;
+    agents: ProjectConfigAgentsYaml;
+  } }> {
+    return this.get(`/projects/${projectId}/config`);
+  }
+
+  async patchPipelineConfig(
+    projectId: string,
+    patch: { adapter?: string; autoMerge?: boolean; mergeMethod?: 'merge' | 'squash' | 'rebase' },
+  ): Promise<{ data: Record<string, unknown> }> {
+    return this.patch(`/projects/${projectId}/config/pipeline`, patch);
+  }
+
+  async patchAgentsConfig(
+    projectId: string,
+    agents: Record<string, Partial<EditableAgentConfig>>,
+  ): Promise<{ data: { agents: Record<string, EditableAgentConfig>; custom_agents?: ProjectConfigCustomAgent[] } }> {
+    return this.patch(`/projects/${projectId}/config/agents`, { agents });
+  }
+
+  async patchCustomAgentsConfig(
+    projectId: string,
+    customAgents: ProjectConfigCustomAgent[],
+  ): Promise<{ data: { agents: Record<string, EditableAgentConfig>; custom_agents?: ProjectConfigCustomAgent[] } }> {
+    return this.patch(`/projects/${projectId}/config/custom-agents`, { customAgents });
+  }
+
+  async patchToolsConfig(
+    projectId: string,
+    tools: Record<string, { builtin?: string[]; mcp?: Array<{ name: string; url: string; tokenFrom: string }> }>,
+  ): Promise<{ data: { agents: Record<string, EditableAgentConfig>; custom_agents?: ProjectConfigCustomAgent[] } }> {
+    return this.patch(`/projects/${projectId}/config/tools`, { tools });
   }
 
   async updateProjectConfig(

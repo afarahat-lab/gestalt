@@ -100,6 +100,26 @@ against a single intent or browses recent activity:
 All commands accept an `<id>` as either a full UUID or an 8-char `correlationId`
 prefix — same form the list tables print.
 
+### 7. Configure the project (project-admin)
+
+Project-admins can edit `HARNESS.json` and `agents.yaml` from either the
+dashboard's ⚙ Settings link or the CLI. Every change clones the repo,
+edits the file, commits `chore: update <section> [gestalt-admin]`, and
+pushes — Git remains the source of truth (ADR-032).
+
+| Command | What it changes |
+|---|---|
+| `gestalt project config show` | Read all six sections (pipeline / agents / custom agents / tools / members / LLMs). |
+| `gestalt project config set-agent <role>` | Patch one framework agent — model, temperature, max tokens, prompt extensions. |
+| `gestalt project config add-custom-agent` | Interactive add (opens `$EDITOR` for the prompt body). |
+| `gestalt project config set-tools <role>` | Toggle built-in file tools + add/remove MCP servers per agent. |
+| `gestalt project config set-pipeline` | Adapter, auto-merge, merge method. Replaces `gestalt projects set-adapter`. |
+| `gestalt project members list / add / remove / role` | Manage project membership (project-admin minimum). |
+
+The dashboard surface at `/app/projects/:id/settings` provides the same
+six tabs with a form-based UI. The sidebar link is visible only to
+project-admins on the current project (and platform-admins).
+
 ---
 
 ## SDLC coverage

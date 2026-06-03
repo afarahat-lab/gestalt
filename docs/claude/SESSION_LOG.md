@@ -10041,3 +10041,278 @@ parity gap that prompted this session is now closed:
 operators who prefer the terminal have full read-only
 access to intent / gate / deploy / maintenance / agent
 state without opening the browser.
+
+---
+
+### Session 2026-06-03 — Claude Code (project admin UI + CLI — config-as-code, Approach A)
+
+Adds a "Project settings" surface to both the dashboard and the CLI
+so project-admins can edit per-project configuration without going
+through Git directly. Every write follows the ADR-032 pattern: server
+clones the project repo, mutates `HARNESS.json` or `agents.yaml`,
+commits `chore: update <section> [gestalt-admin]`, pushes to
+`defaultBranch`, cleans up in `finally`. No new DB tables, no new
+migrations.
+
+Also tightens the existing membership routes to project-admin
+minimum (was operator-level which allowed editors) — the brief
+flagged this as the long-standing gap that project-admins couldn't
+manage their own project's members through the dashboard.
+
+Changed:
+- `packages/server/src/routes/memberships.ts`:
+  `POST/PATCH/DELETE /projects/:id/members` — dropped the
+  `requireRole('operator')` preHandler in favour of a handler-level
+  `checkProjectMembership(..., 'project-admin')`. Editors and
+  readers are now correctly blocked from member management
+- `packages/server/src/routes/project-config.ts` (new): the
+  centerpiece. One GET + four PATCH endpoints + a shared
+  `withWorkingClone(project, token, commitSubject, mutate)` helper:
+  - `GET /projects/:id/config` — shallow clone, read both files,
+    return `{ harness, agents }`. `agents.agents` is server-side
+    filtered to the editable framework subset (10 LLM roles); the
+    legacy `custom_agents` array passes through
+  - `PATCH /projects/:id/config/pipeline` — partial HARNESS.json
+    update. Reuses the same whitelists the existing legacy POST
+    used. Returns the patched harness
+  - `PATCH /projects/:id/config/agents` — partial agents.yaml
+    update keyed by agent role. Validates: known role names,
+    temperature 0..2, maxTokens > 0, model is string or null.
+    Per-agent merge: only the supplied fields change. Returns
+    the post-merge agents.yaml
+  - `PATCH /projects/:id/config/custom-agents` — full replace of
+    the `custom_agents:` array. Runs `scheduleCustomAgents` on
+    the payload BEFORE the commit so cycles / unknown
+    `runs_after` targets / self-loops return 400
+    `INVALID_CUSTOM_AGENT_SCHEDULE` with the typed scheduler
+    error
+  - `PATCH /projects/:id/config/tools` — partial per-agent
+    `tools:` block update. Built-in tools validated against the
+    four ADR-038 names; MCP entries validated for `name + url +
+    tokenFrom` shape
+  - **Three exported `apply<X>Patch` helpers** (`Pipeline`,
+    `Agents`, `CustomAgents`, `Tools`) wrap the
+    clone-edit-commit-push flow with per-section logic. The
+    pipeline helper is RE-EXPORTED so the legacy POST handler in
+    `projects.ts` can call into it for backward compat
+  - All routes use `checkProjectMembership(..., 'project-admin')`.
+    Every successful patch writes an audit row with
+    `action: 'project.config-updated'`, `metadata: { section,
+    changedFields[], commitSha, ip }`. Values are NOT in the
+    audit — they may contain tokens (MCP `tokenFrom: 'env:VAR'`
+    surfaces an env-var name; future credential fields could
+    leak more)
+- `packages/server/src/routes/projects.ts`: legacy
+  `POST /projects/:id/config` body replaced with a delegation to
+  `applyPipelinePatch`. Same legacy response shape (`updated`,
+  `adapter`, `autoMerge`, `mergeMethod`, `commitSha`, `reason`)
+  preserved so the CLI's `gestalt projects set-adapter` keeps
+  working unchanged. One mutation path per file
+- `packages/server/src/app.ts`: registered
+  `registerProjectConfigRoutes(app)`
+- `packages/cli/src/api/client.ts`: new types
+  `EditableAgentConfig`, `EditableAgentLlm`, `EditableAgentTools`,
+  `ProjectConfigCustomAgent`, `ProjectConfigAgentsYaml`. Five new
+  client methods: `getProjectConfig`, `patchPipelineConfig`,
+  `patchAgentsConfig`, `patchCustomAgentsConfig`,
+  `patchToolsConfig`. The pre-existing `updateProjectConfig`
+  (legacy POST) is preserved
+- `packages/cli/src/commands/project-config.ts` (new): ten
+  named exports — the seven config subcommands +
+  three members subcommands (list / add / remove / role).
+  `add-custom-agent` opens `$EDITOR` (falls back to `vi`) for
+  the multi-line prompt body; `confirm` prompts on
+  `remove-custom-agent` and `members remove`. All commands
+  resolve project by `--project <name>` flag OR the current
+  project from `~/.gestalt/config.json`
+- `packages/cli/src/index.ts`: registered the new
+  `gestalt project` (singular) parent with `config` +
+  `members` sub-parents and all seven subcommands. The plural
+  `gestalt projects` (list / use / set-adapter) coexists —
+  per the brief, the singular form is for per-project
+  administration; the plural for cross-project navigation
+- `packages/dashboard/src/types.ts`: added
+  `EditableAgentConfig`, `EditableAgentLlm`,
+  `EditableAgentTools`, `ProjectConfigCustomAgent`,
+  `ProjectConfigResponse`
+- `packages/dashboard/src/api/client.ts`: new methods
+  `getProjectConfig`, `patchPipelineConfig`,
+  `patchAgentsConfig`, `patchCustomAgentsConfig`,
+  `patchToolsConfig`
+- `packages/dashboard/src/context/ProjectContext.tsx`: new
+  `currentUserRole: ProjectRole | null` field on the context
+  value. Resolved via `listMembers` + cross-reference against
+  the signed-in user's id. `null` for non-members (and for
+  platform-admins, who bypass project guards server-side —
+  the Layout combines this with `user.role === 'platform-
+  admin'` to decide visibility). Refetches when project
+  selection changes
+- `packages/dashboard/src/components/layout/Layout.tsx`:
+  new `⚙ Settings` nav link below the project selector.
+  Visible ONLY when `canEditProject = isPlatformAdmin ||
+  currentUserRole === 'project-admin'` — the `<li>` is
+  absent from the DOM for editors / readers, not just
+  hidden via CSS
+- `packages/dashboard/src/views/ProjectSettings.tsx` (new):
+  six-tab admin surface. Single
+  `GET /projects/:id/config` on mount drives every tab
+  except Members (which uses the existing
+  `GET /projects/:id/members`):
+  - **Members tab** — table with inline role select +
+    Remove button + Add modal that searches `/users` by
+    email/name
+  - **Agents tab** — per-agent block with editable Role /
+    Goal / Model / Temperature / Max tokens /
+    promptExtensions list. "Save changes" diffs the draft
+    against the loaded config and sends ONE
+    `PATCH /agents` covering every changed role. Separate
+    read-only card lists the 9 infrastructure agents with
+    the brief's note ("cannot be configured — they run
+    deterministic checks")
+  - **Custom agents tab** — list with Edit/Delete buttons +
+    modal for Add/Edit. Modal includes a `runs_after`
+    `<select>` populated with framework + other-custom
+    names (excluding self). Cycle errors from the server
+    render in a red banner without destroying the form
+    state
+  - **Tools tab** — per-agent checkboxes for the four
+    built-in tools + MCP server list with name/url/tokenFrom
+    columns. Add MCP via `window.prompt` (modal can
+    follow); Remove via × button. Single
+    `PATCH /tools` covers all agents
+  - **Pipeline tab** — radio for adapter, checkbox for
+    autoMerge, radio for mergeMethod. Replaces the
+    `gestalt projects set-adapter` flow with a proper UI
+  - **LLMs tab** — read-only summary table. Click row →
+    jump to Agents tab via internal state
+- `packages/dashboard/src/App.tsx`: new
+  `RequireProjectAdmin` guard component + route
+  registration at `/projects/:id/settings`. The guard
+  passes when `user.role === 'platform-admin'` OR
+  `currentUserRole === 'project-admin'`; otherwise
+  redirects to `/`
+
+Verified live against `trackeros`:
+- `pnpm -r build` clean across all 12 packages. Docker
+  server image rebuilt; reaches `Up (healthy)`. New routes
+  register cleanly
+- **GET `/projects/:id/config`** returns the typed payload:
+  `harness` has all 12 expected keys (name / version / tier /
+  templateId / description / stack / adapters / qualityGate /
+  pipeline / maintenance / identity / constraints);
+  `agents.agents` has 6 framework roles (intent-agent,
+  code-agent, review-agent, drift-agent, alignment-agent,
+  context-fixer) — exactly the editable subset;
+  `agents.custom_agents` has `docs-check-agent`
+- **`gestalt project config show`** renders all six
+  sections including the 4 members with their project
+  roles
+- **Agent patch + commit verified**:
+  `gestalt project config set-agent code-agent
+  --temperature 0.3` committed `63cb7f4` to `trackeros/main`
+  with subject `chore: update agents [gestalt-admin]`.
+  Direct git clone confirms `code-agent.llm.temperature:
+  0.3` in the pushed `agents.yaml`
+- **Pipeline patch + commit verified**:
+  `gestalt project config set-pipeline --auto-merge
+  --merge-method squash` committed `261a4cf` to
+  `trackeros/main`. `HARNESS.json` pipeline section now
+  `{ adapter: "github-actions", autoMerge: true,
+  mergeMethod: "squash" }`
+- **Cycle detection verified**: a POST with
+  `agent-a → agent-b` + `agent-b → agent-a` returns 400
+  `INVALID_CUSTOM_AGENT_SCHEDULE` + the typed scheduler
+  error `"Cycle detected in custom agent dependencies:
+  agent-a → agent-b. Custom agents cannot form dependency
+  cycles."` — no commit landed
+- **Editor-tightening verified end-to-end**: created a
+  fresh `editor-test@example.com` user, assigned `editor`
+  role on trackeros. As that editor:
+  - `POST /projects/:id/members` → 403
+    `INSUFFICIENT_PROJECT_ROLE`
+  - `GET /projects/:id/config` → 403
+    `INSUFFICIENT_PROJECT_ROLE`
+  - `GET /intents?projectId=...&limit=1` → 200 with the
+    intent list (reader-level access preserved)
+- **Dashboard bundle**: built clean (Vite, 281 KB ungzipped
+  / 80 KB gzipped). Spot-check on the live bundle confirms
+  the new view + `currentUserRole` + `projects/:id/settings`
+  route + `Project settings` string are all present
+- Operator cleanup at session end: trackeros HARNESS.json
+  reverted to `autoMerge: false`; test user removed via
+  `DELETE /users/:id`
+
+Decisions made:
+- **Approach A (config-as-code) over a parallel DB
+  config store.** The brief was explicit; cleaner story for
+  the operator (git log narrates every change) and avoids
+  the "which is the source of truth — DB or repo?"
+  question. Cost: a clone per write. Mitigated by
+  shallow clones for reads and one full clone per
+  write — typical config write completes in ~3-4 seconds
+  end-to-end against `github.com`
+- **Tightening membership routes to project-admin (was
+  operator).** The brief said "Currently requires
+  platform-admin", which was inaccurate — the actual
+  guard was `requireRole('operator')` which allows
+  editors. The intent of the fix was clearly "EDITORS
+  should not manage members" — so I tightened, not
+  widened. Editors can still submit intents, run
+  maintenance triggers, and view config; only
+  membership management and config patches require
+  project-admin
+- **`gestalt project` (singular) coexists with
+  `gestalt projects` (plural).** Brief was explicit. The
+  noun-verb feel of `project config` and `project
+  members` is cleaner than overloading `projects`
+  (which is about cross-project listing / switching).
+  Operators can pick whichever feels natural per task
+- **The legacy `POST /projects/:id/config` route is
+  retained.** It now delegates to `applyPipelinePatch`
+  but keeps the legacy response shape so
+  `gestalt projects set-adapter` (and any third-party
+  scripts) continue to work. One mutation path per
+  file, two entry points
+- **Audit metadata excludes values.** MCP `tokenFrom:
+  'env:VAR'` would surface an env-var name; future
+  credential fields could leak more. Field names +
+  commit SHA + section name are enough to trace WHO
+  changed WHAT and WHEN; the values land in Git history
+  where they belong
+- **`scheduleCustomAgents` validation runs BEFORE the
+  commit.** A cycle in `runs_after` is a configuration
+  error that should fail fast with the operator's
+  client. Catching it post-commit would require a
+  revert which is uglier
+- **`currentUserRole` resolved via `listMembers`, not a
+  new dedicated endpoint.** The membership list is small
+  (single-digit members per project at steady state)
+  and cached at the page level by the dashboard's data
+  layer. Adding a `GET /projects/:id/my-role` endpoint
+  would be ~10 lines server-side but a parallel surface
+  to maintain. Re-using `listMembers` keeps the data
+  model coherent
+- **`RequireProjectAdmin` waits on BOTH user-load AND
+  project-load.** Renders `null` while either is
+  loading so the route doesn't bounce on first render
+  before the role data lands. The Layout's link uses
+  the same combined check
+- **YAML comments are NOT preserved across config
+  writes.** The `yaml` package's `parseDocument` API
+  could preserve them, but the cost is significant
+  complexity and the seeded `agents.yaml` is mostly
+  machine-shaped. Operators who heavily comment their
+  agents.yaml should be aware. Documented inline in
+  the `stringifyAgentsYaml` helper
+
+Build status: `pnpm -r build` clean across all 12
+packages. Docker server image rebuilt; new routes live.
+Full feature exercised end-to-end against `trackeros`:
+GET config / agent patch / pipeline patch / cycle
+detection / editor tightening / dashboard bundle build.
+Two Git commits landed on `trackeros/main` during
+verification (reverted to baseline at session end).
+
+No new Pending enhancements introduced. The brief's
+flagged gap ("project-admin can manage project members")
+is resolved by the membership tightening described above.

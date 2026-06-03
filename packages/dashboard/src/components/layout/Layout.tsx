@@ -20,9 +20,16 @@ const ADMIN_NAV_ITEM = { path: '/admin', label: 'Admin', icon: '★' };
 export function Layout() {
   const api = useDashboardApi();
   const navigate = useNavigate();
-  const { projects, currentProjectId, setCurrentProjectId, loading: projectsLoading } = useProject();
+  const {
+    projects, currentProjectId, setCurrentProjectId,
+    loading: projectsLoading, currentUserRole,
+  } = useProject();
   const { user: currentUser } = useCurrentUser();
   const isPlatformAdmin = currentUser?.role === 'platform-admin';
+  // ⚙ Settings link is shown when the operator can edit project
+  // config — i.e. is the project-admin on the current project OR
+  // a platform-admin (who bypasses every project guard).
+  const canEditProject = isPlatformAdmin || currentUserRole === 'project-admin';
   const [alertCount, setAlertCount] = useState(0);
   const [connected] = useState(true);
 
@@ -101,6 +108,25 @@ export function Layout() {
               </NavLink>
             </li>
           ))}
+          {/* ⚙ Settings — visible to platform-admin OR project-admin on
+              the current project. Completely absent from the DOM for
+              editors / readers (so an editor can't even see that
+              project config exists). Navigates to a project-scoped
+              path so deep links survive switching projects. */}
+          {canEditProject && currentProjectId && (
+            <li key="settings">
+              <NavLink
+                to={`/projects/${currentProjectId}/settings`}
+                style={({ isActive }) => ({
+                  ...styles.navItem,
+                  ...(isActive ? styles.navItemActive : {}),
+                })}
+              >
+                <span style={styles.navIcon}>⚙</span>
+                <span>Settings</span>
+              </NavLink>
+            </li>
+          )}
           {/* Admin entry is rendered only for platform-admin —
               completely absent from the DOM for everyone else. */}
           {isPlatformAdmin && (

@@ -17,7 +17,7 @@
  *   - Audit records (GP-002) are written for create + init-harness
  */
 
-import { mkdtemp, readFile, rm, writeFile, mkdir } from 'fs/promises';
+import { mkdtemp, rm, writeFile, mkdir } from 'fs/promises';
 import { join, dirname } from 'path';
 import { tmpdir } from 'os';
 import { simpleGit, type SimpleGit } from 'simple-git';
@@ -28,6 +28,7 @@ import {
 } from '@gestalt/core';
 import { requireRole, checkProjectMembership } from '../auth/middleware';
 import { loadTemplate, resolveTemplatesDir } from '../templates/engine';
+import { applyPipelinePatch } from './project-config';
 
 /** ADR-036 — every project today gets the Tier 1 template. Future
  *  templates can be selected via a `templateId` field on the
@@ -389,88 +390,29 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
         });
       }
 
-      const workDir = await mkdtemp(join(tmpdir(), `gestalt-config-${crypto.randomUUID()}-`));
+      // Delegate to the shared `applyPipelinePatch` helper so the
+      // legacy CLI path and the new `PATCH /:id/config/pipeline` go
+      // through one mutation surface. The response shape preserved
+      // below is the LEGACY shape (`updated`, `adapter`,
+      // `autoMerge?`, `mergeMethod?`, `commitSha?`, `reason?`) that
+      // `gestalt projects set-adapter` already consumes.
       try {
-        const cloneUrl = authenticatedGitUrl(project.gitUrl, token);
-        await simpleGit().clone(cloneUrl, workDir);
-        const repo: SimpleGit = simpleGit(workDir);
-
-        try {
-          await repo.checkout(project.defaultBranch);
-        } catch {
-          await repo.checkoutLocalBranch(project.defaultBranch);
-        }
-
-        const harnessPath = join(workDir, 'HARNESS.json');
-        let parsed: Record<string, unknown>;
-        try {
-          const raw = await readFile(harnessPath, 'utf8');
-          parsed = JSON.parse(raw) as Record<string, unknown>;
-        } catch (err) {
-          return reply.code(409).send({
-            error: 'HARNESS.json missing or invalid in repo — run `gestalt init` first',
-            details: err instanceof Error ? err.message : String(err),
-          });
-        }
-
-        const currentPipeline = (parsed['pipeline'] as Record<string, unknown> | undefined) ?? {};
-        const previousAdapter = currentPipeline['adapter'];
-        const previousAutoMerge = currentPipeline['autoMerge'];
-        const previousMergeMethod = currentPipeline['mergeMethod'];
-
-        // Build the patched pipeline by overlaying only the fields the
-        // operator actually provided. Skip fields whose new value
-        // matches the current value so a no-op change does not produce
-        // a commit.
-        const patched: Record<string, unknown> = { ...currentPipeline };
-        const changedFields: string[] = [];
-        if (newAdapter !== undefined && newAdapter !== previousAdapter) {
-          patched['adapter'] = newAdapter;
-          changedFields.push('adapter');
-        }
-        if (newAutoMerge !== undefined && newAutoMerge !== previousAutoMerge) {
-          patched['autoMerge'] = newAutoMerge;
-          changedFields.push('autoMerge');
-        }
-        if (newMergeMethod !== undefined && newMergeMethod !== previousMergeMethod) {
-          patched['mergeMethod'] = newMergeMethod;
-          changedFields.push('mergeMethod');
-        }
-
-        if (changedFields.length === 0) {
+        const patch = {
+          ...(newAdapter !== undefined ? { adapter: newAdapter } : {}),
+          ...(newAutoMerge !== undefined ? { autoMerge: newAutoMerge } : {}),
+          ...(newMergeMethod !== undefined ? { mergeMethod: newMergeMethod } : {}),
+        };
+        const result = await applyPipelinePatch(project, token, patch);
+        const finalPipeline = (result.harness['pipeline'] as Record<string, unknown> | undefined) ?? {};
+        if (result.changedFields.length === 0) {
           return reply.send({
             data: {
               updated: false,
               reason: 'no-change',
-              adapter: (newAdapter ?? previousAdapter) ?? null,
+              adapter: (finalPipeline['adapter'] as string | undefined) ?? null,
             },
           });
         }
-
-        parsed['pipeline'] = patched;
-        await writeFile(harnessPath, JSON.stringify(parsed, null, 2) + '\n', 'utf8');
-
-        await repo.addConfig('user.name', 'Gestalt Platform');
-        await repo.addConfig('user.email', 'platform@gestalt.local');
-        await repo.add('HARNESS.json');
-
-        const status = await repo.status();
-        if (status.files.length === 0) {
-          // File-on-disk identical to working tree even after the
-          // mutation — defensive guard, should be unreachable.
-          return reply.send({
-            data: {
-              updated: false,
-              reason: 'no-diff',
-              adapter: (newAdapter ?? previousAdapter) ?? null,
-            },
-          });
-        }
-
-        const commitSubject = `chore: update pipeline ${changedFields.join(', ')} [gestalt]`;
-        const commit = await repo.commit(commitSubject);
-        await repo.push('origin', project.defaultBranch);
-
         await audit.append({
           actor: request.user.id,
           action: 'project.config-updated',
@@ -479,40 +421,28 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
           correlationId: request.correlationId,
           metadata: {
             field: 'pipeline',
-            changedFields,
-            previousValues: {
-              adapter: previousAdapter ?? null,
-              autoMerge: previousAutoMerge ?? null,
-              mergeMethod: previousMergeMethod ?? null,
-            },
+            section: 'pipeline',
+            changedFields: result.changedFields,
             newValues: {
-              adapter: newAdapter ?? null,
-              autoMerge: newAutoMerge ?? null,
-              mergeMethod: newMergeMethod ?? null,
+              adapter: (finalPipeline['adapter'] as string | undefined) ?? null,
+              autoMerge: (finalPipeline['autoMerge'] as boolean | undefined) ?? null,
+              mergeMethod: (finalPipeline['mergeMethod'] as string | undefined) ?? null,
             },
-            commitSha: commit.commit,
+            commitSha: result.commitSha,
             ip: request.ip,
           },
         });
-
         log.info(
-          {
-            projectId: project.id,
-            adapter: patched['adapter'],
-            autoMerge: patched['autoMerge'],
-            mergeMethod: patched['mergeMethod'],
-            commitSha: commit.commit,
-          },
-          'Project config updated',
+          { projectId: project.id, changedFields: result.changedFields, commitSha: result.commitSha },
+          'Project config updated (legacy POST → applyPipelinePatch)',
         );
-
         return reply.send({
           data: {
             updated: true,
-            adapter: patched['adapter'] ?? null,
-            autoMerge: patched['autoMerge'] ?? null,
-            mergeMethod: patched['mergeMethod'] ?? null,
-            commitSha: commit.commit,
+            adapter: (finalPipeline['adapter'] as string | undefined) ?? null,
+            autoMerge: (finalPipeline['autoMerge'] as boolean | undefined) ?? null,
+            mergeMethod: (finalPipeline['mergeMethod'] as string | undefined) ?? null,
+            commitSha: result.commitSha,
           },
         });
       } catch (err) {
@@ -521,8 +451,6 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
           error: 'Failed to update project config',
           details: err instanceof Error ? err.message : String(err),
         });
-      } finally {
-        await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
       }
     },
   );
