@@ -40,6 +40,27 @@ function truncate(text: string, limit: number): string {
   return text.slice(0, limit) + `\n\n[...truncated, ${text.length - limit} more chars]`;
 }
 
+/**
+ * Pretty-prints the `harness.stack.runtime` string for the
+ * code-prompt's architecture section. Recognised shapes:
+ *   - "node22" / "node20" / "node18"  → "Node 22 LTS" etc.
+ *   - "node"                          → "Node 22 LTS" (default)
+ *   - anything else                   → returned verbatim
+ * Future runtime kinds (deno, bun) pass through unchanged, so a
+ * project declaring them in HARNESS.json gets the truth.
+ */
+function formatRuntime(raw: string): string {
+  const lower = raw.toLowerCase().trim();
+  const nodeMatch = /^node\s*(\d+)?$/.exec(lower);
+  if (nodeMatch) {
+    const major = nodeMatch[1] ?? '22';
+    // Even majors are LTS lines on Node's release schedule.
+    const isLts = Number.parseInt(major, 10) % 2 === 0;
+    return isLts ? `Node ${major} LTS` : `Node ${major}`;
+  }
+  return raw;
+}
+
 export function buildCodePrompt(
   ctx: ContextSnapshot,
   attempt: number,
@@ -73,12 +94,38 @@ export function buildCodePrompt(
     : '';
 
   // ── 1. Architecture context ────────────────────────────────────────
+  //
+  // Runtime note: user projects target Node 22 LTS by default — the
+  // Gestalt PLATFORM runs on Node 20 + pnpm 9.x as a self-imposed
+  // constraint, but that has no bearing on generated user code.
+  // Priority order for picking what the LLM sees:
+  //   1. `harness.stack.runtime` — explicit runtime declared in
+  //      HARNESS.json (the corporate-ops-web-mobile template ships
+  //      with `node22`). Read this directly so the prompt always
+  //      reflects the truth on the project's HARNESS file
+  //   2. otherwise, fall back to "Node 22 LTS" ONLY when the
+  //      architectureMd doesn't already mention a Node version
+  //      (avoids contradicting a legacy project's documented
+  //      runtime, e.g. an old project still pinning Node 20)
+  const harnessRuntime = ctx.harness?.stack?.['runtime'];
+  const archMentionsNode =
+    ctx.architectureMd
+      ? /node\s*\d|Node\s*\d|node\.js|Node\.js/i.test(ctx.architectureMd)
+      : false;
+  const runtimeNote = harnessRuntime
+    ? `\n\nProject runtime: ${formatRuntime(harnessRuntime)}, pnpm as package manager.`
+    : !archMentionsNode
+      ? `\n\nDefault runtime: Node 22 LTS, pnpm as package manager.`
+      : '';
+
   const architectureSection = ctx.architectureMd
-    ? `## Project architecture\n\n${truncate(ctx.architectureMd, ARCHITECTURE_TRUNCATE_CHARS)}\n\n` +
+    ? `## Project architecture\n\n${truncate(ctx.architectureMd, ARCHITECTURE_TRUNCATE_CHARS)}${runtimeNote}\n\n` +
       `You MUST follow the module structure and patterns described ` +
       `above. Do not create files outside the documented structure ` +
       `without a clear reason.`
-    : '';
+    : runtimeNote
+      ? `## Project architecture${runtimeNote}`
+      : '';
 
   // ── 2. Scope enforcement (prevents scope creep) ────────────────────
   //

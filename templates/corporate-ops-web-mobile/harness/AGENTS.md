@@ -7,6 +7,16 @@ Read this file completely before taking any action.
 
 {{projectDescription}}
 
+## Project runtime
+
+- Node 22 LTS
+- pnpm 9.x (or 10.x) — both work with Node 22
+- TypeScript strict mode
+
+Note: the Gestalt platform itself runs on Node 20 + pnpm 9.x as a
+self-imposed constraint. That has no bearing on this project — user
+projects target Node 22 LTS and may use either pnpm 9.x or 10.x.
+
 ## Architecture rules
 
 1. Modules never import from each other's internals — only from index.ts

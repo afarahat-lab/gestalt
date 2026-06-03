@@ -6,7 +6,7 @@
   "description": "{{projectDescription}}",
   "stack": {
     "language": "typescript",
-    "runtime": "node20",
+    "runtime": "node22",
     "packageManager": "pnpm",
     "frontend": "react",
     "backend": "node-fastify",

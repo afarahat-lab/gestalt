@@ -250,33 +250,124 @@ async function resolvePlatformMcpToken(
  * `templates/engine.ts`) consults DB first and falls back to the
  * on-disk tree only when no DB row matches.
  */
+/**
+ * Seed-or-upgrade the built-in `corporate-ops-web-mobile` template
+ * (Option B from the 2026-06-04 Node 22 template-update brief).
+ *
+ * On first boot: no `platform_templates` row → insert from the
+ * on-disk template directory.
+ * On subsequent boots: row exists → compare `row.version` with the
+ * version in `templates/corporate-ops-web-mobile/template.json`. If
+ * the on-disk version is newer (or different), refresh the row's
+ * `files` + `version` + `description` + `tier` via the update API.
+ * `id` + `slug` + `isBuiltin` + `createdAt` are preserved.
+ *
+ * Idempotent — running it multiple times against the same template
+ * version is a no-op (same version → skip log line + return).
+ *
+ * This means a Node 22 template bump (or any future template change)
+ * propagates automatically on the next server restart without
+ * operator SQL. Bump `template.json#version` and rebuild.
+ */
 async function seedBuiltinTemplate(): Promise<void> {
   const slug = 'corporate-ops-web-mobile';
   const repo = getRepositories().platformTemplates;
-  const existing = await repo.findBySlug(slug);
-  if (existing) {
-    log.info({ slug }, 'platform_templates already seeded — skipping');
+
+  let templatesDir: string;
+  let onDiskMeta: { version: string; name: string; description: string; tier: string };
+  let fileMap: Record<string, string>;
+  try {
+    templatesDir = resolveTemplatesDir();
+    fileMap = await collectTemplateFileMap(templatesDir, slug);
+    onDiskMeta = await readTemplateMeta(templatesDir, slug);
+  } catch (err) {
+    log.warn(
+      { err, slug },
+      'Failed to read built-in template from disk — `gestalt init` will use the filesystem fallback',
+    );
     return;
   }
-  try {
-    const templatesDir = resolveTemplatesDir();
-    const fileMap = await collectTemplateFileMap(templatesDir, slug);
-    await repo.create({
-      slug,
-      name: 'Corporate Ops Web/Mobile',
-      description: 'Tier 1 baseline — TypeScript monorepo with a web SPA + mobile shell',
-      tier: 'Tier 1',
-      version: '0.1.0',
-      isDefault: true,
-      isBuiltin: true,
-      files: fileMap,
-      variables: [],
-      createdBy: null,
-    });
-    log.info({ slug, fileCount: Object.keys(fileMap).length }, 'Seeded built-in template');
-  } catch (err) {
-    log.warn({ err, slug }, 'Failed to seed built-in template — `gestalt init` will use the filesystem fallback');
+
+  const existing = await repo.findBySlug(slug);
+  if (existing && existing.version === onDiskMeta.version) {
+    log.info({ slug, version: existing.version }, 'platform_templates up-to-date — skipping seed');
+    return;
   }
+
+  try {
+    if (!existing) {
+      await repo.create({
+        slug,
+        name: onDiskMeta.name,
+        description: onDiskMeta.description,
+        tier: onDiskMeta.tier,
+        version: onDiskMeta.version,
+        isDefault: true,
+        isBuiltin: true,
+        files: fileMap,
+        variables: [],
+        createdBy: null,
+      });
+      log.info(
+        { slug, version: onDiskMeta.version, fileCount: Object.keys(fileMap).length },
+        'Seeded built-in template',
+      );
+    } else {
+      // Refresh in place — preserve id + slug + isBuiltin +
+      // createdAt + createdBy via the update API. `isDefault`
+      // intentionally NOT touched (operators may have flipped
+      // the default to a custom template; the refresh shouldn't
+      // override their choice).
+      await repo.update(existing.id, {
+        name: onDiskMeta.name,
+        description: onDiskMeta.description,
+        tier: onDiskMeta.tier,
+        version: onDiskMeta.version,
+        files: fileMap,
+      });
+      log.info(
+        {
+          slug,
+          previousVersion: existing.version,
+          version: onDiskMeta.version,
+          fileCount: Object.keys(fileMap).length,
+        },
+        'Refreshed built-in template (version bump)',
+      );
+    }
+  } catch (err) {
+    log.warn(
+      { err, slug, version: onDiskMeta.version },
+      'Failed to upsert built-in template — `gestalt init` will use the filesystem fallback',
+    );
+  }
+}
+
+/**
+ * Reads `template.json` from the on-disk template directory and
+ * pulls the fields the seed needs. Falls back to safe defaults
+ * when an individual field is missing so legacy templates without
+ * a complete metadata file still seed.
+ */
+async function readTemplateMeta(
+  templatesDir: string,
+  slug: string,
+): Promise<{ version: string; name: string; description: string; tier: string }> {
+  const path = await import('path');
+  const fs = await import('fs/promises');
+  const metaPath = path.join(templatesDir, slug, 'template.json');
+  const raw = await fs.readFile(metaPath, 'utf8');
+  const parsed = JSON.parse(raw) as {
+    version?: string; name?: string; description?: string; tier?: string;
+  };
+  return {
+    version: parsed.version ?? '0.1.0',
+    name: parsed.name ?? 'Corporate Ops Web/Mobile',
+    description:
+      parsed.description ??
+      'Tier 1 baseline — TypeScript monorepo with a web SPA + mobile shell',
+    tier: parsed.tier ?? 'Tier 1',
+  };
 }
 
 /**

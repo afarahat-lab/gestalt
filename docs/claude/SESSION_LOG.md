@@ -13563,3 +13563,221 @@ iteration:
   pre-existing-issue noise
 - `verifyStagingDeployment` step in promotion-agent for the
   `skipStagingVerification` hint to have a real effect
+
+---
+
+### Session 2026-06-04 — Claude Code (Template runtime fix — Node 22 LTS for user projects)
+
+Small but visible fix: user project templates were inheriting the
+Gestalt platform's own Node 20 / pnpm 9.x constraint (a real
+self-imposed bound for the platform — `node:sqlite` lives in Node
+22, pnpm 10.x requires Node 22, but we pin Node 20 + pnpm 9.x for
+the platform itself). That has no business defaulting to user
+projects. User projects default to Node 22 LTS now, with the
+template documenting that pnpm 9.x AND 10.x both work.
+
+Adopted Option B for the DB-seed re-sync — version-check upsert.
+Bumping `template.json#version` triggers an automatic in-place
+refresh on next server boot. No manual SQL, no
+`docker-compose down -v` to wipe state. Same mechanism handles
+future template changes.
+
+Changed:
+
+- `templates/corporate-ops-web-mobile/ci/gestalt.yml`:
+  - Step name `Setup Node 20` → `Setup Node 22 LTS`
+  - `node-version: '20'` → `node-version: '22'`
+
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`:
+  - `stack.runtime`: `node20` → `node22`
+
+- `templates/corporate-ops-web-mobile/harness/AGENTS.md`:
+  - New "Project runtime" section between "What this project is"
+    and "Architecture rules":
+    - Node 22 LTS
+    - pnpm 9.x (or 10.x) — both work with Node 22
+    - TypeScript strict mode
+  - Explicit "Gestalt platform constraint ≠ user project
+    constraint" note so code-agent (and future maintenance
+    agents reading AGENTS.md) don't get confused by the
+    platform's own pin
+
+- `templates/corporate-ops-web-mobile/template.json`:
+  - `version`: `0.1.0` → `0.2.0`
+
+- `packages/server/src/server.ts`:
+  - `seedBuiltinTemplate` rewritten as a version-checked
+    upsert (Option B):
+    1. Read on-disk template.json metadata via the new
+       `readTemplateMeta(templatesDir, slug)` helper. Failure
+       to read → warn + early-return (preserves the existing
+       filesystem-fallback contract)
+    2. `findBySlug(slug)` to check for the DB row
+    3. If row exists AND `row.version === onDisk.version` →
+       log `platform_templates up-to-date — skipping seed`
+       and return (idempotent)
+    4. If no row → `create` with the on-disk version + files
+    5. If row exists with a different version → `update(id,
+       {name, description, tier, version, files})`. The id,
+       slug, isBuiltin, isDefault, createdAt, createdBy are
+       preserved — operators who flipped the default to a
+       custom template don't get their choice clobbered by
+       a built-in refresh
+  - New `readTemplateMeta(templatesDir, slug)` helper reads
+    `template.json` from disk and pulls
+    `{ version, name, description, tier }`. Safe-defaults
+    on missing fields so legacy templates without complete
+    metadata still seed
+  - All log lines preserved + extended with the new
+    `previousVersion` field on the refresh path so the
+    boot trace narrates the upgrade
+
+- `packages/agents/generate/src/prompts/code-prompt.ts`:
+  - Architecture section gains a runtime note. Priority:
+    1. `harness.stack.runtime` — explicit declaration in
+       HARNESS.json. Pretty-printed via the new
+       `formatRuntime(raw)` helper. Recognises
+       `node22`/`node20`/`node18` (even majors = LTS;
+       odd majors = current). Unknown runtime strings
+       (e.g. `bun`, `deno`) pass through verbatim
+    2. No harness runtime AND architectureMd doesn't
+       already mention a Node version (regex
+       `/node\s*\d|Node\s*\d|node\.js/i`) → inject
+       "Default runtime: Node 22 LTS, pnpm as package
+       manager."
+    3. Architecture mentions Node already → stay quiet
+       (don't contradict a legacy project's documented
+       runtime)
+  - Effect: every code-agent run with the updated template
+    sees "Project runtime: Node 22 LTS" in the architecture
+    section. Legacy projects with Node 20 in their docs
+    keep generating Node 20-compatible code. Projects
+    with no runtime info at all default to Node 22 LTS
+
+Live verified:
+
+- `pnpm -r build` clean across all 12 packages
+- `docker compose up -d --build server` → `Up (healthy)`
+- **First-boot refresh**: server log shows
+  `Refreshed built-in template (version bump)` with
+  `previousVersion: "0.1.0"`, `version: "0.2.0"`,
+  `fileCount: 8`. DB row updated in place:
+  - `slug` unchanged
+  - `version` 0.1.0 → 0.2.0
+  - `is_builtin: true` preserved
+  - `is_default: true` preserved
+  - `name` updated to "Corporate Operations Web & Mobile"
+    (from template.json)
+- **Idempotency**: second `docker compose restart server`
+  log shows `platform_templates up-to-date — skipping seed`.
+  No DB writes
+- **DB row file contents** verified via direct
+  `psql` JSONB extract:
+  - `files->'ci/gestalt.yml'` contains `Setup Node 22 LTS`
+    + `node-version: '22'`
+  - `files->'harness/HARNESS.json'` contains
+    `"runtime": "node22"`
+  - `files->'harness/AGENTS.md'` contains the new
+    "Project runtime" section with Node 22 LTS + pnpm
+    9.x/10.x note
+- **Fresh init path** — `loadTemplate(templatesDir,
+  'corporate-ops-web-mobile', {projectName, projectDescription,
+  defaultBranch})` inside the container produced 8 files with
+  Node 22 surfaced in every expected place
+- **code-prompt 5-invariant matrix** verified via direct
+  `buildCodePrompt(synthCtx)` calls:
+  1. `runtime: node22` → "Node 22 LTS" appears in prompt ✓
+  2. `runtime: node20` (legacy) → "Node 20 LTS" appears
+     (round-trip works — legacy projects respected) ✓
+  3. No runtime + silent architectureMd → "Default runtime:
+     Node 22 LTS" injected ✓
+  4. No runtime + architectureMd says "runs on Node 20" →
+     NO default-runtime injection (existing text respected) ✓
+  5. Future runtime `bun` → "Project runtime: bun" verbatim ✓
+- **Platform itself unchanged**: `docker exec gestalt-server-1
+  node --version` returns `v20.20.2`. Dockerfile FROM lines
+  still `node:20-alpine` (builder + production stages).
+  CLAUDE.md note "pnpm 9.x only — Node 20" stays — it refers
+  to the platform's self-imposed bound, NOT user projects.
+
+Operator action — `trackeros` repo:
+- The trackeros project was initialised with the old template
+  and its `.github/workflows/gestalt.yml` still pins Node 20.
+  The seeded DB row's update doesn't affect existing project
+  repos (the file lives in the project's git tree, written at
+  `init-harness` time). Operator should:
+  ```
+  cd <trackeros-clone>
+  git pull
+  # Edit .github/workflows/gestalt.yml:
+  #   - name: Setup Node 20  →  - name: Setup Node 22 LTS
+  #   node-version: '20'     →  node-version: '22'
+  git add .github/workflows/gestalt.yml
+  git commit -m "chore: update CI to Node 22 LTS"
+  git push
+  ```
+- The Node 20 → Node 22 migration is non-breaking for typical
+  code-agent output today (no `node:sqlite` usage in
+  trackeros's small surface). Until the operator updates the
+  workflow file, trackeros CI continues to run on Node 20 —
+  acceptable steady-state, just not the new default
+- No code-agent change required on trackeros — the
+  architectureMd / HARNESS.json on the existing trackeros tree
+  still says `node20` (the platform won't push a config edit to
+  a project's repo). The next deliberate `gestalt run` cycle on
+  trackeros will continue to generate Node 20-compatible code.
+  Operators who want Node 22 generation on trackeros should
+  also update `HARNESS.json#stack.runtime` to `node22` in the
+  trackeros repo
+
+Decisions made:
+
+- **Version-check seed (Option B) over delete-and-re-run
+  (Option A).** Brief allowed both. Option B is automatic
+  (no operator SQL, works on every deploy) AND idempotent
+  (re-running with the same version is a no-op). Same
+  mechanism handles all future template updates — bump
+  template.json#version, restart, refresh. No risk of
+  forgetting to clean state when a template changes
+- **`update(id, {...})` preserves `id` + `isDefault`.**
+  Operators may have flipped `isDefault` to a custom
+  template they uploaded; the built-in refresh shouldn't
+  override their choice. Same rule for `id` (keeping
+  references in any future denormalised state intact)
+- **`formatRuntime` enforces even-major-is-LTS.** Node's
+  release schedule is even-numbered majors → LTS, odd →
+  current. Node 22 is LTS; Node 23 won't be. The helper
+  encodes this rule so future bumps (Node 24, Node 26, …)
+  Just Work without hand-tuning
+- **Future-runtime pass-through** (`bun`, `deno`, `cloudflare-
+  workers`) — the helper returns unknown runtime strings
+  verbatim. A project that declares `runtime: "bun"` in
+  HARNESS.json gets "Project runtime: bun" in the prompt
+  (NOT "Node bun"). Forward-compatible
+- **Skip-injection on legacy projects.** If a project's
+  architectureMd already mentions Node (any version), we
+  don't inject a default — the operator's documented runtime
+  wins. Prevents the awkward "this project uses Node 18 /
+  Default runtime: Node 22 LTS" contradiction in the prompt
+- **Operator action for trackeros is light-weight + non-
+  breaking.** No urgent push — trackeros's CI continues to
+  run on Node 20 until manually updated. The platform doesn't
+  modify operator-controlled files (the workflow file lives in
+  the project repo, written at init time, owned by the
+  operator from then on)
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker server image rebuilt. Migration count unchanged (no new
+migrations — only the template.json version + the seed logic).
+DB row refreshed via the in-place update path; idempotent on
+restart. Fresh init path verified to produce Node 22 in the
+gestalt.yml workflow. Platform itself still on Node 20.
+
+Pending follow-ups: none introduced. Future possible iterations:
+- Surface `formatRuntime`'s output in the dashboard's
+  "Project" detail view (today HARNESS.json's `stack.runtime`
+  is only visible by reading the file in the repo)
+- Add a `gestalt project doctor` CLI command that checks for
+  workflow file / HARNESS.json runtime drift between the
+  template and the project's committed copy, and surfaces
+  the gap as an operator suggestion
