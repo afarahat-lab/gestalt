@@ -12734,3 +12734,493 @@ trackeros and is deferred to the next routine deploy
 test.
 
 No new Pending enhancements introduced.
+
+---
+
+### Session 2026-06-03 — Claude Code (Autonomous self-healing loop — migration 020)
+
+Largest feature drop since the deploy layer shipped. When ANY
+failure occurs anywhere in the SDLC (generate / gate / pipeline /
+deploy / custom-agent), a new `SelfHealingAgent` automatically
+diagnoses the failure and decides whether to auto-retry or
+escalate. When the retry budget is exhausted or confidence is too
+low, a human alert is created AND the same agent is immediately
+re-invoked as an automated alert resolver (at higher confidence
+bar). All parameters are platform defaults configurable by
+platform-admin via a new dashboard tab + CLI.
+
+Changed (1 migration + 7-area implementation):
+
+**Migration 020 + repository layer:**
+- `packages/adapters/postgres/src/migrations/020_self_healing.sql`
+  (new): `platform_self_healing_config` table with CHECK constraints
+  on max_attempts (0–10) and confidence_threshold (high/medium/low);
+  partial unique index ensures one row per failure type via the
+  UNIQUE constraint. Seeded with the seven failure types from the
+  brief: `generate-error` (2/medium/auto/on), `gate-max-retries`
+  (2/medium/auto/on), `pipeline-failed` (2/medium/auto/on),
+  `pipeline-timeout` (1/high/auto/on — timeouts are usually
+  infrastructure, narrower bar), `deploy-error` (1/medium/auto/on),
+  `maintenance-error` (1/medium/auto/on), `custom-agent-failure`
+  (2/medium/auto/on). `INSERT ... ON CONFLICT DO NOTHING` so the
+  seed is idempotent. `ALTER TABLE intents ADD attempt_count
+  INTEGER NOT NULL DEFAULT 0` + `last_resume_context JSONB`
+  (nullable). `ALTER TYPE deployment_event_type ADD VALUE IF NOT
+  EXISTS 'resume-pushed'`. Pure schema only — no
+  `schema_migrations` writes
+- `packages/core/src/repository/index.ts`:
+  - New `SelfHealingConfigRecord` + `SelfHealingConfigRepository`
+    interface (list / findByType / update)
+  - New `ResumeContext` type — two shapes share the JSONB column:
+    `autoHealed:true` (diagnostician's diagnosis + rootCause +
+    skipAgents + focusFiles) and `autoHealed:false` (operator's
+    verbatim feedback)
+  - `IntentRecord` gained `attemptCount` + `lastResumeContext`;
+    `IntentRepository.create()` Omit type widened
+  - New `IntentRepository.saveResumeContext` (writes via
+    `db.json(...)` typed helper — proper JSONB, not the
+    string-scalar trap) + `incrementAttemptCount` (atomic
+    INSERT-OR-INCREMENT via `COALESCE(attempt_count, 0) + 1
+    RETURNING attempt_count`)
+  - `AlertType` extended with the four new failure types
+    (`generate-error`, `gate-max-retries`, `deploy-error`,
+    `maintenance-error`, `custom-agent-failure`); existing
+    `pipeline-failed`, `pipeline-timeout`, `provide-feedback`
+    remain unchanged
+  - `RepositoryRegistry` gained `selfHealingConfig`
+- `packages/adapters/postgres/src/repositories/self-healing-config.ts`
+  (new): full impl. `update` uses `COALESCE(${field ?? null},
+  field)` so partial PATCH semantics work — fields not supplied
+  keep their prior value; only supplied fields update
+- `packages/adapters/{oracle,mssql}/src/repositories/self-healing-config.ts`
+  (new): throw-stubs. Same pattern as every prior adapter stub
+- `packages/core/src/events/index.ts`: `LiveEventType` extended
+  with `alert.auto-resolved` so the dashboard's Alerts view can
+  remove cards live when the loop auto-resolves them
+
+**SelfHealingAgent + runSelfHealingLoop + queue config helper:**
+- `packages/core/src/queue/index.ts`: new
+  `setQueueConfig(config)` / `getQueueConfig()` / `_resetQueueConfig()`
+  pattern. Mirrors `setMasterKey/getMasterKey` and
+  `setLLMRegistryResolver` — lets the self-healing loop (which
+  runs inside `@gestalt/core` far from server boot) call
+  `dispatch(message, getQueueConfig())` without threading config
+  through every consumer. Server pins at boot step 5c
+- `packages/core/src/agents/self-healing-agent.ts` (new): the
+  diagnostician class. Extends `BaseLLMAgent` for shared LLM
+  routing + capture; hard-coded persona (`"Senior software
+  engineer and technical diagnostician"`, temperature 0.1,
+  maxTokens 2000) — platform-internal, operators don't tune
+  this. The `diagnose(ctx, correlationId, confidenceThreshold)`
+  method:
+  - Builds a structured prompt with seven sections (original
+    intent / failure details / prior signals / generated files /
+    architecture / constraints / golden principles)
+  - Returns JSON-shape diagnosis via `extractJsonObject` + lenient
+    parse (every field defaults safely if missing)
+  - **Confidence threshold downgrade**: if the LLM's emitted
+    confidence is below the platform-admin's per-failure-type bar,
+    `shouldRetry` is forced to `false` regardless. So a diagnosis
+    the LLM marked `shouldRetry:true, confidence:low` against a
+    `confidenceThreshold:medium` setting surfaces as
+    `shouldRetry:false`
+  - **Never throws** — LLM-call failure and JSON-parse failure
+    both fall through to a safe-default
+    `{shouldRetry:false, confidence:low, suggestedFix:'Manual
+    review required'}` diagnosis. The loop's "NEVER throws"
+    invariant depends on this
+  - `buildPrompt`/`parseResponse` stubs throw (the class uses a
+    custom `diagnose()` entry, not the base template `run(task)`)
+- `packages/core/src/agents/self-healing-loop.ts` (new):
+  `runSelfHealingLoop(ctx, payload, signals)` — the brain. Outer
+  try/catch wraps the inner unsafe implementation so any thrown
+  error from a repository call or event emit falls through to
+  human escalation. Inner flow:
+  1. `selfHealingConfig.findByType(payload.failureType)` (falls
+     back to DEFAULT_CONFIG if missing — defensive)
+  2. If `!config.enabled`: escalate immediately with reason
+     "Self-healing disabled"
+  3. `intent.attemptCount` + 1 = current attempt; if > maxAttempts:
+     escalate with reason "Budget exhausted"
+  4. `new SelfHealingAgent().diagnose(ctx, corr, config.confidenceThreshold)`
+  5. If `!diagnosis.shouldRetry`: escalate with reason "Diagnosis:
+     X. Confidence: Y"
+  6. Otherwise (HIGH-confidence retry):
+     - `effectiveSkipAgents = confidence === 'high' ? skipAgents : []`
+       (second defense — the diagnosis itself also enforces this)
+     - `saveResumeContext({operatorFeedback: '[Auto] ${suggestedFix}',
+       autoHealed: true, diagnosis, rootCause, skipAgents,
+       focusFiles, updatedIntentText, ...})`
+     - `incrementAttemptCount` — atomic SQL UPDATE
+     - Return `{shouldRetry: true, escalated: false,
+       autoResolved: false}` — caller dispatches
+  - Escalation path's `escalateToHuman` creates an alert via
+    `alerts.create({type: failureType, severity:'high',
+    requiredAction:'provide-feedback', context: {intentId, branch,
+    prNumber, prUrl, failureType, attemptNumber,
+    escalationReason, ...alertContextExtras}})` then emits
+    `alert.created` SSE. Title built per-failureType from a
+    `TITLE_TEMPLATES` map. Failure non-fatal — log warn + continue
+  - **`attemptAutoResolveAlert` re-invokes the diagnostician at
+    `'high'` confidence** (higher than the per-config threshold).
+    If shouldRetry+high: saves resume context, acks alert as
+    `'system'`, transitions intent to `generating`, dispatches
+    fresh `generate:intent` with `source: 'auto-resolved'`,
+    emits `alert.auto-resolved` SSE. NEVER throws — alert stays
+    open if auto-resolve can't make progress
+  - Returns `{shouldRetry, diagnosis, escalated, autoResolved}` —
+    callers branch on `shouldRetry && !escalated → dispatch`,
+    `!shouldRetry && !escalated → transitionIntent failed`,
+    `escalated && !autoResolved → transitionIntent failed`,
+    `escalated && autoResolved → do nothing (loop already
+    transitioned to generating)`
+  - `shouldSkipAgent(resumeContext, agentRole)` helper exported
+    for orchestrators (returns false unless autoHealed AND role
+    in skipAgents)
+- Core re-exports `SelfHealingAgent`, `runSelfHealingLoop`,
+  `shouldSkipAgent`, `SelfHealingContext`, `SelfHealingDiagnosis`,
+  `FailureType`, `SelfHealingLoopPayload`, `SelfHealingResult`,
+  `ResumeSource`
+
+**Orchestrator + custom-agent wiring:**
+- Server adds boot step 5c — `setQueueConfig(config.queue)` —
+  before any worker starts so dispatchers inside the loop have a
+  config to read
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+  - `IntentTaskPayload.source` union widened to include
+    `'self-healing'`, `'auto-resolved'`, `'operator-resume'`
+  - `intentSource` typed union widened to match
+  - `DrivePlanOptions.skipAgents?: string[]` added —
+    `handleIntentTask` reads `intent.lastResumeContext.skipAgents`
+    AND checks `autoHealed:true` (belt-and-braces), threads in
+  - Each step's per-step branch now checks
+    `opts.skipAgents?.includes(agentRole)` at the top and skips
+    cleanly: creates `agent_executions` row with
+    `status:'skipped'`, emits both `agent.started` + `agent.completed`
+    so the dashboard accordion stays consistent
+  - New `attemptSelfHealingForGenerate` helper — loads intent +
+    signals + artifacts fresh, calls `runSelfHealingLoop` with
+    `failureType:'generate-error'`, dispatches a retry on
+    `shouldRetry+!escalated+diagnosis`, returns `{retryDispatched}`
+  - Wired into `hasPlanFailed` branch AND catch block. Catch
+    block doesn't re-throw when self-healing dispatched (BullMQ
+    would otherwise retry the original job → duplicate dispatch)
+  - New `SelfHealingRetryDispatched` sentinel Error class —
+    thrown by inline self-healing dispatchers (custom-agent path)
+    to bail cleanly. Catch block recognises it via `instanceof`
+    and returns a completed TaskResult without re-running
+    self-healing
+  - New `attemptSelfHealingForCustomAgent` helper — fires only on
+    `result.status === 'error'` (real LLM errors, not finding-
+    based failures which continue to flow as signals). On retry
+    dispatched, completes the execution row + throws the sentinel
+    to bail the cycle
+- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
+  - New `attemptSelfHealingForGate` helper — same shape as the
+    generate one but with `failureType:'gate-max-retries'` and
+    summary including the gate verdict + signal count
+  - Wired into the `!retried` branch (after MAX_GATE_RETRIES
+    exhausted via `maybeDispatchRetry`)
+- `packages/agents/deploy/src/agents/pipeline-agent.ts`:
+  - **Stopped creating alerts directly** (the prior pipeline-
+    feedback session's `createPipelineFailureAlert` removed). The
+    self-healing loop in deploy-orchestrator now owns alert
+    creation as part of its escalation path
+  - `PipelineAgentOutcome` variants gained `pipelineStatus` so
+    deploy-orchestrator can forward it as `alertContextExtras` to
+    the loop (the dashboard PipelineBody card still rendrs
+    correctly because the same fields land in alert.context)
+  - `quoteIntent` + `createPipelineFailureAlert` helpers removed
+    with a comment block documenting where the equivalent logic
+    moved
+- `packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`:
+  - New `attemptSelfHealingForDeploy` helper — generic shape that
+    takes a `failureType: FailureType` so the same helper handles
+    `pipeline-failed`, `pipeline-timeout`, and `deploy-error`
+  - Wired into the pipeline-failed/cancelled/timeout branch
+    (passes `alertContextExtras: {runId, pipelineStatus, adapter}`
+    so the alert context carries CI specifics the dashboard
+    PipelineBody renders) AND the generic catch block
+    (`failureType:'deploy-error'`)
+  - On retry dispatched, returns a completed TaskResult instead
+    of re-throwing (same anti-duplicate-dispatch rule)
+- Maintenance: NOT wired. The runner's per-project catch block
+  records an `agent-error` finding on the maintenance_runs row
+  and continues to the next project. Maintenance runs don't
+  have an intent in scope at that point — the loop's payload
+  requires intentId. The `maintenance-error` seed entry is kept
+  for forward use when the runner gains intent-scoped failure
+  paths
+
+**Context-assembler + code-prompt resume context:**
+- `packages/agents/generate/src/types.ts`:
+  - `ContextSnapshot` gained optional `resumeContext?:
+    ResumeContextSnapshot | null`, `focusFiles?: string[]`,
+    `skipAgents?: string[]`
+  - New local `ResumeContextSnapshot` type — duplicate of core's
+    `ResumeContext` to avoid prompt-builders depending on the
+    repository types directly
+- `packages/agents/generate/src/orchestrator/context-assembler.ts`:
+  - `assembleContext` signature gained optional `intentId`
+  - When supplied, loads `intent.lastResumeContext` and attaches
+    to the snapshot (with skipAgents + focusFiles ergonomic
+    fields). Also threads `resumeContext.priorSignals` into the
+    snapshot's `priorSignals` field (so the prompt's
+    signal-feedback section reflects the historical record)
+    when the orchestrator didn't otherwise route signals
+  - Failure non-fatal — assembly continues without resume context
+- `packages/agents/generate/src/prompts/code-prompt.ts`:
+  - New `resumeSection` rendered between signals and task. Two
+    shapes per `autoHealed`:
+    - true → "## Resumed attempt (N) — auto-diagnosed" + Failure /
+      Diagnosis / Root cause / Suggested fix
+    - false → "## Resumed attempt (N) — operator feedback" +
+      Failure / Operator feedback (verbatim)
+  - Focus files appended as bullet list when present
+
+**Server routes + audit:**
+- `packages/server/src/routes/platform-config.ts`:
+  - New `GET /platform/self-healing` (admin) — returns
+    `{data: SelfHealingConfigRecord[]}`
+  - New `PATCH /platform/self-healing/:failureType` (admin) —
+    partial body: `{maxAttempts?, confidenceThreshold?,
+    autoResolveAlerts?, enabled?}`. Validator returns 400 with
+    typed codes: `INVALID_MAX_ATTEMPTS` (range 0–10),
+    `INVALID_CONFIDENCE_THRESHOLD` (enum check),
+    `INVALID_AUTO_RESOLVE_ALERTS` / `INVALID_ENABLED` (bool
+    check), `EMPTY_PATCH` (at least one field required).
+    Returns 404 for unknown failure type. Audit row
+    `self-healing.config-updated` with metadata
+    `{failureType, changedFields, previousValues, newValues, ip}`
+    so the audit trail shows the delta. GP-002 — every mutation
+    is audited
+- `packages/server/src/oversight/routes.ts`:
+  - New `POST /alerts/:id/resume` (operator + editor membership) —
+    generic human-feedback resume for any failure alert type.
+    Distinct from `pipeline-feedback` (type-specific) and
+    `clarify` (vague intent) and interventions (GP_BREACH).
+    Accepts feedback string, validates alert type is in the
+    failure-types set, requires `context.intentId`. Saves
+    `last_resume_context` with `autoHealed:false`, increments
+    attempt_count, dispatches `source: 'operator-resume'`,
+    acks alert, GP-006 audit (`feedbackLength` only — text
+    NEVER hits audit_log)
+
+**Dashboard:**
+- `packages/dashboard/src/types.ts`: new `SelfHealingConfig` type
+- `packages/dashboard/src/api/client.ts`: new
+  `listSelfHealingConfig` + `updateSelfHealingConfig` methods
+- `packages/dashboard/src/views/Admin.tsx`:
+  - 8th tab `Self-healing` added between Secrets and Templates
+  - New `SelfHealingTab` component — table with per-row controls:
+    toggle Enabled checkbox, `<select>` for maxAttempts (0–10),
+    `<select>` for confidence (high/medium/low), toggle
+    Auto-resolve checkbox. Each change fires a partial PATCH
+    immediately; inline `saving...` then `✓ saved` indicator
+    next to the row. Confidence + auto-resolve documentation
+    text below the table explains the semantics
+  - New `styles.smallSelect` for the dropdowns
+
+**CLI:**
+- `packages/cli/src/api/client.ts`: new
+  `SelfHealingConfigSummary` type + `listSelfHealingConfig` +
+  `updateSelfHealingConfig` methods
+- `packages/cli/src/commands/platform-extras.ts`:
+  - New `platformSelfHealingListCommand` — prints a 5-column
+    table (TYPE/ENABLED/MAX ATTEMPTS/CONFIDENCE/AUTO-RESOLVE)
+    with ✓/✗ for booleans
+  - New `platformSelfHealingConfigureCommand <failureType>` —
+    PATCH with flag combinators: `--max-attempts <n>`,
+    `--confidence high|medium|low`, `--auto-resolve` /
+    `--no-auto-resolve`, `--enable` / `--disable`. Client-side
+    validation (range, enum) fails fast with friendly error.
+    At least one flag required
+- `packages/cli/src/index.ts`: registered
+  `gestalt platform self-healing list/configure` under the
+  existing `gestalt platform` parent
+
+Live verified end-to-end:
+
+- `pnpm -r build` clean across all 12 packages
+- `docker compose up -d --build server` — `Up (healthy)`
+- Migration 020 applied on first boot (`schema_migrations` now
+  lists 20 versions). `\d intents` confirms `attempt_count`
+  (NOT NULL DEFAULT 0) + `last_resume_context` JSONB columns.
+  `\dt platform_self_healing_config` confirms the table.
+  `enum_range(NULL::deployment_event_type)` includes
+  `resume-pushed`
+- Server log shows `Queue config pinned for self-healing
+  dispatch` at boot step 5c
+- Seeded defaults verified: all 7 failure types present with
+  the brief's per-type values (pipeline-timeout=1/high, others
+  per spec)
+- **API endpoints:**
+  - `GET /platform/self-healing` returns 7 rows with the
+    expected shape
+  - `PATCH /platform/self-healing/pipeline-failed
+    {maxAttempts:3}` → 200 with updated row + `updatedBy:
+    <admin uuid>`
+  - `PATCH /platform/self-healing/pipeline-failed
+    {enabled:false}` → 200 (subsequent PATCH-with-existing
+    pattern works)
+  - Validation: `maxAttempts:15` → 400
+    `INVALID_MAX_ATTEMPTS`; `confidenceThreshold:'super'` → 400
+    `INVALID_CONFIDENCE_THRESHOLD`; unknown failure type →
+    404 `NOT_FOUND`; `{}` → 400 `EMPTY_PATCH`
+  - **Audit row** for `self-healing.config-updated` has
+    metadata `{failureType, changedFields,
+    previousValues, newValues, ip}` — exact per-field delta
+    visible. GP-002 ✓
+- **CLI:**
+  - `gestalt platform self-healing list` — table prints all 7
+    types with ✓/✗ for booleans, numeric maxAttempts, color-
+    coded confidence
+  - `gestalt platform self-healing configure pipeline-failed
+    --max-attempts 0` → `✓ Self-healing config updated` with
+    the four current values printed. Confirmed the disabled
+    state on subsequent list call. Reset back to 2 cleanly
+- **POST /alerts/:id/resume happy path:**
+  - Seeded a synthetic `generate-error` alert against a
+    pre-existing trackeros project with intent in `failed`
+    status (`branchName: gestalt/verify-shr-add-a-utility`,
+    `prNumber: 201`, `attemptCount: 1`)
+  - `POST /alerts/<id>/resume {feedback: "..."}` → 200 with
+    `{intentId, status: 'generating', branch, prNumber, prUrl}`
+  - DB inspection:
+    - intent transitioned `failed → generating`, attempt_count
+      went 1 → 2
+    - `last_resume_context` stored as JSONB object (`jsonb_typeof
+      = object`), `autoHealed:false`, `failureType:
+      "generate-error"`, `attemptNumber: 2`
+    - alert acknowledged_at populated, acknowledged_by =
+      admin uuid
+    - audit_log row `alert.resume-submitted` carries
+      `{type: "generate-error", intentId, feedbackLength: 95,
+      branch, prNumber, ip}` ONLY — direct probe
+      `metadata::text LIKE '%string.split%'` (the actual
+      feedback content) returned 0 rows. GP-006 ✓
+    - BullMQ `bull:gestalt-generate:active` had 1 job (the
+      resume dispatch); worker picked it up immediately
+- **Worker pickup:** intent ran the full cycle through generate →
+  gate → deploy and reached `deploying`. Synthetic branch
+  didn't exist on the real GitHub repo so orchestrator
+  gracefully fell back to default branch (same WARN +
+  fallback design as the pipeline-feedback flow's resume).
+  The end-to-end "intent failed → operator submitted resume →
+  resume cycle ran" path is fully wired
+- **Validation matrix for /alerts/:id/resume:**
+  - Missing feedback → 400 `INVALID_FEEDBACK`
+  - `clarification-needed` alert type → 400
+    `INVALID_ALERT_TYPE` "use the type-specific endpoint"
+  - Unknown alert UUID → 404 "Alert not found"
+- **Dashboard bundle:** rebuilt clean (Vite 352 KB ungzipped);
+  spot-grep confirms the new `Self-healing configuration`
+  string is in the bundle
+- Cleanup: synthetic intent + alert + audit + execution rows
+  scrubbed at end of session; trackeros DB back to baseline
+
+Verification status per the brief's scenarios:
+
+| Scenario | Verified |
+|---|---|
+| 1 — Auto-healed, no human involvement | Code path exercised via /alerts/:id/resume + DB inspection. Full LLM-driven auto-retry on a real failing intent requires a project with deterministic failure — deferred to next routine cycle |
+| 2 — Budget exhausted, auto-resolve attempt | escalateToHuman + autoResolved path coded; auto-resolve path triggers when config.autoResolveAlerts AND alert created |
+| 3 — Custom agent failure | Code path wired; SelfHealingRetryDispatched sentinel + catch handling in orchestrator. Live verification needs a deterministically-failing custom agent (operator action) |
+| 4 — Config change from dashboard | Live verified via PATCH endpoint + CLI configure. Dashboard tab compiled into bundle |
+| 5 — Human feedback fallback | Live verified end-to-end against synthetic alert: feedback submitted, intent transitioned, last_resume_context saved with autoHealed:false, attempt_count incremented, alert acked, worker picked up the resume cycle, GP-006 audit confirmed |
+
+Decisions made:
+
+- **`runSelfHealingLoop` returns `autoResolved` flag** (added
+  beyond brief's `{shouldRetry, diagnosis, escalated}`).
+  Without it, callers couldn't distinguish "escalated, alert
+  open, transition to failed" from "escalated, alert
+  auto-resolved, intent already generating — DO NOT override".
+  Documented inline in the return type's JSDoc
+- **Confidence threshold downgrade enforced inside
+  `SelfHealingAgent.diagnose`** not at the loop layer. Putting
+  it in the agent means the same threshold logic applies
+  regardless of caller. The loop's secondary skipAgents-clear
+  on lower-confidence is belt-and-braces defense
+- **Pipeline-agent stops creating alerts directly.** Trade-off:
+  loses pipeline-agent's title format (e.g. "CI pipeline
+  failed for intent 'X'") in favour of the loop's per-
+  failure-type TITLE_TEMPLATES. The alert context JSONB still
+  carries runId/pipelineStatus/branch/prNumber/prUrl via
+  `alertContextExtras`, so the dashboard PipelineBody card +
+  the existing POST /alerts/:id/pipeline-feedback route both
+  continue to work. Net: same UX, cleaner architecture (loop
+  owns alert creation), no duplicate code path
+- **`SelfHealingRetryDispatched` sentinel error** instead of a
+  bool return from `runOneCustomAgentNode`. The custom-agent
+  chain walker calls the node runner recursively; threading
+  "stop everything" through return values would force every
+  level to check + propagate. Throwing a typed error and
+  catching it ONCE in `handleIntentTask`'s catch block keeps
+  the surface minimal. The catch block then differentiates
+  sentinel-vs-real-error via `instanceof`
+- **Don't re-throw from orchestrator catch when self-healing
+  dispatched.** BullMQ treats a thrown job as "retry me" —
+  but we just queued a NEW retry via self-healing. Throwing
+  would cause double-dispatch. Returning a `failed` (or
+  `completed`) TaskResult tells BullMQ "job done, don't
+  retry". Same pattern in generate orchestrator catch, deploy
+  orchestrator catch
+- **`attempt_count` increments BEFORE the dispatch.** So the
+  next cycle's loop reads the higher count + enforces the
+  budget correctly. If the dispatch itself fails (rare), the
+  counter is "wrong by one" — acceptable trade-off because
+  the operator can manually reset via DB if it ever becomes
+  a problem. The alternative (increment after dispatch
+  success) creates a race where two retries could be queued
+  with the same attempt_count
+- **`skipAgents` honored only at high confidence.** Enforced
+  TWICE: (1) in `runSelfHealingLoopUnsafe` the
+  `effectiveSkipAgents` is conditionally cleared to `[]`
+  before saving the resume context; (2) in `handleIntentTask`
+  the snapshot's `selfHealingSkipAgents` only loads when
+  `resumeCtx.autoHealed` is true. The brief is explicit about
+  this — never skip agents on operator-feedback resumes (no
+  diagnosis was run) or on lower-confidence diagnoses
+- **Maintenance not wired.** The runner's per-project catch
+  records a finding on the maintenance_runs row but doesn't
+  transition any intent (maintenance runs don't have
+  intent-scoped failure paths today). Adding self-healing
+  here would require synthesizing an intent for the failure
+  — over-engineering for a path that the brief doesn't
+  exercise. The `maintenance-error` seed entry is kept
+  for forward compatibility
+- **Alert title templates per failure type** (`TITLE_TEMPLATES`
+  in the loop). Without per-type titles the operator would
+  see seven identical "auto-resolve attempt" cards. The
+  templates give each its own scannable label
+  ("CI pipeline failed for intent 'X' (attempt N)" etc.)
+- **`alertContextExtras` payload field** added so callers can
+  inject domain-specific context into the alert without the
+  loop knowing about it. Currently used by deploy-orchestrator
+  to carry runId + pipelineStatus. Future callers can add
+  whatever the dashboard's per-type renderer needs
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker server image rebuilt; migration 020 applied; queue config
+pinned at boot. Full validation + happy-path + side-effect +
+GP-006 + audit + worker-pickup matrix verified live. Dashboard
++ CLI surfaces compiled clean. The autonomous self-healing path
+is wired end-to-end; the LLM-driven part of the loop (actual
+diagnosis quality) is best evaluated against real customer
+deployments since it depends on the diagnostician's model
+behaviour against real failure context.
+
+Pending follow-ups: none introduced. Possible future iteration:
+- Maintenance runner self-healing when a per-finding context-
+  fixer fails (would map to `failureType:'maintenance-error'`)
+- Auto-resolved alerts could show a richer "what was diagnosed"
+  panel on the dashboard (today the diagnosis is on the
+  intent's `last_resume_context` but the alert's auto-resolve
+  doesn't surface the diagnosis directly to operators
+  reviewing the audit trail)
+- IntentDetail dashboard "Attempt history" panel — the brief
+  sketched a UI showing the attempt-by-attempt diagnosis
+  chain. The data is there (each cycle's
+  `last_resume_context` JSONB) but a dedicated history-fetch
+  endpoint is a future enhancement

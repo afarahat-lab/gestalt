@@ -254,6 +254,19 @@ export interface PlatformSecretSummary {
   updatedAt: string;
 }
 
+// ─── Self-healing config (migration 020) ──────────────────────────────────
+
+export interface SelfHealingConfigSummary {
+  id: string;
+  failureType: string;
+  maxAttempts: number;
+  confidenceThreshold: 'high' | 'medium' | 'low';
+  autoResolveAlerts: boolean;
+  enabled: boolean;
+  updatedBy: string | null;
+  updatedAt: string;
+}
+
 // ─── Platform templates / MCP / tools / identity (Session 3 — migration 017) ─
 
 export interface PlatformTemplateSummary {
@@ -1049,6 +1062,24 @@ export class GestaltApiClient {
     if (!res.ok) throw new ApiClientError(res.status, await res.text());
     if (res.status === 204) return undefined as unknown as T;
     return res.json() as Promise<T>;
+  }
+
+  // ─── Self-healing config (migration 020) ──────────────────────────────────
+
+  async listSelfHealingConfig(): Promise<{ data: SelfHealingConfigSummary[] }> {
+    return this.get('/platform/self-healing');
+  }
+
+  async updateSelfHealingConfig(
+    failureType: string,
+    body: Partial<{
+      maxAttempts: number;
+      confidenceThreshold: 'high' | 'medium' | 'low';
+      autoResolveAlerts: boolean;
+      enabled: boolean;
+    }>,
+  ): Promise<{ data: SelfHealingConfigSummary }> {
+    return this.patch(`/platform/self-healing/${failureType}`, body);
   }
 
   private authHeaders(): Record<string, string> {

@@ -19,6 +19,7 @@ import type {
   PlatformMcpServer, PlatformMcpTestResult, PlatformToolInfo,
   IdentityProvider, IdentityState, RoleMapping,
   PlatformGroup, GroupMember, GroupProjectAssignment, ProjectGroupAssignment,
+  SelfHealingConfig,
 } from '../types';
 
 export class DashboardApiClient {
@@ -348,6 +349,24 @@ export class DashboardApiClient {
 
   async testPlatformLlm(id: string): Promise<{ data: LlmTestResult }> {
     return this.post(`/platform/llms/${id}/test`, {});
+  }
+
+  // ─── Self-healing config (migration 020) ──────────────────────────────────
+
+  async listSelfHealingConfig(): Promise<{ data: SelfHealingConfig[] }> {
+    return this.get('/platform/self-healing');
+  }
+
+  async updateSelfHealingConfig(
+    failureType: string,
+    body: Partial<{
+      maxAttempts: number;
+      confidenceThreshold: 'high' | 'medium' | 'low';
+      autoResolveAlerts: boolean;
+      enabled: boolean;
+    }>,
+  ): Promise<{ data: SelfHealingConfig }> {
+    return this.patch(`/platform/self-healing/${failureType}`, body);
   }
 
   // ─── Platform secrets vault (Session 4 — migration 015) ───────────────────

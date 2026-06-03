@@ -7,8 +7,11 @@
  * Agents never read files directly — they consume the snapshot.
  */
 
-import type { ContextSnapshot, ExecutionPlan, FeedbackSignal, GeneratedArtifact, IntentSpec } from '../types';
-import { createHarnessEngine } from '@gestalt/core';
+import type {
+  ContextSnapshot, ExecutionPlan, FeedbackSignal, GeneratedArtifact, IntentSpec,
+  ResumeContextSnapshot,
+} from '../types';
+import { createHarnessEngine, getRepositories } from '@gestalt/core';
 import { getPriorArtifacts } from './plan-builder';
 import type { AgentRole } from '@gestalt/core';
 import { loadAgentConfig } from '../config/agent-config-loader';
@@ -32,6 +35,7 @@ export async function assembleContext(
   forAgent: AgentRole,
   intentText: string,
   priorSignals: FeedbackSignal[] = [],
+  intentId?: string,
 ): Promise<ContextSnapshot> {
   const engine = createHarnessEngine(projectRoot);
   const baseSnapshot = await engine.buildSnapshot(plan.correlationId);
@@ -62,6 +66,40 @@ export async function assembleContext(
   // identically without an agents.yaml committed.
   const agentConfig = await loadAgentConfig(projectRoot, forAgent);
 
+  // Migration 020 — read the most recent resume context from the
+  // intent row so prompts can render their "Resumed attempt" section
+  // AND the orchestrator can honour `skipAgents` for high-confidence
+  // auto-healed retries. Falls back to undefined when no intentId is
+  // supplied (e.g. legacy callers); the snapshot's optional fields
+  // default to absent.
+  let resumeContext: ResumeContextSnapshot | null | undefined;
+  let resumePriorSignals: FeedbackSignal[] | null = null;
+  if (intentId) {
+    try {
+      const intent = await getRepositories().intents.findById(intentId);
+      resumeContext = (intent?.lastResumeContext ?? null) as ResumeContextSnapshot | null;
+      // When the cycle is a resume (autoHealed OR operator-feedback)
+      // the resume context's priorSignals may include signals the
+      // orchestrator wouldn't otherwise have routed yet. Layer them
+      // into `priorSignals` so the prompt's signal-feedback section
+      // reflects the historical record.
+      if (resumeContext && resumeContext.priorSignals?.length && priorSignals.length === 0) {
+        resumePriorSignals = resumeContext.priorSignals.map((s) => ({
+          id: crypto.randomUUID(),
+          correlationId: plan.correlationId,
+          type: s.type as FeedbackSignal['type'],
+          severity: s.severity as FeedbackSignal['severity'],
+          sourceAgent: s.sourceAgent as FeedbackSignal['sourceAgent'],
+          message: s.message,
+          autoResolvable: true,
+          createdAt: new Date(),
+        }));
+      }
+    } catch {
+      // Non-fatal — assembly continues without resume context.
+    }
+  }
+
   return {
     projectRoot,
     harness: baseSnapshot.harness as ContextSnapshot['harness'],
@@ -73,8 +111,11 @@ export async function assembleContext(
     relevantDecisions: parseDecisions(baseSnapshot.relevantDecisions),
     intentSpec,
     priorArtifacts,
-    priorSignals,
+    priorSignals: resumePriorSignals ?? priorSignals,
     agentConfig,
+    resumeContext: resumeContext ?? undefined,
+    focusFiles: resumeContext?.focusFiles ?? undefined,
+    skipAgents: resumeContext?.skipAgents ?? undefined,
   };
 }
 

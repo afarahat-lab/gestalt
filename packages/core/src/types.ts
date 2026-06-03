@@ -26,7 +26,14 @@ export type AgentRole =
   | 'alignment-agent'
   | 'gc-agent'
   | 'evaluation-agent'
-  | 'context-fixer';
+  | 'context-fixer'
+  /**
+   * Autonomous self-healing diagnostician (migration 020). Diagnoses
+   * failures and decides whether to auto-retry or escalate. Not part
+   * of any plan — invoked directly from `runSelfHealingLoop` outside
+   * the orchestrator's per-step iteration.
+   */
+  | 'self-healing-agent';
 
 // ─── Signal types ─────────────────────────────────────────────────────────────
 

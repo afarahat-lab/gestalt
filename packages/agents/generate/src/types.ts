@@ -218,6 +218,52 @@ export interface ContextSnapshot {
    * resolves to platform defaults so existing projects keep working.
    */
   agentConfig: AgentConfig;
+  /**
+   * The most recent resume context for this intent — populated from
+   * `intent.last_resume_context` when the cycle is a self-healing
+   * retry or operator-feedback resume (migration 020). Prompts
+   * render an extra "Resumed attempt" section when this is present.
+   */
+  resumeContext?: ResumeContextSnapshot | null;
+  /**
+   * Files identified as the root cause by the most recent self-
+   * healing diagnosis. Surfaced in the code-prompt's resume
+   * section to focus the LLM's attention. Drawn from
+   * `resumeContext.focusFiles` for convenience at the prompt-
+   * builder layer.
+   */
+  focusFiles?: string[];
+  /**
+   * Agent roles the self-healing diagnosis recommended skipping
+   * because their prior output is still valid. Mirrors
+   * `resumeContext.skipAgents` (only populated on high-confidence
+   * auto-healed retries). The orchestrator consults this when
+   * deciding whether to skip a step.
+   */
+  skipAgents?: string[];
+}
+
+/**
+ * The shape of `intent.lastResumeContext` as it appears on the
+ * snapshot. This is a local mirror of the core `ResumeContext` type
+ * — duplicated here to avoid an explicit dep on the core repository
+ * types from prompt builders. Fields match the postgres column
+ * (camelCase via postgres.js).
+ */
+export interface ResumeContextSnapshot {
+  operatorFeedback: string;
+  failureType: string;
+  failureSummary: string;
+  priorSignals: Array<{ type: string; message: string; sourceAgent: string; severity: string }>;
+  priorArtifactPaths: string[];
+  attemptNumber: number;
+  feedbackProvidedAt: string;
+  autoHealed: boolean;
+  diagnosis?: string;
+  rootCause?: string;
+  skipAgents?: string[];
+  focusFiles?: string[];
+  updatedIntentText?: string;
 }
 
 // ─── Artifacts ────────────────────────────────────────────────────────────────

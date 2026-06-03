@@ -3,8 +3,11 @@
  * Implements @gestalt/core IntentRepository interface.
  */
 
-import type { IntentRepository, IntentRecord, IntentStatus } from '@gestalt/core';
+import type {
+  IntentRepository, IntentRecord, IntentStatus, ResumeContext,
+} from '@gestalt/core';
 import { getDb } from '../client';
+import { parseJsonb } from '../utils';
 
 export class PostgresIntentRepository implements IntentRepository {
 
@@ -188,4 +191,62 @@ export class PostgresIntentRepository implements IntentRepository {
     `;
     return row ?? null;
   }
+
+  /**
+   * Persists the resume context. Uses postgres.js's typed `db.json`
+   * helper (NOT a stringify-with-cast) so the column stores as proper
+   * JSONB rather than a string scalar. See the 2026-06-02 session log
+   * for the full rationale and the read-path `parseJsonb` helper.
+   *
+   * The text content of the context (operator feedback OR
+   * self-healing diagnosis) MAY include user-supplied prose. It is
+   * NOT echoed into audit metadata — callers record `feedbackLength`
+   * only per GP-006. Auditability is via this column.
+   */
+  async saveResumeContext(id: string, context: ResumeContext): Promise<void> {
+    const db = getDb();
+    const result = await db`
+      UPDATE intents
+      SET last_resume_context = ${db.json(
+        context as unknown as Parameters<typeof db.json>[0],
+      )},
+          updated_at = NOW()
+      WHERE id = ${id}
+    `;
+    if (result.count === 0) throw new Error(`Intent ${id} not found`);
+  }
+
+  /**
+   * Atomically bumps the counter and returns the post-increment
+   * value. The COALESCE handles legacy rows that pre-date migration
+   * 020 (where the column is NULL despite the NOT NULL DEFAULT 0
+   * declaration — would never happen on a clean install, but
+   * belt-and-braces for upgrade safety).
+   */
+  async incrementAttemptCount(id: string): Promise<number> {
+    const db = getDb();
+    const [row] = await db<[{ attemptCount: number }]>`
+      UPDATE intents
+      SET attempt_count = COALESCE(attempt_count, 0) + 1,
+          updated_at = NOW()
+      WHERE id = ${id}
+      RETURNING attempt_count
+    `;
+    if (!row) throw new Error(`Intent ${id} not found`);
+    return row.attemptCount;
+  }
+}
+
+/**
+ * Defensive normaliser for `last_resume_context` column reads. The
+ * shared `parseJsonb` helper handles postgres.js's object-vs-string
+ * variance for JSONB columns. Used by callers that need the typed
+ * `ResumeContext` shape (the server's read path); SELECT * into
+ * `IntentRecord` casts directly so this is belt-and-braces. Exported
+ * for future consumers.
+ */
+export function normaliseResumeContext(value: unknown): ResumeContext | null {
+  if (value === null || value === undefined) return null;
+  const parsed = parseJsonb<Record<string, unknown> | null>(value, null);
+  return parsed as unknown as ResumeContext;
 }

@@ -164,6 +164,16 @@ export function buildCodePrompt(
   // ── 7. Signal feedback (retry cycles only) ─────────────────────────
   const signalsSection = buildSignalFeedback(priorSignals);
 
+  // ── 7b. Resume context (migration 020) ─────────────────────────────
+  // Surfaced when the cycle is a self-healing auto-retry OR an
+  // operator-feedback resume. The autoHealed branch carries the
+  // diagnostician's diagnosis + root cause; the operator branch
+  // carries the operator's free-text fix description verbatim.
+  const resumeContext = ctx.resumeContext;
+  const resumeSection = resumeContext
+    ? buildResumeSection(resumeContext, ctx.focusFiles)
+    : '';
+
   // ── 8. Task instructions ───────────────────────────────────────────
   const retryHint =
     attempt > 0
@@ -202,6 +212,7 @@ export function buildCodePrompt(
     principlesSection,
     domainSection,
     signalsSection,
+    resumeSection,         // ← NEW (migration 020) — self-healing / operator-feedback resume
     taskSection,
   ]
     .filter(Boolean)
@@ -209,3 +220,44 @@ export function buildCodePrompt(
 
   return applyAgentConfig(body, ctx.agentConfig);
 }
+
+/**
+ * Resume-section formatter (migration 020). Two layouts depending
+ * on `autoHealed`:
+ *   - true  → diagnostician's diagnosis + root cause + suggested fix
+ *   - false → operator's feedback verbatim
+ * Optional focus files list (carried as `ctx.focusFiles` for ergonomic
+ * access) appears at the bottom.
+ */
+function buildResumeSection(
+  resume: NonNullable<CodeContextSnapshotLike['resumeContext']>,
+  focusFiles?: string[],
+): string {
+  const header = `## Resumed attempt (${resume.attemptNumber}) — ${
+    resume.autoHealed ? 'auto-diagnosed' : 'operator feedback'
+  }`;
+  const failure = `Failure: ${resume.failureSummary}`;
+  const body = resume.autoHealed
+    ? [
+        `Diagnosis: ${resume.diagnosis ?? '(none recorded)'}`,
+        `Root cause: ${resume.rootCause ?? '(none recorded)'}`,
+        `Suggested fix: ${resume.operatorFeedback}`,
+      ].join('\n')
+    : `Operator feedback: ${resume.operatorFeedback}`;
+  const focus = focusFiles && focusFiles.length > 0
+    ? `\n\nFocus on these files (identified as root cause):\n${focusFiles.map((f) => `  - ${f}`).join('\n')}`
+    : '';
+  return `${header}\n\n${failure}\n\n${body}${focus}`;
+}
+
+/** Structural projection used by the formatter — local to this module. */
+type CodeContextSnapshotLike = {
+  resumeContext?: {
+    operatorFeedback: string;
+    failureSummary: string;
+    attemptNumber: number;
+    autoHealed: boolean;
+    diagnosis?: string;
+    rootCause?: string;
+  } | null;
+};

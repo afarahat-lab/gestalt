@@ -31,6 +31,7 @@ import {
   PostgresIdentityConfigRepository, PostgresRoleMappingRepository,
 } from './repositories/identity-config';
 import { PostgresPlatformGroupRepository } from './repositories/platform-groups';
+import { PostgresSelfHealingConfigRepository } from './repositories/self-healing-config';
 export {
   LastLLMError, CannotDeleteDefaultLLMError,
 } from './repositories/platform-llms';
@@ -73,5 +74,6 @@ export async function createPostgresAdapter(databaseUrl: string): Promise<Reposi
     identityConfig:     new PostgresIdentityConfigRepository(),
     roleMappings:       new PostgresRoleMappingRepository(),
     platformGroups:     new PostgresPlatformGroupRepository(),
+    selfHealingConfig:  new PostgresSelfHealingConfigRepository(),
   };
 }

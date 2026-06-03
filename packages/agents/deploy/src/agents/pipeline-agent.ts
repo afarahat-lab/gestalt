@@ -46,9 +46,9 @@ export interface PipelineAgentInput {
 
 export type PipelineAgentOutcome =
   | { kind: 'passed'; runId: string }
-  | { kind: 'failed'; runId: string; reason: string }
-  | { kind: 'cancelled'; runId: string }
-  | { kind: 'timeout'; runId: string };
+  | { kind: 'failed'; runId: string; reason: string; pipelineStatus: string }
+  | { kind: 'cancelled'; runId: string; pipelineStatus: string }
+  | { kind: 'timeout'; runId: string; pipelineStatus: string };
 
 export interface PipelineAgentResult {
   outcome: PipelineAgentOutcome;
@@ -164,25 +164,17 @@ export async function runPipelineAgent(input: PipelineAgentInput): Promise<Pipel
           message: `${reason} — runId=${runId}`,
         });
 
-        // Brief — pipeline failures create an alert so operators can
-        // submit feedback. Non-fatal: a failed alerts.create logs a
-        // warning and the cycle still returns the signal (which the
-        // orchestrator + retry router still handle as before).
-        await createPipelineFailureAlert({
-          input,
-          alertType: 'pipeline-failed',
-          title: 'CI pipeline failed',
-          description:
-            `The CI pipeline for intent ${quoteIntent(input.intentText)} ${reason.toLowerCase()}. ` +
-            `Run ID: ${runId}. Review the pipeline logs and provide feedback to retry.`,
-          runId,
-          pipelineStatus: status,
-        });
-
+        // Brief — pipeline failures are now wrapped by the
+        // self-healing loop in `deploy-orchestrator` (migration 020).
+        // The loop diagnoses + auto-retries when confident; on
+        // escalation it creates a `pipeline-failed` alert with the
+        // same shape this branch used to write directly. Operator
+        // feedback via POST /alerts/:id/pipeline-feedback continues
+        // to work unchanged.
         return {
           outcome: status === 'cancelled'
-            ? { kind: 'cancelled', runId }
-            : { kind: 'failed', runId, reason },
+            ? { kind: 'cancelled', runId, pipelineStatus: status }
+            : { kind: 'failed', runId, reason, pipelineStatus: status },
           signals: [signal],
         };
       }
@@ -203,19 +195,10 @@ export async function runPipelineAgent(input: PipelineAgentInput): Promise<Pipel
       adapter: adapter.type,
     });
 
-    await createPipelineFailureAlert({
-      input,
-      alertType: 'pipeline-timeout',
-      title: 'CI pipeline timed out',
-      description:
-        `The CI pipeline for intent ${quoteIntent(input.intentText)} did not complete within ` +
-        `${Math.round(timeoutMs / 1000)}s. Run ID: ${runId}. Check the CI infrastructure ` +
-        `or provide feedback to retry.`,
-      runId,
-      pipelineStatus: 'timeout',
-    });
-
-    return { outcome: { kind: 'timeout', runId }, signals: [timeoutSignal] };
+    // Brief — pipeline timeouts are now wrapped by the self-
+    // healing loop in `deploy-orchestrator` (migration 020). See the
+    // matching branch for `kind: 'failed'` for full context.
+    return { outcome: { kind: 'timeout', runId, pipelineStatus: 'timeout' }, signals: [timeoutSignal] };
   } finally {
     await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
   }
@@ -243,72 +226,13 @@ function buildSignal(params: {
   };
 }
 
-/**
- * Render the intent text for the alert title/description. Returns
- * the text quoted, capped at 80 chars with an ellipsis when longer.
- * Returns `(unknown intent)` when text is absent (legacy in-flight
- * jobs may not carry it).
- */
-function quoteIntent(text: string | undefined): string {
-  if (!text) return '(unknown intent)';
-  const oneLine = text.split('\n')[0]!.trim();
-  const capped = oneLine.length > 80 ? `${oneLine.slice(0, 77)}...` : oneLine;
-  return `"${capped}"`;
-}
-
-/**
- * Persist the pipeline-failure/timeout alert. The alert payload
- * carries enough context for the dashboard's pipeline card AND for
- * the `POST /alerts/:id/pipeline-feedback` route to dispatch a
- * resume-on-branch retry without an extra lookup. Non-fatal on
- * error — the orchestrator still sees the signal and transitions
- * the intent to failed.
- */
-async function createPipelineFailureAlert(params: {
-  input: PipelineAgentInput;
-  alertType: 'pipeline-failed' | 'pipeline-timeout';
-  title: string;
-  description: string;
-  runId: string;
-  pipelineStatus: 'failed' | 'cancelled' | 'timeout';
-}): Promise<void> {
-  const { input, alertType, title, description, runId, pipelineStatus } = params;
-  try {
-    const { alerts } = getRepositories();
-    const alert = await alerts.create({
-      correlationId: input.correlationId,
-      intentId: input.intentId,
-      type: alertType,
-      severity: 'high',
-      title,
-      description,
-      requiredAction: 'provide-feedback',
-      context: {
-        intentId: input.intentId,
-        intentText: input.intentText ?? null,
-        projectId: input.projectId,
-        correlationId: input.correlationId,
-        branch: input.branch,
-        prUrl: input.prUrl,
-        prNumber: input.prNumber,
-        runId,
-        pipelineStatus,
-      },
-    });
-    emitLiveEvent('alert.created', input.correlationId, {
-      alertId: alert.id,
-      type: alertType,
-      intentId: input.intentId,
-      severity: 'high',
-    });
-    log.info(
-      { alertId: alert.id, alertType, runId, intentId: input.intentId },
-      'Pipeline failure alert created',
-    );
-  } catch (err) {
-    log.warn(
-      { err: err instanceof Error ? err.message : String(err), runId },
-      'Failed to create pipeline failure alert — operator will not see it in Alerts view',
-    );
-  }
-}
+// Note (migration 020): pipeline-agent no longer creates alerts
+// directly. The self-healing loop in deploy-orchestrator's
+// pipeline-failed branch handles alert creation as part of its
+// escalation path, so the existing pipeline-feedback flow
+// (POST /alerts/:id/pipeline-feedback) and dashboard PipelineBody
+// card both continue to work — runId / pipelineStatus / branch /
+// prNumber / prUrl flow through `alertContextExtras` on the loop's
+// payload. The legacy `createPipelineFailureAlert` + `quoteIntent`
+// helpers were removed; the loop's `TITLE_TEMPLATES` map provides
+// the per-failure-type title prefix.

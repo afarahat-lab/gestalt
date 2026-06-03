@@ -20,6 +20,7 @@ import {
   setLLMRegistryResolver, getRepositories,
   loadMasterKey, decryptSecret,
   setPlatformMcpResolver, McpClient,
+  setQueueConfig,
 } from '@gestalt/core';
 import { setMasterKey, getMasterKey } from './secrets/index';
 import { createPostgresAdapter, closeDb } from '@gestalt/adapter-postgres';
@@ -117,6 +118,13 @@ export async function startServer(): Promise<void> {
     sessionTtlMinutes: config.auth.sessionTtlMinutes,
   });
   log.info('Auth manager ready');
+
+  // 5c. Queue config — pin a process-wide QueueConfig so the
+  // self-healing loop (migration 020) can call `dispatch` from
+  // inside `@gestalt/core` without threading config through every
+  // consumer. Mirrors the master-key + LLM-registry-resolver patterns.
+  setQueueConfig(config.queue);
+  log.info('Queue config pinned for self-healing dispatch');
 
   // 6. Generate-layer orchestrator worker (drains bull:gestalt-generate:*)
   startOrchestratorWorker(config.queue);

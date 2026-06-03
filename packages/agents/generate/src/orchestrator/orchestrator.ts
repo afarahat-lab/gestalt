@@ -17,6 +17,7 @@ import {
   createContextLogger, emitLiveEvent, QUEUE_NAMES,
   McpClient, resolveMcpClients, createHarnessEngine,
   BaseOrchestrator,
+  runSelfHealingLoop,
 } from '@gestalt/core';
 import type {
   TaskMessage, TaskResult, QueueConfig,
@@ -78,7 +79,7 @@ interface IntentTaskPayload {
   clarification?: string;
   ambiguityId?: string;
   resume?: boolean;
-  source?: 'human' | 'maintenance-agent' | 'pipeline-feedback';
+  source?: 'human' | 'maintenance-agent' | 'pipeline-feedback' | 'self-healing' | 'auto-resolved' | 'operator-resume';
   /**
    * Pipeline-feedback resume flow. When set, the orchestrator
    * checks out this branch after the per-cycle clone so the
@@ -208,7 +209,7 @@ async function handleIntentTask(
     // `payload.source` is the DISPATCH source (which is the same on
     // a fresh submit but flips to `pipeline-feedback` on the resume
     // leg). We prefer payload.source for resume context.
-    const intentSource: 'human' | 'maintenance-agent' | 'pipeline-feedback' =
+    const intentSource: 'human' | 'maintenance-agent' | 'pipeline-feedback' | 'self-healing' | 'auto-resolved' | 'operator-resume' =
       payload.source ?? intentRecord.source;
 
     project = await projects.findById(projectId);
@@ -364,6 +365,21 @@ async function handleIntentTask(
       }
     }
 
+    // Self-healing skip list (migration 020). Only honoured when
+    // the resume context was written by `runSelfHealingLoopUnsafe`
+    // at HIGH confidence — the loop clears `skipAgents` for any
+    // lower confidence before persisting, so we can trust whatever
+    // is on the row. We additionally double-check `autoHealed` here
+    // (operator-feedback resumes set autoHealed:false and never
+    // populate skipAgents — belt-and-braces).
+    const resumeCtx = intentRecord.lastResumeContext as unknown as {
+      autoHealed?: boolean; skipAgents?: string[];
+    } | null;
+    const selfHealingSkipAgents =
+      resumeCtx?.autoHealed && Array.isArray(resumeCtx.skipAgents)
+        ? resumeCtx.skipAgents
+        : undefined;
+
     // Drive the plan to completion
     await drivePlan(
       plan,
@@ -380,12 +396,26 @@ async function handleIntentTask(
         projectCredential,
         customAgentsAfter,
         customAgentsAfterCustom,
+        skipAgents: selfHealingSkipAgents,
       },
     );
 
     if (hasPlanFailed(plan)) {
-      await transitionIntent(payload.intentId, correlationId, 'failed');
-      return buildResult(correlationId, 'failed', plan);
+      // Self-healing wraps the failed-plan exit (migration 020). If
+      // the loop dispatches a retry OR auto-resolves an escalated
+      // alert, the intent stays in `generating`; otherwise we
+      // transition to `failed` exactly as before.
+      const healing = await attemptSelfHealingForGenerate(
+        payload.intentId,
+        correlationId,
+        'Generate plan finished with failed step(s)',
+        undefined,
+        childLog,
+      );
+      if (!healing.retryDispatched) {
+        await transitionIntent(payload.intentId, correlationId, 'failed');
+      }
+      return buildResult(correlationId, healing.retryDispatched ? 'completed' : 'failed', plan);
     }
 
     if (plan.state === 'waiting_for_clarification') {
@@ -444,9 +474,54 @@ async function handleIntentTask(
     return buildResult(correlationId, 'completed', plan);
 
   } catch (err) {
+    // Sentinel: an inline self-healing dispatcher (e.g. the
+    // custom-agent failure path) already queued a retry. Return
+    // cleanly without re-running self-healing (which would
+    // duplicate the dispatch).
+    if (err instanceof SelfHealingRetryDispatched) {
+      childLog.info({ source: err.source }, 'Cycle bailed — self-healing retry already queued');
+      return {
+        taskId: crypto.randomUUID(),
+        correlationId,
+        agentRole: 'orchestrator',
+        status: 'completed',
+        output: { planState: 'self-healed' },
+        signals: [],
+        tokensUsed: 0,
+        durationMs: 0,
+        completedAt: new Date(),
+      };
+    }
     childLog.error({ err }, 'Orchestrator error');
-    await transitionIntent(payload.intentId, correlationId, 'failed').catch(() => {});
-    throw err;
+    // Self-healing wraps the catch block (migration 020). If the
+    // loop dispatches a retry, we DON'T transition to failed and
+    // DON'T re-throw (BullMQ would otherwise retry the original
+    // job, double-dispatching the cycle). On escalation without
+    // auto-resolve we still transition to failed and return
+    // cleanly — the alert carries the human-attention signal.
+    const healing = await attemptSelfHealingForGenerate(
+      payload.intentId,
+      correlationId,
+      'Orchestrator threw',
+      err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500),
+      childLog,
+    ).catch(() => ({ retryDispatched: false }));
+    if (!healing.retryDispatched) {
+      await transitionIntent(payload.intentId, correlationId, 'failed').catch(() => {});
+    }
+    // Don't re-throw — see comment above. Return a TaskResult so
+    // BullMQ marks the job done.
+    return {
+      taskId: crypto.randomUUID(),
+      correlationId,
+      agentRole: 'orchestrator',
+      status: healing.retryDispatched ? 'completed' : 'failed',
+      output: { planState: 'error' },
+      signals: [],
+      tokensUsed: 0,
+      durationMs: 0,
+      completedAt: new Date(),
+    };
   } finally {
     // ADR-039 — close every MCP client this cycle opened. Best-
     // effort; a thrown close shouldn't mask the original error path.
@@ -480,7 +555,7 @@ async function handleIntentTask(
  * the flag and skipping the gate dispatch).
  */
 interface DrivePlanOptions {
-  intentSource: 'human' | 'maintenance-agent' | 'pipeline-feedback';
+  intentSource: 'human' | 'maintenance-agent' | 'pipeline-feedback' | 'self-healing' | 'auto-resolved' | 'operator-resume';
   clarification?: string;
   /**
    * ADR-039 — per-cycle MCP client cache. Keyed by `serverName`.
@@ -504,6 +579,16 @@ interface DrivePlanOptions {
    * connect anonymously.
    */
   projectCredential: string | null;
+  /**
+   * Self-healing skip list (migration 020) — agent roles whose
+   * prior output the most recent high-confidence diagnosis said is
+   * still valid. Loaded from `intent.lastResumeContext.skipAgents`
+   * at the top of `handleIntentTask`. Honoured only when the
+   * resume context is `autoHealed: true` AND the confidence was
+   * `'high'` — the loop's `runSelfHealingLoopUnsafe` enforces this
+   * before writing the list.
+   */
+  skipAgents?: string[];
   /**
    * ADR-037 — custom agents that declared `runs_after: <framework>`.
    * Map key is the framework agent name; value is every custom node
@@ -563,6 +648,38 @@ async function drivePlan(
         const startedAt = new Date();
         const { executions, signals, artifacts, executionLogs } = getRepositories();
 
+        // Self-healing skipAgents (migration 020). When a previous
+        // self-healing diagnosis ran at high confidence and listed
+        // this agent role in `skipAgents`, we skip the step entirely
+        // — the diagnosis says its prior output is still valid. We
+        // still create the `agent_executions` row (status=skipped)
+        // for the dashboard's accordion. opts.skipAgents is loaded
+        // by handleIntentTask from intent.lastResumeContext.
+        if (opts.skipAgents && opts.skipAgents.includes(agentRole)) {
+          step.status = 'skipped';
+          childLog.info({ agentRole }, 'Self-healing skip — agent role in lastResumeContext.skipAgents');
+          await executions.create({
+            id: executionId,
+            correlationId: plan.correlationId,
+            intentId,
+            agentRole,
+            taskType,
+            status: 'skipped',
+            tokensUsed: 0,
+            durationMs: 0,
+            startedAt,
+            completedAt: new Date(),
+          });
+          emitLiveEvent('agent.started', plan.correlationId, {
+            executionId, agentRole, taskType, startedAt: startedAt.toISOString(),
+          });
+          emitLiveEvent('agent.completed', plan.correlationId, {
+            executionId, agentRole, status: 'skipped', tokensUsed: 0, durationMs: 0,
+            artifactCount: 0, signalCount: 0,
+          });
+          return;
+        }
+
         step.status = 'running';
         childLog.info({ agentRole }, 'Running agent step');
 
@@ -593,7 +710,7 @@ async function drivePlan(
         let agentInstance: BaseLLMAgent | null = null;
         try {
           const routedSignals = signalsForAgent(agentRole);
-          const context = await assembleContext(projectRoot, plan, agentRole, intentText, routedSignals);
+          const context = await assembleContext(projectRoot, plan, agentRole, intentText, routedSignals, intentId);
           // ADR-039 — resolve MCP clients for this agent's declared
           // servers. Cached by serverName across the cycle so
           // multiple agents that depend on the same MCP server share
@@ -734,7 +851,7 @@ async function drivePlan(
               // matches the pre-enforcement behaviour. context-fixer
               // role coercion stays at the assembleContext boundary.
               const baseCtx = await assembleContext(
-                projectRoot, plan, 'code-agent' as AgentRole, intentText,
+                projectRoot, plan, 'code-agent' as AgentRole, intentText, [], intentId,
               );
               const allSoFar = plan.steps.flatMap((s) => s.result?.artifacts ?? []);
               const customCtx = { ...baseCtx, priorArtifacts: allSoFar };
@@ -908,6 +1025,211 @@ function newAgentForRole(agentRole: AgentRole): BaseLLMAgent {
   }
 }
 
+/**
+ * Sentinel error thrown by inline self-healing dispatchers (e.g. the
+ * custom-agent failure path) to bail the current cycle early. The
+ * generate-orchestrator's catch block recognises it and returns
+ * cleanly without re-running self-healing — a retry is already
+ * queued and re-running would dispatch a duplicate.
+ */
+class SelfHealingRetryDispatched extends Error {
+  constructor(readonly source: string) {
+    super(`Self-healing retry dispatched from ${source}`);
+    this.name = 'SelfHealingRetryDispatched';
+  }
+}
+
+/**
+ * Hands a failed cycle to the self-healing loop (migration 020).
+ * Loads the intent / signals / artifacts fresh (so it works even
+ * when the catch block fired before those were locally captured),
+ * runs `runSelfHealingLoop`, and dispatches a retry on success.
+ *
+ * Returns true when the caller should NOT transition the intent
+ * to `failed` — either because the loop dispatched a retry OR the
+ * auto-resolver already transitioned to `generating`. Returns
+ * false when the caller is responsible for `transitionIntent(..., 'failed')`.
+ *
+ * NEVER throws — every code path catches and falls through to the
+ * caller's failed-transition behaviour.
+ */
+async function attemptSelfHealingForGenerate(
+  intentId: string,
+  correlationId: string,
+  failureSummary: string,
+  technicalDetail: string | undefined,
+  childLog: ReturnType<typeof createContextLogger>,
+): Promise<{ retryDispatched: boolean }> {
+  try {
+    const repos = getRepositories();
+    const intent = await repos.intents.findById(intentId);
+    if (!intent) return { retryDispatched: false };
+
+    const signals = await repos.signals.findByCorrelationId(correlationId);
+    const artifacts = await repos.artifacts.findByCorrelationId(correlationId);
+
+    const result = await runSelfHealingLoop(
+      {
+        intentText: intent.text,
+        failureType: 'generate-error',
+        failureSummary,
+        technicalDetail,
+        attemptNumber: (intent.attemptCount ?? 0) + 1,
+        priorSignals: signals.map((s) => ({
+          type: s.type,
+          message: s.message,
+          sourceAgent: s.sourceAgent,
+          severity: s.severity,
+        })),
+        priorArtifactPaths: artifacts.map((a) => a.path),
+      },
+      {
+        failureType: 'generate-error',
+        correlationId,
+        intentId,
+        projectId: intent.projectId,
+        intentText: intent.text,
+        branchName: intent.branchName,
+        prNumber: intent.prNumber,
+        prUrl: intent.prUrl,
+      },
+      signals,
+    );
+
+    if (result.shouldRetry && !result.escalated && result.diagnosis) {
+      // Caller MUST NOT transition to failed — we dispatched a retry.
+      await dispatch({
+        id: crypto.randomUUID(),
+        correlationId,
+        type: 'generate:intent',
+        sourceAgent: 'self-healing-agent',
+        targetAgent: 'intent-agent',
+        priority: 'normal',
+        payload: {
+          intentId,
+          projectId: intent.projectId,
+          text: result.diagnosis.updatedIntentText ?? intent.text,
+          resumeOnBranch: intent.branchName ?? undefined,
+          prNumber: intent.prNumber ?? undefined,
+          prUrl: intent.prUrl ?? undefined,
+          source: 'self-healing',
+        },
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      }, queueConfigFromEnv());
+      // Bring the intent back to `generating` for the retry leg —
+      // the worker will pick it up momentarily.
+      await transitionIntent(intentId, correlationId, 'generating').catch(() => {});
+      childLog.info({ confidence: result.diagnosis.confidence }, 'Self-healing dispatched retry');
+      return { retryDispatched: true };
+    }
+
+    if (result.escalated && result.autoResolved) {
+      // Auto-resolver already transitioned the intent to `generating`
+      // and dispatched a fresh cycle. Caller must NOT override.
+      childLog.info('Self-healing auto-resolved escalated alert');
+      return { retryDispatched: true };
+    }
+
+    // Escalated without auto-resolve, or loop disabled: caller
+    // transitions to failed. The alert (if any) is already created.
+    return { retryDispatched: false };
+  } catch (err) {
+    childLog.warn({ err }, 'Self-healing loop threw — falling through to failed');
+    return { retryDispatched: false };
+  }
+}
+
+/**
+ * Self-healing for custom-agent LLM errors (migration 020 — the
+ * `custom-agent-failure` failure type). Same shape as
+ * `attemptSelfHealingForGenerate` but with custom-agent context
+ * and a different failure summary. Returns `{ retryDispatched }`;
+ * the caller throws `SelfHealingRetryDispatched` on `true`.
+ *
+ * NEVER throws — returns `{ retryDispatched: false }` on any error.
+ */
+async function attemptSelfHealingForCustomAgent(args: {
+  defName: string;
+  result: { status: string; summary: string; rawResponse: string; errorMessage?: string };
+  intentId: string;
+  correlationId: string;
+  childLog: ReturnType<typeof createContextLogger>;
+}): Promise<{ retryDispatched: boolean }> {
+  const { defName, result, intentId, correlationId, childLog } = args;
+  try {
+    const repos = getRepositories();
+    const intent = await repos.intents.findById(intentId);
+    if (!intent) return { retryDispatched: false };
+
+    const signals = await repos.signals.findByCorrelationId(correlationId);
+    const artifacts = await repos.artifacts.findByCorrelationId(correlationId);
+
+    const healing = await runSelfHealingLoop(
+      {
+        intentText: intent.text,
+        failureType: 'custom-agent-failure',
+        failureSummary: `Custom agent '${defName}' failed: ${result.errorMessage ?? result.summary}`,
+        technicalDetail: result.rawResponse?.slice(0, 500),
+        attemptNumber: (intent.attemptCount ?? 0) + 1,
+        priorSignals: signals.map((s) => ({
+          type: s.type,
+          message: s.message,
+          sourceAgent: s.sourceAgent,
+          severity: s.severity,
+        })),
+        priorArtifactPaths: artifacts.map((a) => a.path),
+      },
+      {
+        failureType: 'custom-agent-failure',
+        correlationId,
+        intentId,
+        projectId: intent.projectId,
+        intentText: intent.text,
+        branchName: intent.branchName,
+        prNumber: intent.prNumber,
+        prUrl: intent.prUrl,
+        alertContextExtras: { customAgentName: defName },
+      },
+      signals,
+    );
+
+    if (healing.shouldRetry && !healing.escalated && healing.diagnosis) {
+      await dispatch({
+        id: crypto.randomUUID(),
+        correlationId,
+        type: 'generate:intent',
+        sourceAgent: 'self-healing-agent',
+        targetAgent: 'intent-agent',
+        priority: 'normal',
+        payload: {
+          intentId,
+          projectId: intent.projectId,
+          text: healing.diagnosis.updatedIntentText ?? intent.text,
+          resumeOnBranch: intent.branchName ?? undefined,
+          prNumber: intent.prNumber ?? undefined,
+          prUrl: intent.prUrl ?? undefined,
+          source: 'self-healing',
+        },
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      }, queueConfigFromEnv());
+      await transitionIntent(intentId, correlationId, 'generating').catch(() => {});
+      childLog.info({ agentName: defName }, 'Custom-agent self-healing dispatched retry');
+      return { retryDispatched: true };
+    }
+
+    if (healing.escalated && healing.autoResolved) {
+      childLog.info({ agentName: defName }, 'Custom-agent self-healing auto-resolved escalated alert');
+      return { retryDispatched: true };
+    }
+    return { retryDispatched: false };
+  } catch (err) {
+    childLog.warn({ err, agentName: defName }, 'Custom-agent self-healing loop threw — falling through');
+    return { retryDispatched: false };
+  }
+}
+
 function buildResult(
   correlationId: string,
   status: TaskResult['status'],
@@ -1063,6 +1385,39 @@ async function runOneCustomAgentNode(
   const stepStatus: ExecutionStatus =
     result.status === 'error' ? 'failed'
     : result.passed ? 'completed' : 'failed';
+
+  // Custom-agent self-healing (migration 020). Fires ONLY on a real
+  // LLM error (`result.status === 'error'`) — finding-based
+  // failures (passed: false but no exception) continue to emit
+  // signals that the gate's retry path handles. Throws the
+  // `SelfHealingRetryDispatched` sentinel when a retry is queued so
+  // the orchestrator can bail the current cycle cleanly.
+  if (result.status === 'error') {
+    try {
+      const healed = await attemptSelfHealingForCustomAgent({
+        defName: def.name,
+        result,
+        intentId,
+        correlationId,
+        childLog,
+      });
+      if (healed.retryDispatched) {
+        // Finish the execution row so the dashboard's accordion
+        // doesn't show a stuck `running` state, then bail.
+        await executions.updateStatus(executionId, 'failed', {
+          tokensUsed: result.tokensUsed,
+          durationMs: result.durationMs,
+          startedAt,
+          completedAt,
+        }).catch(() => {});
+        throw new SelfHealingRetryDispatched(`custom-agent:${def.name}`);
+      }
+    } catch (err) {
+      if (err instanceof SelfHealingRetryDispatched) throw err;
+      childLog.warn({ err, agentName: def.name }, 'Custom-agent self-healing threw — continuing existing flow');
+    }
+  }
+
   await executions.updateStatus(executionId, stepStatus, {
     tokensUsed: result.tokensUsed,
     durationMs: result.durationMs,

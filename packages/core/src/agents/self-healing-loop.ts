@@ -1,0 +1,513 @@
+/**
+ * Self-healing loop (migration 020).
+ *
+ * The brain of the autonomous self-healing feature. Wraps every
+ * failure path in a uniform invocation pattern:
+ *
+ *   const result = await runSelfHealingLoop(ctx, payload, signals);
+ *   if (result.shouldRetry) dispatch(generate:intent, { source: 'self-healing', ... });
+ *   else if (!result.escalated) transition(failed);
+ *   // if escalated: alert already created + auto-resolve already attempted
+ *
+ * Two-stage resolution:
+ *   1. Budget check + SelfHealingAgent diagnosis. If `shouldRetry`
+ *      and budget remaining, save resume context + increment
+ *      attempt counter, return `shouldRetry: true`. Caller dispatches.
+ *   2. Otherwise escalate: create the failure alert AND
+ *      (if `autoResolveAlerts: true` in config) re-invoke the
+ *      diagnostician at high confidence in an attempt to fix the
+ *      alert without operator input.
+ *
+ * Invariants:
+ *   - NEVER throws. Every code path catches and falls back to
+ *     human escalation.
+ *   - `attemptAutoResolveAlert` NEVER throws — the alert remains
+ *     open if auto-resolve fails, non-fatal.
+ *   - `skipAgents` only applied when confidence === 'high' (the
+ *     diagnostician enforces this inside `diagnose()` via its
+ *     confidence-threshold downgrade; we additionally clear the
+ *     list when shouldRetry was downgraded).
+ */
+
+import {
+  SelfHealingAgent,
+  type SelfHealingContext,
+  type SelfHealingDiagnosis,
+} from './self-healing-agent';
+import type {
+  PlatformSignal, AgentRole,
+} from '../types';
+import { getRepositories } from '../repository/index';
+import type {
+  ResumeContext, SelfHealingConfigRecord, AlertType, AlertRequiredAction,
+} from '../repository/index';
+import { dispatch, getQueueConfig } from '../queue/index';
+import { eventBus } from '../events/index';
+import { createContextLogger } from '../logger/index';
+
+const log = createContextLogger({ module: 'self-healing-loop' });
+
+/**
+ * The seven failure types the platform recognises. Wired to
+ * `platform_self_healing_config.failure_type` (migration 020).
+ */
+export type FailureType =
+  | 'generate-error'
+  | 'gate-max-retries'
+  | 'pipeline-failed'
+  | 'pipeline-timeout'
+  | 'deploy-error'
+  | 'maintenance-error'
+  | 'custom-agent-failure';
+
+/**
+ * The payload the loop needs to drive a retry / escalation. The
+ * orchestrator builds this from its own context — same fields the
+ * pipeline-feedback resume payload already used.
+ */
+export interface SelfHealingLoopPayload {
+  failureType: FailureType;
+  correlationId: string;
+  intentId: string;
+  projectId: string;
+  intentText: string;
+  branchName?: string | null;
+  prNumber?: number | null;
+  prUrl?: string | null;
+  /**
+   * Extra fields merged into the escalation alert's `context` JSONB.
+   * Used by callers (pipeline-agent, deploy-orchestrator) that need
+   * the alert to carry domain-specific data the dashboard renders —
+   * e.g. `runId` and `pipelineStatus` for pipeline-failed alerts so
+   * the existing PipelineBody component continues to work.
+   */
+  alertContextExtras?: Record<string, unknown>;
+}
+
+export interface SelfHealingResult {
+  shouldRetry: boolean;
+  diagnosis: SelfHealingDiagnosis | null;
+  /**
+   * True when the loop created an alert for human attention (budget
+   * exhausted, diagnosis declined, or self-healing disabled).
+   */
+  escalated: boolean;
+  /**
+   * True when the escalation path's auto-resolver SUCCESSFULLY
+   * re-dispatched the intent. When true, the intent is already at
+   * `generating` and the caller MUST NOT transition it to `failed`.
+   * When false (the common case for escalations — auto-resolve
+   * didn't reach high confidence), the caller transitions to
+   * `failed` so the alert has a waiting state.
+   */
+  autoResolved: boolean;
+}
+
+/**
+ * Fallback used when `platform_self_healing_config` has no row for
+ * the failure type (shouldn't happen post-migration-020 — the
+ * migration seeds all seven — but a forward-compat third-party
+ * caller might add a new failure type before the seed runs).
+ */
+const DEFAULT_CONFIG: SelfHealingConfigRecord = {
+  id: 'default',
+  failureType: 'unknown',
+  maxAttempts: 2,
+  confidenceThreshold: 'medium',
+  autoResolveAlerts: true,
+  enabled: true,
+  updatedBy: null,
+  updatedAt: new Date(),
+};
+
+/**
+ * Entry point. Returns a `SelfHealingResult` the caller branches on.
+ * NEVER throws — see invariants above.
+ */
+export async function runSelfHealingLoop(
+  context: SelfHealingContext,
+  payload: SelfHealingLoopPayload,
+  signals: PlatformSignal[],
+): Promise<SelfHealingResult> {
+  try {
+    return await runSelfHealingLoopUnsafe(context, payload, signals);
+  } catch (err) {
+    // Outermost safety net. Any unhandled throw from the inner
+    // implementation (repository call, event emit, etc.) falls
+    // through to escalation — we can't lose track of a failing
+    // cycle just because the self-healing path itself broke.
+    log.warn(
+      { err, correlationId: payload.correlationId, failureType: payload.failureType },
+      'runSelfHealingLoop hit unexpected error — escalating',
+    );
+    try {
+      const autoResolved = await escalateToHuman(
+        payload,
+        context,
+        signals,
+        `Self-healing loop error: ${(err as Error)?.message ?? String(err)}`,
+      );
+      return { shouldRetry: false, diagnosis: null, escalated: true, autoResolved };
+    } catch (escalateErr) {
+      // If even escalation throws, log and bail. Returning
+      // `escalated: false` here lets the caller transition to
+      // `failed` so the cycle doesn't hang.
+      log.error({ err: escalateErr }, 'Escalation failed during self-healing fallback');
+      return { shouldRetry: false, diagnosis: null, escalated: false, autoResolved: false };
+    }
+  }
+}
+
+async function runSelfHealingLoopUnsafe(
+  context: SelfHealingContext,
+  payload: SelfHealingLoopPayload,
+  signals: PlatformSignal[],
+): Promise<SelfHealingResult> {
+  const repos = getRepositories();
+
+  const config =
+    (await repos.selfHealingConfig.findByType(payload.failureType)) ?? DEFAULT_CONFIG;
+
+  if (!config.enabled) {
+    const autoResolved = await escalateToHuman(
+      payload,
+      context,
+      signals,
+      'Self-healing disabled for this failure type',
+    );
+    return { shouldRetry: false, diagnosis: null, escalated: true, autoResolved };
+  }
+
+  const intent = await repos.intents.findById(payload.intentId);
+  // `attemptCount` post-migration-020 starts at 0 for fresh intents.
+  // The first call to runSelfHealingLoop is therefore "attempt 1"
+  // semantically — we've already attempted the cycle once and it
+  // failed.
+  const currentAttempt = (intent?.attemptCount ?? 0) + 1;
+
+  if (currentAttempt > config.maxAttempts) {
+    const autoResolved = await escalateToHuman(
+      payload,
+      context,
+      signals,
+      `Budget exhausted after ${currentAttempt - 1} self-healing attempt(s) (max ${config.maxAttempts})`,
+    );
+    return { shouldRetry: false, diagnosis: null, escalated: true, autoResolved };
+  }
+
+  // Diagnosis. The agent itself never throws; even on parse failure
+  // it returns a safe-default `shouldRetry: false, confidence: low`.
+  const agent = new SelfHealingAgent();
+  const diagnosis = await agent.diagnose(
+    context,
+    payload.correlationId,
+    config.confidenceThreshold,
+  );
+
+  if (!diagnosis.shouldRetry) {
+    const autoResolved = await escalateToHuman(
+      payload,
+      context,
+      signals,
+      `Diagnosis: ${diagnosis.diagnosis}. Confidence: ${diagnosis.confidence}`,
+    );
+    return { shouldRetry: false, diagnosis, escalated: true, autoResolved };
+  }
+
+  // High-confidence retry: persist the resume context + bump the
+  // attempt counter. The next dispatch leg reads
+  // `intent.lastResumeContext` to populate the prompt.
+  // skipAgents is only applied at high confidence — clear at lower.
+  const effectiveSkipAgents =
+    diagnosis.confidence === 'high' ? diagnosis.skipAgents ?? [] : [];
+
+  const resumeContext: ResumeContext = {
+    operatorFeedback: `[Auto] ${diagnosis.suggestedFix}`,
+    failureType: payload.failureType,
+    failureSummary: context.failureSummary,
+    priorSignals: signals.map((s) => ({
+      type: s.type,
+      message: s.message,
+      sourceAgent: s.sourceAgent,
+      severity: s.severity,
+    })),
+    priorArtifactPaths: context.priorArtifactPaths,
+    attemptNumber: currentAttempt,
+    feedbackProvidedAt: new Date().toISOString(),
+    autoHealed: true,
+    diagnosis: diagnosis.diagnosis,
+    rootCause: diagnosis.rootCause,
+    skipAgents: effectiveSkipAgents,
+    focusFiles: diagnosis.focusFiles ?? [],
+    updatedIntentText: diagnosis.updatedIntentText,
+  };
+
+  await repos.intents.saveResumeContext(payload.intentId, resumeContext);
+  await repos.intents.incrementAttemptCount(payload.intentId);
+
+  log.info(
+    {
+      correlationId: payload.correlationId,
+      failureType: payload.failureType,
+      attemptNumber: currentAttempt,
+      confidence: diagnosis.confidence,
+      skippedAgents: effectiveSkipAgents.length,
+      focusFiles: (diagnosis.focusFiles ?? []).length,
+    },
+    'Self-healing retry authorised — caller should dispatch',
+  );
+
+  return { shouldRetry: true, diagnosis, escalated: false, autoResolved: false };
+}
+
+/**
+ * Maps the failure type to its alert type. Today the two unions
+ * align 1:1 (every failure type has a matching `AlertType` entry).
+ */
+function failureTypeToAlertType(failureType: FailureType): AlertType {
+  return failureType as AlertType;
+}
+
+/**
+ * Creates the failure alert. Called whenever the self-healing loop
+ * exits without a retry — either disabled, budget exhausted, or
+ * diagnosis said `shouldRetry: false`. Then optionally invokes the
+ * auto-resolver (`attemptAutoResolveAlert`) when the config flag
+ * is set.
+ *
+ * Failure non-fatal: a failed `alerts.create` writes a warn log and
+ * the loop returns `escalated: true` regardless — the operator can
+ * still see the intent reach `failed` from the orchestrator's
+ * caller-side transition.
+ */
+/**
+ * Returns true when the auto-resolve path successfully re-dispatched
+ * the intent (caller MUST NOT transition to `failed` — it's already
+ * at `generating`). Returns false otherwise.
+ */
+async function escalateToHuman(
+  payload: SelfHealingLoopPayload,
+  context: SelfHealingContext,
+  signals: PlatformSignal[],
+  reason: string,
+): Promise<boolean> {
+  const repos = getRepositories();
+  const config =
+    (await repos.selfHealingConfig.findByType(payload.failureType)) ?? DEFAULT_CONFIG;
+
+  let alertId: string | null = null;
+  try {
+    const alert = await repos.alerts.create({
+      correlationId: payload.correlationId,
+      intentId: payload.intentId,
+      type: failureTypeToAlertType(payload.failureType),
+      severity: 'high',
+      title: buildAlertTitle(payload, context),
+      description: `${context.failureSummary}\n\nEscalation reason: ${reason}`,
+      requiredAction: 'provide-feedback' as AlertRequiredAction,
+      context: {
+        intentId: payload.intentId,
+        branch: payload.branchName ?? null,
+        prNumber: payload.prNumber ?? null,
+        prUrl: payload.prUrl ?? null,
+        failureType: payload.failureType,
+        attemptNumber: context.attemptNumber,
+        escalationReason: reason,
+        ...(payload.alertContextExtras ?? {}),
+      },
+    });
+    alertId = alert.id;
+
+    eventBus.emit({
+      type: 'alert.created',
+      correlationId: payload.correlationId,
+      payload: { alertId: alert.id, type: alert.type },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    log.warn(
+      { err, correlationId: payload.correlationId },
+      'Failed to create escalation alert — continuing',
+    );
+  }
+
+  if (config.autoResolveAlerts && alertId) {
+    // Non-blocking attempt to auto-resolve. If it succeeds the
+    // intent is back to `generating`; if not the alert stays open
+    // for human input.
+    return await attemptAutoResolveAlert(alertId, payload, context, signals);
+  }
+  return false;
+}
+
+const TITLE_TEMPLATES: Record<FailureType, string> = {
+  'generate-error':       'Generate failure',
+  'gate-max-retries':     'Quality gate exhausted retries',
+  'pipeline-failed':      'CI pipeline failed',
+  'pipeline-timeout':     'CI pipeline timed out',
+  'deploy-error':         'Deploy failure',
+  'maintenance-error':    'Maintenance run failure',
+  'custom-agent-failure': 'Custom agent failure',
+};
+
+function buildAlertTitle(
+  payload: SelfHealingLoopPayload,
+  context: SelfHealingContext,
+): string {
+  const intentLine = payload.intentText.split('\n')[0].slice(0, 60);
+  const prefix = TITLE_TEMPLATES[payload.failureType] ?? payload.failureType;
+  return `${prefix} for intent '${intentLine}' (attempt ${context.attemptNumber})`;
+}
+
+/**
+ * Re-invokes the diagnostician at HIGH confidence against the same
+ * context — the brief's "automated alert resolver". If the agent
+ * returns a high-confidence shouldRetry, we ack the alert and
+ * dispatch a fresh generate cycle with `source: 'auto-resolved'`.
+ *
+ * NEVER throws — alert stays open if auto-resolve can't make
+ * progress, non-fatal for the caller.
+ */
+/**
+ * Returns true when the auto-resolver successfully dispatched a fresh
+ * cycle (and acknowledged the alert). Returns false when confidence
+ * was too low OR the LLM call failed.
+ */
+async function attemptAutoResolveAlert(
+  alertId: string,
+  payload: SelfHealingLoopPayload,
+  context: SelfHealingContext,
+  signals: PlatformSignal[],
+): Promise<boolean> {
+  const repos = getRepositories();
+  try {
+    const agent = new SelfHealingAgent();
+    const diagnosis = await agent.diagnose(
+      {
+        ...context,
+        failureSummary: `${context.failureSummary} [Alert auto-resolve attempt]`,
+      },
+      payload.correlationId,
+      'high', // Higher bar than the per-config threshold for auto-resolution.
+    );
+
+    if (!diagnosis.shouldRetry || diagnosis.confidence !== 'high') {
+      log.info(
+        {
+          alertId,
+          correlationId: payload.correlationId,
+          confidence: diagnosis.confidence,
+        },
+        'Auto-resolve did not reach high confidence — alert remains open',
+      );
+      return false;
+    }
+
+    const resumeContext: ResumeContext = {
+      operatorFeedback: `[Auto-resolved] ${diagnosis.suggestedFix}`,
+      failureType: payload.failureType,
+      failureSummary: context.failureSummary,
+      priorSignals: signals.map((s) => ({
+        type: s.type,
+        message: s.message,
+        sourceAgent: s.sourceAgent,
+        severity: s.severity,
+      })),
+      priorArtifactPaths: context.priorArtifactPaths,
+      attemptNumber: context.attemptNumber + 1,
+      feedbackProvidedAt: new Date().toISOString(),
+      autoHealed: true,
+      diagnosis: diagnosis.diagnosis,
+      rootCause: diagnosis.rootCause,
+      skipAgents: diagnosis.skipAgents ?? [],
+      focusFiles: diagnosis.focusFiles ?? [],
+      updatedIntentText: diagnosis.updatedIntentText,
+    };
+
+    await repos.intents.saveResumeContext(payload.intentId, resumeContext);
+    await repos.intents.incrementAttemptCount(payload.intentId);
+    // Acknowledged by the platform — actor 'system'. Audit captured
+    // implicitly via the alert row's acknowledgedBy column.
+    await repos.alerts.acknowledge(alertId, 'system');
+    await repos.intents.updateStatus(payload.intentId, 'generating');
+
+    await dispatch(
+      {
+        id: crypto.randomUUID(),
+        correlationId: payload.correlationId,
+        type: 'generate:intent',
+        sourceAgent: 'self-healing-agent',
+        targetAgent: 'intent-agent',
+        priority: 'normal',
+        payload: {
+          intentId: payload.intentId,
+          projectId: payload.projectId,
+          text: diagnosis.updatedIntentText ?? payload.intentText,
+          resumeOnBranch: payload.branchName ?? undefined,
+          prNumber: payload.prNumber ?? undefined,
+          prUrl: payload.prUrl ?? undefined,
+          source: 'auto-resolved',
+        } as Record<string, unknown>,
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      },
+      getQueueConfig(),
+    );
+
+    eventBus.emit({
+      type: 'alert.auto-resolved',
+      correlationId: payload.correlationId,
+      payload: {
+        alertId,
+        diagnosis: diagnosis.diagnosis,
+        rootCause: diagnosis.rootCause,
+      },
+      timestamp: new Date().toISOString(),
+    });
+
+    log.info(
+      { alertId, correlationId: payload.correlationId },
+      'Alert auto-resolved — intent re-dispatched',
+    );
+    return true;
+  } catch (err) {
+    // Non-fatal — alert stays open for human attention.
+    log.warn(
+      { err, alertId, correlationId: payload.correlationId },
+      'Auto-resolve attempt failed — alert remains open',
+    );
+    return false;
+  }
+}
+
+/**
+ * Re-export used by orchestrator-side code that needs to widen its
+ * own failure-source union to include the self-healing variants.
+ */
+export type ResumeSource =
+  | 'human'
+  | 'maintenance-agent'
+  | 'pipeline-feedback'
+  | 'self-healing'
+  | 'auto-resolved'
+  | 'operator-resume';
+
+/**
+ * Skip-agent helper for orchestrators. Returns true when the
+ * agent role appears in the intent's `lastResumeContext.skipAgents`
+ * list AND the resume was auto-healed at high confidence.
+ * Centralised here so the policy ("only honour skipAgents on
+ * auto-healed high-confidence retries") lives in one place.
+ *
+ * Note: the loop already clears `skipAgents` for lower-confidence
+ * diagnoses before writing them — this helper is the second
+ * defence at the consume site.
+ */
+export function shouldSkipAgent(
+  resumeContext: ResumeContext | null | undefined,
+  agentRole: AgentRole,
+): boolean {
+  if (!resumeContext) return false;
+  if (!resumeContext.autoHealed) return false;
+  return (resumeContext.skipAgents ?? []).includes(agentRole);
+}

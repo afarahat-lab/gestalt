@@ -414,6 +414,154 @@ export async function registerOversightRoutes(app: FastifyInstance): Promise<voi
     },
   );
 
+  // POST /alerts/:id/resume — generic human-feedback resume for any
+  // failure alert type (migration 020). The operator's feedback is
+  // saved to `intents.last_resume_context` (autoHealed: false) and
+  // the cycle re-dispatches on the SAME branch + PR. Distinct from
+  // `pipeline-feedback`: pipeline-feedback handles pipeline-failed
+  // / pipeline-timeout specifically and persists to
+  // `intents.clarification`. `resume` is the generic equivalent for
+  // generate-error / gate-max-retries / deploy-error / maintenance-
+  // error / custom-agent-failure escalations.
+  app.post<{ Params: { id: string }; Body: { feedback?: unknown } }>(
+    '/alerts/:id/resume',
+    { preHandler: requireRole('operator') },
+    async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+      const body = request.body ?? {};
+      const feedback = typeof body.feedback === 'string' ? body.feedback.trim() : '';
+      if (!feedback) {
+        return reply.code(400).send({
+          error: 'feedback is required (describe what went wrong and how to fix it)',
+          code: 'INVALID_FEEDBACK',
+        });
+      }
+
+      const { alerts, intents, signals, audit } = getRepositories();
+      const existing = await alerts.findById(request.params.id);
+      if (!existing) return reply.code(404).send({ error: 'Alert not found' });
+      if (existing.acknowledgedAt) {
+        return reply.code(409).send({ error: 'Alert already acknowledged' });
+      }
+      // Reject types that have their own dedicated resume flow.
+      // pipeline-failed / pipeline-timeout → POST /alerts/:id/pipeline-feedback
+      // clarification-needed → POST /intents/:id/clarify
+      // GOLDEN_PRINCIPLE_BREACH → POST /interventions
+      const failureTypes = new Set<string>([
+        'generate-error', 'gate-max-retries', 'deploy-error',
+        'maintenance-error', 'custom-agent-failure',
+        // pipeline-* accepted too — the operator may prefer the
+        // generic resume path if the alert was created by the
+        // self-healing loop (which carries the same shape).
+        'pipeline-failed', 'pipeline-timeout',
+      ]);
+      if (!failureTypes.has(existing.type)) {
+        return reply.code(400).send({
+          error: `Alert type '${existing.type}' does not accept generic resume — use the type-specific endpoint`,
+          code: 'INVALID_ALERT_TYPE',
+        });
+      }
+
+      const ctx = existing.context ?? {};
+      const intentId = typeof ctx['intentId'] === 'string' ? (ctx['intentId'] as string) : null;
+      if (!intentId) {
+        return reply.code(400).send({
+          error: 'Alert has no intentId in context — cannot resume',
+          code: 'INVALID_ALERT_CONTEXT',
+        });
+      }
+      const intent = await intents.findById(intentId);
+      if (!intent) return reply.code(404).send({ error: 'Intent not found' });
+
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, intent.projectId, 'editor')) return;
+
+      // Build a ResumeContext (autoHealed: false — operator-driven).
+      // priorSignals carries the cycle's outstanding signals so the
+      // next intent-agent sees what was tried.
+      const cycleSignals = await signals.findByCorrelationId(intent.correlationId);
+      const failureType = typeof ctx['failureType'] === 'string' ? (ctx['failureType'] as string) : existing.type;
+      const failureSummary = typeof ctx['escalationReason'] === 'string'
+        ? (ctx['escalationReason'] as string)
+        : existing.description;
+
+      await intents.saveResumeContext(intent.id, {
+        operatorFeedback: feedback,
+        failureType,
+        failureSummary,
+        priorSignals: cycleSignals.map((s) => ({
+          type: s.type, message: s.message,
+          sourceAgent: s.sourceAgent, severity: s.severity,
+        })),
+        priorArtifactPaths: [],
+        attemptNumber: (intent.attemptCount ?? 0) + 1,
+        feedbackProvidedAt: new Date().toISOString(),
+        autoHealed: false,
+      });
+      await intents.incrementAttemptCount(intent.id);
+
+      const config = loadConfig();
+      const message: TaskMessage = {
+        id: crypto.randomUUID(),
+        correlationId: intent.correlationId,
+        type: 'generate:intent',
+        sourceAgent: 'orchestrator',
+        targetAgent: 'intent-agent',
+        priority: 'normal' as TaskPriority,
+        payload: {
+          intentId: intent.id,
+          projectId: intent.projectId,
+          text: intent.text,
+          clarification: feedback,
+          source: 'operator-resume',
+          resumeOnBranch: intent.branchName ?? undefined,
+          prNumber: intent.prNumber ?? undefined,
+          prUrl: intent.prUrl ?? undefined,
+        },
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      };
+      await dispatch(message, config.queue);
+      await intents.updateStatus(intent.id, 'generating');
+
+      const ack = await alerts.acknowledge(existing.id, request.user.id);
+
+      await audit.append({
+        actor: request.user.id,
+        action: 'alert.resume-submitted',
+        entityType: 'alerts',
+        entityId: ack.id,
+        correlationId: intent.correlationId,
+        metadata: {
+          type: ack.type,
+          intentId: intent.id,
+          feedbackLength: feedback.length,
+          branch: intent.branchName,
+          prNumber: intent.prNumber,
+          ip: request.ip,
+        },
+      });
+
+      emitLiveEvent('intent.status-changed', intent.correlationId, {
+        intentId: intent.id, status: 'generating',
+      });
+      emitLiveEvent('alert.acknowledged', ack.correlationId, { alertId: ack.id });
+      log.info(
+        { alertId: ack.id, intentId: intent.id, alertType: ack.type, branch: intent.branchName },
+        'Operator resume submitted — cycle re-dispatched',
+      );
+
+      return reply.send({
+        data: {
+          intentId: intent.id,
+          status: 'generating',
+          branch: intent.branchName,
+          prNumber: intent.prNumber,
+          prUrl: intent.prUrl,
+        },
+      });
+    },
+  );
+
   // POST /interventions lives in routes/interventions.ts now (ADR-021,
   // migration 011). The earlier 501 stub used to point operators at the
   // clarification endpoint; that flow is still right for vague intents,

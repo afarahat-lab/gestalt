@@ -7,7 +7,7 @@
  */
 
 import type {
-  IntentRepository, IntentRecord, IntentStatus,
+  IntentRepository, IntentRecord, IntentStatus, ResumeContext,
 } from '@gestalt/core';
 
 const notImplemented = (): never => {
@@ -17,7 +17,7 @@ const notImplemented = (): never => {
 export class MssqlIntentRepository implements IntentRepository {
   async healthCheck(): Promise<boolean> { return notImplemented(); }
   async create(
-    _intent: Omit<IntentRecord, 'createdAt' | 'updatedAt' | 'resolvedAt' | 'clarification'>,
+    _intent: Omit<IntentRecord, 'createdAt' | 'updatedAt' | 'resolvedAt' | 'clarification' | 'branchName' | 'prNumber' | 'prUrl' | 'attemptCount' | 'lastResumeContext'>,
   ): Promise<IntentRecord> { return notImplemented(); }
   async findById(_id: string): Promise<IntentRecord | null> { return notImplemented(); }
   async findByCorrelationId(_correlationId: string): Promise<IntentRecord | null> { return notImplemented(); }
@@ -38,4 +38,6 @@ export class MssqlIntentRepository implements IntentRepository {
   async countActiveByProject(_projectId: string): Promise<number> { return notImplemented(); }
   async findLatestByProject(_projectId: string): Promise<IntentRecord | null> { return notImplemented(); }
   async saveBranchInfo(_id: string, _params: { branchName: string; prNumber?: number | null; prUrl?: string | null }): Promise<IntentRecord> { return notImplemented(); }
+  async saveResumeContext(_id: string, _context: ResumeContext): Promise<void> { return notImplemented(); }
+  async incrementAttemptCount(_id: string): Promise<number> { return notImplemented(); }
 }

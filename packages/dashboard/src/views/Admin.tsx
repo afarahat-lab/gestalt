@@ -28,9 +28,10 @@ import type {
   PlatformTemplateSummary, PlatformMcpServer, PlatformMcpTestResult,
   PlatformToolInfo, IdentityState, IdentityProvider, RoleMapping,
   PlatformGroup, GroupMember, GroupProjectAssignment, ProjectGroupAssignment,
+  SelfHealingConfig,
 } from '../types';
 
-type Tab = 'users' | 'projects' | 'groups' | 'llms' | 'secrets' | 'templates' | 'mcp' | 'tools' | 'identity';
+type Tab = 'users' | 'projects' | 'groups' | 'llms' | 'secrets' | 'self-healing' | 'templates' | 'mcp' | 'tools' | 'identity';
 
 export function Admin() {
   const [tab, setTab] = useState<Tab>('users');
@@ -48,6 +49,7 @@ export function Admin() {
           ['identity', 'Identity'],
           ['llms', 'LLMs'],
           ['secrets', 'Secrets'],
+          ['self-healing', 'Self-healing'],
           ['templates', 'Templates'],
           ['mcp', 'MCP Servers'],
           ['tools', 'Tools'],
@@ -65,6 +67,7 @@ export function Admin() {
       {tab === 'identity' && <IdentityTab />}
       {tab === 'llms' && <LlmsTab />}
       {tab === 'secrets' && <SecretsTab />}
+      {tab === 'self-healing' && <SelfHealingTab />}
       {tab === 'templates' && <TemplatesTab />}
       {tab === 'mcp' && <McpServersTab />}
       {tab === 'tools' && <ToolsTab />}
@@ -1926,6 +1929,146 @@ function extractError(err: ApiError): string {
   } catch { return err.message; }
 }
 
+// ─── Self-healing tab (migration 020) ────────────────────────────────────────
+
+/**
+ * Configure the autonomous retry loop per failure type. Each row's
+ * controls save independently on change (no global Save button) —
+ * the API's PATCH endpoint is partial, so toggling one field
+ * doesn't disturb the others.
+ */
+function SelfHealingTab() {
+  const api = useDashboardApi();
+  const [rows, setRows] = useState<SelfHealingConfig[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [savingType, setSavingType] = useState<string | null>(null);
+  const [savedType, setSavedType] = useState<string | null>(null);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const res = await api.listSelfHealingConfig();
+      setRows(res.data);
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+  useEffect(() => { void load(); /* eslint-disable-next-line */ }, []);
+
+  async function patchRow(
+    failureType: string,
+    body: Partial<Pick<SelfHealingConfig, 'maxAttempts' | 'confidenceThreshold' | 'autoResolveAlerts' | 'enabled'>>,
+  ) {
+    setSavingType(failureType);
+    setError(null);
+    try {
+      const res = await api.updateSelfHealingConfig(failureType, body);
+      setRows((current) => current.map((r) => r.failureType === failureType ? res.data : r));
+      setSavedType(failureType);
+      // Clear the "saved" indicator after a moment.
+      setTimeout(() => {
+        setSavedType((s) => s === failureType ? null : s);
+      }, 1500);
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally {
+      setSavingType(null);
+    }
+  }
+
+  if (loading) return <p style={{ color: 'var(--text-dim)' }}>Loading self-healing config...</p>;
+
+  return (
+    <div>
+      <div style={{ marginBottom: '12px' }}>
+        <h3 style={styles.cardTitle}>Self-healing configuration ({rows.length})</h3>
+      </div>
+      <p style={{ color: 'var(--text-dim)', fontSize: '12px', margin: '0 0 12px' }}>
+        Configure autonomous retry behaviour per failure type. When the budget is
+        exhausted, alerts are created for human review. <strong>Auto-resolve</strong>{' '}
+        attempts to fix escalated alerts automatically before waiting for human input.
+        Each row saves immediately on change.
+      </p>
+      {error && <div style={styles.errorBanner}>{error}</div>}
+      <table style={styles.table}>
+        <thead>
+          <tr>
+            <th style={styles.th}>Failure type</th>
+            <th style={styles.th}>Enabled</th>
+            <th style={styles.th}>Max attempts</th>
+            <th style={styles.th}>Confidence</th>
+            <th style={styles.th}>Auto-resolve</th>
+            <th style={styles.th}></th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.failureType}>
+              <td style={styles.td}><code style={{ fontFamily: 'var(--font-mono)' }}>{r.failureType}</code></td>
+              <td style={styles.td}>
+                <input
+                  type="checkbox"
+                  checked={r.enabled}
+                  disabled={savingType === r.failureType}
+                  onChange={(e) => void patchRow(r.failureType, { enabled: e.target.checked })}
+                />
+              </td>
+              <td style={styles.td}>
+                <select
+                  value={r.maxAttempts}
+                  disabled={savingType === r.failureType}
+                  onChange={(e) => void patchRow(r.failureType, { maxAttempts: parseInt(e.target.value, 10) })}
+                  style={styles.smallSelect}
+                >
+                  {Array.from({ length: 11 }, (_, i) => i).map((n) => (
+                    <option key={n} value={n}>{n}</option>
+                  ))}
+                </select>
+              </td>
+              <td style={styles.td}>
+                <select
+                  value={r.confidenceThreshold}
+                  disabled={savingType === r.failureType}
+                  onChange={(e) => void patchRow(r.failureType, { confidenceThreshold: e.target.value as 'high' | 'medium' | 'low' })}
+                  style={styles.smallSelect}
+                >
+                  <option value="high">high</option>
+                  <option value="medium">medium</option>
+                  <option value="low">low</option>
+                </select>
+              </td>
+              <td style={styles.td}>
+                <input
+                  type="checkbox"
+                  checked={r.autoResolveAlerts}
+                  disabled={savingType === r.failureType}
+                  onChange={(e) => void patchRow(r.failureType, { autoResolveAlerts: e.target.checked })}
+                />
+              </td>
+              <td style={styles.td}>
+                {savingType === r.failureType ? (
+                  <span style={{ color: 'var(--text-dim)', fontSize: '12px' }}>saving...</span>
+                ) : savedType === r.failureType ? (
+                  <span style={{ color: 'var(--green)', fontSize: '12px' }}>✓ saved</span>
+                ) : null}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p style={{ color: 'var(--text-dim)', fontSize: '11px', marginTop: '16px', lineHeight: 1.5 }}>
+        <strong>Confidence threshold:</strong> minimum confidence level for automatic retry.
+        "high" = only retry when very sure. "medium" = retry when reasonably confident.<br />
+        <strong>Auto-resolve:</strong> attempt to fix escalated alerts automatically
+        before waiting for human input (high-confidence threshold applies regardless).
+      </p>
+    </div>
+  );
+}
+
 // ─── Templates tab (Session 3 — migration 017) ───────────────────────────────
 
 function TemplatesTab() {
@@ -2650,6 +2793,12 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: '6px', overflow: 'hidden',
   },
   table: { width: '100%', borderCollapse: 'collapse', fontSize: '13px' },
+  smallSelect: {
+    padding: '4px 8px', fontSize: '12px',
+    background: 'var(--bg-subtle)', color: 'var(--text-primary)',
+    border: '1px solid var(--border)', borderRadius: '4px',
+    fontFamily: 'var(--font-mono)',
+  },
   subtable: { width: '100%', borderCollapse: 'collapse', fontSize: '12px', marginBottom: '8px' },
   th: { textAlign: 'left', padding: '10px 12px', color: 'var(--text-dim)', fontWeight: 500, borderBottom: '1px solid var(--border)', fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em' },
   td: { padding: '10px 12px', borderBottom: '1px solid var(--border)', color: 'var(--text-primary)' },

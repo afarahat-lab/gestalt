@@ -19,3 +19,4 @@ export {
   OracleIdentityConfigRepository, OracleRoleMappingRepository,
 } from './repositories/identity-config';
 export { OraclePlatformGroupRepository } from './repositories/platform-groups';
+export { OracleSelfHealingConfigRepository } from './repositories/self-healing-config';

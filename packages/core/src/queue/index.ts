@@ -75,6 +75,46 @@ export function getQueue(name: QueueName, config: QueueConfig): Queue {
   return queue;
 }
 
+// ─── Process-scope QueueConfig pinning ────────────────────────────────────────
+//
+// `dispatch(message, config)` takes the config explicitly so callers
+// can be tested without a global. But code paths that have no
+// natural access to config (e.g. the self-healing loop in core that
+// runs inside agent code, far from server boot) need a shared
+// reference. `setQueueConfig` is called once at server startup; every
+// downstream consumer reads it via `getQueueConfig`.
+//
+// Mirrors the `setMasterKey` / `getMasterKey` and
+// `setLLMRegistryResolver` / `getLLMClientForModel` patterns.
+
+let _queueConfig: QueueConfig | null = null;
+
+/**
+ * Pin a process-wide `QueueConfig`. Called once at server startup
+ * (after config load). Re-calling overwrites — useful for tests.
+ */
+export function setQueueConfig(config: QueueConfig): void {
+  _queueConfig = config;
+  log.debug({ redisUrl: config.redisUrl ? '<set>' : '<unset>' }, 'QueueConfig pinned');
+}
+
+/**
+ * Returns the pinned QueueConfig. Throws when called before
+ * `setQueueConfig` — typically only the server's startup ordering
+ * could violate this (boot logs surface the trace cleanly).
+ */
+export function getQueueConfig(): QueueConfig {
+  if (!_queueConfig) {
+    throw new Error('QueueConfig not initialised — call setQueueConfig(config) at startup');
+  }
+  return _queueConfig;
+}
+
+/** Test helper. */
+export function _resetQueueConfig(): void {
+  _queueConfig = null;
+}
+
 // ─── Task dispatch ────────────────────────────────────────────────────────────
 
 /**

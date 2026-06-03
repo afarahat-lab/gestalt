@@ -34,6 +34,18 @@ export type { McpServerConfig } from './tools/mcp-resolver';
 // — moved to core from agents-generate so every layer shares one
 // implementation).
 export { BaseLLMAgent } from './agents/base-llm-agent';
+export {
+  SelfHealingAgent,
+} from './agents/self-healing-agent';
+export type {
+  SelfHealingContext, SelfHealingDiagnosis,
+} from './agents/self-healing-agent';
+export {
+  runSelfHealingLoop, shouldSkipAgent,
+} from './agents/self-healing-loop';
+export type {
+  FailureType, SelfHealingLoopPayload, SelfHealingResult, ResumeSource,
+} from './agents/self-healing-loop';
 export { BaseOrchestrator, setPlatformMcpResolver } from './orchestrator/base-orchestrator';
 export type { OrchestratorContext, PlatformMcpResolver } from './orchestrator/base-orchestrator';
 export {
@@ -73,7 +85,10 @@ export {
 
 // Queue
 export type { QueueName, TaskHandler } from './queue/index';
-export { QUEUE_NAMES, getQueue, dispatch, createWorker, createQueueEventListener } from './queue/index';
+export {
+  QUEUE_NAMES, getQueue, dispatch, createWorker, createQueueEventListener,
+  setQueueConfig, getQueueConfig,
+} from './queue/index';
 
 // Repository
 export type {
@@ -100,6 +115,8 @@ export type {
   PlatformGroupRecord, GroupMembershipRecord, GroupProjectAssignmentRecord,
   GroupMemberWithUser, GroupProjectWithProject,
   EffectiveProjectMembership, PlatformGroupRepository,
+  SelfHealingConfigRecord, SelfHealingConfigRepository,
+  ResumeContext,
   RepositoryRegistry,
   IntentRepository, AgentExecutionRepository,
   ArtifactRepository, SignalRepository,

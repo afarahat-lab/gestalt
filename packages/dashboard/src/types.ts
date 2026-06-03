@@ -577,3 +577,22 @@ export interface ProjectGroupAssignment {
   assignedAt: string;
   memberCount: number;
 }
+
+// ─── Self-healing config (migration 020) ────────────────────────────────────
+
+/**
+ * One row of `platform_self_healing_config` as returned by
+ * `GET /platform/self-healing`. Edited in-place by the dashboard's
+ * Admin → Self-healing tab; each row saves on change (no global
+ * Save button).
+ */
+export interface SelfHealingConfig {
+  id: string;
+  failureType: string;
+  maxAttempts: number;
+  confidenceThreshold: 'high' | 'medium' | 'low';
+  autoResolveAlerts: boolean;
+  enabled: boolean;
+  updatedBy: string | null;
+  updatedAt: string;
+}

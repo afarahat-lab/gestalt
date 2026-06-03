@@ -133,6 +133,7 @@ import {
   platformGroupsRemoveMemberCommand,
   platformGroupsAssignCommand, platformGroupsUnassignCommand,
   platformGroupsShowCommand,
+  platformSelfHealingListCommand, platformSelfHealingConfigureCommand,
 } from './commands/platform-extras';
 import {
   usersListCommand, usersAddCommand, usersRoleCommand, usersDeactivateCommand,
@@ -721,6 +722,44 @@ platformSecrets
   .option('--server <url>', 'Server URL (one-shot override for this invocation)')
   .action(async (name: string, opts: { server?: string }) => {
     await platformSecretsRemoveCommand(name, { server: opts.server }).catch(fatalError);
+  });
+
+// gestalt platform self-healing — autonomous retry config (migration 020)
+const platformSelfHealing = platform
+  .command('self-healing')
+  .description('Configure the autonomous self-healing loop per failure type. The loop diagnoses + retries failures automatically; when budget exhausted, it creates an alert AND optionally attempts auto-resolution.');
+
+platformSelfHealing
+  .command('list')
+  .description('Table of every failure type with its current config — enabled, max attempts, confidence threshold, auto-resolve.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (opts: { server?: string }) => {
+    await platformSelfHealingListCommand({ server: opts.server }).catch(fatalError);
+  });
+
+platformSelfHealing
+  .command('configure <failureType>')
+  .description('Update self-healing config for a failure type. Combine flags freely; only supplied fields change. At least one flag is required.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--max-attempts <n>', 'Max self-healing retries (0–10). 0 disables auto-retry for this type.')
+  .option('--confidence <level>', 'Minimum confidence for auto-retry. One of: high, medium, low.')
+  .option('--auto-resolve', 'Enable auto-resolution on escalation.')
+  .option('--no-auto-resolve', 'Disable auto-resolution on escalation.')
+  .option('--enable', 'Enable self-healing for this failure type.')
+  .option('--disable', 'Disable self-healing — failures escalate immediately.')
+  .action(async (failureType: string, opts: {
+    server?: string; maxAttempts?: string; confidence?: string;
+    autoResolve?: boolean; noAutoResolve?: boolean; enable?: boolean; disable?: boolean;
+  }) => {
+    await platformSelfHealingConfigureCommand(failureType, {
+      server: opts.server,
+      maxAttempts: opts.maxAttempts,
+      confidence: opts.confidence,
+      autoResolve: opts.autoResolve,
+      noAutoResolve: opts.noAutoResolve,
+      enable: opts.enable,
+      disable: opts.disable,
+    }).catch(fatalError);
   });
 
 // gestalt platform projects — cross-project management (platform-admin only)

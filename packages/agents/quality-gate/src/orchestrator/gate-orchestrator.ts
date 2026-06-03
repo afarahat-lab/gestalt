@@ -34,6 +34,7 @@ import {
   createWorker, dispatch, getRepositories,
   createContextLogger, emitLiveEvent, QUEUE_NAMES,
   BaseOrchestrator,
+  runSelfHealingLoop,
 } from '@gestalt/core';
 import type {
   TaskMessage, TaskResult, TaskPriority, QueueConfig,
@@ -354,7 +355,21 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
         childLog,
       });
       if (!retried) {
-        await transitionIntent(payload.intentId, correlationId, 'failed');
+        // Gate retry budget exhausted — hand off to self-healing
+        // (migration 020) before marking the intent failed. If
+        // self-healing dispatches a fresh cycle the intent stays in
+        // `generating`; otherwise it transitions to `failed` and the
+        // escalation alert (if any) carries the human-attention
+        // signal.
+        const healing = await attemptSelfHealingForGate({
+          intentId: payload.intentId,
+          correlationId,
+          gateResult: result,
+          childLog,
+        });
+        if (!healing.retryDispatched) {
+          await transitionIntent(payload.intentId, correlationId, 'failed');
+        }
       }
     }
 
@@ -635,6 +650,96 @@ async function dispatchDeployPR(args: {
  * Failure is non-fatal — the intent is already escalated, so a
  * missed alert is worse UX but not data loss. We log + continue.
  */
+/**
+ * Hands a max-retries-exhausted gate cycle to the self-healing loop
+ * (migration 020). Same shape as the generate orchestrator's
+ * `attemptSelfHealingForGenerate`: returns `{ retryDispatched }`,
+ * the caller transitions to `failed` only when false.
+ *
+ * NEVER throws — falls back to false on any error.
+ */
+async function attemptSelfHealingForGate(args: {
+  intentId: string;
+  correlationId: string;
+  gateResult: GateResult;
+  childLog: ReturnType<typeof createContextLogger>;
+}): Promise<{ retryDispatched: boolean }> {
+  const { intentId, correlationId, gateResult, childLog } = args;
+  try {
+    const repos = getRepositories();
+    const intent = await repos.intents.findById(intentId);
+    if (!intent) return { retryDispatched: false };
+
+    const signals = await repos.signals.findByCorrelationId(correlationId);
+    const artifacts = await repos.artifacts.findByCorrelationId(correlationId);
+
+    const result = await runSelfHealingLoop(
+      {
+        intentText: intent.text,
+        failureType: 'gate-max-retries',
+        failureSummary: `Quality gate exhausted retry budget — ${gateResult.signals.length} signal(s) remain`,
+        technicalDetail: summariseGateResult(gateResult).slice(0, 500),
+        attemptNumber: (intent.attemptCount ?? 0) + 1,
+        priorSignals: signals.map((s) => ({
+          type: s.type,
+          message: s.message,
+          sourceAgent: s.sourceAgent,
+          severity: s.severity,
+        })),
+        priorArtifactPaths: artifacts.map((a) => a.path),
+      },
+      {
+        failureType: 'gate-max-retries',
+        correlationId,
+        intentId,
+        projectId: intent.projectId,
+        intentText: intent.text,
+        branchName: intent.branchName,
+        prNumber: intent.prNumber,
+        prUrl: intent.prUrl,
+      },
+      signals,
+    );
+
+    if (result.shouldRetry && !result.escalated && result.diagnosis) {
+      // Dispatch a fresh generate cycle. The next cycle's
+      // context-assembler will read intent.lastResumeContext and
+      // populate the prompt's resume section automatically.
+      await dispatch({
+        id: crypto.randomUUID(),
+        correlationId,
+        type: 'generate:intent',
+        sourceAgent: 'self-healing-agent',
+        targetAgent: 'intent-agent',
+        priority: 'normal',
+        payload: {
+          intentId,
+          projectId: intent.projectId,
+          text: result.diagnosis.updatedIntentText ?? intent.text,
+          resumeOnBranch: intent.branchName ?? undefined,
+          prNumber: intent.prNumber ?? undefined,
+          prUrl: intent.prUrl ?? undefined,
+          source: 'self-healing',
+        },
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      }, { redisUrl: process.env['REDIS_URL'] ?? 'redis://localhost:6379' });
+      await transitionIntent(intentId, correlationId, 'generating').catch(() => {});
+      childLog.info({ confidence: result.diagnosis.confidence }, 'Gate self-healing dispatched retry');
+      return { retryDispatched: true };
+    }
+
+    if (result.escalated && result.autoResolved) {
+      childLog.info('Gate self-healing auto-resolved escalated alert');
+      return { retryDispatched: true };
+    }
+    return { retryDispatched: false };
+  } catch (err) {
+    childLog.warn({ err }, 'Gate self-healing loop threw — falling through to failed');
+    return { retryDispatched: false };
+  }
+}
+
 async function createBreachAlert(args: {
   correlationId: string;
   intentId: string;

@@ -29,10 +29,12 @@
 import {
   createWorker, dispatch, getRepositories,
   createContextLogger, emitLiveEvent, QUEUE_NAMES,
+  runSelfHealingLoop,
 } from '@gestalt/core';
 import type {
   TaskMessage, TaskResult, QueueConfig, TaskPriority,
   PlatformSignal, ExecutionStatus, IntentStatus,
+  FailureType,
 } from '@gestalt/core';
 import { runPRAgent } from '../agents/pr-agent';
 import { runPipelineAgent } from '../agents/pipeline-agent';
@@ -174,8 +176,34 @@ async function handleDeployTask(
         childLog,
       );
       if (result.outcome.kind !== 'passed') {
-        await transitionIntent(payload.intentId, correlationId, 'failed');
-        return buildTaskResult(message, 'failed', startedAt);
+        // Self-healing (migration 020) — diagnose + maybe-retry +
+        // maybe-escalate-with-auto-resolve. Replaces the prior
+        // pipeline-agent direct alert creation; the loop's
+        // `escalateToHuman` writes the same shape using
+        // `alertContextExtras` to carry runId + pipelineStatus.
+        const failureType: FailureType =
+          result.outcome.kind === 'timeout' ? 'pipeline-timeout' : 'pipeline-failed';
+        const reason =
+          result.outcome.kind === 'failed' ? result.outcome.reason
+          : result.outcome.kind === 'cancelled' ? 'CI run cancelled'
+          : 'CI run did not complete within timeout';
+        const healing = await attemptSelfHealingForDeploy({
+          intentId: payload.intentId,
+          correlationId,
+          failureType,
+          failureSummary:
+            `CI pipeline outcome=${result.outcome.kind} for run ${result.outcome.runId}. ${reason}`,
+          alertContextExtras: {
+            runId: result.outcome.runId,
+            pipelineStatus: result.outcome.pipelineStatus,
+            adapter: 'github-actions',
+          },
+          childLog,
+        });
+        if (!healing.retryDispatched) {
+          await transitionIntent(payload.intentId, correlationId, 'failed');
+        }
+        return buildTaskResult(message, healing.retryDispatched ? 'completed' : 'failed', startedAt);
       }
       // Pass → dispatch staging promotion. prNumber + intentText are
       // forwarded so the promotion-agent can call mergePullRequest()
@@ -265,7 +293,26 @@ async function handleDeployTask(
       return buildTaskResult(message, 'failed', startedAt);
     }
     if (payload.intentId) {
-      await transitionIntent(payload.intentId, correlationId, 'failed').catch(() => undefined);
+      // Self-healing (migration 020) wraps the generic deploy
+      // catch block. Same shape as the pipeline-failed branch
+      // above but with failureType 'deploy-error'.
+      const healing = await attemptSelfHealingForDeploy({
+        intentId: payload.intentId,
+        correlationId,
+        failureType: 'deploy-error',
+        failureSummary: `Deploy orchestrator threw on ${type}`,
+        technicalDetail: err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500),
+        childLog,
+      }).catch(() => ({ retryDispatched: false }));
+      if (!healing.retryDispatched) {
+        await transitionIntent(payload.intentId, correlationId, 'failed').catch(() => undefined);
+      }
+      // Don't re-throw when self-healing dispatched a retry — the
+      // new cycle is already queued; throwing would tell BullMQ to
+      // retry the original job. Return a TaskResult instead.
+      if (healing.retryDispatched) {
+        return buildTaskResult(message, 'completed', startedAt);
+      }
     }
     throw err;
   }
@@ -456,4 +503,97 @@ function buildTaskResult(
 
 function queueConfigFromEnv(): QueueConfig {
   return { redisUrl: process.env['REDIS_URL'] ?? 'redis://localhost:6379' };
+}
+
+/**
+ * Self-healing helper for the deploy layer (migration 020). Same
+ * shape as the generate / gate equivalents: returns
+ * `{ retryDispatched }`. NEVER throws.
+ *
+ * Dispatches a fresh `generate:intent` with `source: 'self-healing'`
+ * + `resumeOnBranch` so the regeneration sits on top of the
+ * existing PR branch — the squash-merge history reads naturally
+ * (`fix:` follow-up on the original `feat:` PR).
+ */
+async function attemptSelfHealingForDeploy(args: {
+  intentId: string;
+  correlationId: string;
+  failureType: FailureType;
+  failureSummary: string;
+  technicalDetail?: string;
+  alertContextExtras?: Record<string, unknown>;
+  childLog: ReturnType<typeof createContextLogger>;
+}): Promise<{ retryDispatched: boolean }> {
+  const { intentId, correlationId, failureType, failureSummary, technicalDetail, alertContextExtras, childLog } = args;
+  try {
+    const repos = getRepositories();
+    const intent = await repos.intents.findById(intentId);
+    if (!intent) return { retryDispatched: false };
+
+    const signals = await repos.signals.findByCorrelationId(correlationId);
+    const artifacts = await repos.artifacts.findByCorrelationId(correlationId);
+
+    const result = await runSelfHealingLoop(
+      {
+        intentText: intent.text,
+        failureType,
+        failureSummary,
+        technicalDetail,
+        attemptNumber: (intent.attemptCount ?? 0) + 1,
+        priorSignals: signals.map((s) => ({
+          type: s.type,
+          message: s.message,
+          sourceAgent: s.sourceAgent,
+          severity: s.severity,
+        })),
+        priorArtifactPaths: artifacts.map((a) => a.path),
+      },
+      {
+        failureType,
+        correlationId,
+        intentId,
+        projectId: intent.projectId,
+        intentText: intent.text,
+        branchName: intent.branchName,
+        prNumber: intent.prNumber,
+        prUrl: intent.prUrl,
+        alertContextExtras,
+      },
+      signals,
+    );
+
+    if (result.shouldRetry && !result.escalated && result.diagnosis) {
+      await dispatch({
+        id: crypto.randomUUID(),
+        correlationId,
+        type: 'generate:intent',
+        sourceAgent: 'self-healing-agent',
+        targetAgent: 'intent-agent',
+        priority: 'normal',
+        payload: {
+          intentId,
+          projectId: intent.projectId,
+          text: result.diagnosis.updatedIntentText ?? intent.text,
+          resumeOnBranch: intent.branchName ?? undefined,
+          prNumber: intent.prNumber ?? undefined,
+          prUrl: intent.prUrl ?? undefined,
+          source: 'self-healing',
+        },
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      }, queueConfigFromEnv());
+      await transitionIntent(intentId, correlationId, 'generating').catch(() => {});
+      childLog.info({ failureType, confidence: result.diagnosis.confidence }, 'Deploy self-healing dispatched retry');
+      return { retryDispatched: true };
+    }
+
+    if (result.escalated && result.autoResolved) {
+      childLog.info({ failureType }, 'Deploy self-healing auto-resolved escalated alert');
+      return { retryDispatched: true };
+    }
+    return { retryDispatched: false };
+  } catch (err) {
+    childLog.warn({ err, failureType }, 'Deploy self-healing loop threw — falling through to failed');
+    return { retryDispatched: false };
+  }
 }

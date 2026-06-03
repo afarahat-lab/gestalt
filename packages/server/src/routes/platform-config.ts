@@ -300,6 +300,157 @@ export async function registerPlatformConfigRoutes(app: FastifyInstance): Promis
       }
     },
   );
+
+  // ─── Self-healing config (migration 020) ───────────────────────────
+
+  // GET /platform/self-healing — list all failure-type configs
+  app.get(
+    '/platform/self-healing',
+    { preHandler: requireRole('admin') },
+    async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+      const records = await getRepositories().selfHealingConfig.list();
+      return reply.send({ data: records });
+    },
+  );
+
+  // PATCH /platform/self-healing/:failureType — update one row
+  app.patch<{
+    Params: { failureType: string };
+    Body: {
+      maxAttempts?: number;
+      confidenceThreshold?: 'high' | 'medium' | 'low';
+      autoResolveAlerts?: boolean;
+      enabled?: boolean;
+    };
+  }>(
+    '/platform/self-healing/:failureType',
+    { preHandler: requireRole('admin') },
+    async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+      const body = request.body ?? {};
+      const validation = validateSelfHealingUpdateBody(body);
+      if (!validation.ok) {
+        return reply.code(400).send({ error: validation.error, code: validation.code });
+      }
+
+      const { selfHealingConfig, audit } = getRepositories();
+      const existing = await selfHealingConfig.findByType(request.params.failureType);
+      if (!existing) {
+        return reply.code(404).send({
+          error: `Self-healing config for failure type '${request.params.failureType}' not found`,
+          code: 'NOT_FOUND',
+        });
+      }
+
+      // Compute changed-fields BEFORE the update so the audit row
+      // captures the delta.
+      const changedFields: string[] = [];
+      const previousValues: Record<string, unknown> = {};
+      const newValues: Record<string, unknown> = {};
+      for (const key of ['maxAttempts', 'confidenceThreshold', 'autoResolveAlerts', 'enabled'] as const) {
+        const next = validation.fields[key];
+        if (next !== undefined && next !== existing[key]) {
+          changedFields.push(key);
+          previousValues[key] = existing[key];
+          newValues[key] = next;
+        }
+      }
+
+      try {
+        const updated = await selfHealingConfig.update(request.params.failureType, {
+          ...validation.fields,
+          updatedBy: request.user.id,
+        });
+        await audit.append({
+          actor: request.user.id,
+          action: 'self-healing.config-updated',
+          entityType: 'platform_self_healing_config',
+          entityId: updated.id,
+          correlationId: request.correlationId,
+          metadata: {
+            failureType: updated.failureType,
+            changedFields,
+            previousValues,
+            newValues,
+            ip: request.ip,
+          },
+        });
+        log.info(
+          { failureType: updated.failureType, changedFields },
+          'Self-healing config updated',
+        );
+        return reply.send({ data: updated });
+      } catch (err) {
+        log.error({ err }, 'Self-healing config update failed');
+        return reply.code(500).send({
+          error: 'Failed to update self-healing config',
+          details: err instanceof Error ? err.message : String(err),
+        });
+      }
+    },
+  );
+}
+
+/**
+ * Validates a PATCH /platform/self-healing/:failureType body.
+ * Pure function — returns { ok, fields } or { ok: false, code, error }.
+ */
+function validateSelfHealingUpdateBody(body: {
+  maxAttempts?: unknown;
+  confidenceThreshold?: unknown;
+  autoResolveAlerts?: unknown;
+  enabled?: unknown;
+}): {
+  ok: true;
+  fields: {
+    maxAttempts?: number;
+    confidenceThreshold?: 'high' | 'medium' | 'low';
+    autoResolveAlerts?: boolean;
+    enabled?: boolean;
+  };
+} | { ok: false; code: string; error: string } {
+  const fields: {
+    maxAttempts?: number;
+    confidenceThreshold?: 'high' | 'medium' | 'low';
+    autoResolveAlerts?: boolean;
+    enabled?: boolean;
+  } = {};
+  if (body.maxAttempts !== undefined) {
+    if (typeof body.maxAttempts !== 'number' || !Number.isInteger(body.maxAttempts)) {
+      return { ok: false, code: 'INVALID_MAX_ATTEMPTS', error: 'maxAttempts must be an integer' };
+    }
+    if (body.maxAttempts < 0 || body.maxAttempts > 10) {
+      return { ok: false, code: 'INVALID_MAX_ATTEMPTS', error: 'maxAttempts must be between 0 and 10' };
+    }
+    fields.maxAttempts = body.maxAttempts;
+  }
+  if (body.confidenceThreshold !== undefined) {
+    if (body.confidenceThreshold !== 'high' && body.confidenceThreshold !== 'medium' && body.confidenceThreshold !== 'low') {
+      return {
+        ok: false,
+        code: 'INVALID_CONFIDENCE_THRESHOLD',
+        error: 'confidenceThreshold must be one of: high, medium, low',
+      };
+    }
+    fields.confidenceThreshold = body.confidenceThreshold;
+  }
+  if (body.autoResolveAlerts !== undefined) {
+    if (typeof body.autoResolveAlerts !== 'boolean') {
+      return { ok: false, code: 'INVALID_AUTO_RESOLVE_ALERTS', error: 'autoResolveAlerts must be a boolean' };
+    }
+    fields.autoResolveAlerts = body.autoResolveAlerts;
+  }
+  if (body.enabled !== undefined) {
+    if (typeof body.enabled !== 'boolean') {
+      return { ok: false, code: 'INVALID_ENABLED', error: 'enabled must be a boolean' };
+    }
+    fields.enabled = body.enabled;
+  }
+  if (Object.keys(fields).length === 0) {
+    return { ok: false, code: 'EMPTY_PATCH', error: 'At least one field must be supplied' };
+  }
+  return { ok: true, fields };
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

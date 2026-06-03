@@ -26,6 +26,15 @@ export type LiveEventType =
   | 'deployment.updated'
   | 'alert.created'
   | 'alert.acknowledged'
+  /**
+   * The self-healing agent auto-resolved an escalated alert at high
+   * confidence and re-dispatched the intent. The dashboard's Alerts
+   * view consumes this event to remove the card from the list. The
+   * IntentDetail attempt-history panel also updates because the
+   * intent transitions to `generating` in the same atomic write
+   * sequence. Migration 020.
+   */
+  | 'alert.auto-resolved'
   | 'maintenance.run-completed'
   | 'project.deleted';
 

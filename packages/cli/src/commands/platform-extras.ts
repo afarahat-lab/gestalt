@@ -21,6 +21,7 @@ import {
   type PlatformToolInfo, type IdentityStateResponse,
   type PlatformSecretSummary,
   type PlatformGroupSummary,
+  type SelfHealingConfigSummary,
 } from '../api/client';
 import { loadCliConfig, resolveServerUrl } from '../ui/config';
 import {
@@ -717,5 +718,110 @@ export async function platformGroupsShowCommand(
     blank();
   } catch (err) {
     handleErr(err, serverUrl, `Failed to show group ${name}`);
+  }
+}
+
+// ─── Self-healing config (migration 020) ────────────────────────────────────
+
+/**
+ * `gestalt platform self-healing list` — print the seven failure-type
+ * config rows. The platform's table is small (single-digit) so we
+ * fit every row in a single column-aligned table without paging.
+ */
+export async function platformSelfHealingListCommand(options: BaseOptions = {}): Promise<void> {
+  const ctx = await openClient(options);
+  if (!ctx) return;
+  const { client, serverUrl } = ctx;
+  try {
+    const res = await client.listSelfHealingConfig();
+    blank();
+    if (res.data.length === 0) {
+      console.log(c.dim('No self-healing config rows. Migration 020 may not have run.'));
+      blank();
+      return;
+    }
+    printTable(
+      res.data.map((row): Record<string, string> => ({
+        type:        row.failureType,
+        enabled:     row.enabled ? c.success('✓') : c.dim('✗'),
+        maxAttempts: String(row.maxAttempts),
+        confidence:  row.confidenceThreshold,
+        autoResolve: row.autoResolveAlerts ? c.success('✓') : c.dim('✗'),
+      })),
+      [
+        { key: 'type',        header: 'TYPE',         width: 22 },
+        { key: 'enabled',     header: 'ENABLED',      width: 9 },
+        { key: 'maxAttempts', header: 'MAX ATTEMPTS', width: 13 },
+        { key: 'confidence',  header: 'CONFIDENCE',   width: 11 },
+        { key: 'autoResolve', header: 'AUTO-RESOLVE', width: 13 },
+      ],
+    );
+    blank();
+    console.log(c.dim(`  ${res.data.length} failure type(s) configured`));
+    console.log(c.dim('  Edit with: gestalt platform self-healing configure <failureType> [flags]'));
+    blank();
+  } catch (err) {
+    handleErr(err, serverUrl, 'Failed to list self-healing config');
+  }
+}
+
+/**
+ * `gestalt platform self-healing configure <failureType>` — partial
+ * PATCH against `/platform/self-healing/:failureType`. At least one
+ * flag must be supplied; the server's validator returns 400
+ * `EMPTY_PATCH` otherwise.
+ */
+export async function platformSelfHealingConfigureCommand(
+  failureType: string,
+  options: BaseOptions & {
+    maxAttempts?: string;
+    confidence?: string;
+    autoResolve?: boolean;
+    noAutoResolve?: boolean;
+    enable?: boolean;
+    disable?: boolean;
+  } = {},
+): Promise<void> {
+  const ctx = await openClient(options);
+  if (!ctx) return;
+  const { client, serverUrl } = ctx;
+
+  const body: Partial<SelfHealingConfigSummary> = {};
+  if (options.maxAttempts !== undefined) {
+    const n = parseInt(options.maxAttempts, 10);
+    if (!Number.isInteger(n) || n < 0 || n > 10) {
+      console.log(c.error('--max-attempts must be an integer between 0 and 10'));
+      process.exit(1);
+    }
+    body.maxAttempts = n;
+  }
+  if (options.confidence !== undefined) {
+    if (options.confidence !== 'high' && options.confidence !== 'medium' && options.confidence !== 'low') {
+      console.log(c.error('--confidence must be one of: high, medium, low'));
+      process.exit(1);
+    }
+    body.confidenceThreshold = options.confidence;
+  }
+  if (options.autoResolve === true) body.autoResolveAlerts = true;
+  if (options.noAutoResolve === true) body.autoResolveAlerts = false;
+  if (options.enable === true) body.enabled = true;
+  if (options.disable === true) body.enabled = false;
+
+  if (Object.keys(body).length === 0) {
+    console.log(c.error('No changes supplied. Use --max-attempts, --confidence, --auto-resolve / --no-auto-resolve, --enable / --disable'));
+    process.exit(1);
+  }
+
+  try {
+    const res = await client.updateSelfHealingConfig(failureType, body);
+    blank();
+    console.log(c.success(`✓ Self-healing config updated for ${failureType}`));
+    console.log(c.dim(`  enabled:             ${res.data.enabled}`));
+    console.log(c.dim(`  maxAttempts:         ${res.data.maxAttempts}`));
+    console.log(c.dim(`  confidenceThreshold: ${res.data.confidenceThreshold}`));
+    console.log(c.dim(`  autoResolveAlerts:   ${res.data.autoResolveAlerts}`));
+    blank();
+  } catch (err) {
+    handleErr(err, serverUrl, `Failed to update self-healing config for ${failureType}`);
   }
 }

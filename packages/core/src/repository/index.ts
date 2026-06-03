@@ -61,10 +61,72 @@ export interface IntentRecord {
   branchName: string | null;
   prNumber: number | null;
   prUrl: string | null;
+  /**
+   * Counter incremented each time the platform dispatches a retry
+   * cycle for this intent — operator-feedback resume, self-healing
+   * auto-retry, or auto-resolve from an escalated alert. Used by the
+   * self-healing loop to enforce per-failure-type retry budgets
+   * (`platform_self_healing_config.max_attempts`) and by the
+   * dashboard's IntentDetail "Attempt history" panel. Migration 020.
+   */
+  attemptCount: number;
+  /**
+   * The most recent resume context for this intent — either the
+   * operator's feedback text + diagnosis or the self-healing agent's
+   * autonomous diagnosis. Read by `context-assembler` on every
+   * dispatch so the prompt's resume section reflects the latest
+   * attempt. JSONB on disk; null on intents that have never been
+   * resumed. Migration 020.
+   */
+  lastResumeContext: ResumeContext | null;
+}
+
+/**
+ * Persisted on `intents.last_resume_context` (JSONB) every time the
+ * platform dispatches a retry cycle. Two shapes share the same
+ * column:
+ *   - `autoHealed: true`  — the self-healing agent diagnosed and
+ *     auto-routed. `diagnosis` / `rootCause` / `skipAgents` /
+ *     `focusFiles` carry the agent's recommendation
+ *   - `autoHealed: false` — operator supplied free-text feedback
+ *     via `POST /alerts/:id/resume` or `POST /alerts/:id/pipeline-feedback`
+ *
+ * `operatorFeedback` is the prose the prompt reads: prefixed
+ * `[Auto] <suggestedFix>` for auto-healed, the verbatim operator
+ * text otherwise.
+ */
+export interface ResumeContext {
+  operatorFeedback: string;
+  failureType: string;
+  failureSummary: string;
+  priorSignals: Array<{ type: string; message: string; sourceAgent: string; severity: string }>;
+  priorArtifactPaths: string[];
+  attemptNumber: number;
+  feedbackProvidedAt: string;
+  autoHealed: boolean;
+  diagnosis?: string;
+  rootCause?: string;
+  /**
+   * Agent roles whose prior output is fine and may be skipped on the
+   * retry leg. The orchestrator honours this list ONLY when the
+   * diagnosis confidence was `high` — see `runSelfHealingLoop`.
+   */
+  skipAgents?: string[];
+  /**
+   * Files identified as the root cause. Surfaced in the code-prompt's
+   * resume section to focus the LLM's attention.
+   */
+  focusFiles?: string[];
+  /**
+   * Reframed intent text the agent suggests. The orchestrator
+   * dispatches this as the new `text` field; the original
+   * `intents.text` column is preserved as the historical record.
+   */
+  updatedIntentText?: string;
 }
 
 export interface IntentRepository extends BaseRepository {
-  create(intent: Omit<IntentRecord, 'createdAt' | 'updatedAt' | 'resolvedAt' | 'clarification' | 'branchName' | 'prNumber' | 'prUrl'>): Promise<IntentRecord>;
+  create(intent: Omit<IntentRecord, 'createdAt' | 'updatedAt' | 'resolvedAt' | 'clarification' | 'branchName' | 'prNumber' | 'prUrl' | 'attemptCount' | 'lastResumeContext'>): Promise<IntentRecord>;
   findById(id: string): Promise<IntentRecord | null>;
   findByCorrelationId(correlationId: string): Promise<IntentRecord | null>;
   updateStatus(id: string, status: IntentStatus): Promise<IntentRecord>;
@@ -86,6 +148,20 @@ export interface IntentRepository extends BaseRepository {
     prNumber?: number | null;
     prUrl?: string | null;
   }): Promise<IntentRecord>;
+  /**
+   * Persists the self-healing or operator-feedback resume context
+   * on `intents.last_resume_context` (JSONB). Called by
+   * `runSelfHealingLoop` (autonomous diagnosis path) and by
+   * `POST /alerts/:id/resume` / `pipeline-feedback` (operator-feedback
+   * path) before the retry dispatch. Migration 020.
+   */
+  saveResumeContext(id: string, context: ResumeContext): Promise<void>;
+  /**
+   * Atomically bumps `intents.attempt_count` and returns the new
+   * value. Read on the next dispatch by `runSelfHealingLoop` to
+   * enforce the per-failure-type retry budget. Migration 020.
+   */
+  incrementAttemptCount(id: string): Promise<number>;
   list(params: { projectId: string; status?: IntentStatus; limit: number; offset: number }): Promise<{ records: IntentRecord[]; total: number }>;
   /**
    * Server-wide intent list (no project filter). Used by the
@@ -409,6 +485,11 @@ export interface RepositoryRegistry {
   identityConfig: IdentityConfigRepository;
   roleMappings: RoleMappingRepository;
   platformGroups: PlatformGroupRepository;
+  /**
+   * Platform-level defaults for the autonomous self-healing loop.
+   * Migration 020.
+   */
+  selfHealingConfig: SelfHealingConfigRepository;
 }
 
 // ─── Platform LLM registry (migration 014) ───────────────────────────────────
@@ -786,6 +867,49 @@ export interface PlatformGroupRepository extends BaseRepository {
   }>>;
 }
 
+// ─── Self-healing config (migration 020) ─────────────────────────────────────
+
+/**
+ * Platform-level defaults for the autonomous self-healing loop. Seeded
+ * with one row per failure type by migration 020. Platform-admins
+ * tune the values from `Admin → Self-healing` tab; `runSelfHealingLoop`
+ * reads `findByType` on every failure.
+ */
+export interface SelfHealingConfigRecord {
+  id: string;
+  failureType: string;
+  /** Max self-healing retries per cycle (0–10). 0 disables auto-retry. */
+  maxAttempts: number;
+  /** Minimum confidence for `shouldRetry` to take effect. */
+  confidenceThreshold: 'high' | 'medium' | 'low';
+  /**
+   * When escalation creates an alert, immediately attempt to resolve
+   * it via the self-healing agent at high confidence. Independent of
+   * `enabled` — an admin can disable auto-retry while keeping
+   * auto-resolve, or vice versa.
+   */
+  autoResolveAlerts: boolean;
+  /** Master kill-switch for this failure type. When false: escalate immediately. */
+  enabled: boolean;
+  updatedBy: string | null;
+  updatedAt: Date;
+}
+
+export interface SelfHealingConfigRepository extends BaseRepository {
+  list(): Promise<SelfHealingConfigRecord[]>;
+  findByType(failureType: string): Promise<SelfHealingConfigRecord | null>;
+  update(
+    failureType: string,
+    params: {
+      maxAttempts?: number;
+      confidenceThreshold?: 'high' | 'medium' | 'low';
+      autoResolveAlerts?: boolean;
+      enabled?: boolean;
+      updatedBy: string;
+    },
+  ): Promise<SelfHealingConfigRecord>;
+}
+
 // ─── Intervention repository (ADR-021) ───────────────────────────────────────
 
 /**
@@ -859,7 +983,39 @@ export type AlertType =
    * to investigate the CI infrastructure itself rather than the
    * generated code.
    */
-  | 'pipeline-timeout';
+  | 'pipeline-timeout'
+  /**
+   * Generic error in the generate orchestrator's catch block —
+   * e.g. an agent threw, the LLM provider hard-errored, the clone
+   * step failed. Self-healing routes these through
+   * `runSelfHealingLoop` with `failureType: 'generate-error'`.
+   * Migration 020.
+   */
+  | 'generate-error'
+  /**
+   * Quality gate exhausted its retry budget without a `pass`
+   * verdict. The cycle's prior signals are surfaced to the
+   * self-healing agent for diagnosis. Migration 020.
+   */
+  | 'gate-max-retries'
+  /**
+   * Deploy chain (pr-agent / pipeline-agent / promotion-agent)
+   * threw an unexpected error. Distinct from `pipeline-failed`
+   * (which is the CI-system reporting failure). Migration 020.
+   */
+  | 'deploy-error'
+  /**
+   * Maintenance scheduler / runner threw an unexpected error.
+   * Migration 020.
+   */
+  | 'maintenance-error'
+  /**
+   * A custom agent (declared in `agents.yaml custom_agents:`)
+   * returned `status: error` or `failed`. The brief routes these
+   * through self-healing so a misbehaving custom agent doesn't
+   * silently block the cycle. Migration 020.
+   */
+  | 'custom-agent-failure';
 
 export type AlertRequiredAction =
   | 'provide-clarification'
