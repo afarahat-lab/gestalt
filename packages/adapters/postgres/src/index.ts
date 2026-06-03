@@ -25,6 +25,11 @@ import { PostgresProjectMembershipRepository } from './repositories/memberships'
 import { PostgresInterventionRepository } from './repositories/interventions';
 import { PostgresPlatformLLMRepository } from './repositories/platform-llms';
 import { PostgresPlatformSecretRepository } from './repositories/platform-secrets';
+import { PostgresPlatformTemplateRepository } from './repositories/platform-templates';
+import { PostgresPlatformMcpServerRepository } from './repositories/platform-mcp-servers';
+import {
+  PostgresIdentityConfigRepository, PostgresRoleMappingRepository,
+} from './repositories/identity-config';
 export {
   LastLLMError, CannotDeleteDefaultLLMError,
 } from './repositories/platform-llms';
@@ -60,7 +65,11 @@ export async function createPostgresAdapter(databaseUrl: string): Promise<Reposi
     executionLogs:    new PostgresAgentExecutionLogRepository(),
     memberships:      new PostgresProjectMembershipRepository(),
     interventions:    new PostgresInterventionRepository(),
-    platformLlms:     new PostgresPlatformLLMRepository(),
-    platformSecrets:  new PostgresPlatformSecretRepository(),
+    platformLlms:       new PostgresPlatformLLMRepository(),
+    platformSecrets:    new PostgresPlatformSecretRepository(),
+    platformTemplates:  new PostgresPlatformTemplateRepository(),
+    platformMcpServers: new PostgresPlatformMcpServerRepository(),
+    identityConfig:     new PostgresIdentityConfigRepository(),
+    roleMappings:       new PostgresRoleMappingRepository(),
   };
 }

@@ -25,9 +25,11 @@ import { ApiError } from '../api/client';
 import type {
   UserSummary, UserDetail, ProjectMember, ProjectSummary, UserRole, ProjectRole,
   PlatformLLM, LlmTestResult, PlatformSecret,
+  PlatformTemplateSummary, PlatformMcpServer, PlatformMcpTestResult,
+  PlatformToolInfo, IdentityState, IdentityProvider, RoleMapping,
 } from '../types';
 
-type Tab = 'users' | 'projects' | 'llms' | 'secrets';
+type Tab = 'users' | 'projects' | 'llms' | 'secrets' | 'templates' | 'mcp' | 'tools' | 'identity';
 
 export function Admin() {
   const [tab, setTab] = useState<Tab>('users');
@@ -38,27 +40,31 @@ export function Admin() {
         <p style={styles.subtitle}>Platform users, project memberships, LLM registry, and the encrypted secrets vault</p>
       </div>
       <div style={styles.tabs}>
-        <button
-          style={tab === 'users' ? { ...styles.tab, ...styles.tabActive } : styles.tab}
-          onClick={() => setTab('users')}
-        >Users</button>
-        <button
-          style={tab === 'projects' ? { ...styles.tab, ...styles.tabActive } : styles.tab}
-          onClick={() => setTab('projects')}
-        >Projects</button>
-        <button
-          style={tab === 'llms' ? { ...styles.tab, ...styles.tabActive } : styles.tab}
-          onClick={() => setTab('llms')}
-        >LLMs</button>
-        <button
-          style={tab === 'secrets' ? { ...styles.tab, ...styles.tabActive } : styles.tab}
-          onClick={() => setTab('secrets')}
-        >Secrets</button>
+        {([
+          ['users', 'Users'],
+          ['projects', 'Projects'],
+          ['identity', 'Identity'],
+          ['llms', 'LLMs'],
+          ['secrets', 'Secrets'],
+          ['templates', 'Templates'],
+          ['mcp', 'MCP Servers'],
+          ['tools', 'Tools'],
+        ] as const).map(([id, label]) => (
+          <button
+            key={id}
+            style={tab === id ? { ...styles.tab, ...styles.tabActive } : styles.tab}
+            onClick={() => setTab(id)}
+          >{label}</button>
+        ))}
       </div>
       {tab === 'users' && <UsersTab />}
       {tab === 'projects' && <ProjectsTab />}
+      {tab === 'identity' && <IdentityTab />}
       {tab === 'llms' && <LlmsTab />}
       {tab === 'secrets' && <SecretsTab />}
+      {tab === 'templates' && <TemplatesTab />}
+      {tab === 'mcp' && <McpServersTab />}
+      {tab === 'tools' && <ToolsTab />}
     </div>
   );
 }
@@ -1420,10 +1426,716 @@ function formatDate(iso: string): string {
 }
 
 function extractError(err: ApiError): string {
+  // The constructor stores the JSON body as `err.body`; `err.message`
+  // is the "API error N: <body>" prefix. Parse body first.
+  try {
+    const p = JSON.parse(err.body) as { error?: string };
+    return p.error ?? err.body;
+  } catch { /* not JSON */ }
   try {
     const p = JSON.parse(err.message) as { error?: string };
     return p.error ?? err.message;
   } catch { return err.message; }
+}
+
+// ─── Templates tab (Session 3 — migration 017) ───────────────────────────────
+
+function TemplatesTab() {
+  const api = useDashboardApi();
+  const [rows, setRows] = useState<PlatformTemplateSummary[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const res = await api.listPlatformTemplates();
+      setRows(res.data);
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+  useEffect(() => { void load(); /* eslint-disable-next-line */ }, []);
+
+  async function handleSetDefault(t: PlatformTemplateSummary) {
+    setError(null);
+    try { await api.setDefaultPlatformTemplate(t.id); await load(); }
+    catch (err) { setError(err instanceof ApiError ? extractError(err) : String(err)); }
+  }
+  async function handleDelete(t: PlatformTemplateSummary) {
+    if (!window.confirm(`Delete template '${t.name}'?`)) return;
+    setError(null);
+    try { await api.deletePlatformTemplate(t.id); await load(); }
+    catch (err) { setError(err instanceof ApiError ? extractError(err) : String(err)); }
+  }
+
+  if (loading) return <p style={{ color: 'var(--text-dim)' }}>Loading templates...</p>;
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+        <h3 style={styles.cardTitle}>Project templates ({rows.length})</h3>
+        <button style={styles.primaryBtn} onClick={() => setUploading(true)}>+ Upload template</button>
+      </div>
+      <p style={{ color: 'var(--text-dim)', fontSize: '12px', margin: '0 0 12px' }}>
+        Built-in templates ship with the platform and cannot be deleted. Custom templates can be
+        set as default — the default is used by `gestalt init` for every new project.
+      </p>
+      {error && <div style={styles.errorBanner}>{error}</div>}
+      <table style={styles.table}>
+        <thead>
+          <tr>
+            <th style={styles.th}>Name</th>
+            <th style={styles.th}>Slug</th>
+            <th style={styles.th}>Tier</th>
+            <th style={styles.th}>Version</th>
+            <th style={styles.th}>Default</th>
+            <th style={styles.th}>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.length === 0 && (
+            <tr><td colSpan={6} style={styles.empty}>No templates registered yet</td></tr>
+          )}
+          {rows.map((t) => (
+            <tr key={t.id}>
+              <td style={styles.td}>
+                {t.name}
+                {t.description && <div style={{ color: 'var(--text-dim)', fontSize: '11px' }}>{t.description}</div>}
+              </td>
+              <td style={styles.td}><code>{t.slug}</code></td>
+              <td style={styles.td}>{t.tier}{t.isBuiltin ? ' (built-in)' : ''}</td>
+              <td style={styles.td}>{t.version}</td>
+              <td style={styles.td}>{t.isDefault ? '★' : ''}</td>
+              <td style={styles.td}>
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  {!t.isDefault && (
+                    <button style={styles.linkBtn} onClick={() => void handleSetDefault(t)}>★ Set default</button>
+                  )}
+                  {!t.isBuiltin && (
+                    <button style={styles.dangerBtn} onClick={() => void handleDelete(t)}>×</button>
+                  )}
+                </div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {uploading && (
+        <UploadTemplateModal
+          onClose={() => setUploading(false)}
+          onUploaded={async () => { setUploading(false); await load(); }}
+        />
+      )}
+    </div>
+  );
+}
+
+function UploadTemplateModal(props: { onClose: () => void; onUploaded: () => Promise<void> | void }) {
+  const api = useDashboardApi();
+  const [name, setName] = useState('');
+  const [slug, setSlug] = useState('');
+  const [description, setDescription] = useState('');
+  const [tier, setTier] = useState('Custom');
+  const [version, setVersion] = useState('1.0.0');
+  const [files, setFiles] = useState<Record<string, string> | null>(null);
+  const [fileNames, setFileNames] = useState<string[]>([]);
+  const [missing, setMissing] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  const REQUIRED_BASENAMES = ['AGENTS.md', 'HARNESS.json', 'agents.yaml'];
+
+  async function handleZip(e: React.ChangeEvent<HTMLInputElement>) {
+    setError(null);
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const { default: JSZip } = await import('jszip');
+      const zip = await JSZip.loadAsync(file);
+      const extracted: Record<string, string> = {};
+      await Promise.all(Object.entries(zip.files).map(async ([path, entry]) => {
+        if ((entry as { dir: boolean }).dir) return;
+        extracted[path] = await (entry as { async: (t: string) => Promise<string> }).async('string');
+      }));
+      setFiles(extracted);
+      setFileNames(Object.keys(extracted).sort());
+      const basenames = new Set(Object.keys(extracted).map((p) => p.split('/').pop() ?? p));
+      setMissing(REQUIRED_BASENAMES.filter((b) => !basenames.has(b)));
+    } catch (err) {
+      setError(`Failed to read ZIP: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  async function submit() {
+    setError(null);
+    if (!name.trim() || !slug.trim()) { setError('Name and slug are required'); return; }
+    if (!files || Object.keys(files).length === 0) { setError('Upload a ZIP first'); return; }
+    if (missing.length > 0) {
+      setError(`Template is missing required files: ${missing.join(', ')}`);
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await api.createPlatformTemplate({
+        slug: slug.trim(),
+        name: name.trim(),
+        description: description.trim() || null,
+        tier: tier.trim() || 'custom',
+        version: version.trim() || '0.1.0',
+        files,
+        variables: [],
+      });
+      await props.onUploaded();
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div style={styles.modalBackdrop} onClick={props.onClose}>
+      <div style={{ ...styles.modal, maxWidth: '560px' }} onClick={(e) => e.stopPropagation()}>
+        <h3 style={styles.cardTitle}>Upload template</h3>
+        {error && <div style={styles.errorBanner}>{error}</div>}
+        <label style={styles.label}>Name
+          <input style={styles.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="My Custom Template" />
+        </label>
+        <label style={styles.label}>Slug (lowercase, kebab-case)
+          <input style={styles.input} value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="my-custom-template" />
+        </label>
+        <label style={styles.label}>Description (optional)
+          <input style={styles.input} value={description} onChange={(e) => setDescription(e.target.value)} />
+        </label>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <label style={{ ...styles.label, flex: 1 }}>Tier
+            <input style={styles.input} value={tier} onChange={(e) => setTier(e.target.value)} placeholder="Tier 1 / Custom" />
+          </label>
+          <label style={{ ...styles.label, flex: 1 }}>Version
+            <input style={styles.input} value={version} onChange={(e) => setVersion(e.target.value)} placeholder="1.0.0" />
+          </label>
+        </div>
+        <label style={styles.label}>Template ZIP
+          <input type="file" accept=".zip" onChange={(e) => void handleZip(e)} style={styles.input} />
+        </label>
+        {fileNames.length > 0 && (
+          <div style={{ fontSize: '11px', color: 'var(--text-dim)' }}>
+            <strong>{fileNames.length} files extracted:</strong>
+            <ul style={{ maxHeight: '120px', overflow: 'auto', margin: '4px 0', padding: '0 0 0 16px' }}>
+              {fileNames.slice(0, 12).map((p) => <li key={p}><code>{p}</code></li>)}
+              {fileNames.length > 12 && <li>... and {fileNames.length - 12} more</li>}
+            </ul>
+            {missing.length > 0 && (
+              <div style={{ color: 'var(--red)' }}>
+                ⚠ Missing required files: {missing.join(', ')}
+              </div>
+            )}
+          </div>
+        )}
+        <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+          <button style={styles.linkBtn} onClick={props.onClose}>Cancel</button>
+          <button style={styles.primaryBtn} onClick={() => void submit()} disabled={submitting || !files || missing.length > 0}>
+            {submitting ? 'Uploading...' : 'Upload'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── MCP Servers tab (Session 3 — migration 017) ─────────────────────────────
+
+function McpServersTab() {
+  const api = useDashboardApi();
+  const [rows, setRows] = useState<PlatformMcpServer[]>([]);
+  const [secrets, setSecrets] = useState<PlatformSecret[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [editing, setEditing] = useState<PlatformMcpServer | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [testing, setTesting] = useState<string | null>(null);
+  const [testResult, setTestResult] = useState<Record<string, PlatformMcpTestResult>>({});
+
+  async function load() {
+    setLoading(true);
+    try {
+      const [serversRes, secretsRes] = await Promise.all([
+        api.listPlatformMcpServers(),
+        api.listPlatformSecrets(),
+      ]);
+      setRows(serversRes.data);
+      setSecrets(secretsRes.data);
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+  useEffect(() => { void load(); /* eslint-disable-next-line */ }, []);
+
+  async function handleTest(s: PlatformMcpServer) {
+    setTesting(s.id);
+    try {
+      const res = await api.testPlatformMcpServer(s.id);
+      setTestResult((prev) => ({ ...prev, [s.id]: res.data }));
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally { setTesting(null); }
+  }
+  async function handleDelete(s: PlatformMcpServer) {
+    if (!window.confirm(`Remove MCP server '${s.name}'?`)) return;
+    setError(null);
+    try { await api.deletePlatformMcpServer(s.id); await load(); }
+    catch (err) { setError(err instanceof ApiError ? extractError(err) : String(err)); }
+  }
+  async function handleToggle(s: PlatformMcpServer) {
+    setError(null);
+    try { await api.updatePlatformMcpServer(s.id, { enabled: !s.enabled }); await load(); }
+    catch (err) { setError(err instanceof ApiError ? extractError(err) : String(err)); }
+  }
+
+  if (loading) return <p style={{ color: 'var(--text-dim)' }}>Loading MCP servers...</p>;
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+        <h3 style={styles.cardTitle}>Platform MCP servers ({rows.length})</h3>
+        <button style={styles.primaryBtn} onClick={() => { setCreating(true); setEditing(null); }}>+ Add MCP server</button>
+      </div>
+      <p style={{ color: 'var(--text-dim)', fontSize: '12px', margin: '0 0 12px' }}>
+        Platform-level MCP servers are merged with project-level ones (declared in agents.yaml). Each
+        server is enabled per-cycle to all agents OR filtered to a specific set of agent roles.
+      </p>
+      {error && <div style={styles.errorBanner}>{error}</div>}
+      <table style={styles.table}>
+        <thead>
+          <tr>
+            <th style={styles.th}>Name</th>
+            <th style={styles.th}>URL</th>
+            <th style={styles.th}>Agents</th>
+            <th style={styles.th}>Status</th>
+            <th style={styles.th}>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.length === 0 && (
+            <tr><td colSpan={5} style={styles.empty}>No MCP servers configured</td></tr>
+          )}
+          {rows.map((s) => {
+            const r = testResult[s.id];
+            return (
+              <tr key={s.id}>
+                <td style={styles.td}>
+                  {s.name}
+                  {s.description && <div style={{ color: 'var(--text-dim)', fontSize: '11px' }}>{s.description}</div>}
+                </td>
+                <td style={styles.td}><code style={{ fontSize: '11px' }}>{s.url}</code></td>
+                <td style={styles.td}>{s.agentRoles.length === 0 ? 'all' : s.agentRoles.join(', ')}</td>
+                <td style={styles.td}>
+                  <span style={{ color: s.enabled ? 'var(--green)' : 'var(--text-dim)' }}>
+                    {s.enabled ? '● enabled' : '○ disabled'}
+                  </span>
+                </td>
+                <td style={styles.td}>
+                  <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                    <button style={styles.linkBtn} disabled={testing === s.id} onClick={() => void handleTest(s)}>
+                      {testing === s.id ? 'Testing...' : 'Test'}
+                    </button>
+                    {r && (
+                      <span style={r.ok ? styles.testOk : styles.testFail}>
+                        {r.ok ? `✓ ${r.toolCount} tools (${r.latencyMs}ms)` : `✗ ${r.error?.slice(0, 24) ?? 'error'}`}
+                      </span>
+                    )}
+                    <button style={styles.linkBtn} onClick={() => void handleToggle(s)}>
+                      {s.enabled ? 'Disable' : 'Enable'}
+                    </button>
+                    <button style={styles.linkBtn} onClick={() => { setEditing(s); setCreating(false); }}>Edit</button>
+                    <button style={styles.dangerBtn} onClick={() => void handleDelete(s)}>×</button>
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      {(creating || editing) && (
+        <McpServerModal
+          existing={editing}
+          secrets={secrets}
+          onClose={() => { setCreating(false); setEditing(null); }}
+          onSaved={async () => { setCreating(false); setEditing(null); await load(); }}
+        />
+      )}
+    </div>
+  );
+}
+
+function McpServerModal(props: {
+  existing: PlatformMcpServer | null;
+  secrets: PlatformSecret[];
+  onClose: () => void;
+  onSaved: () => Promise<void> | void;
+}) {
+  const api = useDashboardApi();
+  const [name, setName] = useState(props.existing?.name ?? '');
+  const [url, setUrl] = useState(props.existing?.url ?? '');
+  const [description, setDescription] = useState(props.existing?.description ?? '');
+  const [secretId, setSecretId] = useState(props.existing?.secretId ?? '');
+  const [enabled, setEnabled] = useState(props.existing?.enabled ?? true);
+  const [agentRolesText, setAgentRolesText] = useState((props.existing?.agentRoles ?? []).join(', '));
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function save() {
+    setError(null);
+    if (!name.trim() || !url.trim()) { setError('Name and URL are required'); return; }
+    const agentRoles = agentRolesText.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+    setSubmitting(true);
+    try {
+      const body = {
+        name: name.trim(),
+        url: url.trim(),
+        description: description.trim() || null,
+        secretId: secretId || null,
+        enabled,
+        agentRoles,
+      };
+      if (props.existing) {
+        await api.updatePlatformMcpServer(props.existing.id, body);
+      } else {
+        await api.createPlatformMcpServer(body);
+      }
+      await props.onSaved();
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally { setSubmitting(false); }
+  }
+
+  return (
+    <div style={styles.modalBackdrop} onClick={props.onClose}>
+      <div style={{ ...styles.modal, maxWidth: '520px' }} onClick={(e) => e.stopPropagation()}>
+        <h3 style={styles.cardTitle}>{props.existing ? `Edit ${props.existing.name}` : 'Add MCP server'}</h3>
+        {error && <div style={styles.errorBanner}>{error}</div>}
+        <label style={styles.label}>Name
+          <input style={styles.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="github" />
+        </label>
+        <label style={styles.label}>URL
+          <input style={styles.input} value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://mcp.example.com/v1 or stdio:./mcp-server" />
+        </label>
+        <label style={styles.label}>Description (optional)
+          <input style={styles.input} value={description} onChange={(e) => setDescription(e.target.value)} />
+        </label>
+        <label style={styles.label}>Bearer token secret (vault)
+          <select style={styles.select} value={secretId} onChange={(e) => setSecretId(e.target.value)}>
+            <option value="">— Anonymous —</option>
+            {props.secrets.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+        </label>
+        <label style={styles.label}>Agent roles (comma-separated; blank = all agents)
+          <input style={styles.input} value={agentRolesText} onChange={(e) => setAgentRolesText(e.target.value)} placeholder="code-agent, review-agent" />
+        </label>
+        <label style={styles.checkboxLabel}>
+          <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
+          Enabled
+        </label>
+        <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+          <button style={styles.linkBtn} onClick={props.onClose}>Cancel</button>
+          <button style={styles.primaryBtn} onClick={() => void save()} disabled={submitting || !name.trim() || !url.trim()}>
+            {submitting ? 'Saving...' : (props.existing ? 'Update' : 'Add')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Tools tab (Session 3 — read-only informational) ─────────────────────────
+
+function ToolsTab() {
+  const api = useDashboardApi();
+  const [tools, setTools] = useState<PlatformToolInfo[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await api.listPlatformTools();
+        setTools(res.data);
+      } catch (err) {
+        setError(err instanceof ApiError ? extractError(err) : String(err));
+      } finally { setLoading(false); }
+    })().catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  if (loading) return <p style={{ color: 'var(--text-dim)' }}>Loading tools...</p>;
+
+  return (
+    <div>
+      <h3 style={styles.cardTitle}>Built-in tools ({tools.length})</h3>
+      <p style={{ color: 'var(--text-dim)', fontSize: '12px', margin: '0 0 12px' }}>
+        These tools are available to agents for reading project files. Configure per-agent in
+        Project Settings → Agents. To add MCP tools (server-issued), use Platform MCP Servers above.
+      </p>
+      {error && <div style={styles.errorBanner}>{error}</div>}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        {tools.map((t) => (
+          <div key={t.name} style={{ ...styles.card, padding: '12px 14px' }}>
+            <div
+              style={{ display: 'flex', justifyContent: 'space-between', cursor: 'pointer' }}
+              onClick={() => setExpanded(expanded === t.name ? null : t.name)}
+            >
+              <div>
+                <code style={{ fontSize: '13px', color: 'var(--text-primary)' }}>{t.name}</code>
+                <div style={{ color: 'var(--text-dim)', fontSize: '12px', marginTop: '2px' }}>
+                  {t.description}
+                </div>
+              </div>
+              <span style={{ color: 'var(--text-dim)' }}>{expanded === t.name ? '▼' : '▶'}</span>
+            </div>
+            <div style={{ marginTop: '6px', fontSize: '11px', color: 'var(--text-dim)' }}>
+              Default agents: {t.defaultAgents.length > 0 ? t.defaultAgents.join(', ') : 'none'}
+            </div>
+            {expanded === t.name && (
+              <pre style={{ background: 'var(--bg-subtle)', borderRadius: '4px', padding: '8px', fontSize: '11px', overflow: 'auto', margin: '8px 0 0' }}>
+{JSON.stringify(t.inputSchema, null, 2)}
+              </pre>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Identity tab (Session 3 — migration 017) ────────────────────────────────
+
+function IdentityTab() {
+  const api = useDashboardApi();
+  const [state, setState] = useState<IdentityState | null>(null);
+  const [secrets, setSecrets] = useState<PlatformSecret[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [reloadStatus, setReloadStatus] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<IdentityProvider | null>(null);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const [idRes, secRes] = await Promise.all([
+        api.getPlatformIdentity(),
+        api.listPlatformSecrets(),
+      ]);
+      setState(idRes.data);
+      setSecrets(secRes.data);
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally { setLoading(false); }
+  }
+  useEffect(() => { void load(); /* eslint-disable-next-line */ }, []);
+
+  async function handleReload() {
+    setReloadStatus('Reloading...');
+    try {
+      const res = await api.reloadIdentity();
+      setReloadStatus(`✓ Active providers: ${res.data.providers.join(', ') || 'local'}`);
+      await load();
+      setTimeout(() => setReloadStatus(null), 4000);
+    } catch (err) {
+      setReloadStatus(`✗ ${err instanceof ApiError ? extractError(err) : String(err)}`);
+    }
+  }
+
+  if (loading || !state) return <p style={{ color: 'var(--text-dim)' }}>Loading identity config...</p>;
+
+  const findProvider = (p: IdentityProvider) => state.providers.find((x) => x.provider === p) ?? null;
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+        <h3 style={styles.cardTitle}>Corporate identity</h3>
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          {reloadStatus && <span style={{ fontSize: '12px', color: 'var(--text-dim)' }}>{reloadStatus}</span>}
+          <button style={styles.linkBtn} onClick={() => void handleReload()}>Reload</button>
+        </div>
+      </div>
+      <p style={{ color: 'var(--text-dim)', fontSize: '12px', margin: '0 0 12px' }}>
+        Active providers: {state.activeProviders.length > 0 ? state.activeProviders.join(', ') : 'local only'}.
+        Sensitive fields (certificates, client secrets, keytabs) live in the secrets vault — only the
+        reference id is stored in the identity config.
+      </p>
+      {error && <div style={styles.errorBanner}>{error}</div>}
+
+      {(['kerberos', 'saml', 'oidc'] as const).map((providerType) => (
+        <IdentityProviderCard
+          key={providerType}
+          providerType={providerType}
+          existing={findProvider(providerType)}
+          secrets={secrets}
+          expanded={expanded === providerType}
+          onToggleExpand={() => setExpanded(expanded === providerType ? null : providerType)}
+          onSaved={() => void load()}
+        />
+      ))}
+
+      <h3 style={{ ...styles.cardTitle, marginTop: '20px' }}>Role mappings</h3>
+      <p style={{ color: 'var(--text-dim)', fontSize: '12px', margin: '0 0 8px' }}>
+        IdP group names that map to a platform role. Members of these groups get the role on their
+        next login.
+      </p>
+      <RoleMappingList mappings={state.roleMappings} onChanged={() => void load()} />
+    </div>
+  );
+}
+
+function IdentityProviderCard(props: {
+  providerType: IdentityProvider;
+  existing: { id: string; enabled: boolean; config: Record<string, unknown> } | null;
+  secrets: PlatformSecret[];
+  expanded: boolean;
+  onToggleExpand: () => void;
+  onSaved: () => void;
+}) {
+  const api = useDashboardApi();
+  const enabled = props.existing?.enabled ?? false;
+  const [cfgText, setCfgText] = useState(() => JSON.stringify(props.existing?.config ?? {}, null, 2));
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setCfgText(JSON.stringify(props.existing?.config ?? {}, null, 2));
+  }, [props.existing]);
+
+  async function handleToggleEnabled() {
+    setError(null);
+    try {
+      await api.patchIdentityProvider(props.providerType, { enabled: !enabled });
+      props.onSaved();
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    }
+  }
+  async function save() {
+    setError(null);
+    let parsed: Record<string, unknown>;
+    try { parsed = JSON.parse(cfgText) as Record<string, unknown>; }
+    catch (err) { setError(`Invalid JSON: ${err instanceof Error ? err.message : String(err)}`); return; }
+    setSaving(true);
+    try {
+      await api.patchIdentityProvider(props.providerType, { config: parsed });
+      props.onSaved();
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally { setSaving(false); }
+  }
+
+  return (
+    <div style={{ ...styles.card, padding: '12px 14px', marginBottom: '8px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer' }} onClick={props.onToggleExpand}>
+        <div>
+          <strong style={{ color: 'var(--text-primary)' }}>
+            {props.providerType === 'kerberos' && 'Kerberos / SPNEGO'}
+            {props.providerType === 'saml' && 'SAML 2.0'}
+            {props.providerType === 'oidc' && 'OIDC'}
+          </strong>
+          {enabled ? <span style={{ color: 'var(--green)', marginLeft: '8px' }}>● enabled</span> : <span style={{ color: 'var(--text-dim)', marginLeft: '8px' }}>○ disabled</span>}
+        </div>
+        <span style={{ color: 'var(--text-dim)' }}>{props.expanded ? '▼' : '▶'}</span>
+      </div>
+      {props.expanded && (
+        <div style={{ marginTop: '10px' }}>
+          {error && <div style={styles.errorBanner}>{error}</div>}
+          <p style={{ color: 'var(--text-dim)', fontSize: '11px', margin: '0 0 6px' }}>
+            Sensitive fields must be supplied as <code>*SecretId</code> references — pick a vault
+            secret name from the list below and paste its UUID into the appropriate field.
+            Vault secrets:{' '}
+            {props.secrets.length > 0
+              ? props.secrets.map((s) => <span key={s.id} title={s.id}><code>{s.name}</code> </span>)
+              : <em>none yet — add one in the Secrets tab</em>}
+          </p>
+          <label style={styles.label}>Config (JSON)
+            <textarea
+              style={{ ...styles.input, fontFamily: 'var(--font-mono)', fontSize: '11px', minHeight: '160px' }}
+              value={cfgText}
+              onChange={(e) => setCfgText(e.target.value)}
+              spellCheck={false}
+            />
+          </label>
+          <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+            <button style={styles.linkBtn} onClick={() => void handleToggleEnabled()}>{enabled ? 'Disable' : 'Enable'}</button>
+            <button style={styles.primaryBtn} onClick={() => void save()} disabled={saving}>{saving ? 'Saving...' : 'Save config'}</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RoleMappingList(props: { mappings: RoleMapping[]; onChanged: () => void }) {
+  const api = useDashboardApi();
+  const [adding, setAdding] = useState(false);
+  const [groupName, setGroupName] = useState('');
+  const [role, setRole] = useState<'platform-admin' | 'user'>('platform-admin');
+  const [error, setError] = useState<string | null>(null);
+
+  async function add() {
+    setError(null);
+    if (!groupName.trim()) { setError('Group name is required'); return; }
+    try {
+      await api.addRoleMapping({ groupName: groupName.trim(), platformRole: role });
+      setGroupName(''); setAdding(false); props.onChanged();
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    }
+  }
+  async function remove(m: RoleMapping) {
+    if (!window.confirm(`Remove mapping for '${m.groupName}'?`)) return;
+    try { await api.removeRoleMapping(m.id); props.onChanged(); }
+    catch (err) { setError(err instanceof ApiError ? extractError(err) : String(err)); }
+  }
+
+  return (
+    <div>
+      {error && <div style={styles.errorBanner}>{error}</div>}
+      {!adding && <button style={styles.primaryBtn} onClick={() => setAdding(true)}>+ Add mapping</button>}
+      {adding && (
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'flex-end', marginBottom: '8px' }}>
+          <label style={{ ...styles.label, flex: 2 }}>Group name
+            <input style={styles.input} value={groupName} onChange={(e) => setGroupName(e.target.value)} placeholder="gestalt-admins" />
+          </label>
+          <label style={{ ...styles.label, flex: 1 }}>Role
+            <select style={styles.select} value={role} onChange={(e) => setRole(e.target.value as 'platform-admin' | 'user')}>
+              <option value="platform-admin">Platform admin</option>
+              <option value="user">User</option>
+            </select>
+          </label>
+          <button style={styles.primaryBtn} onClick={() => void add()}>Add</button>
+          <button style={styles.linkBtn} onClick={() => setAdding(false)}>Cancel</button>
+        </div>
+      )}
+      <table style={{ ...styles.table, marginTop: '8px' }}>
+        <thead><tr><th style={styles.th}>Group name</th><th style={styles.th}>Platform role</th><th style={styles.th}></th></tr></thead>
+        <tbody>
+          {props.mappings.length === 0 && (
+            <tr><td colSpan={3} style={styles.empty}>No role mappings configured</td></tr>
+          )}
+          {props.mappings.map((m) => (
+            <tr key={m.id}>
+              <td style={styles.td}><code>{m.groupName}</code></td>
+              <td style={styles.td}>{m.platformRole}</td>
+              <td style={styles.td}><button style={styles.dangerBtn} onClick={() => void remove(m)}>×</button></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 const styles: Record<string, React.CSSProperties> = {
@@ -1431,7 +2143,7 @@ const styles: Record<string, React.CSSProperties> = {
   header: { marginBottom: '20px' },
   title: { margin: 0, fontSize: '20px', fontWeight: 600, color: 'var(--text-primary)' },
   subtitle: { margin: '4px 0 0 0', color: 'var(--text-dim)', fontSize: '13px' },
-  tabs: { display: 'flex', gap: '4px', borderBottom: '1px solid var(--border)', marginBottom: '16px' },
+  tabs: { display: 'flex', flexWrap: 'wrap', gap: '4px', borderBottom: '1px solid var(--border)', marginBottom: '16px' },
   tab: {
     background: 'transparent', border: 'none', padding: '8px 14px',
     fontSize: '13px', color: 'var(--text-secondary)',

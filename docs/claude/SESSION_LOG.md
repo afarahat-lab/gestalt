@@ -11335,3 +11335,410 @@ sessions.
 No new Pending enhancements introduced. The original "platform-
 admin can't create or delete projects from the UI" gap is now
 fully resolved.
+
+---
+
+### Session 2026-06-03 — Claude Code (Session 3: Templates / Platform MCP / Tools view / Corporate Identity UI + [+ Create project] bug fix — migration 017)
+
+Five areas in one session. The first is a bug fix; the four others add
+new platform-admin surfaces backed by `017_platform_admin`.
+
+**Bug fix — [+ Create project] button visibility.** The button is in the
+source (line 482 of `Admin.tsx`) and is rendered unconditionally — the
+parent `<Admin>` route is already gated by `RequirePlatformAdmin`. The
+button was missing from the running container because the docker image
+in use was built BEFORE the project-management session's dashboard
+changes committed in `3b7a273`. The end-of-session image rebuild
+resolves it; verified via `grep "+ Create project"` inside the new
+container bundle returning two matches (button + hint string) vs. one
+match in the stale bundle (hint only).
+
+**Migration 017 — four new tables:**
+- `platform_templates` — harness templates. Partial unique index on
+  `is_default` (same pattern as `platform_llms.is_default`).
+  `files` JSONB stores `{ templateRelativePath: content }` map.
+  `is_builtin` flag marks seeded templates (read-only via API).
+- `platform_mcp_servers` — platform-wide MCP servers. `secret_id`
+  references `platform_secrets`. `agent_roles` is TEXT[] (empty =
+  applies to all agents). Partial index on `enabled = TRUE` for the
+  hot-path lookup.
+- `platform_identity_config` — one row per provider (kerberos/saml/
+  oidc, CHECK-constrained). `config` JSONB. Sensitive fields live as
+  `*SecretId` references INSIDE the config — never as plaintext.
+- `platform_role_mappings` — IdP group → platform role
+  (`platform-admin | user`).
+
+Changed (high level):
+
+- `packages/core/src/repository/index.ts`: new types
+  `PlatformTemplateRecord` + `PlatformTemplateSummary` (no `files`
+  field), `PlatformMcpServerRecord`, `IdentityConfigRecord`,
+  `RoleMappingRecord`, `IdentityProvider` union. Four new repository
+  interfaces (`PlatformTemplateRepository` /
+  `PlatformMcpServerRepository` / `IdentityConfigRepository` /
+  `RoleMappingRepository`). All four added to `RepositoryRegistry`
+- `packages/core/src/events/index.ts`: no event additions (Templates
+  / MCP / Identity changes don't currently emit SSE)
+- `packages/adapters/postgres/src/repositories/platform-templates.ts`
+  (new) — `setDefault` uses the partial-unique-index + transaction
+  trick; `files` and `variables` written via `db.json(...)` helper
+- `packages/adapters/postgres/src/repositories/platform-mcp-servers.ts`
+  (new) — `agentRoles` written as native string[] (postgres.js binds
+  TEXT[] directly); `listEnabled` is the orchestrator hot-path query
+- `packages/adapters/postgres/src/repositories/identity-config.ts`
+  (new) — `upsert` uses INSERT ... ON CONFLICT (provider) DO UPDATE;
+  `RoleMappingRepository` is in the same file
+- `packages/adapters/{oracle,mssql}/src/repositories/{platform-
+  templates,platform-mcp-servers,identity-config}.ts` (new) —
+  throw-stubs for all four new repositories
+
+**Area 1 — Templates:**
+- `packages/server/src/server.ts`: new step 4c calls
+  `seedBuiltinTemplate()` after the LLM registry is wired. If a row
+  with `slug = 'corporate-ops-web-mobile'` exists, skip; otherwise
+  walk the on-disk `templates/corporate-ops-web-mobile/` tree via
+  the new `collectTemplateFileMap` helper and INSERT a row with
+  `isBuiltin: true, isDefault: true`
+- `packages/server/src/templates/engine.ts`: `loadTemplate` now
+  checks the DB first via
+  `getRepositories().platformTemplates.findBySlug(templateId)`. On
+  match, runs `{{var}}` substitution on the stored file map; on
+  miss, falls back to the on-disk tree (preserves the pre-017
+  filesystem path for dev / unit-test setups). New
+  `collectTemplateFileMap(templatesDir, templateId)` exported for
+  the seeder
+- `packages/server/src/routes/projects.ts`:
+  `POST /projects/:id/init-harness` now resolves
+  `getRepositories().platformTemplates.findDefault()?.slug` first
+  and falls back to the built-in slug only if no default is set —
+  so flipping the default in the dashboard immediately affects every
+  subsequent `gestalt init`
+- `packages/server/src/routes/templates.ts` (new) — five endpoints:
+  - `GET /platform/templates` (any authenticated user, summary
+    projection without `files`)
+  - `GET /platform/templates/:id` (any authenticated user, full
+    record)
+  - `POST /platform/templates` (platform-admin) — validates that
+    AGENTS.md + HARNESS.json + agents.yaml appear in the file map
+    (checked against the BASENAME of each path so an operator who
+    uploaded `my-template/AGENTS.md` doesn't get a false negative).
+    Returns 400 `MISSING_REQUIRED_FILES` with `missingFiles: [...]`
+    on failure
+  - `POST /platform/templates/:id/set-default` (platform-admin) —
+    atomically swaps the default
+  - `DELETE /platform/templates/:id` (platform-admin) — refuses
+    with 400 `BUILTIN_TEMPLATE` on built-ins and 400
+    `CANNOT_DELETE_DEFAULT` on the default
+
+**Area 2 — Platform MCP servers:**
+- `packages/server/src/routes/platform-mcp.ts` (new):
+  - `GET /platform/mcp-servers` (any authenticated user — needed by
+    orchestrators on the hot path)
+  - `POST /platform/mcp-servers` (platform-admin)
+  - `PATCH /platform/mcp-servers/:id` (platform-admin)
+  - `DELETE /platform/mcp-servers/:id` (platform-admin)
+  - `POST /platform/mcp-servers/:id/test` (platform-admin) —
+    connects via `McpClient`, calls `listTools`, returns
+    `{ ok, toolCount, latencyMs, error? }`. The McpClient's
+    defensive design returns `[]` on connection failure (rather
+    than throwing) so the test endpoint reports `ok: true,
+    toolCount: 0` for unreachable URLs — readable as "no tools
+    found" by the operator
+- `packages/core/src/orchestrator/base-orchestrator.ts`: extracted
+  the project-MCP logic into `resolveProjectMcp` and added
+  `resolvePlatformMcp(agentRole, mcpCache)` that:
+  1. Returns `[]` if the resolver isn't wired (test setups)
+  2. Queries `platformMcpServers.listEnabled()` from the registry
+  3. Filters by `agentRoles.length === 0 || .includes(agentRole)`
+  4. Skips any server whose name is already in the cache (project
+     MCP wins on collision)
+  5. Calls the injected resolver per server to build the McpClient
+- New `setPlatformMcpResolver(resolver | null)` exported from core
+  + new `PlatformMcpResolver` type. Resolver signature:
+  `(server: PlatformMcpServerRecord) => Promise<McpClient | null>`
+- `packages/server/src/server.ts`: new step 4d wires
+  `setPlatformMcpResolver` with a function that does the vault
+  decrypt + builds the `McpClient`. The vault `getMasterKey()`
+  call stays in the server package; `@gestalt/core` only sees the
+  pre-built `McpClient`. Mirrors the `setLLMRegistryResolver`
+  pattern from migration 014
+- New `resolvePlatformMcpToken` helper in `server.ts` —
+  log-warns with the server NAME (never secret id or key
+  material) on decrypt failure and returns undefined (anonymous
+  connection)
+
+**Area 3 — Platform tools:**
+- `packages/core/src/agents/agent-config-loader.ts`:
+  `PER_ROLE_DEFAULTS` made `export` (was private) so the route
+  layer can iterate it
+- `packages/core/src/index.ts`: re-exports `PER_ROLE_DEFAULTS`
+- `packages/server/src/routes/platform-tools.ts` (new):
+  `GET /platform/tools` (any authenticated user) — computes a
+  per-tool list of default-agents by iterating PER_ROLE_DEFAULTS
+  once per request (cheap; the defaults table is single-digit
+  size). Returns
+  `{ name, description, inputSchema, defaultAgents }[]`. No DB,
+  no migration
+
+**Area 4 — Identity:**
+- `packages/server/src/auth/config-loader.ts`: rewrote
+  `loadIdentityConfig` to try the DB FIRST
+  (`platform_identity_config` + `platform_role_mappings`), then
+  fall back to `auth.config.json`, then to the HARNESS.json
+  legacy path, then to the local-only default. New
+  `loadFromDatabase` + `hydrateProviderConfig` helpers walk the
+  persisted JSONB and vault-resolve every `*SecretId` reference
+  before mapping to the legacy `AuthProviderConfig` shape
+- `packages/server/src/auth/auth-manager.ts`: added
+  `swapProviders(providers)`, `getActiveProviderTypes()`,
+  `getIdentityConfig()` to `AuthManager`. New top-level
+  `reinitAuth(authManager, loadIdentityConfig)` function that
+  re-reads config, instantiates the providers via the new
+  `instantiateProviders` helper (extracted from the existing
+  `createAuthManager` body), and atomically calls
+  `swapProviders`. In-flight requests using `authenticate` are
+  unaffected — `this.providers` is read per call
+- `packages/server/src/routes/identity.ts` (new):
+  - `GET /platform/identity` (platform-admin) — returns
+    `{ providers, roleMappings, activeProviders }`. Defensive
+    `sanitiseConfig` strips any sensitive plaintext that
+    somehow ended up persisted (it shouldn't — both the PATCH
+    validator and operators should use `*SecretId`)
+  - `PATCH /platform/identity/:provider` (platform-admin) —
+    merges body.config into the existing config and upserts.
+    **Rejects with 400 `SENSITIVE_FIELD_INLINE` if any of
+    `cert`, `clientSecret`, `clientSecretValue`,
+    `keytabContent` appears at the top level** — must use the
+    `*SecretId` form. Audit metadata records changed-field
+    NAMES only, never values
+  - `POST /platform/identity/reload` (platform-admin) — calls
+    `reinitAuth(authManager, loadIdentityConfig)`, returns
+    `{ providers: [...] }` with the active provider types
+  - `POST /platform/identity/role-mappings` (platform-admin) —
+    duplicate group name → 409 `GROUP_TAKEN`
+  - `DELETE /platform/identity/role-mappings/:id`
+    (platform-admin)
+- `packages/server/src/app.ts`: registers all four new route
+  groups (templates / platform-mcp / platform-tools / identity).
+  Identity's registrar takes the `authManager` as a second
+  argument so it can call `reinitAuth`
+
+**Dashboard:**
+- `packages/dashboard/package.json`: added `jszip ^3.10.1`
+- `packages/dashboard/src/types.ts`: 9 new types
+  (`PlatformTemplateSummary`, `PlatformTemplate`,
+  `PlatformMcpServer`, `PlatformMcpTestResult`,
+  `PlatformToolInfo`, `IdentityState`, `IdentityProviderConfig`,
+  `RoleMapping`, `TemplateVariable`, `IdentityProvider`)
+- `packages/dashboard/src/api/client.ts`: matching set of API
+  methods — `listPlatformTemplates` /
+  `createPlatformTemplate` / `setDefaultPlatformTemplate` /
+  `deletePlatformTemplate`; `listPlatformMcpServers` and 4
+  CRUD + `testPlatformMcpServer`; `listPlatformTools`;
+  `getPlatformIdentity` / `patchIdentityProvider` /
+  `reloadIdentity` / `addRoleMapping` / `removeRoleMapping`
+- `packages/dashboard/src/views/Admin.tsx`: tab vocabulary
+  expanded from 4 to 8 (`users` / `projects` / `identity` /
+  `llms` / `secrets` / `templates` / `mcp` / `tools`). Tab
+  container styled with `flex-wrap: wrap` so 8 tabs render at
+  any viewport width without overflow. Four new tab
+  components:
+  - `TemplatesTab` + `UploadTemplateModal` — table with
+    [+ Upload template] + per-row [★ Set default] + [×]
+    actions. Modal handles ZIP file picker, runs jszip
+    extraction client-side, warns when AGENTS.md /
+    HARNESS.json / agents.yaml are missing before submitting
+  - `McpServersTab` + `McpServerModal` — table with status
+    glyph (● enabled / ○ disabled), per-row [Test] / [Enable
+    /Disable] / [Edit] / [×]. Modal includes a vault-secret
+    `<select>` (loaded alongside the servers list) and an
+    agent-roles comma-separated input
+  - `ToolsTab` — read-only cards, click to expand and show
+    the JSON inputSchema
+  - `IdentityTab` + `IdentityProviderCard` +
+    `RoleMappingList` — 3 collapsible provider cards
+    (Kerberos / SAML / OIDC) with [Enable/Disable] +
+    JSON-textarea Config editor + helpful vault secrets
+    reference. [Reload] button at the top fires
+    `POST /platform/identity/reload` and prints the active
+    providers inline. Role mappings have an inline add form
+    + table with [×] remove
+- Extracted-error helper `extractError(err)` updated to parse
+  `err.body` FIRST (the actual JSON body) before falling back
+  to `err.message` (which is the "API error N: ..." prefix
+  shape — `JSON.parse` would fail otherwise)
+
+**CLI:**
+- `packages/cli/package.json`: added `adm-zip ^0.5.10` +
+  `@types/adm-zip ^0.5.5`
+- `packages/cli/src/api/client.ts`: matching new client
+  methods + types (PlatformTemplateSummary,
+  PlatformMcpServer, PlatformToolInfo,
+  IdentityStateResponse, RoleMappingSummary)
+- `packages/cli/src/commands/platform-extras.ts` (new) — 17
+  command functions covering all four areas. Notable:
+  - `platformTemplatesUploadCommand(zipPath)` reads the ZIP
+    via `adm-zip`, extracts entries to a map, prompts for
+    name/slug/description/tier/version, POSTs the result
+  - `platformMcpAddCommand` shows a numbered list of vault
+    secrets and lets the operator pick one for the bearer
+    token
+  - `platformIdentityConfigureCommand(providerType)` prints
+    example JSON configs per provider type before prompting
+    for the actual config JSON
+- `packages/cli/src/index.ts`: 17 new `program.command(...)`
+  registrations across four new parent groups
+  (`platform templates`, `platform mcp`, `platform tools`,
+  `platform identity`)
+
+Verified live:
+
+- `pnpm -r build` clean across all 12 packages
+- `docker compose up -d --build server` — `Up (healthy)`;
+  migration 017 applied in order (`schema_migrations` lists 17
+  versions). Built-in template seeded automatically; subsequent
+  boots log `platform_templates already seeded — skipping`
+- `Platform MCP server resolver wired` logged at boot
+- Templates: `GET /platform/templates` returns the seeded
+  `corporate-ops-web-mobile` with `isDefault: true,
+  isBuiltin: true`. `POST /platform/templates` with a valid
+  AGENTS.md + HARNESS.json + agents.yaml succeeds (201).
+  Missing-files variant returns 400 `MISSING_REQUIRED_FILES`
+  with the list. `set-default` on the custom flips the star;
+  `DELETE` on the built-in returns 400 `BUILTIN_TEMPLATE`;
+  `DELETE` on the new default (after set-default)
+  returns 400 `CANNOT_DELETE_DEFAULT`. Restore built-in as
+  default + delete custom → HTTP 204
+- MCP servers: `POST /platform/mcp-servers` with
+  `agentRoles: ['code-agent']` succeeds; `GET` returns the
+  row with the array stored correctly. `POST .../test`
+  against an unreachable URL returns
+  `{ ok: true, toolCount: 0, latencyMs: 279 }` — the McpClient
+  silently returns `[]` on connection failure (by design at
+  the orchestrator boundary). DELETE returns 204
+- Tools: `GET /platform/tools` returns the four built-in tools
+  with their correct default-agent lists derived from
+  PER_ROLE_DEFAULTS (e.g. readFile has 6 default agents
+  including review-agent and context-fixer)
+- Identity: initial `GET /platform/identity` returns empty
+  providers + `activeProviders: ['local']`. PATCH oidc with
+  a valid config succeeds; the sensitive-field guard fires
+  correctly on `{"config":{"clientSecret":"PLAINTEXT-VALUE"}}`
+  → 400 `SENSITIVE_FIELD_INLINE`. `POST .../reload` returns
+  `{ providers: ['oidc', 'local'] }` and `GET /auth/providers`
+  (the public endpoint) immediately returns
+  `['oidc', 'local']` — **hot reload activated OIDC without a
+  server restart**. Role mapping POST succeeds and is visible
+  via the GET endpoint. Disable + reload deactivates OIDC and
+  `/auth/providers` returns `['local']` again
+- CLI: `gestalt platform templates list` renders the seeded
+  template with the `★` prefix. `gestalt platform tools list`
+  prints all four tools with their descriptions and default
+  agents. `gestalt platform identity show` prints the active
+  providers + collapsed provider list + role mappings
+- **Bug fix verified**: container's rebuilt dashboard bundle
+  (`index-Mt1QJnVg.js`) contains "+ Create project" twice
+  (button text + empty-state hint), confirming the button
+  renders in the Admin → Projects tab
+
+Decisions:
+
+- **`PER_ROLE_DEFAULTS` exported, not duplicated.** The
+  tools route iterates the same table the loader uses; any
+  future role-default change automatically reflects in the
+  `defaultAgents` list without a parallel data structure
+- **Built-in template seeding is idempotent on `slug`.** If
+  someone uploads a custom template with the same slug as
+  the built-in, the seed step (which runs first) wins and
+  the custom upload would 409 SLUG_TAKEN. We don't try to
+  re-seed if the row exists — operators who explicitly
+  delete a built-in (which is blocked, but defensively) and
+  restart would need a database-level intervention to get
+  it back. The on-disk fallback in `loadTemplate` means
+  `gestalt init` still works even if the seed was missed
+- **Template required-files check uses BASENAME matching.**
+  A ZIP that puts `my-template/AGENTS.md` at the top level
+  still passes; only the unwrapped `path.split('/').pop()`
+  is used for the required-file presence check. The engine's
+  repo-path mapper handles the actual path normalisation at
+  init-harness time
+- **Platform MCP servers honor project-level precedence.**
+  If a project's agents.yaml declares an MCP server with the
+  same NAME as a platform one, the project's client wins
+  (already in the cache when `resolvePlatformMcp` runs, so
+  the platform version skips). Documented in the brief and
+  enforced in `resolvePlatformMcp` via the `mcpCache.has`
+  check
+- **`PlatformMcpResolver` injection mirrors
+  `setLLMRegistryResolver`.** Server-side wiring keeps the
+  vault decrypt + `getMasterKey()` inside the server
+  package; `@gestalt/core` only sees the pre-built
+  `McpClient`. Same pattern, same trade-off (clean
+  separation, slight boot-time coupling)
+- **Identity config: DB > auth.config.json > HARNESS.json >
+  local-only.** Adds a layer at the top of the resolution
+  chain without breaking any of the three existing paths.
+  Operators with `auth.config.json` mounted continue to
+  work; the file is just not the primary source anymore
+- **Sensitive identity fields rejected inline at the PATCH
+  layer.** The persistence layer doesn't enforce this
+  (it would silently accept anything in the JSONB blob), so
+  the route's `SENSITIVE_FIELD_INLINE` check is the
+  authoritative guard. Defense-in-depth: `sanitiseConfig`
+  ALSO strips them from the GET response, so even if a row
+  somehow ended up with plaintext it never escapes via the API
+- **`reinitAuth` uses provider swap, not full restart.**
+  `AuthManager.providers` is a private field replaced
+  atomically. `authenticate` reads the field per call, so
+  in-flight requests complete with whichever list was
+  current at the time of their call. Either old or new list
+  is fine; partial mid-list states don't exist
+- **`extractError` parses `err.body` first.** The dashboard's
+  `ApiError.message` is `"API error N: <body>"`; trying
+  `JSON.parse` on that always fails. The fix parses
+  `err.body` (the actual response body) first and falls
+  back to message on failure. The previous behaviour worked
+  by accident on the local fallback path
+- **Bug fix root cause: stale docker bundle, no code change.**
+  The button has existed in the source since the
+  project-management session's commit `3b7a273`. The running
+  container had a docker image built before that commit
+  landed in the build, so the bundle inside didn't have the
+  button code. The session-end rebuild during this session's
+  verification fixes it — confirmed by grep before and after
+
+Operator action — pending:
+
+- No operator action required for this session's features.
+  All changes are server-side / dashboard-side / CLI-side
+  and seed themselves at first boot. Operators who want to
+  use a custom template can upload it via the dashboard or
+  `gestalt platform templates upload <zip>` once they're
+  ready
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Migration 017 applied. Server image rebuilt. Full feature
+verified end-to-end:
+- Templates: GET / upload / set-default / delete guards all
+  exercised
+- MCP servers: CRUD + test endpoint
+- Tools: GET returns 4 built-ins with correct default-agent
+  lists
+- Identity: PATCH + sensitive-field guard + reload activates
+  OIDC without restart + role mappings
+- Bug fix: container bundle now contains the button
+
+No new Pending enhancements introduced. Possible future
+follow-ups:
+- Pre-populated example configs in the dashboard's Identity
+  tab (instead of free-text JSON, render typed forms per
+  provider type with vault secret pickers for sensitive
+  fields)
+- Template variable substitution UI — today the template engine
+  supports `{{var}}` substitution but operators can't preview
+  which variables a custom template uses before applying it
+- MCP server test endpoint reports `toolCount: 0` for both
+  "connected with zero tools" and "connection failed with
+  silent listTools empty array". Distinguishing the two would
+  require McpClient to surface the underlying connection error
+  separately from the listTools-failed-silently path

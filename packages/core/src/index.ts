@@ -34,10 +34,11 @@ export type { McpServerConfig } from './tools/mcp-resolver';
 // — moved to core from agents-generate so every layer shares one
 // implementation).
 export { BaseLLMAgent } from './agents/base-llm-agent';
-export { BaseOrchestrator } from './orchestrator/base-orchestrator';
-export type { OrchestratorContext } from './orchestrator/base-orchestrator';
+export { BaseOrchestrator, setPlatformMcpResolver } from './orchestrator/base-orchestrator';
+export type { OrchestratorContext, PlatformMcpResolver } from './orchestrator/base-orchestrator';
 export {
   loadAgentConfig, loadCustomAgents, defaultAgentConfig,
+  PER_ROLE_DEFAULTS,
 } from './agents/agent-config-loader';
 export {
   applyAgentConfig, buildPersona, buildExtensionsBlock,
@@ -91,6 +92,11 @@ export type {
   InterventionRecord, InterventionAction,
   PlatformLLMRecord, PlatformLLMRepository,
   PlatformSecretRecord, PlatformSecretSummary, PlatformSecretRepository,
+  PlatformTemplateRecord, PlatformTemplateSummary, PlatformTemplateRepository,
+  TemplateVariable,
+  PlatformMcpServerRecord, PlatformMcpServerRepository,
+  IdentityConfigRecord, IdentityConfigRepository, IdentityProvider,
+  RoleMappingRecord, RoleMappingRepository,
   RepositoryRegistry,
   IntentRepository, AgentExecutionRepository,
   ArtifactRepository, SignalRepository,

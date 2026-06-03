@@ -365,7 +365,13 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
         // engine walks the template, substitutes `{{variables}}`, and
         // returns the list of files-to-commit with their target
         // paths inside the project repo.
-        const harnessFiles = await loadTemplate(TEMPLATES_DIR, DEFAULT_TEMPLATE_ID, {
+        // Resolve which template to apply: the platform default (set
+        // via the dashboard's Templates tab) wins; if no default is
+        // set, fall back to the built-in slug so existing deployments
+        // continue to work.
+        const defaultTemplate = await getRepositories().platformTemplates.findDefault();
+        const templateId = defaultTemplate?.slug ?? DEFAULT_TEMPLATE_ID;
+        const harnessFiles = await loadTemplate(TEMPLATES_DIR, templateId, {
           projectName: project.name,
           projectDescription: projectDescription.trim(),
           defaultBranch: project.defaultBranch,

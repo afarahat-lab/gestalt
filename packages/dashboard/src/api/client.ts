@@ -15,6 +15,9 @@ import type {
   CreateUserParams, UserRole, ProjectRole,
   ProjectConfigResponse, EditableAgentConfig, ProjectConfigCustomAgent,
   PlatformLLM, LlmTestResult, PlatformSecret,
+  PlatformTemplateSummary, PlatformTemplate, TemplateVariable,
+  PlatformMcpServer, PlatformMcpTestResult, PlatformToolInfo,
+  IdentityProvider, IdentityState, RoleMapping,
 } from '../types';
 
 export class DashboardApiClient {
@@ -358,6 +361,106 @@ export class DashboardApiClient {
 
   async deletePlatformSecret(id: string): Promise<void> {
     await this.delete(`/platform/secrets/${id}`);
+  }
+
+  // ─── Platform templates (Session 3 — migration 017) ──────────────────────
+
+  async listPlatformTemplates(): Promise<{ data: PlatformTemplateSummary[] }> {
+    return this.get('/platform/templates');
+  }
+
+  async getPlatformTemplate(id: string): Promise<{ data: PlatformTemplate }> {
+    return this.get(`/platform/templates/${id}`);
+  }
+
+  async createPlatformTemplate(body: {
+    slug: string;
+    name: string;
+    description?: string | null;
+    tier?: string;
+    version?: string;
+    files: Record<string, string>;
+    variables?: TemplateVariable[];
+    isDefault?: boolean;
+  }): Promise<{ data: PlatformTemplateSummary }> {
+    return this.post('/platform/templates', body);
+  }
+
+  async setDefaultPlatformTemplate(id: string): Promise<{ data: PlatformTemplateSummary }> {
+    return this.post(`/platform/templates/${id}/set-default`, {});
+  }
+
+  async deletePlatformTemplate(id: string): Promise<void> {
+    await this.delete(`/platform/templates/${id}`);
+  }
+
+  // ─── Platform MCP servers (Session 3 — migration 017) ────────────────────
+
+  async listPlatformMcpServers(): Promise<{ data: PlatformMcpServer[] }> {
+    return this.get('/platform/mcp-servers');
+  }
+
+  async createPlatformMcpServer(body: {
+    name: string;
+    url: string;
+    description?: string | null;
+    secretId?: string | null;
+    enabled?: boolean;
+    agentRoles?: string[];
+  }): Promise<{ data: PlatformMcpServer }> {
+    return this.post('/platform/mcp-servers', body);
+  }
+
+  async updatePlatformMcpServer(
+    id: string,
+    body: Partial<{
+      name: string; url: string; description: string | null;
+      secretId: string | null; enabled: boolean; agentRoles: string[];
+    }>,
+  ): Promise<{ data: PlatformMcpServer }> {
+    return this.patch(`/platform/mcp-servers/${id}`, body);
+  }
+
+  async deletePlatformMcpServer(id: string): Promise<void> {
+    await this.delete(`/platform/mcp-servers/${id}`);
+  }
+
+  async testPlatformMcpServer(id: string): Promise<{ data: PlatformMcpTestResult }> {
+    return this.post(`/platform/mcp-servers/${id}/test`, {});
+  }
+
+  // ─── Platform tools (Session 3 — read-only) ──────────────────────────────
+
+  async listPlatformTools(): Promise<{ data: PlatformToolInfo[] }> {
+    return this.get('/platform/tools');
+  }
+
+  // ─── Platform identity (Session 3 — migration 017) ───────────────────────
+
+  async getPlatformIdentity(): Promise<{ data: IdentityState }> {
+    return this.get('/platform/identity');
+  }
+
+  async patchIdentityProvider(
+    provider: IdentityProvider,
+    body: { enabled?: boolean; config?: Record<string, unknown> },
+  ): Promise<{ data: unknown }> {
+    return this.patch(`/platform/identity/${provider}`, body);
+  }
+
+  async reloadIdentity(): Promise<{ data: { providers: string[] } }> {
+    return this.post('/platform/identity/reload', {});
+  }
+
+  async addRoleMapping(body: {
+    groupName: string;
+    platformRole: 'platform-admin' | 'user';
+  }): Promise<{ data: RoleMapping }> {
+    return this.post('/platform/identity/role-mappings', body);
+  }
+
+  async removeRoleMapping(id: string): Promise<void> {
+    await this.delete(`/platform/identity/role-mappings/${id}`);
   }
 
   // ─── Project config (Approach A — config-as-code) ──────────────────────────

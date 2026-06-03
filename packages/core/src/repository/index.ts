@@ -383,6 +383,10 @@ export interface RepositoryRegistry {
   interventions: InterventionRepository;
   platformLlms: PlatformLLMRepository;
   platformSecrets: PlatformSecretRepository;
+  platformTemplates: PlatformTemplateRepository;
+  platformMcpServers: PlatformMcpServerRepository;
+  identityConfig: IdentityConfigRepository;
+  roleMappings: RoleMappingRepository;
 }
 
 // ─── Platform LLM registry (migration 014) ───────────────────────────────────
@@ -522,6 +526,138 @@ export interface PlatformSecretRepository extends BaseRepository {
    * guard and by the dashboard's delete-confirm panel.
    */
   findReferencingLlms(secretId: string): Promise<Array<{ id: string; name: string }>>;
+}
+
+// ─── Platform templates (Session 3 — migration 017) ──────────────────────────
+
+/**
+ * Variables a template declares for substitution. Documented in the
+ * template's metadata so the operator UI can render input fields.
+ * Today the engine only does `{{key}}` regex replacement — no
+ * conditionals — so `type` is informational.
+ */
+export interface TemplateVariable {
+  name: string;
+  description?: string;
+  type?: 'string' | 'number' | 'boolean';
+  required?: boolean;
+  defaultValue?: string;
+}
+
+export interface PlatformTemplateRecord {
+  id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  tier: string;
+  version: string;
+  isDefault: boolean;
+  isBuiltin: boolean;
+  /**
+   * Repo-path → file content map. The template engine reads this
+   * directly and runs `{{var}}` substitution per file. Built-in
+   * templates seed this from the on-disk `templates/<slug>/` tree at
+   * startup; custom templates land via the Upload flow.
+   */
+  files: Record<string, string>;
+  variables: TemplateVariable[];
+  createdBy: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/** Without `files` — used by list endpoints because file maps can be
+ *  large (multi-KB per file × 8+ files per template). */
+export type PlatformTemplateSummary = Omit<PlatformTemplateRecord, 'files'>;
+
+export interface PlatformTemplateRepository extends BaseRepository {
+  list(): Promise<PlatformTemplateSummary[]>;
+  findById(id: string): Promise<PlatformTemplateRecord | null>;
+  findBySlug(slug: string): Promise<PlatformTemplateRecord | null>;
+  findDefault(): Promise<PlatformTemplateRecord | null>;
+  create(template: Omit<PlatformTemplateRecord, 'id' | 'createdAt' | 'updatedAt'>): Promise<PlatformTemplateRecord>;
+  update(id: string, updates: Partial<Omit<PlatformTemplateRecord, 'id' | 'createdAt'>>): Promise<PlatformTemplateRecord>;
+  /** Atomically clears the existing default and sets the new one. */
+  setDefault(id: string): Promise<void>;
+  delete(id: string): Promise<void>;
+}
+
+// ─── Platform MCP servers (Session 3 — migration 017) ────────────────────────
+
+export interface PlatformMcpServerRecord {
+  id: string;
+  name: string;
+  url: string;
+  description: string | null;
+  /** Reference into `platform_secrets` for the bearer token; null = anonymous. */
+  secretId: string | null;
+  enabled: boolean;
+  /** Empty array = applies to ALL agents; otherwise per-role allow-list. */
+  agentRoles: string[];
+  createdBy: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface PlatformMcpServerRepository extends BaseRepository {
+  list(): Promise<PlatformMcpServerRecord[]>;
+  /** Filtered to `enabled = TRUE`. Called by every cycle's
+   *  BaseOrchestrator.resolveAgentContext on hot path. */
+  listEnabled(): Promise<PlatformMcpServerRecord[]>;
+  findById(id: string): Promise<PlatformMcpServerRecord | null>;
+  findByName(name: string): Promise<PlatformMcpServerRecord | null>;
+  create(server: Omit<PlatformMcpServerRecord, 'id' | 'createdAt' | 'updatedAt'>): Promise<PlatformMcpServerRecord>;
+  update(id: string, updates: Partial<Omit<PlatformMcpServerRecord, 'id' | 'createdAt'>>): Promise<PlatformMcpServerRecord>;
+  delete(id: string): Promise<void>;
+}
+
+// ─── Platform identity config (Session 3 — migration 017) ────────────────────
+
+export type IdentityProvider = 'kerberos' | 'saml' | 'oidc';
+
+export interface IdentityConfigRecord {
+  id: string;
+  provider: IdentityProvider;
+  enabled: boolean;
+  /**
+   * Provider-specific configuration. Sensitive fields (cert,
+   * clientSecret, keytabContent) are NEVER stored inline — only as
+   * `*SecretId` references into `platform_secrets`. The route layer
+   * enforces this on PATCH.
+   */
+  config: Record<string, unknown>;
+  updatedBy: string | null;
+  updatedAt: Date;
+}
+
+export interface IdentityConfigRepository extends BaseRepository {
+  list(): Promise<IdentityConfigRecord[]>;
+  findByProvider(provider: IdentityProvider): Promise<IdentityConfigRecord | null>;
+  /** Insert-or-update on `(provider)`. */
+  upsert(params: {
+    provider: IdentityProvider;
+    enabled: boolean;
+    config: Record<string, unknown>;
+    updatedBy: string;
+  }): Promise<IdentityConfigRecord>;
+}
+
+export interface RoleMappingRecord {
+  id: string;
+  groupName: string;
+  platformRole: 'platform-admin' | 'user';
+  createdBy: string | null;
+  createdAt: Date;
+}
+
+export interface RoleMappingRepository extends BaseRepository {
+  list(): Promise<RoleMappingRecord[]>;
+  add(params: {
+    groupName: string;
+    platformRole: 'platform-admin' | 'user';
+    createdBy: string;
+  }): Promise<RoleMappingRecord>;
+  remove(id: string): Promise<void>;
 }
 
 // ─── Intervention repository (ADR-021) ───────────────────────────────────────

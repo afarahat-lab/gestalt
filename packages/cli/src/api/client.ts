@@ -254,6 +254,71 @@ export interface PlatformSecretSummary {
   updatedAt: string;
 }
 
+// ─── Platform templates / MCP / tools / identity (Session 3 — migration 017) ─
+
+export interface PlatformTemplateSummary {
+  id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  tier: string;
+  version: string;
+  isDefault: boolean;
+  isBuiltin: boolean;
+  variables: unknown[];
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PlatformMcpServer {
+  id: string;
+  name: string;
+  url: string;
+  description: string | null;
+  secretId: string | null;
+  enabled: boolean;
+  agentRoles: string[];
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PlatformMcpTestResult {
+  ok: boolean;
+  toolCount: number;
+  latencyMs: number;
+  error?: string;
+}
+
+export interface PlatformToolInfo {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  defaultAgents: string[];
+}
+
+export interface IdentityStateResponse {
+  providers: Array<{
+    id: string;
+    provider: 'kerberos' | 'saml' | 'oidc';
+    enabled: boolean;
+    config: Record<string, unknown>;
+    updatedBy: string | null;
+    updatedAt: string;
+  }>;
+  roleMappings: RoleMappingSummary[];
+  activeProviders: string[];
+}
+
+export interface RoleMappingSummary {
+  id: string;
+  groupName: string;
+  platformRole: 'platform-admin' | 'user';
+  createdBy: string | null;
+  createdAt: string;
+}
+
 // ─── Deployments (ADR-033 / ADR-034) ─────────────────────────────────────────
 
 export type DeploymentEventType =
@@ -417,6 +482,75 @@ export class GestaltApiClient {
    *  cycle is in flight. The remote Git repository is NOT deleted. */
   async deleteProject(projectId: string): Promise<void> {
     await this.delete(`/projects/${projectId}`);
+  }
+
+  // ─── Platform templates / MCP / tools / identity (Session 3) ─────────────
+
+  async listPlatformTemplates(): Promise<{ data: PlatformTemplateSummary[] }> {
+    return this.get('/platform/templates');
+  }
+  async createPlatformTemplate(body: {
+    slug: string; name: string; description?: string | null;
+    tier?: string; version?: string;
+    files: Record<string, string>;
+  }): Promise<{ data: PlatformTemplateSummary }> {
+    return this.post('/platform/templates', body);
+  }
+  async setDefaultPlatformTemplate(id: string): Promise<{ data: PlatformTemplateSummary }> {
+    return this.post(`/platform/templates/${id}/set-default`, {});
+  }
+  async deletePlatformTemplate(id: string): Promise<void> {
+    await this.delete(`/platform/templates/${id}`);
+  }
+
+  async listPlatformMcpServers(): Promise<{ data: PlatformMcpServer[] }> {
+    return this.get('/platform/mcp-servers');
+  }
+  async createPlatformMcpServer(body: {
+    name: string; url: string; description?: string | null;
+    secretId?: string | null; enabled?: boolean; agentRoles?: string[];
+  }): Promise<{ data: PlatformMcpServer }> {
+    return this.post('/platform/mcp-servers', body);
+  }
+  async updatePlatformMcpServer(
+    id: string,
+    body: Partial<{
+      name: string; url: string; description: string | null;
+      secretId: string | null; enabled: boolean; agentRoles: string[];
+    }>,
+  ): Promise<{ data: PlatformMcpServer }> {
+    return this.patch(`/platform/mcp-servers/${id}`, body);
+  }
+  async deletePlatformMcpServer(id: string): Promise<void> {
+    await this.delete(`/platform/mcp-servers/${id}`);
+  }
+  async testPlatformMcpServer(id: string): Promise<{ data: PlatformMcpTestResult }> {
+    return this.post(`/platform/mcp-servers/${id}/test`, {});
+  }
+
+  async listPlatformTools(): Promise<{ data: PlatformToolInfo[] }> {
+    return this.get('/platform/tools');
+  }
+
+  async getPlatformIdentity(): Promise<{ data: IdentityStateResponse }> {
+    return this.get('/platform/identity');
+  }
+  async patchIdentityProvider(
+    provider: 'kerberos' | 'saml' | 'oidc',
+    body: { enabled?: boolean; config?: Record<string, unknown> },
+  ): Promise<{ data: unknown }> {
+    return this.patch(`/platform/identity/${provider}`, body);
+  }
+  async reloadIdentity(): Promise<{ data: { providers: string[] } }> {
+    return this.post('/platform/identity/reload', {});
+  }
+  async addRoleMapping(body: {
+    groupName: string; platformRole: 'platform-admin' | 'user';
+  }): Promise<{ data: RoleMappingSummary }> {
+    return this.post('/platform/identity/role-mappings', body);
+  }
+  async removeRoleMapping(id: string): Promise<void> {
+    await this.delete(`/platform/identity/role-mappings/${id}`);
   }
 
   // ─── Platform LLM registry (Session 3) ────────────────────────────────────

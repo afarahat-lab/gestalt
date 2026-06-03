@@ -58,6 +58,7 @@ import { createHarnessEngine } from '../harness/index';
 import { resolveMcpClients } from '../tools/mcp-resolver';
 import { McpClient } from '../tools/mcp-client';
 import { loadAgentConfig } from '../agents/agent-config-loader';
+import { getRepositories } from '../repository/index';
 import type { HarnessConfig } from '../harness/index';
 import type { AgentConfig } from '../agents/agent-config';
 
@@ -152,28 +153,107 @@ export abstract class BaseOrchestrator {
     projectCredential: string | null,
   ): Promise<{ agentConfig: AgentConfig; mcpClients: McpClient[] }> {
     const agentConfig = await loadAgentConfig(projectRoot, agentRole);
+
+    // Project-level MCP servers — declared in `agents.yaml`.
+    const projectMcpClients = await this.resolveProjectMcp(
+      agentConfig, mcpCache, harnessConfig, projectCredential,
+    );
+
+    // Platform-level MCP servers (Session 3 — migration 017).
+    // Iterated from `platform_mcp_servers` and filtered to those
+    // applicable to the current agent role. The resolver is
+    // injected by the server at boot (so token decryption stays
+    // server-side).
+    const platformMcpClients = await this.resolvePlatformMcp(agentRole, mcpCache);
+
+    return {
+      agentConfig,
+      mcpClients: [...projectMcpClients, ...platformMcpClients],
+    };
+  }
+
+  private async resolveProjectMcp(
+    agentConfig: AgentConfig,
+    mcpCache: Map<string, McpClient>,
+    harnessConfig: HarnessConfig | null,
+    projectCredential: string | null,
+  ): Promise<McpClient[]> {
     const mcpServers = agentConfig.tools?.mcp ?? [];
-    if (mcpServers.length === 0) {
-      return { agentConfig, mcpClients: [] };
-    }
+    if (mcpServers.length === 0) return [];
     const unresolved = mcpServers.filter((m) => !mcpCache.has(m.name));
     if (unresolved.length > 0) {
-      // resolveMcpClients tolerates null harness; we pass an empty
-      // shell so the resolver's `tokenFrom: 'harness'` lookup falls
-      // through gracefully.
       const fallbackHarness = harnessConfig ?? ({
         name: '', description: '', version: '',
         constraints: { rules: [] },
         qualityGate: { maxRetries: 0, signalsToHuman: [] },
       } as unknown as HarnessConfig);
-      const newClients = resolveMcpClients(
-        unresolved, fallbackHarness, projectCredential,
-      );
+      const newClients = resolveMcpClients(unresolved, fallbackHarness, projectCredential);
       for (const c of newClients) mcpCache.set(c.serverName, c);
     }
-    const clients = mcpServers
+    return mcpServers
       .map((m) => mcpCache.get(m.name))
       .filter((c): c is McpClient => c !== undefined);
-    return { agentConfig, mcpClients: clients };
   }
+
+  private async resolvePlatformMcp(
+    agentRole: string,
+    mcpCache: Map<string, McpClient>,
+  ): Promise<McpClient[]> {
+    const resolver = getPlatformMcpResolver();
+    if (!resolver) return [];
+
+    let enabled;
+    try {
+      enabled = await getRepositories().platformMcpServers.listEnabled();
+    } catch {
+      // Repository not wired (e.g. test setup) → no platform MCP.
+      return [];
+    }
+
+    const applicable = enabled.filter((s) =>
+      s.agentRoles.length === 0 || s.agentRoles.includes(agentRole),
+    );
+
+    const clients: McpClient[] = [];
+    for (const server of applicable) {
+      // Project-level wins: if a project's agents.yaml declares an
+      // MCP server with the same name as a platform one, the
+      // project's client is already in the cache from
+      // `resolveProjectMcp` above. Skip the platform version here
+      // to honour the precedence.
+      if (mcpCache.has(server.name)) continue;
+      const client = await resolver(server);
+      if (client) {
+        mcpCache.set(server.name, client);
+        clients.push(client);
+      }
+    }
+    return clients;
+  }
+}
+
+/**
+ * Platform MCP server resolver. The server injects this at boot via
+ * `setPlatformMcpResolver` so that token decryption stays server-
+ * side (the master key never reaches `@gestalt/core`). Mirrors the
+ * `setLLMRegistryResolver` pattern from migration 014.
+ *
+ * The resolver receives the persisted `PlatformMcpServerRecord` and
+ * returns a ready-to-use `McpClient` (or null if e.g. the vault
+ * secret can't be decrypted).
+ */
+import type { PlatformMcpServerRecord } from '../repository';
+
+export type PlatformMcpResolver = (
+  server: PlatformMcpServerRecord,
+) => Promise<McpClient | null>;
+
+let _platformMcpResolver: PlatformMcpResolver | null = null;
+
+export function setPlatformMcpResolver(resolver: PlatformMcpResolver | null): void {
+  _platformMcpResolver = resolver;
+}
+
+function getPlatformMcpResolver(): PlatformMcpResolver | null {
+  return _platformMcpResolver;
 }

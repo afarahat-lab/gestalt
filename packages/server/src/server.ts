@@ -19,6 +19,7 @@ import {
   loadConfig, createLLMClient, setRepositories, createContextLogger,
   setLLMRegistryResolver, getRepositories,
   loadMasterKey, decryptSecret,
+  setPlatformMcpResolver, McpClient,
 } from '@gestalt/core';
 import { setMasterKey, getMasterKey } from './secrets/index';
 import { createPostgresAdapter, closeDb } from '@gestalt/adapter-postgres';
@@ -29,6 +30,7 @@ import { startMaintenanceScheduler } from '@gestalt/agents-maintenance';
 import { createApp } from './app';
 import { createAuthManager } from './auth/auth-manager';
 import { loadIdentityConfig } from './auth/config-loader';
+import { collectTemplateFileMap, resolveTemplatesDir } from './templates/engine';
 
 const log = createContextLogger({ module: 'server' });
 
@@ -85,6 +87,28 @@ export async function startServer(): Promise<void> {
     };
   });
   log.info('Platform LLM registry resolver wired');
+
+  // 4c. Platform templates (Session 3 — migration 017).
+  //
+  // Seed the built-in `corporate-ops-web-mobile` template from the
+  // on-disk `templates/` directory on first boot. Custom templates are
+  // operator-uploaded via the dashboard / CLI; the built-in seed
+  // gives a baseline so a fresh deployment can immediately run
+  // `gestalt init` without first manually uploading a template.
+  await seedBuiltinTemplate();
+
+  // 4d. Platform MCP server resolver (Session 3 — migration 017).
+  //
+  // `BaseOrchestrator.resolveAgentContext` iterates the enabled
+  // server list and calls this resolver per-server to get a ready
+  // `McpClient`. Vault decryption happens here so the master key
+  // stays inside the server package — `@gestalt/core` only sees
+  // the pre-resolved token.
+  setPlatformMcpResolver(async (server) => {
+    const token = await resolvePlatformMcpToken(server);
+    return new McpClient(server.name, server.url, token);
+  });
+  log.info('Platform MCP server resolver wired');
 
   // 5. Auth manager
   const identityConfig = await loadIdentityConfig();
@@ -171,6 +195,80 @@ async function seedPlatformLlmsIfEmpty(
     { model: llmConfig.model, baseUrl: llmConfig.baseUrl },
     'Seeded default LLM from .env config',
   );
+}
+
+/**
+ * Resolve a Platform MCP server's bearer token at orchestration
+ * time. `secretId` → vault decrypt; null → anonymous connection.
+ * Decryption failures log a warning with the server NAME only
+ * (never the secret id or key material) and return `undefined`
+ * so the client connects unauthenticated — the MCP server's own
+ * auth rejection then surfaces in the orchestrator's tool-call
+ * logs.
+ */
+async function resolvePlatformMcpToken(
+  server: { name: string; secretId: string | null },
+): Promise<string | undefined> {
+  if (!server.secretId) return undefined;
+  const secret = await getRepositories().platformSecrets.findById(server.secretId);
+  if (!secret) {
+    log.warn({ serverName: server.name }, 'Platform MCP server references missing vault secret');
+    return undefined;
+  }
+  try {
+    return decryptSecret(
+      { encrypted: secret.encrypted, iv: secret.iv, authTag: secret.authTag },
+      getMasterKey(),
+    );
+  } catch (err) {
+    log.warn(
+      { err: err instanceof Error ? err.message : String(err), serverName: server.name },
+      'Vault decrypt failed for Platform MCP server token',
+    );
+    return undefined;
+  }
+}
+
+/**
+ * First-boot seed for `platform_templates`. Idempotent: if a row
+ * with `slug = 'corporate-ops-web-mobile'` already exists, do
+ * nothing. Otherwise read every file under the on-disk
+ * `templates/corporate-ops-web-mobile/` tree into a
+ * `{ templateRelativePath: content }` map and INSERT a row with
+ * `isBuiltin: true, isDefault: true`.
+ *
+ * Custom templates uploaded via the dashboard / CLI live in the same
+ * table; the engine's read path (`loadTemplate` in
+ * `templates/engine.ts`) consults DB first and falls back to the
+ * on-disk tree only when no DB row matches.
+ */
+async function seedBuiltinTemplate(): Promise<void> {
+  const slug = 'corporate-ops-web-mobile';
+  const repo = getRepositories().platformTemplates;
+  const existing = await repo.findBySlug(slug);
+  if (existing) {
+    log.info({ slug }, 'platform_templates already seeded — skipping');
+    return;
+  }
+  try {
+    const templatesDir = resolveTemplatesDir();
+    const fileMap = await collectTemplateFileMap(templatesDir, slug);
+    await repo.create({
+      slug,
+      name: 'Corporate Ops Web/Mobile',
+      description: 'Tier 1 baseline — TypeScript monorepo with a web SPA + mobile shell',
+      tier: 'Tier 1',
+      version: '0.1.0',
+      isDefault: true,
+      isBuiltin: true,
+      files: fileMap,
+      variables: [],
+      createdBy: null,
+    });
+    log.info({ slug, fileCount: Object.keys(fileMap).length }, 'Seeded built-in template');
+  } catch (err) {
+    log.warn({ err, slug }, 'Failed to seed built-in template — `gestalt init` will use the filesystem fallback');
+  }
 }
 
 /**

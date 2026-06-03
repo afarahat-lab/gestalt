@@ -458,3 +458,84 @@ export interface PlatformSecret {
   createdAt: string;
   updatedAt: string;
 }
+
+// ─── Templates / MCP / Tools / Identity (Session 3 — migration 017) ─────────
+
+export interface TemplateVariable {
+  name: string;
+  description?: string;
+  type?: 'string' | 'number' | 'boolean';
+  required?: boolean;
+  defaultValue?: string;
+}
+
+export interface PlatformTemplateSummary {
+  id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  tier: string;
+  version: string;
+  isDefault: boolean;
+  isBuiltin: boolean;
+  variables: TemplateVariable[];
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PlatformTemplate extends PlatformTemplateSummary {
+  files: Record<string, string>;
+}
+
+export interface PlatformMcpServer {
+  id: string;
+  name: string;
+  url: string;
+  description: string | null;
+  secretId: string | null;
+  enabled: boolean;
+  agentRoles: string[];
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PlatformMcpTestResult {
+  ok: boolean;
+  toolCount: number;
+  latencyMs: number;
+  error?: string;
+}
+
+export interface PlatformToolInfo {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  defaultAgents: string[];
+}
+
+export type IdentityProvider = 'kerberos' | 'saml' | 'oidc';
+
+export interface IdentityProviderConfig {
+  id: string;
+  provider: IdentityProvider;
+  enabled: boolean;
+  config: Record<string, unknown>;
+  updatedBy: string | null;
+  updatedAt: string;
+}
+
+export interface RoleMapping {
+  id: string;
+  groupName: string;
+  platformRole: 'platform-admin' | 'user';
+  createdBy: string | null;
+  createdAt: string;
+}
+
+export interface IdentityState {
+  providers: IdentityProviderConfig[];
+  roleMappings: RoleMapping[];
+  activeProviders: string[];
+}

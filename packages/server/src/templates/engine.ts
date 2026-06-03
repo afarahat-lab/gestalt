@@ -29,7 +29,7 @@
 import { readFile, readdir, access } from 'fs/promises';
 import { accessSync } from 'fs';
 import { join } from 'path';
-import { createContextLogger } from '@gestalt/core';
+import { createContextLogger, getRepositories } from '@gestalt/core';
 
 const log = createContextLogger({ module: 'template-engine' });
 
@@ -84,9 +84,6 @@ export async function loadTemplate(
   templateId: string,
   variables: TemplateVariables,
 ): Promise<HarnessFile[]> {
-  const templateDir = join(templatesDir, templateId);
-  await access(templateDir);
-
   const today = new Date().toISOString().split('T')[0]!;
   const projectSlug =
     variables.projectSlug?.trim()
@@ -99,9 +96,87 @@ export async function loadTemplate(
     projectSlug,
   };
 
+  // DB-first lookup (Session 3 — migration 017). Custom templates +
+  // the seeded built-in both live in `platform_templates`. Filesystem
+  // fallback below preserves the pre-017 behaviour for any operator
+  // who's running against a stale DB or in a test setup that skipped
+  // the seed step.
+  try {
+    const dbTemplate = await getRepositories().platformTemplates.findBySlug(templateId);
+    if (dbTemplate) {
+      return applyVariablesFromFileMap(dbTemplate.files, vars);
+    }
+  } catch (err) {
+    // Repository unavailable (e.g. unit-test harness) → fall through
+    // to filesystem. Logged at debug so a misconfigured deployment
+    // surfaces in the broader server log without being noisy.
+    log.debug({ err }, 'platformTemplates repo unavailable — falling back to filesystem');
+  }
+
+  const templateDir = join(templatesDir, templateId);
+  await access(templateDir);
+
   const files: HarnessFile[] = [];
   await collectFiles(templateDir, templateDir, vars, files);
   return files;
+}
+
+/**
+ * Applies variable substitution + repo-path mapping to a flat
+ * `{ templateRelativePath: content }` map. Used by the DB-stored
+ * template path — the filesystem path uses `collectFiles` instead
+ * because it has to walk a directory tree and skip metadata files.
+ */
+function applyVariablesFromFileMap(
+  fileMap: Record<string, string>,
+  vars: TemplateVariables,
+): HarnessFile[] {
+  const files: HarnessFile[] = [];
+  for (const [templateRelativePath, raw] of Object.entries(fileMap)) {
+    const content = substitute(raw, vars);
+    const repoPath = resolveRepoPath(templateRelativePath);
+    files.push({ repoPath, content });
+  }
+  return files;
+}
+
+/**
+ * Walks the on-disk template directory and returns the
+ * `{ templateRelativePath: content }` map suitable for storing in
+ * `platform_templates.files`. Used by the boot-time seeder for the
+ * built-in `corporate-ops-web-mobile` template.
+ */
+export async function collectTemplateFileMap(
+  templatesDir: string,
+  templateId: string,
+): Promise<Record<string, string>> {
+  const templateDir = join(templatesDir, templateId);
+  await access(templateDir);
+  const map: Record<string, string> = {};
+  await collectIntoMap(templateDir, templateDir, map);
+  return map;
+}
+
+async function collectIntoMap(
+  baseDir: string,
+  currentDir: string,
+  out: Record<string, string>,
+): Promise<void> {
+  const entries = await readdir(currentDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = join(currentDir, entry.name);
+    if (entry.isDirectory()) {
+      if (SKIP_DIRS.has(entry.name)) continue;
+      await collectIntoMap(baseDir, fullPath, out);
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    const isTopLevel = currentDir === baseDir;
+    if (isTopLevel && SKIP_FILES.has(entry.name)) continue;
+    const raw = await readFile(fullPath, 'utf8');
+    const templateRelativePath = fullPath.slice(baseDir.length + 1).replace(/\\/g, '/');
+    out[templateRelativePath] = raw;
+  }
 }
 
 async function collectFiles(

@@ -76,7 +76,7 @@ const CONTEXT_FIXER_TOOLS: AgentToolConfig = {
  * Operators tune these via agents.yaml — they shouldn't have to edit
  * this table.
  */
-const PER_ROLE_DEFAULTS: Record<string, AgentConfig> = {
+export const PER_ROLE_DEFAULTS: Record<string, AgentConfig> = {
   // ─── Generate layer ───────────────────────────────────────────
   'intent-agent': {
     role: 'Senior software architect',

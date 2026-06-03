@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-03 (Claude Code — Project management in Platform Admin: new `DELETE /projects/:id` (platform-admin only) with active-intents guard + FK-safe cascade through memberships / credentials / maintenance runs; `GET /projects` enriched for platform-admin with `memberCount` / `intentCount` / `lastActivityAt`; new repository methods `intents.{countByProject, countActiveByProject, findLatestByProject}` + `memberships.{countByProject, deleteAllForProject}` + `projects.{delete, deleteAllCredentials}` + `maintenanceRuns.deleteAllForProject` (postgres real impl, oracle/mssql throw-stubs); dashboard Admin → Projects tab rewritten with [+ Create project] + search + per-row [⚙][→][×] actions + typed-name confirmation modal; `gestalt platform projects list/create/delete` CLI with PROJECT_HAS_ACTIVE_INTENTS surface; `project.deleted` SSE event added to `LiveEventType` union — no migrations)
+**Last updated:** 2026-06-03 (Claude Code — Session 3: Templates / Platform MCP / Tools view / Corporate Identity UI + dashboard [+ Create project] bug fix. Migration 017 adds `platform_templates`, `platform_mcp_servers`, `platform_identity_config`, `platform_role_mappings`; built-in `corporate-ops-web-mobile` template seeded at boot from disk; template engine reads DB first then falls back to filesystem; `gestalt init` uses the platform default. Platform MCP servers merged with project-level via `BaseOrchestrator.resolveAgentContext` + `setPlatformMcpResolver` boot-time injection. `GET /platform/tools` derives from FILE_TOOL_DEFINITIONS + PER_ROLE_DEFAULTS. Corporate identity config persists in `platform_identity_config`; sensitive fields use `*SecretId` vault references (SENSITIVE_FIELD_INLINE guard); `POST /platform/identity/reload` activates providers without server restart via `AuthManager.swapProviders`. Admin view gains 4 new tabs (Templates, MCP Servers, Tools, Identity); jszip for ZIP upload, adm-zip for CLI. The [+ Create project] button bug was a stale docker bundle — resolved by the session-end image rebuild)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -22,13 +22,13 @@ the historical record of how the state evolved._
   are summarised in the "Session log" entries dated 2026-05-29 / 30
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
-- All sixteen migrations apply on startup: `001_initial`, `002_local_auth`,
+- All seventeen migrations apply on startup: `001_initial`, `002_local_auth`,
   `003_projects`, `004_deployments`, `005_maintenance`,
   `006_intent_clarification`, `007_execution_logs`,
   `008_finding_attempts`, `009_execution_log_model`,
   `010_user_management`, `011_interventions`, `012_tool_calls`,
   `013_auto_merge`, `014_llm_registry`, `015_secrets_vault`,
-  `016_relax_llm_apikey_env`
+  `016_relax_llm_apikey_env`, `017_platform_admin`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
 - **Dashboard SPA reachable in the browser, deep-linkable, no path

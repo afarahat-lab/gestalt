@@ -34,6 +34,10 @@
  *   gestalt platform projects list                          — cross-project, all stats
  *   gestalt platform projects create                        — interactive register + init-harness
  *   gestalt platform projects delete <name>                 — typed-name confirmation
+ *   gestalt platform templates list/upload/set-default/delete   — harness templates
+ *   gestalt platform mcp list/add/enable/disable/test/remove    — platform-wide MCP servers
+ *   gestalt platform tools list                                 — built-in tool inspector
+ *   gestalt platform identity show/configure/reload/...         — corporate identity
  *   gestalt run "<intent>" [--server <url>] [--priority critical|high|normal|low]
  *   gestalt intent list [--project <name>] [--status <s>] [--limit 20]
  *   gestalt intent show <id> [--watch]                — execution-flow graph
@@ -105,6 +109,19 @@ import {
   platformProjectsListCommand, platformProjectsCreateCommand,
   platformProjectsDeleteCommand,
 } from './commands/platform-config';
+import {
+  platformTemplatesListCommand, platformTemplatesUploadCommand,
+  platformTemplatesSetDefaultCommand, platformTemplatesDeleteCommand,
+  platformMcpListCommand, platformMcpAddCommand,
+  platformMcpEnableCommand, platformMcpDisableCommand,
+  platformMcpTestCommand, platformMcpRemoveCommand,
+  platformToolsListCommand,
+  platformIdentityShowCommand, platformIdentityConfigureCommand,
+  platformIdentityEnableCommand, platformIdentityDisableCommand,
+  platformIdentityReloadCommand,
+  platformIdentityAddRoleMappingCommand,
+  platformIdentityRemoveRoleMappingCommand,
+} from './commands/platform-extras';
 import {
   usersListCommand, usersAddCommand, usersRoleCommand, usersDeactivateCommand,
   usersAssignCommand, usersUnassignCommand, usersMembersCommand,
@@ -695,6 +712,170 @@ platformProjects
   .option('--server <url>', 'Server URL (one-shot override for this invocation)')
   .action(async (name: string, opts: { server?: string }) => {
     await platformProjectsDeleteCommand(name, { server: opts.server }).catch(fatalError);
+  });
+
+// gestalt platform templates — harness templates (Session 3 — migration 017)
+const platformTemplates = platform
+  .command('templates')
+  .description('Manage harness templates (the file map used by `gestalt init`).');
+
+platformTemplates
+  .command('list')
+  .description('List registered templates. Built-in templates ship with the platform.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (opts: { server?: string }) => {
+    await platformTemplatesListCommand({ server: opts.server }).catch(fatalError);
+  });
+
+platformTemplates
+  .command('upload <zipPath>')
+  .description('Upload a ZIP archive as a custom template. Prompts for name/slug/tier interactively.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (zipPath: string, opts: { server?: string }) => {
+    await platformTemplatesUploadCommand(zipPath, { server: opts.server }).catch(fatalError);
+  });
+
+platformTemplates
+  .command('set-default <slug>')
+  .description('Atomically set the default template — used by `gestalt init` for every new project.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (slug: string, opts: { server?: string }) => {
+    await platformTemplatesSetDefaultCommand(slug, { server: opts.server }).catch(fatalError);
+  });
+
+platformTemplates
+  .command('delete <slug>')
+  .description('Delete a custom template. Refuses on built-in or default templates.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (slug: string, opts: { server?: string }) => {
+    await platformTemplatesDeleteCommand(slug, { server: opts.server }).catch(fatalError);
+  });
+
+// gestalt platform mcp — platform-wide MCP servers (Session 3 — migration 017)
+const platformMcp = platform
+  .command('mcp')
+  .description('Manage platform-wide MCP servers (merged with project-level ones at orchestration time).');
+
+platformMcp
+  .command('list')
+  .description('Table of registered MCP servers.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (opts: { server?: string }) => {
+    await platformMcpListCommand({ server: opts.server }).catch(fatalError);
+  });
+
+platformMcp
+  .command('add')
+  .description('Interactively register an MCP server (name, URL, optional vault token, agent role filter).')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (opts: { server?: string }) => {
+    await platformMcpAddCommand({ server: opts.server }).catch(fatalError);
+  });
+
+platformMcp
+  .command('enable <name>')
+  .description('Enable an MCP server.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (name: string, opts: { server?: string }) => {
+    await platformMcpEnableCommand(name, { server: opts.server }).catch(fatalError);
+  });
+
+platformMcp
+  .command('disable <name>')
+  .description('Disable an MCP server (keeps the config, agents stop seeing it on the next cycle).')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (name: string, opts: { server?: string }) => {
+    await platformMcpDisableCommand(name, { server: opts.server }).catch(fatalError);
+  });
+
+platformMcp
+  .command('test <name>')
+  .description('Connect to the server, call listTools, report tool count + latency.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (name: string, opts: { server?: string }) => {
+    await platformMcpTestCommand(name, { server: opts.server }).catch(fatalError);
+  });
+
+platformMcp
+  .command('remove <name>')
+  .description('Delete an MCP server.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (name: string, opts: { server?: string }) => {
+    await platformMcpRemoveCommand(name, { server: opts.server }).catch(fatalError);
+  });
+
+// gestalt platform tools — read-only informational view (Session 3)
+const platformTools = platform
+  .command('tools')
+  .description('Inspect the built-in tools available to agents.');
+
+platformTools
+  .command('list')
+  .description('Print all four built-in tools with their description and the agents that have each enabled by default.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (opts: { server?: string }) => {
+    await platformToolsListCommand({ server: opts.server }).catch(fatalError);
+  });
+
+// gestalt platform identity — corporate identity config (Session 3 — migration 017)
+const platformIdentity = platform
+  .command('identity')
+  .description('Manage corporate identity providers (Kerberos / SAML / OIDC) and IdP group → role mappings.');
+
+platformIdentity
+  .command('show')
+  .description('Print provider status, active providers, and role mappings.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (opts: { server?: string }) => {
+    await platformIdentityShowCommand({ server: opts.server }).catch(fatalError);
+  });
+
+platformIdentity
+  .command('configure <provider>')
+  .description('Configure one provider (kerberos|saml|oidc). Prompts for a JSON config; sensitive fields use *SecretId references into the vault.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (provider: string, opts: { server?: string }) => {
+    await platformIdentityConfigureCommand(provider, { server: opts.server }).catch(fatalError);
+  });
+
+platformIdentity
+  .command('enable <provider>')
+  .description('Enable a provider. Run `reload` afterwards to activate.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (provider: string, opts: { server?: string }) => {
+    await platformIdentityEnableCommand(provider, { server: opts.server }).catch(fatalError);
+  });
+
+platformIdentity
+  .command('disable <provider>')
+  .description('Disable a provider. Run `reload` afterwards to deactivate.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (provider: string, opts: { server?: string }) => {
+    await platformIdentityDisableCommand(provider, { server: opts.server }).catch(fatalError);
+  });
+
+platformIdentity
+  .command('reload')
+  .description('Hot-reload identity config from the database without restarting the server.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (opts: { server?: string }) => {
+    await platformIdentityReloadCommand({ server: opts.server }).catch(fatalError);
+  });
+
+platformIdentity
+  .command('add-role-mapping <groupName> <platformRole>')
+  .description('Map an IdP group name to a platform role (platform-admin|user).')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (groupName: string, platformRole: string, opts: { server?: string }) => {
+    await platformIdentityAddRoleMappingCommand(groupName, platformRole, { server: opts.server }).catch(fatalError);
+  });
+
+platformIdentity
+  .command('remove-role-mapping <groupName>')
+  .description('Remove an IdP group → role mapping.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (groupName: string, opts: { server?: string }) => {
+    await platformIdentityRemoveRoleMappingCommand(groupName, { server: opts.server }).catch(fatalError);
   });
 
 // gestalt run

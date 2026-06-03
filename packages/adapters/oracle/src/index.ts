@@ -13,3 +13,8 @@ export { OracleProjectMembershipRepository } from './repositories/memberships';
 export { OracleInterventionRepository } from './repositories/interventions';
 export { OraclePlatformLLMRepository } from './repositories/platform-llms';
 export { OraclePlatformSecretRepository } from './repositories/platform-secrets';
+export { OraclePlatformTemplateRepository } from './repositories/platform-templates';
+export { OraclePlatformMcpServerRepository } from './repositories/platform-mcp-servers';
+export {
+  OracleIdentityConfigRepository, OracleRoleMappingRepository,
+} from './repositories/identity-config';

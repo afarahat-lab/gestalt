@@ -13,3 +13,8 @@ export { MssqlProjectMembershipRepository } from './repositories/memberships';
 export { MssqlInterventionRepository } from './repositories/interventions';
 export { MssqlPlatformLLMRepository } from './repositories/platform-llms';
 export { MssqlPlatformSecretRepository } from './repositories/platform-secrets';
+export { MssqlPlatformTemplateRepository } from './repositories/platform-templates';
+export { MssqlPlatformMcpServerRepository } from './repositories/platform-mcp-servers';
+export {
+  MssqlIdentityConfigRepository, MssqlRoleMappingRepository,
+} from './repositories/identity-config';

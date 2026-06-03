@@ -144,6 +144,84 @@ export class AuthManager {
   ): Promise<string> {
     return this.createSession(identity, upsertUser);
   }
+
+  /**
+   * Atomically replace the provider registry. Used by
+   * `reinitAuth(authManager)` after a `PATCH /platform/identity/:provider`
+   * so config changes take effect without restarting the server.
+   * The swap is synchronous — in-flight requests using the old
+   * provider list complete with the old list (`authenticate` reads
+   * `this.providers` at call time, which is fine since both arrays
+   * are immutable from the consumer's perspective).
+   */
+  swapProviders(providers: AuthProvider[]): void {
+    this.providers = providers;
+  }
+
+  /** Read the identity config the manager was constructed with. */
+  getIdentityConfig(): IdentityConfig {
+    return this.identityConfig;
+  }
+
+  /** Return the list of provider types currently registered. */
+  getActiveProviderTypes(): string[] {
+    return this.providers.map((p) => p.type);
+  }
+}
+
+/**
+ * Re-reads the identity config from the database and rebuilds the
+ * provider list, then atomically swaps it onto the AuthManager. The
+ * AuthManager's `swapProviders` semantics mean in-flight requests
+ * complete safely against whichever list was current when they
+ * called `authenticate`.
+ *
+ * Returns the list of active provider types after the reload so the
+ * route can surface them to the operator.
+ */
+export async function reinitAuth(
+  manager: AuthManager,
+  loadIdentityConfig: () => Promise<IdentityConfig>,
+): Promise<string[]> {
+  const identityConfig = await loadIdentityConfig();
+  const providers = await instantiateProviders(identityConfig);
+  manager.swapProviders(providers);
+  return providers.map((p) => p.type);
+}
+
+async function instantiateProviders(identityConfig: IdentityConfig): Promise<AuthProvider[]> {
+  const providers: AuthProvider[] = [];
+  for (const providerConfig of identityConfig.providers) {
+    if (!providerConfig.enabled) continue;
+    switch (providerConfig.type) {
+      case 'windows-kerberos': {
+        const { WindowsKerberosProvider } = await import('./providers/kerberos.js');
+        providers.push(new WindowsKerberosProvider(providerConfig));
+        break;
+      }
+      case 'saml': {
+        const { SamlProvider } = await import('./providers/saml.js');
+        providers.push(new SamlProvider(providerConfig));
+        break;
+      }
+      case 'oidc': {
+        const { OidcProvider } = await import('./providers/oidc.js');
+        const oidc = new OidcProvider(providerConfig);
+        await oidc.init();
+        providers.push(oidc);
+        break;
+      }
+      case 'local': {
+        if (process.env['NODE_ENV'] === 'production' && !providerConfig.allowedInProduction) {
+          break;
+        }
+        const { LocalProvider } = await import('./providers/local.js');
+        providers.push(new LocalProvider(providerConfig));
+        break;
+      }
+    }
+  }
+  return providers;
 }
 
 // ─── Auth errors ──────────────────────────────────────────────────────────────
