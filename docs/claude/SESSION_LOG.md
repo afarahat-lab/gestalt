@@ -12013,3 +12013,170 @@ Migration 018 applied. Server image rebuilt. Full feature
 verified end-to-end against the live platform — group-derived
 project access, max-of-roles precedence, CLI flow, CASCADE on
 delete, direct membership survival.
+
+---
+
+### Session 2026-06-03 — Claude Code (surface group assignments in project member views)
+
+Operators couldn't see which groups were assigned to a specific
+project from inside the project context. The data was always
+available (via `GET /platform/groups/:id/projects` per group), but
+forced an N+1 walk. This session adds the project-side endpoint
+(`GET /projects/:id/groups`) + threads it through both
+Admin → Projects detail panel and Project Settings → Members tab,
+plus the CLI's `project members list` view. No new migrations.
+
+Changed:
+
+- `packages/core/src/repository/index.ts`:
+  `PlatformGroupRepository.listAssignedToProject(projectId)`
+  added. Returns `{ group: PlatformGroupRecord, role, assignedAt,
+  memberCount }[]` — the joined view the routes consume directly.
+  Documented as the project-side counterpart to the existing
+  `listProjectAssignments(groupId)`
+- `packages/adapters/postgres/src/repositories/platform-groups.ts`:
+  `listAssignedToProject` impl. Single round-trip:
+  `group_project_assignments` JOIN `platform_groups` LEFT JOIN a
+  `(group_id, COUNT(*))` subquery on `group_memberships`. LEFT JOIN
+  so a group with zero members still appears with `memberCount: 0`.
+  Ordered by group name
+- `packages/adapters/{oracle,mssql}/src/repositories/platform-groups.ts`:
+  throw-stub `listAssignedToProject` for parity
+- `packages/server/src/routes/memberships.ts`: new
+  `GET /projects/:id/groups` route. Loads the project (404 if
+  missing), runs `checkProjectMembership(... 'reader')` so every
+  project member can SEE which groups have access (informational —
+  the brief calls this out), then calls
+  `platformGroups.listAssignedToProject(projectId)`. Mutations
+  still go through `/platform/groups/:groupId/projects` (POST upsert,
+  DELETE) which require platform-admin
+- `packages/dashboard/src/types.ts`: new `ProjectGroupAssignment`
+  type mirroring the route shape (group + role + assignedAt +
+  memberCount)
+- `packages/dashboard/src/api/client.ts`: new
+  `listProjectGroups(projectId)` method
+- `packages/dashboard/src/views/Admin.tsx`:
+  `MembersList` (rendered in the per-project expanded row of the
+  Projects tab) gains a "Group assignments" section below the
+  existing "Direct members" section. Loaded in parallel with the
+  global groups list (for the `+ Assign group` picker). Per-row
+  select for in-place role change (UPSERT via
+  `assignGroupToProject` with the new role) + Remove button.
+  Footer line shows "Effective access: N direct + M via groups =
+  up to P users" — labelled "up to" because the count doesn't
+  dedupe users who appear in both surfaces (brief calls out this
+  limitation explicitly)
+- `packages/dashboard/src/views/ProjectSettings.tsx`:
+  `MembersTab` extended with a Group access card below the
+  existing Direct members card. Same data flow as Admin's
+  `MembersList` — loads members + project groups + all platform
+  groups in parallel on mount; per-row role select + Remove;
+  `+ Assign group` opens a new `AssignGroupModal` (group picker +
+  role select) that calls `assignGroupToProject`. Action banner
+  reuses the existing `actionMsg` / `actionError` plumbing
+- `packages/cli/src/api/client.ts`: new `listProjectGroups`
+  method
+- `packages/cli/src/commands/project-config.ts`:
+  `projectMembersListCommand` rewritten to call BOTH
+  `listProjectMembers` and `listProjectGroups` in parallel.
+  Prints two clearly-labelled sections:
+  - `Direct members — <projectName> (N)` table
+  - `Group assignments — <projectName> (N)` table with `Group /
+    Members ("N members") / Role / Description` columns
+  - New `projectMembersAssignGroupCommand(projectName, groupName,
+    { role })` — resolves the group by name, calls
+    `assignGroupToProject` (UPSERT — re-running updates the role in
+    place)
+  - New `projectMembersRemoveGroupCommand(projectName, groupName)`
+    — calls `unassignGroupFromProject`
+- `packages/cli/src/index.ts`: registers
+  `gestalt project members assign-group <projectName> <groupName>
+  [--role <role>]` (default `editor`) and `remove-group
+  <projectName> <groupName>` subcommands
+
+Verified live end-to-end:
+
+- `pnpm -r build` clean across all 12 packages; server image
+  rebuilt
+- Seeded a synthetic project `verify-proj-groups` + admin
+  membership for `a@b.c` via SQL
+- Group `verify-pj-group` (already existed) had `user@test.local`
+  as a member; assigned the group to `verify-proj-groups` as
+  editor via the existing route
+- `GET /projects/<id>/groups` returns `{ data: [{ group, role:
+  'editor', assignedAt, memberCount: 1 }] }` — single row with
+  the embedded group record and member count populated by the
+  SQL LEFT JOIN
+- `user@test.local` (group editor, no direct membership) hit the
+  endpoint → HTTP 200 with the same payload (reader+ check passes
+  via group editor role — the `checkProjectMembership` integration
+  from Brief 1 already accounted for this)
+- UPSERT in-place: POST the existing route with
+  `role: 'project-admin'` → subsequent GET shows the new role
+- **CLI `gestalt project members list --project verify-proj-groups`**
+  prints both sections cleanly:
+  ```
+  Direct members — verify-proj-groups (1)
+  ...
+  a@b.c    amr    ★ project-admin    6/3/2026
+
+  Group assignments — verify-proj-groups (1)
+  ...
+  verify-pj-group    1 member    ★ project-admin    For group-in-project view
+  ```
+- `gestalt project members remove-group verify-proj-groups
+  verify-pj-group` succeeded, then
+  `assign-group verify-proj-groups verify-pj-group --role reader`
+  re-assigned with the new role — final list shows
+  `verify-pj-group    1 member    ○ reader`
+- Cleanup: DELETE the group + project rows; `\dt` confirms clean
+  state
+
+Decisions:
+
+- **`GET /projects/:id/groups` requires reader+, not project-admin.**
+  The brief was explicit: every member sees which groups have
+  access (informational). Mutations still flow through the
+  platform-group routes which require platform-admin. The
+  dashboard's per-row role select + Remove buttons in the
+  ProjectSettings → Members tab will surface a 403 if a regular
+  editor tries to mutate — that's the right UX because the
+  controls would be invisible without first showing the data
+- **Member count as a LEFT JOIN, not a follow-up COUNT per group.**
+  The route returns N rows; an N+1 follow-up would make a 5-group
+  project do 6 queries instead of 1. The LEFT JOIN (versus inner
+  JOIN) ensures groups with zero members still render with
+  `memberCount: 0` rather than vanishing from the list
+- **"Effective access: N direct + M via groups = up to P users"
+  in the dashboard footer.** Brief was explicit about the
+  deduplication caveat — a user can be both a direct member AND
+  a member of an assigned group. The "up to" label sets the right
+  expectation without requiring a full user-deduplicated count
+  (which would mean joining direct memberships against every
+  assigned group's member list — an O(M*N) query that's overkill
+  for an informational footer)
+- **UPSERT semantics surfaced in both UI and CLI.** The role
+  select on a group row calls `assignGroupToProject` with the
+  NEW role; the existing route does
+  `INSERT ... ON CONFLICT DO UPDATE`. Operators expect "change
+  editor to project-admin" to be one action; no separate "update"
+  path needed
+- **CLI uses `openClient({ ...options, project: projectName })`
+  to override the current-project lookup.** The new
+  `assign-group` / `remove-group` subcommands take `<projectName>`
+  as a positional argument (per the brief), not via `--project`,
+  so they can read against a project other than the operator's
+  current one without losing context. The threaded `project`
+  option in `openClient` is the existing pattern
+- **`AssignGroupModal` is a new shared modal in ProjectSettings**
+  rather than reusing the inline picker from Admin. The
+  ProjectSettings tab uses modals throughout (its existing
+  `AddMemberModal` is a modal too) — visual consistency wins over
+  code reuse for a 50-line component
+
+Build status: `pnpm -r build` clean across all 12 packages; server
+image rebuilt. New route + dashboard + CLI all verified live with
+a synthetic project. No migration needed; no existing data shape
+changed.
+
+No new Pending enhancements introduced.

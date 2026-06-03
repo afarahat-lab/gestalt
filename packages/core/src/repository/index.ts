@@ -748,6 +748,21 @@ export interface PlatformGroupRepository extends BaseRepository {
    * `max(roleRank(direct), roleRank(group))`.
    */
   getEffectiveMemberships(userId: string): Promise<EffectiveProjectMembership[]>;
+
+  /**
+   * Project-side view of group assignments. Returned for the
+   * `GET /projects/:id/groups` endpoint — each row carries the
+   * group record, the role it has on the project, and the current
+   * member count so the dashboard can render "(8 members)" inline
+   * without an N+1 lookup. One row per group assigned to the
+   * project.
+   */
+  listAssignedToProject(projectId: string): Promise<Array<{
+    group: PlatformGroupRecord;
+    role: 'project-admin' | 'editor' | 'reader';
+    assignedAt: Date;
+    memberCount: number;
+  }>>;
 }
 
 // ─── Intervention repository (ADR-021) ───────────────────────────────────────

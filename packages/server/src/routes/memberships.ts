@@ -248,4 +248,33 @@ export async function registerMembershipRoutes(app: FastifyInstance): Promise<vo
       return reply.code(204).send();
     },
   );
+
+  // ── List groups assigned to project ────────────────────────────────────────
+  //
+  // Project-side counterpart to `/platform/groups/:id/projects`. Used by the
+  // Admin → Projects detail panel and Project Settings → Members tab to
+  // render "Group access" alongside the direct membership list. Member
+  // count comes from a single LEFT JOIN inside the repository so the
+  // dashboard can show "(8 members)" without an N+1 lookup.
+  //
+  // Reader minimum — every project member can SEE which groups have
+  // access (informational); only platform-admin and project-admin can
+  // mutate (those mutations go through `/platform/groups/:id/projects`).
+
+  app.get<{ Params: { id: string } }>(
+    '/projects/:id/groups',
+    async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+      const projectId = request.params.id;
+      const { projects, platformGroups } = getRepositories();
+
+      const project = await projects.findById(projectId);
+      if (!project) return reply.code(404).send({ error: 'Project not found' });
+
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, projectId, 'reader')) return;
+
+      const rows = await platformGroups.listAssignedToProject(projectId);
+      return reply.send({ data: rows });
+    },
+  );
 }

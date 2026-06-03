@@ -27,7 +27,7 @@ import type {
   PlatformLLM, LlmTestResult, PlatformSecret,
   PlatformTemplateSummary, PlatformMcpServer, PlatformMcpTestResult,
   PlatformToolInfo, IdentityState, IdentityProvider, RoleMapping,
-  PlatformGroup, GroupMember, GroupProjectAssignment,
+  PlatformGroup, GroupMember, GroupProjectAssignment, ProjectGroupAssignment,
 } from '../types';
 
 type Tab = 'users' | 'projects' | 'groups' | 'llms' | 'secrets' | 'templates' | 'mcp' | 'tools' | 'identity';
@@ -760,12 +760,37 @@ function MembersList(props: { projectId: string; members: ProjectMember[]; onCha
   const [selUser, setSelUser] = useState('');
   const [selRole, setSelRole] = useState<ProjectRole>('editor');
 
+  // Group assignments — loaded alongside direct members. The route
+  // returns group + role + memberCount in one shot.
+  const [groupAssignments, setGroupAssignments] = useState<ProjectGroupAssignment[]>([]);
+  const [allGroups, setAllGroups] = useState<PlatformGroup[]>([]);
+  const [showAddGroup, setShowAddGroup] = useState(false);
+  const [selGroup, setSelGroup] = useState('');
+  const [selGroupRole, setSelGroupRole] = useState<ProjectRole>('editor');
+  const [groupsError, setGroupsError] = useState<string | null>(null);
+
   useEffect(() => {
     api.listUsers().then((r) => setUsers(r.data)).catch(() => {});
   }, [api]);
 
+  async function reloadGroups() {
+    try {
+      const [proj, all] = await Promise.all([
+        api.listProjectGroups(props.projectId),
+        api.listPlatformGroups(),
+      ]);
+      setGroupAssignments(proj.data);
+      setAllGroups(all.data);
+    } catch (err) {
+      setGroupsError(err instanceof ApiError ? extractError(err) : String(err));
+    }
+  }
+  useEffect(() => { void reloadGroups(); /* eslint-disable-next-line */ }, [props.projectId]);
+
   const memberSet = new Set(props.members.map((m) => m.userId));
   const candidates = users.filter((u) => !u.deactivatedAt && !memberSet.has(u.id));
+  const assignedGroupIds = new Set(groupAssignments.map((a) => a.group.id));
+  const availableGroups = allGroups.filter((g) => !assignedGroupIds.has(g.id));
 
   async function changeRole(userId: string, role: ProjectRole) {
     try {
@@ -795,11 +820,47 @@ function MembersList(props: { projectId: string; members: ProjectMember[]; onCha
     }
   }
 
+  async function changeGroupRole(groupId: string, role: ProjectRole) {
+    try {
+      // UPSERT — re-assigning with a different role updates in place.
+      await api.assignGroupToProject(groupId, props.projectId, role);
+      await reloadGroups();
+    } catch (err) {
+      setGroupsError(err instanceof ApiError ? extractError(err) : String(err));
+    }
+  }
+  async function removeGroup(groupId: string, groupName: string) {
+    if (!window.confirm(`Remove group '${groupName}' from this project? Direct member access is unaffected.`)) return;
+    try {
+      await api.unassignGroupFromProject(groupId, props.projectId);
+      await reloadGroups();
+    } catch (err) {
+      setGroupsError(err instanceof ApiError ? extractError(err) : String(err));
+    }
+  }
+  async function assignGroup() {
+    if (!selGroup) return;
+    try {
+      await api.assignGroupToProject(selGroup, props.projectId, selGroupRole);
+      setShowAddGroup(false); setSelGroup('');
+      await reloadGroups();
+    } catch (err) {
+      setGroupsError(err instanceof ApiError ? extractError(err) : String(err));
+    }
+  }
+
+  // Approximate user count — direct members + sum of group member counts.
+  // Doesn't dedupe users who are both direct members AND in an assigned
+  // group, so we label it "up to N" to set expectations.
+  const directCount = props.members.length;
+  const groupMembersTotal = groupAssignments.reduce((sum, a) => sum + a.memberCount, 0);
+  const effectiveUpper = directCount + groupMembersTotal;
+
   return (
     <div style={styles.expandedInner}>
-      <p style={styles.subhead}>Members</p>
-      {props.members.length === 0 && <p style={styles.muted}>No members.</p>}
-      {props.members.length > 0 && (
+      <p style={styles.subhead}>Direct members ({directCount})</p>
+      {directCount === 0 && <p style={styles.muted}>No direct members.</p>}
+      {directCount > 0 && (
         <table style={styles.subtable}>
           <thead><tr><th style={styles.th}>Email</th><th style={styles.th}>Display name</th><th style={styles.th}>Role</th><th style={styles.th}></th></tr></thead>
           <tbody>
@@ -840,6 +901,60 @@ function MembersList(props: { projectId: string; members: ProjectMember[]; onCha
           <button style={styles.muteBtn} onClick={() => setShowAdd(false)}>Cancel</button>
         </div>
       )}
+
+      <p style={{ ...styles.subhead, marginTop: '14px' }}>Group assignments ({groupAssignments.length})</p>
+      {groupsError && <div style={styles.errorBanner}>{groupsError}</div>}
+      {groupAssignments.length === 0 && <p style={styles.muted}>No groups assigned.</p>}
+      {groupAssignments.length > 0 && (
+        <table style={styles.subtable}>
+          <thead><tr><th style={styles.th}>Group</th><th style={styles.th}>Members</th><th style={styles.th}>Role</th><th style={styles.th}></th></tr></thead>
+          <tbody>
+            {groupAssignments.map((a) => (
+              <tr key={a.group.id}>
+                <td style={styles.td}>
+                  {a.group.name}
+                  {a.group.description && <div style={{ color: 'var(--text-dim)', fontSize: '11px' }}>{a.group.description}</div>}
+                </td>
+                <td style={styles.td}>{a.memberCount}</td>
+                <td style={styles.td}>
+                  <select value={a.role} onChange={(e) => changeGroupRole(a.group.id, e.target.value as ProjectRole)} style={styles.roleSelect}>
+                    <option value="project-admin">project-admin</option>
+                    <option value="editor">editor</option>
+                    <option value="reader">reader</option>
+                  </select>
+                </td>
+                <td style={styles.td}>
+                  <button style={styles.dangerBtn} onClick={() => removeGroup(a.group.id, a.group.name)}>Remove</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {!showAddGroup && availableGroups.length > 0 && (
+        <button style={styles.muteBtn} onClick={() => setShowAddGroup(true)}>+ Assign group</button>
+      )}
+      {showAddGroup && (
+        <div style={styles.inlineRow}>
+          <select value={selGroup} onChange={(e) => setSelGroup(e.target.value)} style={styles.roleSelect}>
+            <option value="">Select group…</option>
+            {availableGroups.map((g) => (<option key={g.id} value={g.id}>{g.name}</option>))}
+          </select>
+          <select value={selGroupRole} onChange={(e) => setSelGroupRole(e.target.value as ProjectRole)} style={styles.roleSelect}>
+            <option value="project-admin">project-admin</option>
+            <option value="editor">editor</option>
+            <option value="reader">reader</option>
+          </select>
+          <button style={styles.primaryBtn} disabled={!selGroup} onClick={assignGroup}>Assign</button>
+          <button style={styles.muteBtn} onClick={() => setShowAddGroup(false)}>Cancel</button>
+        </div>
+      )}
+
+      <p style={{ ...styles.muted, marginTop: '14px', fontSize: '11px' }}>
+        Effective access: {directCount} direct + {groupMembersTotal} via groups = up to {effectiveUpper} users
+        (the same user can appear in both surfaces — the higher role wins per
+        <code style={{ color: 'var(--text-dim)' }}> requireProjectMembership</code>).
+      </p>
     </div>
   );
 }

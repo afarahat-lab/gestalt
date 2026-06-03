@@ -614,6 +614,19 @@ export class GestaltApiClient {
   async listGroupProjects(groupId: string): Promise<{ data: GroupProjectWithProject[] }> {
     return this.get(`/platform/groups/${groupId}/projects`);
   }
+
+  /** Project-side view of group assignments. Drives the "Group
+   *  assignments" section in `gestalt project members list`. */
+  async listProjectGroups(projectId: string): Promise<{
+    data: Array<{
+      group: PlatformGroupSummary;
+      role: 'project-admin' | 'editor' | 'reader';
+      assignedAt: string;
+      memberCount: number;
+    }>
+  }> {
+    return this.get(`/projects/${projectId}/groups`);
+  }
   async assignGroupToProject(
     groupId: string,
     projectId: string,

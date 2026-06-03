@@ -18,7 +18,7 @@ import type {
   PlatformTemplateSummary, PlatformTemplate, TemplateVariable,
   PlatformMcpServer, PlatformMcpTestResult, PlatformToolInfo,
   IdentityProvider, IdentityState, RoleMapping,
-  PlatformGroup, GroupMember, GroupProjectAssignment,
+  PlatformGroup, GroupMember, GroupProjectAssignment, ProjectGroupAssignment,
 } from '../types';
 
 export class DashboardApiClient {
@@ -501,6 +501,13 @@ export class DashboardApiClient {
   }
   async unassignGroupFromProject(groupId: string, projectId: string): Promise<void> {
     await this.delete(`/platform/groups/${groupId}/projects/${projectId}`);
+  }
+
+  /** Project-side view of group assignments. Drives the "Group access"
+   *  section in Admin → Projects detail and Project Settings →
+   *  Members. Reader minimum at the route level. */
+  async listProjectGroups(projectId: string): Promise<{ data: ProjectGroupAssignment[] }> {
+    return this.get(`/projects/${projectId}/groups`);
   }
 
   // ─── Project config (Approach A — config-as-code) ──────────────────────────

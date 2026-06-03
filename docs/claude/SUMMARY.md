@@ -16,7 +16,7 @@ entries from `SESSION_LOG.md`.
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-03 (Claude Code — Brief 1: Platform groups (bulk user management). Migration 018 adds `platform_groups`, `group_memberships`, `group_project_assignments` with CASCADE on group delete. New `PlatformGroupRepository` with `getEffectiveMemberships(userId)` computing the max role per project across the user's groups via a single SQL CASE-rank aggregation. `requireProjectMembership` + `requireRole` preHandler both merge direct + group-derived membership using max-role precedence. `GET /projects` for regular users returns the union of direct + group-accessible projects. Ten new routes under `/platform/groups`: CRUD + members (add/remove/list) + project assignments (assign/remove/list). Admin gains a "Groups" tab (between Projects and Identity) with Create/Manage panels. `gestalt platform groups list/create/delete/show/add-member/remove-member/assign/unassign` CLI. Verified live: editor via group passes POST /intents but is correctly denied POST /projects/:id/config; max(direct=reader, group=editor)=editor confirmed via successful POST /intents; group delete cascades memberships + assignments but leaves direct project_memberships untouched)
+**Last updated:** 2026-06-03 (Claude Code — Surface group assignments in project member views. New `GET /projects/:id/groups` (reader+) returns `{ group, role, assignedAt, memberCount }[]` via a single SQL JOIN + LEFT JOIN aggregate on `group_memberships`; new `PlatformGroupRepository.listAssignedToProject(projectId)` method (postgres real impl, oracle/mssql throw-stubs). Admin → Projects expanded row gains a Group assignments section with assign/role-change/remove + an "Effective access: N direct + M via groups = up to P users" footer. Project Settings → Members tab gains a Group access section with the same controls + an info note about precedence. CLI `gestalt project members list` prints both Direct members and Group assignments sections side-by-side; new `gestalt project members assign-group <project> <group> --role <role>` and `remove-group <project> <group>` subcommands. Verified live: GET returns the group + memberCount; user with group access can read; UPSERT in-place changes role; CLI flow round-trips through remove + assign --role reader)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -2918,296 +2918,6 @@ enforced"):
 
 ## Recent session log (last 3 entries)
 
-### Session 2026-06-03 — Claude Code (project management in Platform Admin: DELETE /projects/:id + enriched GET /projects + dashboard ProjectsTab rewrite + gestalt platform projects CLI)
-
-Closes the long-standing "platform-admins can't create or delete
-projects from the UI" gap. Adds a typed DELETE endpoint with an
-active-intents guard, enriches GET /projects with cross-project
-stats for platform-admin, rewrites the Admin → Projects tab into a
-full management surface, and ships a `gestalt platform projects`
-CLI group. No new migrations, no new tables — everything sits on the
-existing schema.
-
-Changed:
-
-- `packages/core/src/repository/index.ts`:
-  - `IntentRepository` gained `countByProject(projectId)`,
-    `countActiveByProject(projectId)` (non-terminal statuses only —
-    drives the DELETE guard), `findLatestByProject(projectId)`
-    (`ORDER BY created_at DESC LIMIT 1` — drives `lastActivityAt`)
-  - `ProjectMembershipRepository` gained `countByProject(projectId)`
-    + `deleteAllForProject(projectId)` (returns affected count)
-  - `ProjectRepository` gained `delete(projectId)` + `deleteAllCredentials
-    (projectId)`
-  - `MaintenanceRunRepository` gained `deleteAllForProject(projectId)`
-- `packages/core/src/events/index.ts`: `LiveEventType` union extended
-  with `'project.deleted'` so the SSE stream can carry the new event
-- `packages/adapters/postgres/src/repositories/intents.ts`:
-  implemented the three new methods. `countActiveByProject` uses
-  `WHERE status IN ('generating','in-review','deploying','waiting-for-clarification')`
-  — `escalated` is intentionally NOT in the set (it's paused awaiting
-  operator intervention, deploy chain is not in flight)
-- `packages/adapters/postgres/src/repositories/memberships.ts`:
-  implemented `countByProject` + `deleteAllForProject`. The delete
-  uses the `WITH deleted AS (... RETURNING 1) SELECT COUNT(*)` trick
-  to surface affected-row counts (postgres.js doesn't return them on
-  a naked DELETE — same pattern `gcOlderThan` uses in
-  `deployment-events.ts`)
-- `packages/adapters/postgres/src/repositories/projects.ts`:
-  implemented `delete(id)` + `deleteAllCredentials(id)`. Same
-  affected-count CTE pattern
-- `packages/adapters/postgres/src/repositories/maintenance-runs.ts`:
-  implemented `deleteAllForProject(id)` with the same pattern
-- `packages/adapters/{oracle,mssql}/src/repositories/{intents,
-  memberships,projects,maintenance-runs}.ts`: throw-stubs for every
-  new method so interface drift in core surfaces as a build break
-  here. Same convention every prior session has used
-- `packages/server/src/routes/projects.ts`:
-  - **`GET /projects`** rewritten for the platform-admin branch:
-    parallel `Promise.all(rows.map(...))` that lifts `memberCount`
-    / `intentCount` / `lastActivityAt` per row via the new repo
-    methods. Regular-user branch unchanged — they still see only
-    their per-membership list with no enrichment. The enrichment is
-    intentionally added in a way that the existing `ProjectSummary`
-    type covers via optional fields: clients that don't know to
-    read them just ignore them
-  - **`DELETE /projects/:id`** new route — `requireRole('admin')`
-    preHandler (platform-admin only). Flow:
-    1. Load project; 404 if missing
-    2. `intents.countActiveByProject(id)` — if > 0, return HTTP 400
-       `{ error: '...', code: 'PROJECT_HAS_ACTIVE_INTENTS',
-       activeIntents: N }` so the dashboard's confirm modal can
-       render the typed explanation
-    3. `intents.countByProject(id)` for the audit row
-    4. Tear down in FK-safe order:
-       `memberships.deleteAllForProject` →
-       `projects.deleteAllCredentials` →
-       `maintenanceRuns.deleteAllForProject` → `projects.delete`.
-       `finding_attempts` cascades automatically via its existing
-       ON DELETE CASCADE FK
-    5. Audit row `project.deleted` with `metadata = { name, gitUrl,
-       intentCount, ip }`. The gitUrl is recorded so a future
-       investigator can find the source of truth (the remote repo is
-       NOT deleted by this endpoint — explicit operator decision per
-       the brief)
-    6. `emitLiveEvent('project.deleted', projectId, { projectId, name })`
-       so the dashboard's sidebar selector updates without a refresh
-    7. HTTP 204
-  - **Important architectural detail**: `intents.project_id` is
-    `TEXT NOT NULL` with NO FK constraint (per the original
-    001_initial.sql schema). When a project is deleted, intent rows
-    remain in the DB as orphans. This is intentional historical
-    record — `agent_executions` / `signals` / `artifacts` /
-    `deployment_events` / `interventions` all reference intents
-    (not projects), so the full execution history of past cycles is
-    preserved indefinitely. Operators investigating a past incident
-    can still query `audit_log` + the orphan intent + its execution
-    artifacts after the project itself has been removed
-- `packages/dashboard/src/types.ts`: `ProjectSummary` gained optional
-  `memberCount` / `intentCount` / `lastActivityAt` fields
-- `packages/dashboard/src/api/client.ts`: new `createProject`,
-  `initProjectHarness`, `deleteProject` methods
-- `packages/dashboard/src/context/ProjectContext.tsx`: exposed the
-  existing internal `refresh()` on the context value so the Admin
-  Projects tab can trigger an immediate sidebar selector refresh
-  after create/delete (instead of waiting for the window-focus
-  refresh)
-- `packages/dashboard/src/views/Admin.tsx`: `ProjectsTab` rewritten.
-  Toolbar with `+ Create project` + Search input. Table columns
-  changed from `Project / Git URL / Members` to `Name (with Git
-  URL subtitle) / Members / Intents / Last activity / Actions`.
-  New `formatRelative(iso)` helper renders `42s ago` / `5m ago` /
-  `2h ago` / `3d ago` / falls back to locale date past 30 days.
-  Per-row actions: `⚙` (open project settings via
-  `navigate('/projects/:id/settings')`), `→` (set
-  `currentProjectId` via context + `navigate('/')`), `×` (open
-  delete modal). The pre-existing inline `MembersList`
-  expand-on-click is preserved
-- `CreateProjectModal` (new) — name / Git URL / default branch
-  (default `main`) / Git token (password input) / optional
-  description. Two-stage submission with visible stage labels:
-  `Registering project...` (POST /projects), `Cloning + writing
-  harness...` (POST /projects/:id/init-harness with auto-default
-  description `Project <name> created via platform admin`). Done
-  screen shows `✓ Project <name> created. Harness committed and
-  pushed to <gitUrl>.` and a `Close` button that triggers the
-  parent's `reload()` + `refreshContext()`
-- `DeleteProjectModal` (new) — three-bullet list of what gets
-  deleted (intents + execution history, member assignments, Git
-  credentials + maintenance runs) using the enriched
-  `intentCount` / `memberCount` for accuracy. Explicit "The Git
-  repository itself will NOT be deleted" notice. Requires typing
-  the project name exactly to enable the red `Delete project`
-  button (button shows 40% opacity + `not-allowed` cursor when
-  disabled). Parses `PROJECT_HAS_ACTIVE_INTENTS` from
-  `err.body` and surfaces "Cannot delete — this project has N
-  active intents. Wait for them to complete or fail first."
-  inline without dismissing the modal
-- `packages/cli/src/api/client.ts`:
-  - `ProjectRecord` gained the same optional enrichment fields
-    (memberCount / intentCount / lastActivityAt) so the CLI's
-    `platform projects list` can render them
-  - new `deleteProject(id)` method
-- `packages/cli/src/commands/platform-config.ts`:
-  - new `platformProjectsListCommand` — table via the existing
-    `printTable` helper. Columns: `Name (26) / Members (10) /
-    Intents (10) / Last activity (16) / Git URL (48)`. Empty
-    list prints `No projects registered.`
-  - new `platformProjectsCreateCommand` — interactive prompts
-    (name / git URL / default branch with `main` default /
-    hidden TTY git token via `promptSecret` / optional
-    description). Two-stage flow with `Registering project...`
-    + `Initialising harness (clone + commit + push)...` status
-    lines, then `✓ Project created and harness initialised:
-    <name>`
-  - new `platformProjectsDeleteCommand` — prints the three-
-    bullet "will delete" summary, then prompts `Type the
-    project name to confirm:` and aborts if the typed input
-    doesn't match. Special-cases `PROJECT_HAS_ACTIVE_INTENTS`
-    (parses the error string) → `✗ Cannot delete — this
-    project has active intents.` with a hint pointing at
-    `gestalt alerts`
-- `packages/cli/src/index.ts`: registered `gestalt platform
-  projects` parent + `list / create / delete <name>`
-  subcommands. Top-of-file comment + header docstring updated
-
-Verified live end-to-end (against an existing postgres; no DB
-volume wipe — only the new schema-less code paths needed
-exercising):
-
-- `pnpm -r build` clean across all 12 packages
-- `docker compose up -d --build server` — `Up (healthy)`; new
-  routes register at startup; existing migrations unchanged
-- **Enriched GET /projects** (with a seeded test project that has 1
-  membership + 2 intents): returns `memberCount: 1, intentCount: 2,
-  lastActivityAt: <iso>` — verified via direct curl + jq
-- **Active-intents guard**: inserted one `generating` intent → DELETE
-  returned `{"error":"Cannot delete — this project has active
-  intents. Wait for them to complete or fail first.","code":
-  "PROJECT_HAS_ACTIVE_INTENTS","activeIntents":1}` + HTTP 400. Flipped
-  the intent to `failed` → DELETE returned HTTP 204
-- **Post-delete state inspection**:
-  ```
-  projects                    | 0
-  memberships                 | 0
-  intents (orphans, expected) | 3
-  audit (project.deleted)     | 1
-  ```
-  The 3 intent rows are the intentional historical record. The
-  audit row carries `metadata = { "name":"verify-pm-test",
-  "gitUrl":"https://github.com/example/verify-pm-test.git",
-  "intentCount":3, "ip":"192.168.65.1" }` — no other fields, no
-  leaked credentials
-- **404 path**: bogus UUID returns `{"error":"Project not found"}`
-  + HTTP 404
-- **Auth guards**: no Authorization header → HTTP 401
-  `{"error":"Authentication required"}`. As a regular `user` role
-  → HTTP 403 `{"error":"Platform admin required","code":"FORBIDDEN"}`.
-  The regular user's `GET /projects` returns `{"data":[]}` (their
-  per-membership filter; never reaches the enrichment branch — the
-  enrichment code is gated on `request.user.role === 'platform-admin'`)
-- **CLI populated list**: `gestalt platform projects list` against
-  a seeded `cli-test` project renders:
-  ```
-  Name                        Members     Intents     Last activity     Git URL
-  cli-test                    1           0           0s ago            https://github.com/example/cli-test.git
-  ```
-- **CLI delete with matching name**: pipe `cli-test` to stdin → 6-line
-  confirmation block + `? Type the project name to confirm:` prompt
-  + `✓ Project deleted: cli-test`. Direct DB query confirms the
-  project row is gone
-- **CLI delete with mismatched name**: pipe `WRONG_NAME` to stdin →
-  same confirmation block + `Names do not match. Aborted.` + exit
-  code 1. Direct DB query confirms the project row is still present
-
-Decisions:
-
-- **Active-intents guard rejects `generating | in-review | deploying
-  | waiting-for-clarification`** — the four non-terminal statuses that
-  could mutate the project's Git tree or queue more work. `escalated`
-  is intentionally NOT in the set: it's a paused state awaiting
-  operator intervention via `POST /interventions`, and the deploy
-  chain is not in flight. An operator who wants to delete an
-  escalated-cycle project can do so without first acknowledging the
-  breach (they've decided the project goes; the breach data
-  becomes part of the historical record). Documented in the postgres
-  impl's comment
-- **`memberCount`/`intentCount`/`lastActivityAt` are optional on the
-  shared `ProjectSummary` type.** Regular users get the same TypeScript
-  type but with the fields missing at runtime. The dashboard's
-  pre-existing list view doesn't touch them; the new Admin view falls
-  back to `'—'` when undefined. Could have introduced a separate
-  `PlatformAdminProjectSummary extends ProjectSummary` but the
-  optionality is simpler and the call sites that consume the
-  enrichment (Admin tab + CLI `platform projects list`) are exactly
-  the call sites that know to expect platform-admin returns
-- **Intent rows are intentional orphans on project deletion.**
-  Per ADR-002 (ephemeral workers) and the way the historical record
-  is structured, `agent_executions` / `signals` / `artifacts` /
-  `deployment_events` / `interventions` all FK to intents (not
-  projects). Deleting the project but preserving the intents means
-  the full execution history survives — an operator investigating
-  a past incident months later can still query `audit_log` (for
-  the project.deleted record) + the orphan intents + their
-  artifacts. The 3 orphan intent rows in the verification cycle
-  are the documented expected behaviour
-- **Explicit deletes of `memberships` / `maintenanceRuns` even
-  though some FKs have ON DELETE CASCADE.** `project_memberships.
-  project_id` has CASCADE; the explicit delete is for predictability
-  (the route always knows the row count it removed; the audit-side
-  story is clean). `maintenance_runs.project_id` has NO ON DELETE
-  clause (defaults to NO ACTION which would BLOCK the delete) — the
-  explicit delete is REQUIRED here, not optional. The verification
-  cycle didn't exercise this path because the test project had no
-  maintenance runs, but the code path is structurally identical to
-  the memberships path
-- **`gestalt platform projects list` is distinct from `gestalt
-  projects list`.** The plural `projects` command (existing) shows
-  the current user's per-membership list — operators run it from
-  any role. The new singular-under-platform `projects` command shows
-  every project with cross-project stats — platform-admin only.
-  The CLI top-of-file comment + header docstring document the
-  distinction
-- **Dashboard `[→] Switch to this project` uses the existing
-  `ProjectContext.setCurrentProjectId`.** No new context method.
-  Platform-admins bypass every project membership check server-side,
-  so they can "enter" any project's intent feed / maintenance view
-  / etc. as if they were a member. The Layout sidebar's project
-  selector updates because the same `setCurrentProjectId` writes to
-  localStorage
-- **CreateProjectModal description auto-defaults rather than being
-  required.** The brief specified `Project <name> created via
-  platform admin` as the default. Letting the operator type a
-  custom description is the niche case (most platform-admins
-  creating via the dashboard won't bother); requiring it would
-  add friction
-- **`project.deleted` SSE event payload is minimal: `{ projectId,
-  name }`.** No need to include gitUrl or the intent count — the
-  dashboard's only consumer of this event today is the
-  ProjectContext refresh trigger. Future consumers can add fields
-  to the payload without breaking the existing one
-- **No migration even though we expose new DB-side semantics.**
-  Every new repo method is a different SQL query against existing
-  tables — no schema changes, no enum additions. The schema-level
-  contract didn't move; the API surface did
-
-Build status: `pnpm -r build` clean across all 12 packages. Server
-image rebuilt; new routes register at startup; all 16 migrations
-still apply on first start. CLI rebuilt and the linked binary
-surfaces the new subcommands. Full feature verified end-to-end
-against seeded data; the only path NOT exercised live is the
-`gestalt platform projects create` interactive flow (requires a
-real Git URL + PAT) — verified by inspection that it calls
-`createProject` + `initHarness` against the same routes the
-existing `gestalt init` flow uses, which IS tested live in earlier
-sessions.
-
-No new Pending enhancements introduced. The original "platform-
-admin can't create or delete projects from the UI" gap is now
-fully resolved.
-
----
-
 ### Session 2026-06-03 — Claude Code (Session 3: Templates / Platform MCP / Tools view / Corporate Identity UI + [+ Create project] bug fix — migration 017)
 
 Five areas in one session. The first is a bug fix; the four others add
@@ -3883,3 +3593,170 @@ Migration 018 applied. Server image rebuilt. Full feature
 verified end-to-end against the live platform — group-derived
 project access, max-of-roles precedence, CLI flow, CASCADE on
 delete, direct membership survival.
+
+---
+
+### Session 2026-06-03 — Claude Code (surface group assignments in project member views)
+
+Operators couldn't see which groups were assigned to a specific
+project from inside the project context. The data was always
+available (via `GET /platform/groups/:id/projects` per group), but
+forced an N+1 walk. This session adds the project-side endpoint
+(`GET /projects/:id/groups`) + threads it through both
+Admin → Projects detail panel and Project Settings → Members tab,
+plus the CLI's `project members list` view. No new migrations.
+
+Changed:
+
+- `packages/core/src/repository/index.ts`:
+  `PlatformGroupRepository.listAssignedToProject(projectId)`
+  added. Returns `{ group: PlatformGroupRecord, role, assignedAt,
+  memberCount }[]` — the joined view the routes consume directly.
+  Documented as the project-side counterpart to the existing
+  `listProjectAssignments(groupId)`
+- `packages/adapters/postgres/src/repositories/platform-groups.ts`:
+  `listAssignedToProject` impl. Single round-trip:
+  `group_project_assignments` JOIN `platform_groups` LEFT JOIN a
+  `(group_id, COUNT(*))` subquery on `group_memberships`. LEFT JOIN
+  so a group with zero members still appears with `memberCount: 0`.
+  Ordered by group name
+- `packages/adapters/{oracle,mssql}/src/repositories/platform-groups.ts`:
+  throw-stub `listAssignedToProject` for parity
+- `packages/server/src/routes/memberships.ts`: new
+  `GET /projects/:id/groups` route. Loads the project (404 if
+  missing), runs `checkProjectMembership(... 'reader')` so every
+  project member can SEE which groups have access (informational —
+  the brief calls this out), then calls
+  `platformGroups.listAssignedToProject(projectId)`. Mutations
+  still go through `/platform/groups/:groupId/projects` (POST upsert,
+  DELETE) which require platform-admin
+- `packages/dashboard/src/types.ts`: new `ProjectGroupAssignment`
+  type mirroring the route shape (group + role + assignedAt +
+  memberCount)
+- `packages/dashboard/src/api/client.ts`: new
+  `listProjectGroups(projectId)` method
+- `packages/dashboard/src/views/Admin.tsx`:
+  `MembersList` (rendered in the per-project expanded row of the
+  Projects tab) gains a "Group assignments" section below the
+  existing "Direct members" section. Loaded in parallel with the
+  global groups list (for the `+ Assign group` picker). Per-row
+  select for in-place role change (UPSERT via
+  `assignGroupToProject` with the new role) + Remove button.
+  Footer line shows "Effective access: N direct + M via groups =
+  up to P users" — labelled "up to" because the count doesn't
+  dedupe users who appear in both surfaces (brief calls out this
+  limitation explicitly)
+- `packages/dashboard/src/views/ProjectSettings.tsx`:
+  `MembersTab` extended with a Group access card below the
+  existing Direct members card. Same data flow as Admin's
+  `MembersList` — loads members + project groups + all platform
+  groups in parallel on mount; per-row role select + Remove;
+  `+ Assign group` opens a new `AssignGroupModal` (group picker +
+  role select) that calls `assignGroupToProject`. Action banner
+  reuses the existing `actionMsg` / `actionError` plumbing
+- `packages/cli/src/api/client.ts`: new `listProjectGroups`
+  method
+- `packages/cli/src/commands/project-config.ts`:
+  `projectMembersListCommand` rewritten to call BOTH
+  `listProjectMembers` and `listProjectGroups` in parallel.
+  Prints two clearly-labelled sections:
+  - `Direct members — <projectName> (N)` table
+  - `Group assignments — <projectName> (N)` table with `Group /
+    Members ("N members") / Role / Description` columns
+  - New `projectMembersAssignGroupCommand(projectName, groupName,
+    { role })` — resolves the group by name, calls
+    `assignGroupToProject` (UPSERT — re-running updates the role in
+    place)
+  - New `projectMembersRemoveGroupCommand(projectName, groupName)`
+    — calls `unassignGroupFromProject`
+- `packages/cli/src/index.ts`: registers
+  `gestalt project members assign-group <projectName> <groupName>
+  [--role <role>]` (default `editor`) and `remove-group
+  <projectName> <groupName>` subcommands
+
+Verified live end-to-end:
+
+- `pnpm -r build` clean across all 12 packages; server image
+  rebuilt
+- Seeded a synthetic project `verify-proj-groups` + admin
+  membership for `a@b.c` via SQL
+- Group `verify-pj-group` (already existed) had `user@test.local`
+  as a member; assigned the group to `verify-proj-groups` as
+  editor via the existing route
+- `GET /projects/<id>/groups` returns `{ data: [{ group, role:
+  'editor', assignedAt, memberCount: 1 }] }` — single row with
+  the embedded group record and member count populated by the
+  SQL LEFT JOIN
+- `user@test.local` (group editor, no direct membership) hit the
+  endpoint → HTTP 200 with the same payload (reader+ check passes
+  via group editor role — the `checkProjectMembership` integration
+  from Brief 1 already accounted for this)
+- UPSERT in-place: POST the existing route with
+  `role: 'project-admin'` → subsequent GET shows the new role
+- **CLI `gestalt project members list --project verify-proj-groups`**
+  prints both sections cleanly:
+  ```
+  Direct members — verify-proj-groups (1)
+  ...
+  a@b.c    amr    ★ project-admin    6/3/2026
+
+  Group assignments — verify-proj-groups (1)
+  ...
+  verify-pj-group    1 member    ★ project-admin    For group-in-project view
+  ```
+- `gestalt project members remove-group verify-proj-groups
+  verify-pj-group` succeeded, then
+  `assign-group verify-proj-groups verify-pj-group --role reader`
+  re-assigned with the new role — final list shows
+  `verify-pj-group    1 member    ○ reader`
+- Cleanup: DELETE the group + project rows; `\dt` confirms clean
+  state
+
+Decisions:
+
+- **`GET /projects/:id/groups` requires reader+, not project-admin.**
+  The brief was explicit: every member sees which groups have
+  access (informational). Mutations still flow through the
+  platform-group routes which require platform-admin. The
+  dashboard's per-row role select + Remove buttons in the
+  ProjectSettings → Members tab will surface a 403 if a regular
+  editor tries to mutate — that's the right UX because the
+  controls would be invisible without first showing the data
+- **Member count as a LEFT JOIN, not a follow-up COUNT per group.**
+  The route returns N rows; an N+1 follow-up would make a 5-group
+  project do 6 queries instead of 1. The LEFT JOIN (versus inner
+  JOIN) ensures groups with zero members still render with
+  `memberCount: 0` rather than vanishing from the list
+- **"Effective access: N direct + M via groups = up to P users"
+  in the dashboard footer.** Brief was explicit about the
+  deduplication caveat — a user can be both a direct member AND
+  a member of an assigned group. The "up to" label sets the right
+  expectation without requiring a full user-deduplicated count
+  (which would mean joining direct memberships against every
+  assigned group's member list — an O(M*N) query that's overkill
+  for an informational footer)
+- **UPSERT semantics surfaced in both UI and CLI.** The role
+  select on a group row calls `assignGroupToProject` with the
+  NEW role; the existing route does
+  `INSERT ... ON CONFLICT DO UPDATE`. Operators expect "change
+  editor to project-admin" to be one action; no separate "update"
+  path needed
+- **CLI uses `openClient({ ...options, project: projectName })`
+  to override the current-project lookup.** The new
+  `assign-group` / `remove-group` subcommands take `<projectName>`
+  as a positional argument (per the brief), not via `--project`,
+  so they can read against a project other than the operator's
+  current one without losing context. The threaded `project`
+  option in `openClient` is the existing pattern
+- **`AssignGroupModal` is a new shared modal in ProjectSettings**
+  rather than reusing the inline picker from Admin. The
+  ProjectSettings tab uses modals throughout (its existing
+  `AddMemberModal` is a modal too) — visual consistency wins over
+  code reuse for a 50-line component
+
+Build status: `pnpm -r build` clean across all 12 packages; server
+image rebuilt. New route + dashboard + CLI all verified live with
+a synthetic project. No migration needed; no existing data shape
+changed.
+
+No new Pending enhancements introduced.

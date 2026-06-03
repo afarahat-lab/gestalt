@@ -27,4 +27,5 @@ export class MssqlPlatformGroupRepository implements PlatformGroupRepository {
   async removeFromProject(_g: string, _p: string): Promise<void> { return notImplemented(); }
   async listProjectAssignments(_g: string): Promise<GroupProjectWithProject[]> { return notImplemented(); }
   async getEffectiveMemberships(_u: string): Promise<EffectiveProjectMembership[]> { return notImplemented(); }
+  async listAssignedToProject(_p: string): Promise<Array<{ group: PlatformGroupRecord; role: 'project-admin' | 'editor' | 'reader'; assignedAt: Date; memberCount: number }>> { return notImplemented(); }
 }

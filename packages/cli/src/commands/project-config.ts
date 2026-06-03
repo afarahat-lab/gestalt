@@ -474,32 +474,114 @@ export async function projectMembersListCommand(options: BaseOptions = {}): Prom
   if (!ctx) return;
   const { client, projectId, projectName, serverUrl } = ctx;
   try {
-    const res = await client.listProjectMembers(projectId);
+    // Both lookups in parallel — they're independent and operators
+    // expect both surfaces in a single command.
+    const [direct, groups] = await Promise.all([
+      client.listProjectMembers(projectId),
+      client.listProjectGroups(projectId).catch(() => ({ data: [] })),
+    ]);
     blank();
-    console.log(c.bold(`Members of ${projectName} (${res.data.length})`));
+    console.log(c.bold(`Direct members — ${projectName} (${direct.data.length})`));
     divider();
-    if (res.data.length === 0) {
-      console.log(c.dim('No members yet — add one with: gestalt project members add <email> --role <role>'));
-      blank();
-      return;
+    if (direct.data.length === 0) {
+      console.log(c.dim('No direct members — add one with: gestalt project members add <email> --role <role>'));
+    } else {
+      printTable(
+        direct.data.map((m) => ({
+          email: m.email,
+          name: m.displayName || c.dim('(no name)'),
+          role: projectRoleBadge(m.projectRole),
+          added: new Date(m.createdAt).toLocaleDateString(),
+        })),
+        [
+          { key: 'email', header: 'Email', width: 36 },
+          { key: 'name',  header: 'Name',  width: 24 },
+          { key: 'role',  header: 'Role',  width: 18 },
+          { key: 'added', header: 'Added', width: 12 },
+        ],
+      );
     }
-    printTable(
-      res.data.map((m) => ({
-        email: m.email,
-        name: m.displayName || c.dim('(no name)'),
-        role: projectRoleBadge(m.projectRole),
-        added: new Date(m.createdAt).toLocaleDateString(),
-      })),
-      [
-        { key: 'email', header: 'Email', width: 36 },
-        { key: 'name',  header: 'Name',  width: 24 },
-        { key: 'role',  header: 'Role',  width: 18 },
-        { key: 'added', header: 'Added', width: 12 },
-      ],
-    );
+    blank();
+    console.log(c.bold(`Group assignments — ${projectName} (${groups.data.length})`));
+    divider();
+    if (groups.data.length === 0) {
+      console.log(c.dim('No groups assigned — assign one with: gestalt project members assign-group <projectName> <groupName> --role <role>'));
+    } else {
+      printTable(
+        groups.data.map((g) => ({
+          group: c.info(g.group.name),
+          members: `${g.memberCount} member${g.memberCount === 1 ? '' : 's'}`,
+          role: projectRoleBadge(g.role),
+          description: g.group.description ? c.dim(g.group.description) : c.dim('—'),
+        })),
+        [
+          { key: 'group',       header: 'Group',       width: 28 },
+          { key: 'members',     header: 'Members',     width: 14 },
+          { key: 'role',        header: 'Role',        width: 18 },
+          { key: 'description', header: 'Description', width: 40 },
+        ],
+      );
+    }
     blank();
   } catch (err) {
     handleErr(err, serverUrl, 'Failed to list members');
+  }
+}
+
+export interface MembersAssignGroupOptions extends BaseOptions {
+  role?: string;
+}
+
+export async function projectMembersAssignGroupCommand(
+  projectName: string,
+  groupName: string,
+  options: MembersAssignGroupOptions = {},
+): Promise<void> {
+  const ctx = await openClient({ ...options, project: projectName });
+  if (!ctx) return;
+  const { client, projectId, serverUrl } = ctx;
+  const role = options.role ?? 'editor';
+  if (!['project-admin', 'editor', 'reader'].includes(role)) {
+    console.log(c.error(`Invalid role '${role}'. Must be one of: project-admin, editor, reader`));
+    process.exit(1);
+  }
+  try {
+    const groupsRes = await client.listPlatformGroups();
+    const group = groupsRes.data.find((g) => g.name === groupName);
+    if (!group) {
+      console.log(c.error(`No group named '${groupName}'. Run: gestalt platform groups list`));
+      process.exit(1);
+    }
+    await client.assignGroupToProject(group.id, projectId, role as 'project-admin' | 'editor' | 'reader');
+    blank();
+    console.log(c.success(`✓ Assigned group '${groupName}' to project '${projectName}' as ${role}`));
+    blank();
+  } catch (err) {
+    handleErr(err, serverUrl, `Failed to assign group ${groupName}`);
+  }
+}
+
+export async function projectMembersRemoveGroupCommand(
+  projectName: string,
+  groupName: string,
+  options: BaseOptions = {},
+): Promise<void> {
+  const ctx = await openClient({ ...options, project: projectName });
+  if (!ctx) return;
+  const { client, projectId, serverUrl } = ctx;
+  try {
+    const groupsRes = await client.listPlatformGroups();
+    const group = groupsRes.data.find((g) => g.name === groupName);
+    if (!group) {
+      console.log(c.error(`No group named '${groupName}'. Run: gestalt platform groups list`));
+      process.exit(1);
+    }
+    await client.unassignGroupFromProject(group.id, projectId);
+    blank();
+    console.log(c.success(`✓ Removed group '${groupName}' from project '${projectName}'`));
+    blank();
+  } catch (err) {
+    handleErr(err, serverUrl, `Failed to remove group ${groupName}`);
   }
 }
 

@@ -22,6 +22,8 @@
  *   gestalt project config set-tools <role>
  *   gestalt project config set-pipeline                      — replaces set-adapter
  *   gestalt project members list / add / remove / role
+ *   gestalt project members assign-group <project> <group> --role <role>
+ *   gestalt project members remove-group <project> <group>
  *   gestalt platform llms list                              — registered LLMs
  *   gestalt platform llms add                               — interactive add
  *   gestalt platform llms set-default <name>
@@ -102,6 +104,7 @@ import {
   projectConfigSetToolsCommand, projectConfigSetPipelineCommand,
   projectMembersListCommand, projectMembersAddCommand,
   projectMembersRemoveCommand, projectMembersRoleCommand,
+  projectMembersAssignGroupCommand, projectMembersRemoveGroupCommand,
 } from './commands/project-config';
 import {
   platformLlmsListCommand, platformLlmsAddCommand,
@@ -401,6 +404,23 @@ projectMembers
   .option('--project <name>', 'Project name (defaults to current project)')
   .action(async (email: string, role: string, opts: { server?: string; project?: string }) => {
     await projectMembersRoleCommand(email, role, { server: opts.server, project: opts.project }).catch(fatalError);
+  });
+
+projectMembers
+  .command('assign-group <projectName> <groupName>')
+  .description('Assign a platform group to this project (UPSERT — re-runs update the role in place).')
+  .option('--role <role>', 'Role for the group on this project (project-admin|editor|reader)', 'editor')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (projectName: string, groupName: string, opts: { role?: string; server?: string }) => {
+    await projectMembersAssignGroupCommand(projectName, groupName, { role: opts.role, server: opts.server }).catch(fatalError);
+  });
+
+projectMembers
+  .command('remove-group <projectName> <groupName>')
+  .description('Remove a platform group from this project. Direct memberships are unaffected.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (projectName: string, groupName: string, opts: { server?: string }) => {
+    await projectMembersRemoveGroupCommand(projectName, groupName, { server: opts.server }).catch(fatalError);
   });
 
 // gestalt maintenance

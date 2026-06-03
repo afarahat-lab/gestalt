@@ -252,6 +252,57 @@ export class PostgresPlatformGroupRepository implements PlatformGroupRepository 
 
   // ─── Effective memberships ──────────────────────────────────────────────
 
+  async listAssignedToProject(projectId: string): Promise<Array<{
+    group: PlatformGroupRecord;
+    role: 'project-admin' | 'editor' | 'reader';
+    assignedAt: Date;
+    memberCount: number;
+  }>> {
+    const db = getDb();
+    // Single round-trip: project assignments → JOIN groups → LEFT JOIN
+    // membership-count subquery. `LEFT JOIN` so a group with zero
+    // members still appears with `memberCount: 0` rather than being
+    // filtered out.
+    const rows = await db<Array<{
+      groupId: string; groupName: string; groupDescription: string | null;
+      groupCreatedBy: string | null; groupCreatedAt: Date;
+      role: 'project-admin' | 'editor' | 'reader';
+      assignedAt: Date;
+      memberCount: string;
+    }>>`
+      SELECT
+        g.id          AS group_id,
+        g.name        AS group_name,
+        g.description AS group_description,
+        g.created_by  AS group_created_by,
+        g.created_at  AS group_created_at,
+        a.role,
+        a.assigned_at,
+        COALESCE(mc.member_count, 0)::text AS member_count
+      FROM group_project_assignments a
+      JOIN platform_groups g ON g.id = a.group_id
+      LEFT JOIN (
+        SELECT group_id, COUNT(*)::int AS member_count
+        FROM group_memberships
+        GROUP BY group_id
+      ) mc ON mc.group_id = g.id
+      WHERE a.project_id = ${projectId}
+      ORDER BY g.name ASC
+    `;
+    return rows.map((r) => ({
+      group: {
+        id: r.groupId,
+        name: r.groupName,
+        description: r.groupDescription,
+        createdBy: r.groupCreatedBy,
+        createdAt: r.groupCreatedAt,
+      },
+      role: r.role,
+      assignedAt: r.assignedAt,
+      memberCount: parseInt(r.memberCount, 10),
+    }));
+  }
+
   async getEffectiveMemberships(userId: string): Promise<EffectiveProjectMembership[]> {
     const db = getDb();
     // Single round-trip: JOIN memberships → assignments, group by

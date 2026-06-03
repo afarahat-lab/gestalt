@@ -566,3 +566,14 @@ export interface GroupProjectAssignment {
   assignedAt: string;
   project: ProjectSummary;
 }
+
+/** Project-side view returned by `GET /projects/:id/groups`. Each
+ *  row carries the group record, the role the group has on the
+ *  project, and the group's current member count so the dashboard
+ *  can show "(N members)" without an N+1 lookup. */
+export interface ProjectGroupAssignment {
+  group: PlatformGroup;
+  role: 'project-admin' | 'editor' | 'reader';
+  assignedAt: string;
+  memberCount: number;
+}

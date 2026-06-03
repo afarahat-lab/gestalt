@@ -33,6 +33,7 @@ import { PageHeader, Card, EmptyState, LoadingSpinner } from '../components/shar
 import type {
   ProjectConfigResponse, EditableAgentConfig, ProjectConfigCustomAgent,
   ProjectMember, UserSummary, ProjectRole, PlatformLLM,
+  PlatformGroup, ProjectGroupAssignment,
 } from '../types';
 import { ApiError } from '../api/client';
 
@@ -162,16 +163,28 @@ export function ProjectSettings() {
 function MembersTab({ projectId }: { projectId: string }) {
   const api = useDashboardApi();
   const [members, setMembers] = useState<ProjectMember[]>([]);
+  const [groups, setGroups] = useState<ProjectGroupAssignment[]>([]);
+  const [allGroups, setAllGroups] = useState<PlatformGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
+  const [showAddGroup, setShowAddGroup] = useState(false);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
   const load = async () => {
     setLoading(true);
     try {
-      const res = await api.listMembers(projectId);
-      setMembers(res.data);
+      // Run all three in parallel — the route guarantees they're all
+      // available to anyone with reader+ access (no per-section auth
+      // fork).
+      const [m, g, all] = await Promise.all([
+        api.listMembers(projectId),
+        api.listProjectGroups(projectId),
+        api.listPlatformGroups(),
+      ]);
+      setMembers(m.data);
+      setGroups(g.data);
+      setAllGroups(all.data);
     } finally {
       setLoading(false);
     }
@@ -201,13 +214,41 @@ function MembersTab({ projectId }: { projectId: string }) {
     }
   }
 
+  async function handleGroupRoleChange(groupId: string, role: ProjectRole, groupName: string) {
+    setActionMsg(null); setActionError(null);
+    try {
+      // UPSERT — the assign-to-project endpoint updates the role in
+      // place when a row already exists for this (group, project).
+      await api.assignGroupToProject(groupId, projectId, role);
+      setActionMsg(`Updated group '${groupName}' → ${role}`);
+      await load();
+    } catch (err) {
+      setActionError(err instanceof ApiError ? extractErrorMessage(err) : String(err));
+    }
+  }
+
+  async function handleGroupRemove(groupId: string, groupName: string) {
+    if (!window.confirm(`Remove group '${groupName}' from this project? Group members lose group-derived access; direct members are unaffected.`)) return;
+    setActionMsg(null); setActionError(null);
+    try {
+      await api.unassignGroupFromProject(groupId, projectId);
+      setActionMsg(`Removed group '${groupName}'`);
+      await load();
+    } catch (err) {
+      setActionError(err instanceof ApiError ? extractErrorMessage(err) : String(err));
+    }
+  }
+
   if (loading) return <LoadingSpinner />;
+
+  const assignedGroupIds = new Set(groups.map((g) => g.group.id));
+  const availableGroups = allGroups.filter((g) => !assignedGroupIds.has(g.id));
 
   return (
     <Card>
       <div style={styles.cardBody}>
         <div style={styles.cardHeader}>
-          <h3 style={styles.cardTitle}>Members</h3>
+          <h3 style={styles.cardTitle}>Direct members ({members.length})</h3>
           <button style={styles.primaryBtn} onClick={() => setShowAdd(true)}>+ Add member</button>
         </div>
         {actionMsg && <div style={styles.successBanner}>{actionMsg}</div>}
@@ -246,12 +287,131 @@ function MembersTab({ projectId }: { projectId: string }) {
         </table>
         {members.length === 0 && (
           <p style={{ color: 'var(--text-dim)', textAlign: 'center', padding: '20px' }}>
-            No members yet.
+            No direct members yet.
           </p>
         )}
+
+        <div style={{ ...styles.cardHeader, marginTop: '20px' }}>
+          <h3 style={styles.cardTitle}>Group access ({groups.length})</h3>
+          {availableGroups.length > 0 && (
+            <button style={styles.primaryBtn} onClick={() => setShowAddGroup(true)}>+ Assign group</button>
+          )}
+        </div>
+        <table style={styles.table}>
+          <thead>
+            <tr>
+              <th style={styles.th}>Group</th>
+              <th style={styles.th}>Members</th>
+              <th style={styles.th}>Role</th>
+              <th style={styles.th}>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {groups.map((a) => (
+              <tr key={a.group.id}>
+                <td style={styles.td}>
+                  {a.group.name}
+                  {a.group.description && <div style={{ color: 'var(--text-dim)', fontSize: '11px' }}>{a.group.description}</div>}
+                </td>
+                <td style={styles.td}>{a.memberCount}</td>
+                <td style={styles.td}>
+                  <select
+                    value={a.role}
+                    onChange={(e) => void handleGroupRoleChange(a.group.id, e.target.value as ProjectRole, a.group.name)}
+                    style={styles.select}
+                  >
+                    <option value="project-admin">★ Project admin</option>
+                    <option value="editor">● Editor</option>
+                    <option value="reader">○ Reader</option>
+                  </select>
+                </td>
+                <td style={styles.td}>
+                  <button style={styles.dangerBtn} onClick={() => void handleGroupRemove(a.group.id, a.group.name)}>Remove</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {groups.length === 0 && (
+          <p style={{ color: 'var(--text-dim)', textAlign: 'center', padding: '20px' }}>
+            No groups assigned. Click + Assign group to grant access to every member of a platform group at once.
+          </p>
+        )}
+        <p style={{ color: 'var(--text-dim)', fontSize: '11px', margin: '10px 0 0' }}>
+          ℹ Group members inherit the group's project role. If a user has both direct and group access, the higher role applies.
+        </p>
+
         {showAdd && <AddMemberModal projectId={projectId} onClose={() => setShowAdd(false)} onAdded={() => { void load(); setShowAdd(false); }} />}
+        {showAddGroup && (
+          <AssignGroupModal
+            projectId={projectId}
+            availableGroups={availableGroups}
+            onClose={() => setShowAddGroup(false)}
+            onAdded={() => { void load(); setShowAddGroup(false); }}
+          />
+        )}
       </div>
     </Card>
+  );
+}
+
+function AssignGroupModal(props: {
+  projectId: string;
+  availableGroups: PlatformGroup[];
+  onClose: () => void;
+  onAdded: () => void;
+}) {
+  const api = useDashboardApi();
+  const [groupId, setGroupId] = useState('');
+  const [role, setRole] = useState<ProjectRole>('editor');
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  async function save() {
+    if (!groupId) return;
+    setError(null);
+    setSaving(true);
+    try {
+      await api.assignGroupToProject(groupId, props.projectId, role);
+      props.onAdded();
+    } catch (err) {
+      setError(err instanceof ApiError ? extractErrorMessage(err) : String(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div style={styles.modalBackdrop} onClick={props.onClose}>
+      <div style={{ ...styles.modal, maxWidth: '460px' }} onClick={(e) => e.stopPropagation()}>
+        <h3 style={styles.cardTitle}>Assign a group</h3>
+        {error && <div style={styles.errorBanner}>{error}</div>}
+        <label style={styles.label}>Group
+          <select style={styles.select} value={groupId} onChange={(e) => setGroupId(e.target.value)} autoFocus>
+            <option value="">— select a group —</option>
+            {props.availableGroups.map((g) => (
+              <option key={g.id} value={g.id}>{g.name}{g.description ? ` — ${g.description}` : ''}</option>
+            ))}
+          </select>
+        </label>
+        <label style={styles.label}>Role
+          <select style={styles.select} value={role} onChange={(e) => setRole(e.target.value as ProjectRole)}>
+            <option value="project-admin">★ Project admin</option>
+            <option value="editor">● Editor</option>
+            <option value="reader">○ Reader</option>
+          </select>
+        </label>
+        <p style={{ color: 'var(--text-dim)', fontSize: '11px', margin: 0 }}>
+          Every member of the group gets this role on the project. Direct memberships are unaffected.
+        </p>
+        <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+          <button style={styles.linkBtn} onClick={props.onClose}>Cancel</button>
+          <button style={styles.primaryBtn} disabled={!groupId || saving} onClick={() => void save()}>
+            {saving ? 'Assigning...' : 'Assign'}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
