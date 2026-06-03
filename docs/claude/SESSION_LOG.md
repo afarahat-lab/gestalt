@@ -13781,3 +13781,297 @@ Pending follow-ups: none introduced. Future possible iterations:
   workflow file / HARNESS.json runtime drift between the
   template and the project's committed copy, and surfaces
   the gap as an operator suggestion
+
+---
+
+### Session 2026-06-04 — Claude Code (Dynamic harness — LLM-generated stack config at `gestalt init`)
+
+Builds on the prior session's template runtime fix. `gestalt init`
+used to copy a static template with hardcoded TypeScript / Node 22 /
+pnpm / Vitest assumptions into every project. This session makes
+the harness content dynamic: the LLM looks at the project
+description, picks the language / runtime / package manager / test
+framework / framework / database, and the engine substitutes those
+choices into the template at init time.
+
+The result is a harness that actually reflects the project from
+day one — a Python project gets `setup-python` + `pip install` +
+`pytest` in its CI workflow, `Senior Python engineer` as the
+code-agent role, and `pip` as the package manager in the
+ARCHITECTURE.md Stack section.
+
+Changed:
+
+- `packages/server/src/templates/stack-config.ts` (new):
+  - `StackConfig` interface — 14 structured fields the LLM
+    populates from the project description. The two
+    pre-rendered string fields (`stackSection` markdown and
+    `agentPromptExtensionsYaml` YAML) are produced inside
+    `parseStackConfig` so the template engine just runs a flat
+    string substitution (no `{{#if}}` conditional logic
+    required)
+  - `DEFAULT_STACK_CONFIG` — TypeScript / Node 22 / pnpm /
+    Vitest. Used when the LLM call fails OR parse fails. Both
+    pre-rendered fields baked in
+  - `generateStackConfig(description, name)` — calls
+    `getLLMClient` directly (NOT BaseLLMAgent — this runs
+    before the platform LLM registry is wired for the cycle).
+    Uses `temperature: 0.1` for deterministic stack decisions
+    and `maxTokens: 1000` (well under the 2000-default since
+    structured JSON output is compact). NEVER throws — every
+    failure path returns `{ ...DEFAULT_STACK_CONFIG }`
+  - `buildStackPrompt` — concrete Rules section + worked
+    examples of `ciSetupSteps` for Node and Python, so the
+    LLM understands the YAML indentation contract
+  - `parseStackConfig` — defensive on every field via
+    `stringOr` / `nullableString` helpers. The LLM emitting
+    the literal string `"null"` for a nullable field
+    (observed once in scratch testing) is mapped to JS
+    `null` for the consumer's benefit
+  - `stripIndent` + `indentSteps` helpers normalise the LLM's
+    `ciSetupSteps` block: strip common leading whitespace,
+    then re-apply a uniform 6-space indent so every line
+    lands at the depth `steps:` items live at in the
+    workflow. Idempotent — applies to both LLM output AND
+    the hardcoded default
+  - `renderStackSection` — produces the ARCHITECTURE.md
+    Stack section from the structured fields. Null fields
+    (e.g. no Runtime line for a Python project) are filtered
+    so the section reflects only what's true
+  - `renderPromptExtensionsYaml` — produces the
+    `code-agent.prompt_extensions:` YAML lines (with the
+    correct 6-space indent for the `agents.yaml` block).
+    Empty extension list renders as `      []`
+
+- Four template files updated to use stack-driven
+  placeholders:
+  - `templates/corporate-ops-web-mobile/ci/gestalt.yml`:
+    Hardcoded `Setup Node 22 LTS` + `node-version: '22'` +
+    `Setup pnpm` + `pnpm install --frozen-lockfile` + `pnpm
+    test` REMOVED. Replaced with two placeholders:
+    `{{ciSetupSteps}}` at column 0 (the LLM-generated YAML
+    block carries its own indent) and `{{testCmd}}` inside
+    the existing `Run tests` step. The conditional file-
+    presence check was widened to recognise `requirements.txt`
+    / `pyproject.toml` / `go.mod` / `Cargo.toml` so non-Node
+    projects don't print the "no project manifest" warning
+  - `templates/corporate-ops-web-mobile/harness/HARNESS.json`:
+    `stack` object replaced. Legacy `runtime: "node22"` field
+    DROPPED in favour of `nodeVersion: "{{nodeVersion}}"`.
+    Added `testFramework`, `framework`, `frontend`, `database`
+    fields (all `{{placeholder}}`-driven). `architectureStyle`
+    kept as the only hardcoded field
+  - `templates/corporate-ops-web-mobile/harness/agents.yaml`:
+    `code-agent.role` now `"Senior {{language}} engineer"`
+    and `test-agent.goal` references `{{testFramework}}`.
+    `code-agent.prompt_extensions` populated by
+    `{{agentPromptExtensionsYaml}}` (pre-rendered YAML
+    lines from the stack config). The big example block at
+    the end of the file is unchanged
+  - `templates/corporate-ops-web-mobile/harness/AGENTS.md`:
+    Hardcoded "Node 22 LTS / pnpm 9.x" section removed.
+    Replaced with `{{stackSection}}` — the pre-rendered
+    markdown list, plus a one-line note that the Gestalt
+    platform's own pin doesn't apply to user projects
+  - `templates/corporate-ops-web-mobile/docs/ARCHITECTURE.md`:
+    Hardcoded layer-structure + dependency rules section
+    REPLACED with `## Overview` ({{architectureNotes}}) +
+    `## Stack` ({{stackSection}}) + `## Module structure`
+    ({{moduleStructure}}) + `## Key patterns` + `##
+    Dependency rules` (kept generic — no language-specific
+    wording)
+  - `template.json#version` bumped 0.2.0 → 0.3.1 (Option B
+    version-check from the prior session triggers an
+    in-place refresh of the DB row on next boot)
+
+- `packages/agents/generate/src/prompts/code-prompt.ts`:
+  - Architecture-section runtime note updated to read EITHER
+    `harness.stack.nodeVersion` (new template shape — dynamic
+    harness) OR `harness.stack.runtime` (legacy back-compat
+    for projects initialised before this session)
+  - New branch for non-Node languages — when
+    `harness.stack.language` is something other than
+    TypeScript / JavaScript, the prompt emits "Project
+    language: Python, pip as package manager." style. Reads
+    `harness.stack.packageManager` to surface the right tool
+    name
+  - Priority order spelled out in the comment block — the
+    code-agent's runtime context is always grounded in the
+    project's HARNESS.json when populated
+
+- `packages/server/src/routes/projects.ts`
+  (`POST /projects/:id/init-harness`):
+  - Calls `generateStackConfig(projectDescription, project.name)`
+    before `loadTemplate`. Logs the chosen language /
+    packageManager / nodeVersion / testFramework
+  - Threads all 15 stack-driven variables into the
+    `loadTemplate` call. Nullable fields (nodeVersion /
+    buildCmd / framework / frontend / database) render
+    as empty string (or `"N/A"` for nodeVersion) so the
+    template doesn't emit literal `null` text. The
+    `architectureStyle` variable wasn't required — kept
+    hardcoded as "modular-monolith" in HARNESS.json
+
+- `packages/cli/src/commands/init.ts`:
+  - Phase 1 description prompt rewritten with stack-aware
+    guidance: "Describe your project's tech stack and
+    purpose. Include: what the application does,
+    programming language and key frameworks, package
+    manager preference, test framework preference."
+  - Worked example: "A React Native mobile app with a
+    Node.js/Express backend, PostgreSQL database, using
+    npm and Jest." — operators see the kind of content
+    that produces a good stack config
+
+Live verified end-to-end with REAL LLM calls (model: `gpt-4o`,
+~800 tokens per scenario):
+
+- **Boot**: `Refreshed built-in template (version bump)` logged
+  with `previousVersion: "0.2.0"` → `version: "0.3.1"`. DB row
+  in `platform_templates` updated in place (id / slug /
+  isBuiltin / createdAt preserved)
+- **Test 1 — TypeScript/Express/Jest/npm/PostgreSQL**:
+  - Stack returned: `language: TypeScript, nodeVersion: 22,
+    packageManager: npm, installCmd: "npm install --ci",
+    testCmd: "npm test", testFramework: Jest, framework:
+    Express, database: PostgreSQL`
+  - `gestalt.yml`: `actions/setup-node@v4` + `node-version:
+    '22'` + `npm install --ci` + `npm test` (replacing the
+    hardcoded pnpm chain)
+  - `HARNESS.json` stack: `{"language":"TypeScript",
+    "nodeVersion":"22","packageManager":"npm","testFramework":
+    "Jest","framework":"Express","frontend":"","database":
+    "PostgreSQL","architectureStyle":"modular-monolith"}`
+  - `ARCHITECTURE.md` Stack section: `Runtime: Node 22 LTS /
+    Package manager: npm / Test framework: Jest / Backend:
+    Express / Database: PostgreSQL`
+  - `agents.yaml` code-agent role: `Senior TypeScript engineer`,
+    `prompt_extensions` array length: 2 — both stack-relevant
+    rules (e.g. "Use TypeScript strict mode")
+- **Test 2 — Python/FastAPI/pytest/pip**:
+  - Stack returned: `language: Python, nodeVersion: null,
+    packageManager: pip, installCmd: "pip install -r
+    requirements.txt", testCmd: "pytest tests/",
+    testFramework: pytest, framework: FastAPI`
+  - `gestalt.yml`: `actions/setup-python@v5` + `python-version:
+    '3.12'` + `pip install -r requirements.txt` + `pytest
+    tests/` — the LLM correctly chose the Python-specific
+    setup action
+  - `HARNESS.json` stack: `nodeVersion: "N/A"` (placeholder
+    gracefully handles null — no literal `"null"` string in
+    JSON)
+  - `ARCHITECTURE.md` Stack section: `Package manager: pip /
+    Test framework: pytest / Backend: FastAPI` — no Runtime
+    line (correctly omitted because nodeVersion was null)
+  - `agents.yaml` code-agent role: `Senior Python engineer`
+- **Test 3 — React Native / TypeScript / Expo / pnpm**:
+  - Stack returned: `frontend: "React Native", framework:
+    null, packageManager: pnpm, testFramework: Jest,
+    nodeVersion: 22`
+  - `ARCHITECTURE.md` Stack section includes `Frontend:
+    React Native`
+- **Test 4 — LLM endpoint unreachable (fallback)**:
+  - Overrode `config.llm.baseUrl` to `http://localhost:1/v1`
+    (unreachable port) and called `generateStackConfig`
+  - Server logged `LLM call failed { type: 'provider-error',
+    message: 'TypeError: fetch failed', retryable: false }`
+    followed by `Stack config LLM call failed — using
+    defaults` warning. NEVER threw
+  - Returned `language: TypeScript, nodeVersion: 22,
+    packageManager: pnpm, testFramework: Vitest, installCmd:
+    "pnpm install --frozen-lockfile", testCmd: "pnpm test"`
+    — matches `DEFAULT_STACK_CONFIG` exactly
+- **Test 5 — existing trackeros unaffected**: trackeros's
+  committed harness files in its Git repo are NOT touched by
+  the DB row refresh. `init-harness` runs once at project
+  creation; existing projects retain their committed state
+- **YAML validity smoke** — `yaml.parse(gestalt.yml)` and
+  `yaml.parse(agents.yaml)` BOTH succeed for all 3
+  LLM-driven scenarios. Steps array in gestalt.yml is the
+  expected 4-element shape (Checkout / setup-language / run
+  install / Run tests). code-agent.prompt_extensions is a
+  proper YAML array (length 2 in every case)
+
+Decisions made:
+
+- **Stack config NOT persisted in DB.** The committed harness
+  files in the project repo are the authoritative record.
+  Storing the structured config in any DB column would
+  invite drift between "what the LLM picked" and "what the
+  operator actually committed" — same rationale ADR-032
+  uses for treating the Git repo as the project filesystem
+- **`stackSection` + `agentPromptExtensionsYaml` are
+  pre-rendered in `parseStackConfig`.** The brief noted the
+  current `{{name}}`-only engine doesn't support `{{#if}}`
+  conditional blocks. Pre-rendering keeps the engine's
+  one-regex-substitution semantics intact while still
+  letting the template show only the fields that are true
+  for the project (e.g. no Runtime line for Python). The
+  alternative — extending the engine with conditionals —
+  was rejected as over-engineering for one new feature
+- **Placeholder at column 0 + LLM output pre-indented.**
+  The engine does a literal string substitution; if the
+  placeholder lives at column N, only the FIRST line of a
+  multi-line value gets the N-space prefix. Putting the
+  placeholder at column 0 + having `indentSteps` apply
+  uniform indentation across every line in the LLM's
+  output guarantees correct YAML structure regardless of
+  what the LLM emits. Verified with `yaml.parse` against
+  3 distinct stack outputs
+- **`stripIndent` + `indentSteps` are idempotent.** Apply
+  in sequence (strip first, then re-apply) so both the
+  LLM-emitted block (may have any indent) AND the
+  hardcoded default (already 6-space-indented) flow
+  through cleanly. Belt-and-braces — running the helper
+  twice produces the same output
+- **NEVER throws contract on `generateStackConfig`.**
+  `init-harness` is operator-facing; a thrown error here
+  would surface as "init failed" with no clear
+  remediation. Falling back to defaults means the
+  operator gets a TypeScript/Node 22/pnpm/Vitest project
+  even when the LLM is down — they can edit the committed
+  harness files afterwards if needed
+- **Legacy `runtime` field DROPPED from HARNESS.json.**
+  Replaced with `nodeVersion` (more specific). Back-compat
+  for existing projects handled in `code-prompt.ts`'s
+  runtime-note builder — reads BOTH fields. Projects
+  initialised before this session continue to work
+  unchanged; projects initialised after carry the cleaner
+  field name
+- **`generateStackConfig` uses `getLLMClient()` directly,
+  NOT `BaseLLMAgent`.** This runs before any
+  per-correlation context exists (no intent, no orchestrator
+  cycle). Using the platform default LLM client + a simple
+  `complete()` call keeps the dependency surface small.
+  The temperature + maxTokens + correlationId-less request
+  is exactly the right shape for a one-shot stack
+  classification
+
+Pending follow-ups: none introduced. Possible future
+iterations:
+- A "regenerate stack config" CLI subcommand for operators
+  who want to re-run `generateStackConfig` against their
+  existing project's HARNESS.json description (today the
+  generation runs only at init time)
+- Per-project test customisation (e.g. integration vs unit
+  test scripts) — currently `testCmd` is a single string;
+  could be a structured object
+- A dashboard surface for viewing the chosen stack on the
+  project detail page (today operators read HARNESS.json
+  in the repo to see the stack)
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker server image rebuilt; template.json#version 0.3.1
+triggered the version-check re-seed. All 5 verification
+scenarios passed (3 real LLM calls + LLM-failure fallback +
+existing-project untouched). YAML validity confirmed for
+every produced workflow + agents.yaml file. No new
+migrations.
+
+Operator action — pending: none from this session. The
+existing trackeros project remains on its current Node 20
+workflow file (operator action from the prior session
+still applies — the operator may at their discretion
+update trackeros's workflow to Node 22 LTS). New
+`gestalt init` projects from this point forward get
+dynamic stack-driven harness files.

@@ -109,11 +109,21 @@ export async function initCommand(options: { server?: string } = {}): Promise<vo
 
   console.log(c.info('Phase 1 — Project Description'));
   divider();
-  console.log('Describe your project in your own words.');
-  console.log(c.dim('What are you building, who will use it, what problem does it solve?'));
+  console.log("Describe your project's tech stack and purpose. Include:");
+  console.log(c.dim('- What the application does'));
+  console.log(c.dim('- Programming language and key frameworks'));
+  console.log(c.dim('- Package manager preference (npm / pnpm / yarn / pip / poetry / ...)'));
+  console.log(c.dim('- Test framework preference (if any)'));
+  blank();
+  console.log(
+    c.dim(
+      'Example: "A React Native mobile app with a Node.js/Express backend, ' +
+      'PostgreSQL database, using npm and Jest"',
+    ),
+  );
   blank();
 
-  const description = await prompt('Your description');
+  const description = await prompt('Description');
   if (!description.trim()) {
     console.log(c.error('Description is required.'));
     process.exit(1);

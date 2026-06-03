@@ -5,12 +5,13 @@
   "templateId": "corporate-ops-web-mobile",
   "description": "{{projectDescription}}",
   "stack": {
-    "language": "typescript",
-    "runtime": "node22",
-    "packageManager": "pnpm",
-    "frontend": "react",
-    "backend": "node-fastify",
-    "database": "postgres",
+    "language": "{{language}}",
+    "nodeVersion": "{{nodeVersion}}",
+    "packageManager": "{{packageManager}}",
+    "testFramework": "{{testFramework}}",
+    "framework": "{{framework}}",
+    "frontend": "{{frontend}}",
+    "database": "{{database}}",
     "architectureStyle": "modular-monolith"
   },
   "adapters": {

@@ -28,6 +28,7 @@ import {
 } from '@gestalt/core';
 import { requireRole, checkProjectMembership } from '../auth/middleware';
 import { loadTemplate, resolveTemplatesDir } from '../templates/engine';
+import { generateStackConfig } from '../templates/stack-config';
 import { applyPipelinePatch } from './project-config';
 import { emitLiveEvent } from '../events';
 
@@ -373,6 +374,28 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
           }
         }
 
+        // Dynamic-harness (2026-06-04 session) — ask the LLM to
+        // analyse the project description and produce a tailored
+        // stack config. NEVER throws: on LLM-call failure or parse
+        // failure `generateStackConfig` returns a copy of
+        // `DEFAULT_STACK_CONFIG` so `init-harness` always completes.
+        // The result drives the template's stack-aware placeholders
+        // ({{language}}, {{nodeVersion}}, {{ciSetupSteps}}, …).
+        const stackConfig = await generateStackConfig(
+          projectDescription.trim(),
+          project.name,
+        );
+        log.info(
+          {
+            projectId: project.id,
+            language: stackConfig.language,
+            packageManager: stackConfig.packageManager,
+            nodeVersion: stackConfig.nodeVersion,
+            testFramework: stackConfig.testFramework,
+          },
+          'Stack config generated for project',
+        );
+
         // ADR-036: harness content lives in `templates/<id>/`. The
         // engine walks the template, substitutes `{{variables}}`, and
         // returns the list of files-to-commit with their target
@@ -387,6 +410,26 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
           projectName: project.name,
           projectDescription: projectDescription.trim(),
           defaultBranch: project.defaultBranch,
+          // Stack-driven variables. nodeVersion / buildCmd /
+          // framework / frontend / database may be null — the
+          // template renders the placeholder as the empty string
+          // (or 'N/A' for nodeVersion) so non-Node projects don't
+          // produce a literal `null` in their HARNESS.json.
+          language:                  stackConfig.language,
+          nodeVersion:               stackConfig.nodeVersion ?? 'N/A',
+          packageManager:            stackConfig.packageManager,
+          installCmd:                stackConfig.installCmd,
+          testCmd:                   stackConfig.testCmd,
+          buildCmd:                  stackConfig.buildCmd ?? '',
+          testFramework:             stackConfig.testFramework,
+          framework:                 stackConfig.framework ?? '',
+          frontend:                  stackConfig.frontend ?? '',
+          database:                  stackConfig.database ?? '',
+          moduleStructure:           stackConfig.moduleStructure,
+          architectureNotes:         stackConfig.architectureNotes,
+          stackSection:              stackConfig.stackSection,
+          agentPromptExtensionsYaml: stackConfig.agentPromptExtensionsYaml,
+          ciSetupSteps:              stackConfig.ciSetupSteps,
         });
 
         for (const file of harnessFiles) {

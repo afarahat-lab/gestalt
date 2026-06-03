@@ -95,28 +95,50 @@ export function buildCodePrompt(
 
   // ── 1. Architecture context ────────────────────────────────────────
   //
-  // Runtime note: user projects target Node 22 LTS by default — the
-  // Gestalt PLATFORM runs on Node 20 + pnpm 9.x as a self-imposed
-  // constraint, but that has no bearing on generated user code.
+  // Runtime + language note: user projects target Node 22 LTS by
+  // default — the Gestalt PLATFORM runs on Node 20 + pnpm 9.x as a
+  // self-imposed constraint, but that has no bearing on generated
+  // user code. The dynamic-harness session (2026-06-04) also
+  // surfaces `language` + `packageManager` so non-Node projects
+  // (Python, Go, etc.) get a meaningful note.
+  //
   // Priority order for picking what the LLM sees:
-  //   1. `harness.stack.runtime` — explicit runtime declared in
-  //      HARNESS.json (the corporate-ops-web-mobile template ships
-  //      with `node22`). Read this directly so the prompt always
-  //      reflects the truth on the project's HARNESS file
-  //   2. otherwise, fall back to "Node 22 LTS" ONLY when the
+  //   1. `harness.stack.nodeVersion` — explicit Node version from
+  //      the dynamic-harness HARNESS.json (new template shape)
+  //   2. `harness.stack.runtime` — legacy field for back-compat
+  //      with projects initialised before the dynamic-harness
+  //      session (the old template wrote `runtime: "node22"`)
+  //   3. `harness.stack.language` non-TypeScript → render that
+  //      language directly (e.g. "Project language: Python, pip
+  //      as package manager.")
+  //   4. otherwise, fall back to "Node 22 LTS" ONLY when the
   //      architectureMd doesn't already mention a Node version
   //      (avoids contradicting a legacy project's documented
   //      runtime, e.g. an old project still pinning Node 20)
-  const harnessRuntime = ctx.harness?.stack?.['runtime'];
+  const stack = ctx.harness?.stack ?? {};
+  const harnessNodeVersion = stack['nodeVersion'];
+  const harnessRuntime = stack['runtime'];
+  const harnessLanguage = stack['language'];
+  const harnessPackageManager = stack['packageManager'] ?? 'pnpm';
   const archMentionsNode =
     ctx.architectureMd
       ? /node\s*\d|Node\s*\d|node\.js|Node\.js/i.test(ctx.architectureMd)
       : false;
-  const runtimeNote = harnessRuntime
-    ? `\n\nProject runtime: ${formatRuntime(harnessRuntime)}, pnpm as package manager.`
-    : !archMentionsNode
-      ? `\n\nDefault runtime: Node 22 LTS, pnpm as package manager.`
-      : '';
+  const isNonNodeLanguage =
+    harnessLanguage !== undefined &&
+    harnessLanguage !== '' &&
+    harnessLanguage.toLowerCase() !== 'typescript' &&
+    harnessLanguage.toLowerCase() !== 'javascript';
+  const runtimeNote =
+    harnessNodeVersion && harnessNodeVersion !== 'N/A' && harnessNodeVersion !== 'null'
+      ? `\n\nProject runtime: ${formatRuntime(`node${harnessNodeVersion}`)}, ${harnessPackageManager} as package manager.`
+      : harnessRuntime
+        ? `\n\nProject runtime: ${formatRuntime(harnessRuntime)}, ${harnessPackageManager} as package manager.`
+        : isNonNodeLanguage
+          ? `\n\nProject language: ${harnessLanguage}, ${harnessPackageManager} as package manager.`
+          : !archMentionsNode
+            ? `\n\nDefault runtime: Node 22 LTS, pnpm as package manager.`
+            : '';
 
   const architectureSection = ctx.architectureMd
     ? `## Project architecture\n\n${truncate(ctx.architectureMd, ARCHITECTURE_TRUNCATE_CHARS)}${runtimeNote}\n\n` +

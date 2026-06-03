@@ -8,7 +8,7 @@ recipe in `CLAUDE.md` after every session._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-04 (Claude Code — Template runtime fix: user projects default to Node 22 LTS (no migration). The Gestalt PLATFORM itself stays on Node 20 + pnpm 9.x (real `node:sqlite` / pnpm 9.x constraint) — that's documented as a self-imposed bound that doesn't apply to user projects. `templates/corporate-ops-web-mobile/ci/gestalt.yml` now uses `node-version: '22'` and step name "Setup Node 22 LTS". `harness/HARNESS.json` template `stack.runtime` flipped `node20 → node22`. `harness/AGENTS.md` gains a new "Project runtime" section documenting Node 22 LTS + pnpm 9.x/10.x both supported (with explicit "Gestalt platform constraint ≠ user project constraint" note). `template.json#version` bumped `0.1.0 → 0.2.0`. Server boot's `seedBuiltinTemplate` rewritten to compare DB row version against on-disk `template.json` version — version match → skip; version drift OR no row → upsert via the existing `PlatformTemplateRepository.update` (in place; `id` + `slug` + `isBuiltin` + `createdAt` + `isDefault` preserved). Idempotent. New `readTemplateMeta(templatesDir, slug)` helper reads template.json once at boot. `code-prompt.ts` architecture section gains runtime-aware note: priority order is (1) `harness.stack.runtime` formatted via new `formatRuntime` helper ("node22" → "Node 22 LTS", even-major-is-LTS rule; unknown values like "bun" pass through verbatim); (2) if no harness runtime AND architectureMd doesn't already mention a Node version (`/node\s*\d|Node\s*\d|node\.js/i` check) → default "Node 22 LTS"; (3) otherwise stay quiet so legacy projects with Node 20 in their architecture aren't contradicted. Live verified: server restart logged `Refreshed built-in template (version bump)` with `previousVersion: 0.1.0` → `version: 0.2.0`; second restart logged `platform_templates up-to-date — skipping seed` (idempotency). DB row now carries the new files (gestalt.yml has Node 22 LTS step + node-version '22'; HARNESS.json runtime: node22; AGENTS.md has Project runtime section). Fresh `loadTemplate` simulation produced the 8 expected files with Node 22 in workflow + HARNESS + AGENTS. code-prompt 5-invariant matrix passed (node22 → Node 22 LTS; node20 → Node 20 LTS round-trip; no runtime + silent arch → default Node 22 LTS; legacy arch mentioning Node 20 → respected without contradicting default; future runtime "bun" → verbatim). Platform itself confirmed still on Node 20 via `docker exec gestalt-server-1 node --version` → `v20.20.2`. **Operator action — trackeros repo:** the project was initialised under the old template and its `.github/workflows/gestalt.yml` still pins Node 20. Update with `git pull && edit .github/workflows/gestalt.yml: node-version '20' → '22' && commit && push`. Until done, trackeros CI runs on Node 20 (not breaking — Node 20 works for typical code-agent output today). PRE-EXISTING: Hybrid LLM recovery for all scripted deploy agents (Option B, no migration): `SelfHealingDiagnosis` extended with `retryTaskType: 'generate:intent' | 'deploy:pr' | 'deploy:pipeline' | 'deploy:promote' | 'none'` + `retryPayloadHints: Record<string, unknown>`. New `SelfHealingRetryTaskType` exported. Diagnosis prompt rewritten with "Available retry task types" + "Known failure patterns" sections (git push → deploy:pr with unshallow+forceWithLease; CI timeout → deploy:pipeline with extendTimeout; staging gate → deploy:promote; gate failures → generate:intent; infrastructure → none). `parseDiagnosis` defaults retryTaskType to `'generate:intent'` (preserving pre-Option-B legacy diagnoses) and rejects malformed hints (array → `{}`). `safeDefaultDiagnosis` returns `retryTaskType: 'none'`. `runSelfHealingLoop` rewrite: replaces the hardcoded single-queue dispatch with `buildRetryDispatch(taskType, payload, diagnosis, source)` — builds a per-queue-shaped payload (generate:intent gets `text` + `resumeOnBranch`; deploy:pr gets `branch` + `prNumber` + empty `artifacts`; deploy:pipeline gets `branch`; deploy:promotion picks `targetEnvironment: 'production'` when the diagnostician's hint `retryProductionOnly: true` fires, else 'staging'). Loop NOW owns the dispatch + status transition (orchestrator helpers simplified — drop their duplicate dispatch code). `'none'` treated as `shouldRetry: false` (escalation path). ResumeContext gains `retryTaskType` + `retryPayloadHints` so the dashboard's attempt-history view can show which queue the loop retried on. `attemptAutoResolveAlert` uses the same `buildRetryDispatch(source: 'auto-resolved')` so escalation auto-resolves can also route to non-`generate:intent` queues. **All three scripted deploy agents gained `selfHealingHints` + `selfHealingDiagnosis` fields on their input + matching local `SelfHealingHints` interfaces:** pr-agent reads `unshallow` (runs `git fetch --unshallow` best-effort, non-fatal), `forceWithLease` (push with --force-with-lease + --set-upstream), `rebaseBranch` (fetch + rebase default branch, abort cleanly on conflict), `skipArtifactRewrite` (skip writing files + lockfile sync — push existing branch state). On push failure pr-agent rethrows so the deploy-orchestrator's catch wrapper invokes runSelfHealingLoop with the NEW error context (re-diagnosis). pipeline-agent reads `extendTimeout` (doubles the polling window — 20m default → 40m) and `skipTrigger` (re-polls existing run when hint object carries `runId`; silently falls back to fresh trigger when `runId` absent — forward-compat). promotion-agent reads `skipStagingVerification` (no-op today, logged for forward-compat with a future verifyStagingDeployment) and `retryProductionOnly` (consumed at dispatch site by the loop — picks `targetEnvironment: 'production'`; ADR-034 staging-confirmation invariant still enforced in agent regardless). All three deploy payload types (DeployPRPayload / DeployPipelinePayload / DeployPromotionPayload) extended via shared `SelfHealingDispatchFields` interface carrying `source` + `selfHealingHints` + `selfHealingDiagnosis`. Unknown hints silently ignored by every agent (forward-compat — future diagnoses can ship new hints without crashing older workers). Source field extended union: `'self-healing'` (regular retry) | `'auto-resolved'` (alert auto-resolution) | `'operator-resume'` | `'pipeline-feedback'` | `'human'` | `'maintenance-agent'`. Live verified end-to-end: (1) parseDiagnosis 6-invariant matrix — full diagnosis with retryTaskType+hints parses correctly; legacy diagnosis defaults to generate:intent; retryTaskType=none recognised; unknown retryTaskType falls back to generate:intent; malformed hints (array) defaults to {}; garbage JSON safe-defaults with retryTaskType=none. (2) Scenario 1 live: synthetic non-fast-forward diagnosis dispatched `deploy:pr` (NOT generate:intent), server log shows `Self-healing retry dispatched retryTaskType=deploy:pr hintKeys=[unshallow, forceWithLease]`, pr-agent received the dispatch with hints visible in logs, took the resume path on the synthetic branch (push failed because the branch was fake — same WARN+fallback as prior session). last_resume_context stored `retryTaskType: deploy:pr` + `retryPayloadHints: {unshallow, forceWithLease}` + `autoHealed: true`. (3) Scenario 4 live: fresh trivial intent — first cycle's pr-agent ran the scripted happy path with ZERO `hints` log entries / ZERO "Resuming on existing branch" log lines / ZERO self-healing references for the FIRST deploy:pr call. Subsequent self-healing fired because trackeros project's CI deterministically fails (pre-existing unrelated issue) — when CI failed, the loop diagnosed `retryTaskType: "generate:intent"` (the LLM correctly picked the right queue, NOT a hardcoded map) and re-ran the full generate cycle. No new migration required — hints flow through BullMQ payload, retryTaskType + retryPayloadHints persist in `intents.last_resume_context` via the column added in migration 020. PRE-EXISTING: Autonomous self-healing loop (migration 020): `platform_self_healing_config` table seeded with the seven failure types (`generate-error`, `gate-max-retries`, `pipeline-failed`, `pipeline-timeout`, `deploy-error`, `maintenance-error`, `custom-agent-failure`) — each with per-type defaults the platform-admin can tune. `intents` gains `attempt_count INTEGER NOT NULL DEFAULT 0` + `last_resume_context JSONB`; `deployment_event_type` adds `resume-pushed`. New `SelfHealingConfigRepository` (postgres impl + oracle/mssql throw-stubs). New `IntentRepository.saveResumeContext` + `incrementAttemptCount`. New `SelfHealingAgent` class in `@gestalt/core/agents/self-healing-agent.ts` extends `BaseLLMAgent` — diagnoses failures returning structured `{ diagnosis, rootCause, suggestedFix, confidence, shouldRetry, skipAgents, focusFiles, updatedIntentText }`; per-type `confidence_threshold` downgrades shouldRetry when LLM confidence is below the operator's bar; safe-default `shouldRetry:false, confidence:low` on LLM/parse failure (NEVER throws). New `runSelfHealingLoop(ctx, payload, signals)` in `self-healing-loop.ts` — budget check → diagnosis → either dispatch retry (`source: 'self-healing'`, resumes on intent.branchName) OR escalate (creates alert via shared `escalateToHuman` with per-failureType title template) + auto-resolve at high confidence (`source: 'auto-resolved'`); returns `{shouldRetry, diagnosis, escalated, autoResolved}` so caller branches cleanly. `alertContextExtras` payload field merges into alert.context (pipeline-* carry runId + pipelineStatus). `setQueueConfig/getQueueConfig` pattern added to `@gestalt/core/queue` (server pins config.queue at boot step 5c) so the loop can dispatch without threading config through every consumer. Wired into every failure path: generate orchestrator `hasPlanFailed` AND catch block (generate-error), gate orchestrator max-retries (gate-max-retries), deploy orchestrator pipeline-failed branch (pipeline-failed/pipeline-timeout — pipeline-agent stopped creating alerts directly; loop owns alert creation with rich context), deploy generic catch (deploy-error), custom agent LLM error inside `runOneCustomAgentNode` (custom-agent-failure — throws `SelfHealingRetryDispatched` sentinel caught in orchestrator catch to avoid double-dispatch). Context-assembler reads `intent.lastResumeContext` and attaches to ContextSnapshot.resumeContext + skipAgents + focusFiles. Code-prompt gains a new "Resumed attempt (N) — auto-diagnosed | operator feedback" section (between signals and task) showing diagnosis/rootCause/suggestedFix for autoHealed cycles or operatorFeedback verbatim for human cycles, plus focus files. Orchestrator honours skipAgents (high-confidence auto-healed retries only) — skipped steps create `agent_executions` rows with status `skipped` so the dashboard accordion stays consistent. New routes: `GET /platform/self-healing` (admin — list all 7 configs); `PATCH /platform/self-healing/:failureType` (admin — partial update with validation: maxAttempts 0–10, confidenceThreshold enum, audit captures changedFields+previousValues+newValues per GP-002); `POST /alerts/:id/resume` (operator + editor membership — generic human-feedback resume for any failure alert type; saves last_resume_context with autoHealed:false, increments attempt_count, dispatches `source: 'operator-resume'`, GP-006 audit carries feedbackLength only). Dashboard adds 8th `Self-healing` tab in Admin between Secrets and Templates — table with per-row toggle enabled, select maxAttempts (0-10), select confidence (high/medium/low), toggle auto-resolve; saves on change with inline ✓ saved indicator. CLI: `gestalt platform self-healing list/configure <failureType>` (--max-attempts, --confidence, --auto-resolve/--no-auto-resolve, --enable/--disable). New `LiveEventType: 'alert.auto-resolved'` SSE for dashboard live update. Live verified: migration 020 applied + queue config pinned at boot; GET endpoint returns all 7 rows; PATCH validation matrix (maxAttempts>10, invalid confidence, unknown failure type, empty patch); audit metadata captures changedFields/previousValues/newValues; CLI list+configure exercised; POST /alerts/:id/resume happy path (intent transitioned + last_resume_context stored as proper JSONB object with autoHealed:false + attempt_count incremented + alert acked + GP-006 audit confirmed — feedback text NOT in audit_log via direct SQL probe); worker picked up resume payload + full cycle ran end-to-end to `deploying`. Pipeline failure alerts + resume-on-same-branch feedback loop (migration 019): `intents` gains `branch_name TEXT`, `pr_number INTEGER`, `pr_url TEXT` (all nullable); new `IntentRepository.saveBranchInfo`; pipeline-agent creates `pipeline-failed` / `pipeline-timeout` alerts (severity high, requiredAction `provide-feedback`) carrying intentId + branch + prUrl + prNumber + runId + pipelineStatus in context JSONB; new `AlertType` values + `AlertRequiredAction: 'provide-feedback'`; pr-agent persists branch info on fresh-PR path and dispatches a new `resumeOnBranch` flow: when set, fetch + `checkout -B <branch> origin/<branch>`, push to existing branch, NO new PR — reuses the input's `prNumber`/`prUrl`, writes a `pr-opened` event with `metadata.resume: true` so the timeline narrates "fix push" vs original; commit subject becomes `fix: address CI failure — <intent line> [gestalt <corr8>]`. Generate orchestrator threads `resumeOnBranch`/`prNumber`/`prUrl` payload optionals through `drivePlan` → gate's `dispatchDeployPR` → deploy:pr; on resume, fetches + checks out the existing remote branch with WARN-and-fall-through-to-default safety. intent-agent prompt picks up new `clarificationSource: 'pipeline-feedback'` framing ("## CI pipeline failure feedback from operator"); `needsClarification` short-circuits for `pipeline-feedback` to avoid re-pausing. New route `POST /alerts/:id/pipeline-feedback` (`requireRole('operator')` + `checkProjectMembership(editor)`) validates type ∈ {pipeline-failed, pipeline-timeout}, calls `intents.saveClarification(intent.id, feedback)`, dispatches `generate:intent` with full resume payload, transitions to `generating`, acknowledges alert atomically — audit `alert.pipeline-feedback-submitted` carries `feedbackLength + branch + prNumber + intentId + type + ip` ONLY (GP-006). Dashboard Alerts view: new `PipelineBody` (intent line + branch + PR link + run id + pipeline status KV header) and `PipelineFeedbackBlock` (textarea + "retry with fix ▶" button) rendered ABOVE Dismiss for the two new types; new TypeGlyph (✗ red for failed, ⏱ amber for timeout); FixIntentBlock suppressed for pipeline alerts (operators provide CI-fix context via the new block instead). CLI: new `gestalt alerts pipeline-feedback <alertId> [--feedback <text>]` subcommand — displays branch/PR/runId/status context then submits; `gestalt alerts show` Available actions footer routes pipeline alerts to `pipeline-feedback` + `dismiss`. Live verified end-to-end: 4 validation paths (400/404), happy path (200 with intentId + status: generating + branch + PR), atomic ack + clarification persist (116 chars), worker pickup with `resumeOnBranch` log line, GP-006 audit metadata. PRE-EXISTING: pr-agent syncs `pnpm-lock.yaml` after writing artifacts so CI's `--frozen-lockfile` always passes. New shared `execCommand(cmd, args, cwd, timeoutMs)` helper in `packages/agents/deploy/src/agents/exec.ts` — spawn-based, no shell, 2-minute default timeout, surfaces a 400-char stderr tail on non-zero exit. pr-agent's `maybeSyncLockfile(workDir)` stats `package.json` then runs `pnpm install --no-frozen-lockfile`; ENOENT skips (no Node project yet), other failures log WARN and continue (CI is the real source of truth — don't block PR creation over a lockfile sync hiccup). Dockerfile production stage swapped `corepack prepare pnpm@9.15.4 --activate` for `npm install -g pnpm@9.15.4` so the runtime `gestalt` user has pnpm 9.15.4 on PATH (corepack caches per-user; root activation wouldn't reach gestalt and the auto-fetched latest pnpm requires Node 22's `node:sqlite`). Template `gestalt.yml` gains a graceful fallback: if `pnpm-lock.yaml` is missing, emit a `::warning::` and run `pnpm install` without `--frozen-lockfile` so first-CI doesn't hard-fail. context-fixer.ts is unchanged — the ADR-018 path guard restricts it to `docs/*` and `AGENTS.md`, so it can never reach a `package.json` write path. Smoke test inside the rebuilt container: `pnpm 9.15.4` callable, real `pnpm install --no-frozen-lockfile` produces a 384-byte `pnpm-lock.yaml@9.0` for a lodash dependency)
+**Last updated:** 2026-06-04 (Claude Code — Dynamic harness: LLM-generated stack config at `gestalt init` (no migration). New `packages/server/src/templates/stack-config.ts` — `StackConfig` interface (language / nodeVersion / packageManager / installCmd / testCmd / buildCmd / testFramework / framework / frontend / database / moduleStructure / architectureNotes / agentPromptExtensions / ciSetupSteps PLUS pre-rendered `stackSection` markdown + `agentPromptExtensionsYaml`); `DEFAULT_STACK_CONFIG` (TypeScript / Node 22 / pnpm / Vitest); `generateStackConfig(description, name)` — NEVER throws; on LLM failure OR parse failure returns a copy of the defaults. LLM call uses `temperature: 0.1` + `maxTokens: 1000`. `buildStackPrompt` includes "Available retry task types" + concrete examples of `ciSetupSteps` YAML for Node/Python/Go. `parseStackConfig` defensive on every field — partial responses still produce a valid `StackConfig`. New `stripIndent` + `indentSteps` helpers normalise the LLM's `ciSetupSteps` block to land at column 6 (the depth `steps:` items live at in the workflow); placeholder in `ci/gestalt.yml` is at column 0 so each substituted line carries its own indent. Idempotent — applies to both the LLM output AND the hardcoded default. Four template files updated to use placeholders: `ci/gestalt.yml` ({{ciSetupSteps}} multi-line block + {{testCmd}}); `harness/HARNESS.json` (stack object uses {{language}}, {{nodeVersion}}, {{packageManager}}, {{testFramework}}, {{framework}}, {{frontend}}, {{database}}; legacy `runtime` field DROPPED in favour of `nodeVersion`); `harness/agents.yaml` (code-agent role uses {{language}}, test-agent uses {{testFramework}}, code-agent.prompt_extensions uses {{agentPromptExtensionsYaml}} — pre-rendered YAML lines from the stack config); `harness/AGENTS.md` ({{stackSection}} pre-rendered markdown — replaces the old hardcoded "Node 22 LTS / pnpm 9.x" section); `docs/ARCHITECTURE.md` ({{architectureNotes}} + {{stackSection}} + {{moduleStructure}}). `code-prompt.ts` updated to read EITHER `harness.stack.nodeVersion` (new template) OR `harness.stack.runtime` (legacy back-compat) for the runtime note; also handles non-Node `harness.stack.language` (renders "Project language: Python, pip as package manager." style note). `init-harness` route calls `generateStackConfig(projectDescription, project.name)` BEFORE `loadTemplate` and passes all 15 stack-driven variables into the engine. CLI `gestalt init` Phase 1 prompt rewritten with stack-aware guidance ("Describe your project's tech stack and purpose — language and key frameworks, package manager preference, test framework preference" + worked example). `template.json#version` 0.2.0 → 0.3.1 (re-seeded on boot by the Option B version-check from the prior session). Live verified end-to-end with REAL LLM calls (`gpt-4o`): Test 1 (TypeScript/Express/Jest/npm/PostgreSQL) → stack `language: TypeScript, nodeVersion: 22, packageManager: npm, testFramework: Jest, framework: Express, database: PostgreSQL`; gestalt.yml uses `actions/setup-node@v4` + `node-version: '22'` + `npm install --ci`; ARCHITECTURE.md Stack section renders `Runtime: Node 22 LTS / Package manager: npm / Test framework: Jest / Backend: Express / Database: PostgreSQL`; code-agent role: `Senior TypeScript engineer`. Test 2 (Python/FastAPI/pytest/pip) → `language: Python, nodeVersion: null, packageManager: pip, testFramework: pytest, framework: FastAPI`; gestalt.yml uses `actions/setup-python@v5` + `python-version: '3.12'` + `pip install -r requirements.txt`; HARNESS.json `nodeVersion: "N/A"` (placeholder gracefully handles null); ARCHITECTURE.md Stack section omits the Runtime line (no Node version); code-agent role: `Senior Python engineer`. Test 3 (React Native/TypeScript/Expo/pnpm) → `frontend: React Native, packageManager: pnpm, testFramework: Jest`. Test 4 (LLM endpoint unreachable) → `generateStackConfig` warn-logged the provider error and returned a copy of `DEFAULT_STACK_CONFIG` — operator sees `init-harness` complete normally with TypeScript/Node 22/pnpm/Vitest. Test 5 (existing trackeros) → unaffected; `init-harness` only runs at project creation. All 3 LLM-driven scenarios produced **valid YAML** for both gestalt.yml AND agents.yaml (`yaml.parse` succeeded; steps array correctly structured; code-agent prompt_extensions array length: 2 in every case). Stack config NOT persisted in DB — committed harness files are the authoritative record. No new migrations. Tokens used per scenario: ~800 (within the 1000 budget). PRE-EXISTING: Template runtime fix: user projects default to Node 22 LTS (no migration). The Gestalt PLATFORM itself stays on Node 20 + pnpm 9.x (real `node:sqlite` / pnpm 9.x constraint) — that's documented as a self-imposed bound that doesn't apply to user projects. `templates/corporate-ops-web-mobile/ci/gestalt.yml` now uses `node-version: '22'` and step name "Setup Node 22 LTS". `harness/HARNESS.json` template `stack.runtime` flipped `node20 → node22`. `harness/AGENTS.md` gains a new "Project runtime" section documenting Node 22 LTS + pnpm 9.x/10.x both supported (with explicit "Gestalt platform constraint ≠ user project constraint" note). `template.json#version` bumped `0.1.0 → 0.2.0`. Server boot's `seedBuiltinTemplate` rewritten to compare DB row version against on-disk `template.json` version — version match → skip; version drift OR no row → upsert via the existing `PlatformTemplateRepository.update` (in place; `id` + `slug` + `isBuiltin` + `createdAt` + `isDefault` preserved). Idempotent. New `readTemplateMeta(templatesDir, slug)` helper reads template.json once at boot. `code-prompt.ts` architecture section gains runtime-aware note: priority order is (1) `harness.stack.runtime` formatted via new `formatRuntime` helper ("node22" → "Node 22 LTS", even-major-is-LTS rule; unknown values like "bun" pass through verbatim); (2) if no harness runtime AND architectureMd doesn't already mention a Node version (`/node\s*\d|Node\s*\d|node\.js/i` check) → default "Node 22 LTS"; (3) otherwise stay quiet so legacy projects with Node 20 in their architecture aren't contradicted. Live verified: server restart logged `Refreshed built-in template (version bump)` with `previousVersion: 0.1.0` → `version: 0.2.0`; second restart logged `platform_templates up-to-date — skipping seed` (idempotency). DB row now carries the new files (gestalt.yml has Node 22 LTS step + node-version '22'; HARNESS.json runtime: node22; AGENTS.md has Project runtime section). Fresh `loadTemplate` simulation produced the 8 expected files with Node 22 in workflow + HARNESS + AGENTS. code-prompt 5-invariant matrix passed (node22 → Node 22 LTS; node20 → Node 20 LTS round-trip; no runtime + silent arch → default Node 22 LTS; legacy arch mentioning Node 20 → respected without contradicting default; future runtime "bun" → verbatim). Platform itself confirmed still on Node 20 via `docker exec gestalt-server-1 node --version` → `v20.20.2`. **Operator action — trackeros repo:** the project was initialised under the old template and its `.github/workflows/gestalt.yml` still pins Node 20. Update with `git pull && edit .github/workflows/gestalt.yml: node-version '20' → '22' && commit && push`. Until done, trackeros CI runs on Node 20 (not breaking — Node 20 works for typical code-agent output today). PRE-EXISTING: Hybrid LLM recovery for all scripted deploy agents (Option B, no migration): `SelfHealingDiagnosis` extended with `retryTaskType: 'generate:intent' | 'deploy:pr' | 'deploy:pipeline' | 'deploy:promote' | 'none'` + `retryPayloadHints: Record<string, unknown>`. New `SelfHealingRetryTaskType` exported. Diagnosis prompt rewritten with "Available retry task types" + "Known failure patterns" sections (git push → deploy:pr with unshallow+forceWithLease; CI timeout → deploy:pipeline with extendTimeout; staging gate → deploy:promote; gate failures → generate:intent; infrastructure → none). `parseDiagnosis` defaults retryTaskType to `'generate:intent'` (preserving pre-Option-B legacy diagnoses) and rejects malformed hints (array → `{}`). `safeDefaultDiagnosis` returns `retryTaskType: 'none'`. `runSelfHealingLoop` rewrite: replaces the hardcoded single-queue dispatch with `buildRetryDispatch(taskType, payload, diagnosis, source)` — builds a per-queue-shaped payload (generate:intent gets `text` + `resumeOnBranch`; deploy:pr gets `branch` + `prNumber` + empty `artifacts`; deploy:pipeline gets `branch`; deploy:promotion picks `targetEnvironment: 'production'` when the diagnostician's hint `retryProductionOnly: true` fires, else 'staging'). Loop NOW owns the dispatch + status transition (orchestrator helpers simplified — drop their duplicate dispatch code). `'none'` treated as `shouldRetry: false` (escalation path). ResumeContext gains `retryTaskType` + `retryPayloadHints` so the dashboard's attempt-history view can show which queue the loop retried on. `attemptAutoResolveAlert` uses the same `buildRetryDispatch(source: 'auto-resolved')` so escalation auto-resolves can also route to non-`generate:intent` queues. **All three scripted deploy agents gained `selfHealingHints` + `selfHealingDiagnosis` fields on their input + matching local `SelfHealingHints` interfaces:** pr-agent reads `unshallow` (runs `git fetch --unshallow` best-effort, non-fatal), `forceWithLease` (push with --force-with-lease + --set-upstream), `rebaseBranch` (fetch + rebase default branch, abort cleanly on conflict), `skipArtifactRewrite` (skip writing files + lockfile sync — push existing branch state). On push failure pr-agent rethrows so the deploy-orchestrator's catch wrapper invokes runSelfHealingLoop with the NEW error context (re-diagnosis). pipeline-agent reads `extendTimeout` (doubles the polling window — 20m default → 40m) and `skipTrigger` (re-polls existing run when hint object carries `runId`; silently falls back to fresh trigger when `runId` absent — forward-compat). promotion-agent reads `skipStagingVerification` (no-op today, logged for forward-compat with a future verifyStagingDeployment) and `retryProductionOnly` (consumed at dispatch site by the loop — picks `targetEnvironment: 'production'`; ADR-034 staging-confirmation invariant still enforced in agent regardless). All three deploy payload types (DeployPRPayload / DeployPipelinePayload / DeployPromotionPayload) extended via shared `SelfHealingDispatchFields` interface carrying `source` + `selfHealingHints` + `selfHealingDiagnosis`. Unknown hints silently ignored by every agent (forward-compat — future diagnoses can ship new hints without crashing older workers). Source field extended union: `'self-healing'` (regular retry) | `'auto-resolved'` (alert auto-resolution) | `'operator-resume'` | `'pipeline-feedback'` | `'human'` | `'maintenance-agent'`. Live verified end-to-end: (1) parseDiagnosis 6-invariant matrix — full diagnosis with retryTaskType+hints parses correctly; legacy diagnosis defaults to generate:intent; retryTaskType=none recognised; unknown retryTaskType falls back to generate:intent; malformed hints (array) defaults to {}; garbage JSON safe-defaults with retryTaskType=none. (2) Scenario 1 live: synthetic non-fast-forward diagnosis dispatched `deploy:pr` (NOT generate:intent), server log shows `Self-healing retry dispatched retryTaskType=deploy:pr hintKeys=[unshallow, forceWithLease]`, pr-agent received the dispatch with hints visible in logs, took the resume path on the synthetic branch (push failed because the branch was fake — same WARN+fallback as prior session). last_resume_context stored `retryTaskType: deploy:pr` + `retryPayloadHints: {unshallow, forceWithLease}` + `autoHealed: true`. (3) Scenario 4 live: fresh trivial intent — first cycle's pr-agent ran the scripted happy path with ZERO `hints` log entries / ZERO "Resuming on existing branch" log lines / ZERO self-healing references for the FIRST deploy:pr call. Subsequent self-healing fired because trackeros project's CI deterministically fails (pre-existing unrelated issue) — when CI failed, the loop diagnosed `retryTaskType: "generate:intent"` (the LLM correctly picked the right queue, NOT a hardcoded map) and re-ran the full generate cycle. No new migration required — hints flow through BullMQ payload, retryTaskType + retryPayloadHints persist in `intents.last_resume_context` via the column added in migration 020. PRE-EXISTING: Autonomous self-healing loop (migration 020): `platform_self_healing_config` table seeded with the seven failure types (`generate-error`, `gate-max-retries`, `pipeline-failed`, `pipeline-timeout`, `deploy-error`, `maintenance-error`, `custom-agent-failure`) — each with per-type defaults the platform-admin can tune. `intents` gains `attempt_count INTEGER NOT NULL DEFAULT 0` + `last_resume_context JSONB`; `deployment_event_type` adds `resume-pushed`. New `SelfHealingConfigRepository` (postgres impl + oracle/mssql throw-stubs). New `IntentRepository.saveResumeContext` + `incrementAttemptCount`. New `SelfHealingAgent` class in `@gestalt/core/agents/self-healing-agent.ts` extends `BaseLLMAgent` — diagnoses failures returning structured `{ diagnosis, rootCause, suggestedFix, confidence, shouldRetry, skipAgents, focusFiles, updatedIntentText }`; per-type `confidence_threshold` downgrades shouldRetry when LLM confidence is below the operator's bar; safe-default `shouldRetry:false, confidence:low` on LLM/parse failure (NEVER throws). New `runSelfHealingLoop(ctx, payload, signals)` in `self-healing-loop.ts` — budget check → diagnosis → either dispatch retry (`source: 'self-healing'`, resumes on intent.branchName) OR escalate (creates alert via shared `escalateToHuman` with per-failureType title template) + auto-resolve at high confidence (`source: 'auto-resolved'`); returns `{shouldRetry, diagnosis, escalated, autoResolved}` so caller branches cleanly. `alertContextExtras` payload field merges into alert.context (pipeline-* carry runId + pipelineStatus). `setQueueConfig/getQueueConfig` pattern added to `@gestalt/core/queue` (server pins config.queue at boot step 5c) so the loop can dispatch without threading config through every consumer. Wired into every failure path: generate orchestrator `hasPlanFailed` AND catch block (generate-error), gate orchestrator max-retries (gate-max-retries), deploy orchestrator pipeline-failed branch (pipeline-failed/pipeline-timeout — pipeline-agent stopped creating alerts directly; loop owns alert creation with rich context), deploy generic catch (deploy-error), custom agent LLM error inside `runOneCustomAgentNode` (custom-agent-failure — throws `SelfHealingRetryDispatched` sentinel caught in orchestrator catch to avoid double-dispatch). Context-assembler reads `intent.lastResumeContext` and attaches to ContextSnapshot.resumeContext + skipAgents + focusFiles. Code-prompt gains a new "Resumed attempt (N) — auto-diagnosed | operator feedback" section (between signals and task) showing diagnosis/rootCause/suggestedFix for autoHealed cycles or operatorFeedback verbatim for human cycles, plus focus files. Orchestrator honours skipAgents (high-confidence auto-healed retries only) — skipped steps create `agent_executions` rows with status `skipped` so the dashboard accordion stays consistent. New routes: `GET /platform/self-healing` (admin — list all 7 configs); `PATCH /platform/self-healing/:failureType` (admin — partial update with validation: maxAttempts 0–10, confidenceThreshold enum, audit captures changedFields+previousValues+newValues per GP-002); `POST /alerts/:id/resume` (operator + editor membership — generic human-feedback resume for any failure alert type; saves last_resume_context with autoHealed:false, increments attempt_count, dispatches `source: 'operator-resume'`, GP-006 audit carries feedbackLength only). Dashboard adds 8th `Self-healing` tab in Admin between Secrets and Templates — table with per-row toggle enabled, select maxAttempts (0-10), select confidence (high/medium/low), toggle auto-resolve; saves on change with inline ✓ saved indicator. CLI: `gestalt platform self-healing list/configure <failureType>` (--max-attempts, --confidence, --auto-resolve/--no-auto-resolve, --enable/--disable). New `LiveEventType: 'alert.auto-resolved'` SSE for dashboard live update. Live verified: migration 020 applied + queue config pinned at boot; GET endpoint returns all 7 rows; PATCH validation matrix (maxAttempts>10, invalid confidence, unknown failure type, empty patch); audit metadata captures changedFields/previousValues/newValues; CLI list+configure exercised; POST /alerts/:id/resume happy path (intent transitioned + last_resume_context stored as proper JSONB object with autoHealed:false + attempt_count incremented + alert acked + GP-006 audit confirmed — feedback text NOT in audit_log via direct SQL probe); worker picked up resume payload + full cycle ran end-to-end to `deploying`. Pipeline failure alerts + resume-on-same-branch feedback loop (migration 019): `intents` gains `branch_name TEXT`, `pr_number INTEGER`, `pr_url TEXT` (all nullable); new `IntentRepository.saveBranchInfo`; pipeline-agent creates `pipeline-failed` / `pipeline-timeout` alerts (severity high, requiredAction `provide-feedback`) carrying intentId + branch + prUrl + prNumber + runId + pipelineStatus in context JSONB; new `AlertType` values + `AlertRequiredAction: 'provide-feedback'`; pr-agent persists branch info on fresh-PR path and dispatches a new `resumeOnBranch` flow: when set, fetch + `checkout -B <branch> origin/<branch>`, push to existing branch, NO new PR — reuses the input's `prNumber`/`prUrl`, writes a `pr-opened` event with `metadata.resume: true` so the timeline narrates "fix push" vs original; commit subject becomes `fix: address CI failure — <intent line> [gestalt <corr8>]`. Generate orchestrator threads `resumeOnBranch`/`prNumber`/`prUrl` payload optionals through `drivePlan` → gate's `dispatchDeployPR` → deploy:pr; on resume, fetches + checks out the existing remote branch with WARN-and-fall-through-to-default safety. intent-agent prompt picks up new `clarificationSource: 'pipeline-feedback'` framing ("## CI pipeline failure feedback from operator"); `needsClarification` short-circuits for `pipeline-feedback` to avoid re-pausing. New route `POST /alerts/:id/pipeline-feedback` (`requireRole('operator')` + `checkProjectMembership(editor)`) validates type ∈ {pipeline-failed, pipeline-timeout}, calls `intents.saveClarification(intent.id, feedback)`, dispatches `generate:intent` with full resume payload, transitions to `generating`, acknowledges alert atomically — audit `alert.pipeline-feedback-submitted` carries `feedbackLength + branch + prNumber + intentId + type + ip` ONLY (GP-006). Dashboard Alerts view: new `PipelineBody` (intent line + branch + PR link + run id + pipeline status KV header) and `PipelineFeedbackBlock` (textarea + "retry with fix ▶" button) rendered ABOVE Dismiss for the two new types; new TypeGlyph (✗ red for failed, ⏱ amber for timeout); FixIntentBlock suppressed for pipeline alerts (operators provide CI-fix context via the new block instead). CLI: new `gestalt alerts pipeline-feedback <alertId> [--feedback <text>]` subcommand — displays branch/PR/runId/status context then submits; `gestalt alerts show` Available actions footer routes pipeline alerts to `pipeline-feedback` + `dismiss`. Live verified end-to-end: 4 validation paths (400/404), happy path (200 with intentId + status: generating + branch + PR), atomic ack + clarification persist (116 chars), worker pickup with `resumeOnBranch` log line, GP-006 audit metadata. PRE-EXISTING: pr-agent syncs `pnpm-lock.yaml` after writing artifacts so CI's `--frozen-lockfile` always passes. New shared `execCommand(cmd, args, cwd, timeoutMs)` helper in `packages/agents/deploy/src/agents/exec.ts` — spawn-based, no shell, 2-minute default timeout, surfaces a 400-char stderr tail on non-zero exit. pr-agent's `maybeSyncLockfile(workDir)` stats `package.json` then runs `pnpm install --no-frozen-lockfile`; ENOENT skips (no Node project yet), other failures log WARN and continue (CI is the real source of truth — don't block PR creation over a lockfile sync hiccup). Dockerfile production stage swapped `corepack prepare pnpm@9.15.4 --activate` for `npm install -g pnpm@9.15.4` so the runtime `gestalt` user has pnpm 9.15.4 on PATH (corepack caches per-user; root activation wouldn't reach gestalt and the auto-fetched latest pnpm requires Node 22's `node:sqlite`). Template `gestalt.yml` gains a graceful fallback: if `pnpm-lock.yaml` is missing, emit a `::warning::` and run `pnpm install` without `--frozen-lockfile` so first-CI doesn't hard-fail. context-fixer.ts is unchanged — the ADR-018 path guard restricts it to `docs/*` and `AGENTS.md`, so it can never reach a `package.json` write path. Smoke test inside the rebuilt container: `pnpm 9.15.4` callable, real `pnpm install --no-frozen-lockfile` produces a 384-byte `pnpm-lock.yaml@9.0` for a lodash dependency)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -2910,496 +2910,6 @@ enforced"):
 
 ## Recent session log entries
 
-### Session 2026-06-03 — Claude Code (Autonomous self-healing loop — migration 020)
-
-Largest feature drop since the deploy layer shipped. When ANY
-failure occurs anywhere in the SDLC (generate / gate / pipeline /
-deploy / custom-agent), a new `SelfHealingAgent` automatically
-diagnoses the failure and decides whether to auto-retry or
-escalate. When the retry budget is exhausted or confidence is too
-low, a human alert is created AND the same agent is immediately
-re-invoked as an automated alert resolver (at higher confidence
-bar). All parameters are platform defaults configurable by
-platform-admin via a new dashboard tab + CLI.
-
-Changed (1 migration + 7-area implementation):
-
-**Migration 020 + repository layer:**
-- `packages/adapters/postgres/src/migrations/020_self_healing.sql`
-  (new): `platform_self_healing_config` table with CHECK constraints
-  on max_attempts (0–10) and confidence_threshold (high/medium/low);
-  partial unique index ensures one row per failure type via the
-  UNIQUE constraint. Seeded with the seven failure types from the
-  brief: `generate-error` (2/medium/auto/on), `gate-max-retries`
-  (2/medium/auto/on), `pipeline-failed` (2/medium/auto/on),
-  `pipeline-timeout` (1/high/auto/on — timeouts are usually
-  infrastructure, narrower bar), `deploy-error` (1/medium/auto/on),
-  `maintenance-error` (1/medium/auto/on), `custom-agent-failure`
-  (2/medium/auto/on). `INSERT ... ON CONFLICT DO NOTHING` so the
-  seed is idempotent. `ALTER TABLE intents ADD attempt_count
-  INTEGER NOT NULL DEFAULT 0` + `last_resume_context JSONB`
-  (nullable). `ALTER TYPE deployment_event_type ADD VALUE IF NOT
-  EXISTS 'resume-pushed'`. Pure schema only — no
-  `schema_migrations` writes
-- `packages/core/src/repository/index.ts`:
-  - New `SelfHealingConfigRecord` + `SelfHealingConfigRepository`
-    interface (list / findByType / update)
-  - New `ResumeContext` type — two shapes share the JSONB column:
-    `autoHealed:true` (diagnostician's diagnosis + rootCause +
-    skipAgents + focusFiles) and `autoHealed:false` (operator's
-    verbatim feedback)
-  - `IntentRecord` gained `attemptCount` + `lastResumeContext`;
-    `IntentRepository.create()` Omit type widened
-  - New `IntentRepository.saveResumeContext` (writes via
-    `db.json(...)` typed helper — proper JSONB, not the
-    string-scalar trap) + `incrementAttemptCount` (atomic
-    INSERT-OR-INCREMENT via `COALESCE(attempt_count, 0) + 1
-    RETURNING attempt_count`)
-  - `AlertType` extended with the four new failure types
-    (`generate-error`, `gate-max-retries`, `deploy-error`,
-    `maintenance-error`, `custom-agent-failure`); existing
-    `pipeline-failed`, `pipeline-timeout`, `provide-feedback`
-    remain unchanged
-  - `RepositoryRegistry` gained `selfHealingConfig`
-- `packages/adapters/postgres/src/repositories/self-healing-config.ts`
-  (new): full impl. `update` uses `COALESCE(${field ?? null},
-  field)` so partial PATCH semantics work — fields not supplied
-  keep their prior value; only supplied fields update
-- `packages/adapters/{oracle,mssql}/src/repositories/self-healing-config.ts`
-  (new): throw-stubs. Same pattern as every prior adapter stub
-- `packages/core/src/events/index.ts`: `LiveEventType` extended
-  with `alert.auto-resolved` so the dashboard's Alerts view can
-  remove cards live when the loop auto-resolves them
-
-**SelfHealingAgent + runSelfHealingLoop + queue config helper:**
-- `packages/core/src/queue/index.ts`: new
-  `setQueueConfig(config)` / `getQueueConfig()` / `_resetQueueConfig()`
-  pattern. Mirrors `setMasterKey/getMasterKey` and
-  `setLLMRegistryResolver` — lets the self-healing loop (which
-  runs inside `@gestalt/core` far from server boot) call
-  `dispatch(message, getQueueConfig())` without threading config
-  through every consumer. Server pins at boot step 5c
-- `packages/core/src/agents/self-healing-agent.ts` (new): the
-  diagnostician class. Extends `BaseLLMAgent` for shared LLM
-  routing + capture; hard-coded persona (`"Senior software
-  engineer and technical diagnostician"`, temperature 0.1,
-  maxTokens 2000) — platform-internal, operators don't tune
-  this. The `diagnose(ctx, correlationId, confidenceThreshold)`
-  method:
-  - Builds a structured prompt with seven sections (original
-    intent / failure details / prior signals / generated files /
-    architecture / constraints / golden principles)
-  - Returns JSON-shape diagnosis via `extractJsonObject` + lenient
-    parse (every field defaults safely if missing)
-  - **Confidence threshold downgrade**: if the LLM's emitted
-    confidence is below the platform-admin's per-failure-type bar,
-    `shouldRetry` is forced to `false` regardless. So a diagnosis
-    the LLM marked `shouldRetry:true, confidence:low` against a
-    `confidenceThreshold:medium` setting surfaces as
-    `shouldRetry:false`
-  - **Never throws** — LLM-call failure and JSON-parse failure
-    both fall through to a safe-default
-    `{shouldRetry:false, confidence:low, suggestedFix:'Manual
-    review required'}` diagnosis. The loop's "NEVER throws"
-    invariant depends on this
-  - `buildPrompt`/`parseResponse` stubs throw (the class uses a
-    custom `diagnose()` entry, not the base template `run(task)`)
-- `packages/core/src/agents/self-healing-loop.ts` (new):
-  `runSelfHealingLoop(ctx, payload, signals)` — the brain. Outer
-  try/catch wraps the inner unsafe implementation so any thrown
-  error from a repository call or event emit falls through to
-  human escalation. Inner flow:
-  1. `selfHealingConfig.findByType(payload.failureType)` (falls
-     back to DEFAULT_CONFIG if missing — defensive)
-  2. If `!config.enabled`: escalate immediately with reason
-     "Self-healing disabled"
-  3. `intent.attemptCount` + 1 = current attempt; if > maxAttempts:
-     escalate with reason "Budget exhausted"
-  4. `new SelfHealingAgent().diagnose(ctx, corr, config.confidenceThreshold)`
-  5. If `!diagnosis.shouldRetry`: escalate with reason "Diagnosis:
-     X. Confidence: Y"
-  6. Otherwise (HIGH-confidence retry):
-     - `effectiveSkipAgents = confidence === 'high' ? skipAgents : []`
-       (second defense — the diagnosis itself also enforces this)
-     - `saveResumeContext({operatorFeedback: '[Auto] ${suggestedFix}',
-       autoHealed: true, diagnosis, rootCause, skipAgents,
-       focusFiles, updatedIntentText, ...})`
-     - `incrementAttemptCount` — atomic SQL UPDATE
-     - Return `{shouldRetry: true, escalated: false,
-       autoResolved: false}` — caller dispatches
-  - Escalation path's `escalateToHuman` creates an alert via
-    `alerts.create({type: failureType, severity:'high',
-    requiredAction:'provide-feedback', context: {intentId, branch,
-    prNumber, prUrl, failureType, attemptNumber,
-    escalationReason, ...alertContextExtras}})` then emits
-    `alert.created` SSE. Title built per-failureType from a
-    `TITLE_TEMPLATES` map. Failure non-fatal — log warn + continue
-  - **`attemptAutoResolveAlert` re-invokes the diagnostician at
-    `'high'` confidence** (higher than the per-config threshold).
-    If shouldRetry+high: saves resume context, acks alert as
-    `'system'`, transitions intent to `generating`, dispatches
-    fresh `generate:intent` with `source: 'auto-resolved'`,
-    emits `alert.auto-resolved` SSE. NEVER throws — alert stays
-    open if auto-resolve can't make progress
-  - Returns `{shouldRetry, diagnosis, escalated, autoResolved}` —
-    callers branch on `shouldRetry && !escalated → dispatch`,
-    `!shouldRetry && !escalated → transitionIntent failed`,
-    `escalated && !autoResolved → transitionIntent failed`,
-    `escalated && autoResolved → do nothing (loop already
-    transitioned to generating)`
-  - `shouldSkipAgent(resumeContext, agentRole)` helper exported
-    for orchestrators (returns false unless autoHealed AND role
-    in skipAgents)
-- Core re-exports `SelfHealingAgent`, `runSelfHealingLoop`,
-  `shouldSkipAgent`, `SelfHealingContext`, `SelfHealingDiagnosis`,
-  `FailureType`, `SelfHealingLoopPayload`, `SelfHealingResult`,
-  `ResumeSource`
-
-**Orchestrator + custom-agent wiring:**
-- Server adds boot step 5c — `setQueueConfig(config.queue)` —
-  before any worker starts so dispatchers inside the loop have a
-  config to read
-- `packages/agents/generate/src/orchestrator/orchestrator.ts`:
-  - `IntentTaskPayload.source` union widened to include
-    `'self-healing'`, `'auto-resolved'`, `'operator-resume'`
-  - `intentSource` typed union widened to match
-  - `DrivePlanOptions.skipAgents?: string[]` added —
-    `handleIntentTask` reads `intent.lastResumeContext.skipAgents`
-    AND checks `autoHealed:true` (belt-and-braces), threads in
-  - Each step's per-step branch now checks
-    `opts.skipAgents?.includes(agentRole)` at the top and skips
-    cleanly: creates `agent_executions` row with
-    `status:'skipped'`, emits both `agent.started` + `agent.completed`
-    so the dashboard accordion stays consistent
-  - New `attemptSelfHealingForGenerate` helper — loads intent +
-    signals + artifacts fresh, calls `runSelfHealingLoop` with
-    `failureType:'generate-error'`, dispatches a retry on
-    `shouldRetry+!escalated+diagnosis`, returns `{retryDispatched}`
-  - Wired into `hasPlanFailed` branch AND catch block. Catch
-    block doesn't re-throw when self-healing dispatched (BullMQ
-    would otherwise retry the original job → duplicate dispatch)
-  - New `SelfHealingRetryDispatched` sentinel Error class —
-    thrown by inline self-healing dispatchers (custom-agent path)
-    to bail cleanly. Catch block recognises it via `instanceof`
-    and returns a completed TaskResult without re-running
-    self-healing
-  - New `attemptSelfHealingForCustomAgent` helper — fires only on
-    `result.status === 'error'` (real LLM errors, not finding-
-    based failures which continue to flow as signals). On retry
-    dispatched, completes the execution row + throws the sentinel
-    to bail the cycle
-- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
-  - New `attemptSelfHealingForGate` helper — same shape as the
-    generate one but with `failureType:'gate-max-retries'` and
-    summary including the gate verdict + signal count
-  - Wired into the `!retried` branch (after MAX_GATE_RETRIES
-    exhausted via `maybeDispatchRetry`)
-- `packages/agents/deploy/src/agents/pipeline-agent.ts`:
-  - **Stopped creating alerts directly** (the prior pipeline-
-    feedback session's `createPipelineFailureAlert` removed). The
-    self-healing loop in deploy-orchestrator now owns alert
-    creation as part of its escalation path
-  - `PipelineAgentOutcome` variants gained `pipelineStatus` so
-    deploy-orchestrator can forward it as `alertContextExtras` to
-    the loop (the dashboard PipelineBody card still rendrs
-    correctly because the same fields land in alert.context)
-  - `quoteIntent` + `createPipelineFailureAlert` helpers removed
-    with a comment block documenting where the equivalent logic
-    moved
-- `packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`:
-  - New `attemptSelfHealingForDeploy` helper — generic shape that
-    takes a `failureType: FailureType` so the same helper handles
-    `pipeline-failed`, `pipeline-timeout`, and `deploy-error`
-  - Wired into the pipeline-failed/cancelled/timeout branch
-    (passes `alertContextExtras: {runId, pipelineStatus, adapter}`
-    so the alert context carries CI specifics the dashboard
-    PipelineBody renders) AND the generic catch block
-    (`failureType:'deploy-error'`)
-  - On retry dispatched, returns a completed TaskResult instead
-    of re-throwing (same anti-duplicate-dispatch rule)
-- Maintenance: NOT wired. The runner's per-project catch block
-  records an `agent-error` finding on the maintenance_runs row
-  and continues to the next project. Maintenance runs don't
-  have an intent in scope at that point — the loop's payload
-  requires intentId. The `maintenance-error` seed entry is kept
-  for forward use when the runner gains intent-scoped failure
-  paths
-
-**Context-assembler + code-prompt resume context:**
-- `packages/agents/generate/src/types.ts`:
-  - `ContextSnapshot` gained optional `resumeContext?:
-    ResumeContextSnapshot | null`, `focusFiles?: string[]`,
-    `skipAgents?: string[]`
-  - New local `ResumeContextSnapshot` type — duplicate of core's
-    `ResumeContext` to avoid prompt-builders depending on the
-    repository types directly
-- `packages/agents/generate/src/orchestrator/context-assembler.ts`:
-  - `assembleContext` signature gained optional `intentId`
-  - When supplied, loads `intent.lastResumeContext` and attaches
-    to the snapshot (with skipAgents + focusFiles ergonomic
-    fields). Also threads `resumeContext.priorSignals` into the
-    snapshot's `priorSignals` field (so the prompt's
-    signal-feedback section reflects the historical record)
-    when the orchestrator didn't otherwise route signals
-  - Failure non-fatal — assembly continues without resume context
-- `packages/agents/generate/src/prompts/code-prompt.ts`:
-  - New `resumeSection` rendered between signals and task. Two
-    shapes per `autoHealed`:
-    - true → "## Resumed attempt (N) — auto-diagnosed" + Failure /
-      Diagnosis / Root cause / Suggested fix
-    - false → "## Resumed attempt (N) — operator feedback" +
-      Failure / Operator feedback (verbatim)
-  - Focus files appended as bullet list when present
-
-**Server routes + audit:**
-- `packages/server/src/routes/platform-config.ts`:
-  - New `GET /platform/self-healing` (admin) — returns
-    `{data: SelfHealingConfigRecord[]}`
-  - New `PATCH /platform/self-healing/:failureType` (admin) —
-    partial body: `{maxAttempts?, confidenceThreshold?,
-    autoResolveAlerts?, enabled?}`. Validator returns 400 with
-    typed codes: `INVALID_MAX_ATTEMPTS` (range 0–10),
-    `INVALID_CONFIDENCE_THRESHOLD` (enum check),
-    `INVALID_AUTO_RESOLVE_ALERTS` / `INVALID_ENABLED` (bool
-    check), `EMPTY_PATCH` (at least one field required).
-    Returns 404 for unknown failure type. Audit row
-    `self-healing.config-updated` with metadata
-    `{failureType, changedFields, previousValues, newValues, ip}`
-    so the audit trail shows the delta. GP-002 — every mutation
-    is audited
-- `packages/server/src/oversight/routes.ts`:
-  - New `POST /alerts/:id/resume` (operator + editor membership) —
-    generic human-feedback resume for any failure alert type.
-    Distinct from `pipeline-feedback` (type-specific) and
-    `clarify` (vague intent) and interventions (GP_BREACH).
-    Accepts feedback string, validates alert type is in the
-    failure-types set, requires `context.intentId`. Saves
-    `last_resume_context` with `autoHealed:false`, increments
-    attempt_count, dispatches `source: 'operator-resume'`,
-    acks alert, GP-006 audit (`feedbackLength` only — text
-    NEVER hits audit_log)
-
-**Dashboard:**
-- `packages/dashboard/src/types.ts`: new `SelfHealingConfig` type
-- `packages/dashboard/src/api/client.ts`: new
-  `listSelfHealingConfig` + `updateSelfHealingConfig` methods
-- `packages/dashboard/src/views/Admin.tsx`:
-  - 8th tab `Self-healing` added between Secrets and Templates
-  - New `SelfHealingTab` component — table with per-row controls:
-    toggle Enabled checkbox, `<select>` for maxAttempts (0–10),
-    `<select>` for confidence (high/medium/low), toggle
-    Auto-resolve checkbox. Each change fires a partial PATCH
-    immediately; inline `saving...` then `✓ saved` indicator
-    next to the row. Confidence + auto-resolve documentation
-    text below the table explains the semantics
-  - New `styles.smallSelect` for the dropdowns
-
-**CLI:**
-- `packages/cli/src/api/client.ts`: new
-  `SelfHealingConfigSummary` type + `listSelfHealingConfig` +
-  `updateSelfHealingConfig` methods
-- `packages/cli/src/commands/platform-extras.ts`:
-  - New `platformSelfHealingListCommand` — prints a 5-column
-    table (TYPE/ENABLED/MAX ATTEMPTS/CONFIDENCE/AUTO-RESOLVE)
-    with ✓/✗ for booleans
-  - New `platformSelfHealingConfigureCommand <failureType>` —
-    PATCH with flag combinators: `--max-attempts <n>`,
-    `--confidence high|medium|low`, `--auto-resolve` /
-    `--no-auto-resolve`, `--enable` / `--disable`. Client-side
-    validation (range, enum) fails fast with friendly error.
-    At least one flag required
-- `packages/cli/src/index.ts`: registered
-  `gestalt platform self-healing list/configure` under the
-  existing `gestalt platform` parent
-
-Live verified end-to-end:
-
-- `pnpm -r build` clean across all 12 packages
-- `docker compose up -d --build server` — `Up (healthy)`
-- Migration 020 applied on first boot (`schema_migrations` now
-  lists 20 versions). `\d intents` confirms `attempt_count`
-  (NOT NULL DEFAULT 0) + `last_resume_context` JSONB columns.
-  `\dt platform_self_healing_config` confirms the table.
-  `enum_range(NULL::deployment_event_type)` includes
-  `resume-pushed`
-- Server log shows `Queue config pinned for self-healing
-  dispatch` at boot step 5c
-- Seeded defaults verified: all 7 failure types present with
-  the brief's per-type values (pipeline-timeout=1/high, others
-  per spec)
-- **API endpoints:**
-  - `GET /platform/self-healing` returns 7 rows with the
-    expected shape
-  - `PATCH /platform/self-healing/pipeline-failed
-    {maxAttempts:3}` → 200 with updated row + `updatedBy:
-    <admin uuid>`
-  - `PATCH /platform/self-healing/pipeline-failed
-    {enabled:false}` → 200 (subsequent PATCH-with-existing
-    pattern works)
-  - Validation: `maxAttempts:15` → 400
-    `INVALID_MAX_ATTEMPTS`; `confidenceThreshold:'super'` → 400
-    `INVALID_CONFIDENCE_THRESHOLD`; unknown failure type →
-    404 `NOT_FOUND`; `{}` → 400 `EMPTY_PATCH`
-  - **Audit row** for `self-healing.config-updated` has
-    metadata `{failureType, changedFields,
-    previousValues, newValues, ip}` — exact per-field delta
-    visible. GP-002 ✓
-- **CLI:**
-  - `gestalt platform self-healing list` — table prints all 7
-    types with ✓/✗ for booleans, numeric maxAttempts, color-
-    coded confidence
-  - `gestalt platform self-healing configure pipeline-failed
-    --max-attempts 0` → `✓ Self-healing config updated` with
-    the four current values printed. Confirmed the disabled
-    state on subsequent list call. Reset back to 2 cleanly
-- **POST /alerts/:id/resume happy path:**
-  - Seeded a synthetic `generate-error` alert against a
-    pre-existing trackeros project with intent in `failed`
-    status (`branchName: gestalt/verify-shr-add-a-utility`,
-    `prNumber: 201`, `attemptCount: 1`)
-  - `POST /alerts/<id>/resume {feedback: "..."}` → 200 with
-    `{intentId, status: 'generating', branch, prNumber, prUrl}`
-  - DB inspection:
-    - intent transitioned `failed → generating`, attempt_count
-      went 1 → 2
-    - `last_resume_context` stored as JSONB object (`jsonb_typeof
-      = object`), `autoHealed:false`, `failureType:
-      "generate-error"`, `attemptNumber: 2`
-    - alert acknowledged_at populated, acknowledged_by =
-      admin uuid
-    - audit_log row `alert.resume-submitted` carries
-      `{type: "generate-error", intentId, feedbackLength: 95,
-      branch, prNumber, ip}` ONLY — direct probe
-      `metadata::text LIKE '%string.split%'` (the actual
-      feedback content) returned 0 rows. GP-006 ✓
-    - BullMQ `bull:gestalt-generate:active` had 1 job (the
-      resume dispatch); worker picked it up immediately
-- **Worker pickup:** intent ran the full cycle through generate →
-  gate → deploy and reached `deploying`. Synthetic branch
-  didn't exist on the real GitHub repo so orchestrator
-  gracefully fell back to default branch (same WARN +
-  fallback design as the pipeline-feedback flow's resume).
-  The end-to-end "intent failed → operator submitted resume →
-  resume cycle ran" path is fully wired
-- **Validation matrix for /alerts/:id/resume:**
-  - Missing feedback → 400 `INVALID_FEEDBACK`
-  - `clarification-needed` alert type → 400
-    `INVALID_ALERT_TYPE` "use the type-specific endpoint"
-  - Unknown alert UUID → 404 "Alert not found"
-- **Dashboard bundle:** rebuilt clean (Vite 352 KB ungzipped);
-  spot-grep confirms the new `Self-healing configuration`
-  string is in the bundle
-- Cleanup: synthetic intent + alert + audit + execution rows
-  scrubbed at end of session; trackeros DB back to baseline
-
-Verification status per the brief's scenarios:
-
-| Scenario | Verified |
-|---|---|
-| 1 — Auto-healed, no human involvement | Code path exercised via /alerts/:id/resume + DB inspection. Full LLM-driven auto-retry on a real failing intent requires a project with deterministic failure — deferred to next routine cycle |
-| 2 — Budget exhausted, auto-resolve attempt | escalateToHuman + autoResolved path coded; auto-resolve path triggers when config.autoResolveAlerts AND alert created |
-| 3 — Custom agent failure | Code path wired; SelfHealingRetryDispatched sentinel + catch handling in orchestrator. Live verification needs a deterministically-failing custom agent (operator action) |
-| 4 — Config change from dashboard | Live verified via PATCH endpoint + CLI configure. Dashboard tab compiled into bundle |
-| 5 — Human feedback fallback | Live verified end-to-end against synthetic alert: feedback submitted, intent transitioned, last_resume_context saved with autoHealed:false, attempt_count incremented, alert acked, worker picked up the resume cycle, GP-006 audit confirmed |
-
-Decisions made:
-
-- **`runSelfHealingLoop` returns `autoResolved` flag** (added
-  beyond brief's `{shouldRetry, diagnosis, escalated}`).
-  Without it, callers couldn't distinguish "escalated, alert
-  open, transition to failed" from "escalated, alert
-  auto-resolved, intent already generating — DO NOT override".
-  Documented inline in the return type's JSDoc
-- **Confidence threshold downgrade enforced inside
-  `SelfHealingAgent.diagnose`** not at the loop layer. Putting
-  it in the agent means the same threshold logic applies
-  regardless of caller. The loop's secondary skipAgents-clear
-  on lower-confidence is belt-and-braces defense
-- **Pipeline-agent stops creating alerts directly.** Trade-off:
-  loses pipeline-agent's title format (e.g. "CI pipeline
-  failed for intent 'X'") in favour of the loop's per-
-  failure-type TITLE_TEMPLATES. The alert context JSONB still
-  carries runId/pipelineStatus/branch/prNumber/prUrl via
-  `alertContextExtras`, so the dashboard PipelineBody card +
-  the existing POST /alerts/:id/pipeline-feedback route both
-  continue to work. Net: same UX, cleaner architecture (loop
-  owns alert creation), no duplicate code path
-- **`SelfHealingRetryDispatched` sentinel error** instead of a
-  bool return from `runOneCustomAgentNode`. The custom-agent
-  chain walker calls the node runner recursively; threading
-  "stop everything" through return values would force every
-  level to check + propagate. Throwing a typed error and
-  catching it ONCE in `handleIntentTask`'s catch block keeps
-  the surface minimal. The catch block then differentiates
-  sentinel-vs-real-error via `instanceof`
-- **Don't re-throw from orchestrator catch when self-healing
-  dispatched.** BullMQ treats a thrown job as "retry me" —
-  but we just queued a NEW retry via self-healing. Throwing
-  would cause double-dispatch. Returning a `failed` (or
-  `completed`) TaskResult tells BullMQ "job done, don't
-  retry". Same pattern in generate orchestrator catch, deploy
-  orchestrator catch
-- **`attempt_count` increments BEFORE the dispatch.** So the
-  next cycle's loop reads the higher count + enforces the
-  budget correctly. If the dispatch itself fails (rare), the
-  counter is "wrong by one" — acceptable trade-off because
-  the operator can manually reset via DB if it ever becomes
-  a problem. The alternative (increment after dispatch
-  success) creates a race where two retries could be queued
-  with the same attempt_count
-- **`skipAgents` honored only at high confidence.** Enforced
-  TWICE: (1) in `runSelfHealingLoopUnsafe` the
-  `effectiveSkipAgents` is conditionally cleared to `[]`
-  before saving the resume context; (2) in `handleIntentTask`
-  the snapshot's `selfHealingSkipAgents` only loads when
-  `resumeCtx.autoHealed` is true. The brief is explicit about
-  this — never skip agents on operator-feedback resumes (no
-  diagnosis was run) or on lower-confidence diagnoses
-- **Maintenance not wired.** The runner's per-project catch
-  records a finding on the maintenance_runs row but doesn't
-  transition any intent (maintenance runs don't have
-  intent-scoped failure paths today). Adding self-healing
-  here would require synthesizing an intent for the failure
-  — over-engineering for a path that the brief doesn't
-  exercise. The `maintenance-error` seed entry is kept
-  for forward compatibility
-- **Alert title templates per failure type** (`TITLE_TEMPLATES`
-  in the loop). Without per-type titles the operator would
-  see seven identical "auto-resolve attempt" cards. The
-  templates give each its own scannable label
-  ("CI pipeline failed for intent 'X' (attempt N)" etc.)
-- **`alertContextExtras` payload field** added so callers can
-  inject domain-specific context into the alert without the
-  loop knowing about it. Currently used by deploy-orchestrator
-  to carry runId + pipelineStatus. Future callers can add
-  whatever the dashboard's per-type renderer needs
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Docker server image rebuilt; migration 020 applied; queue config
-pinned at boot. Full validation + happy-path + side-effect +
-GP-006 + audit + worker-pickup matrix verified live. Dashboard
-+ CLI surfaces compiled clean. The autonomous self-healing path
-is wired end-to-end; the LLM-driven part of the loop (actual
-diagnosis quality) is best evaluated against real customer
-deployments since it depends on the diagnostician's model
-behaviour against real failure context.
-
-Pending follow-ups: none introduced. Possible future iteration:
-- Maintenance runner self-healing when a per-finding context-
-  fixer fails (would map to `failureType:'maintenance-error'`)
-- Auto-resolved alerts could show a richer "what was diagnosed"
-  panel on the dashboard (today the diagnosis is on the
-  intent's `last_resume_context` but the alert's auto-resolve
-  doesn't surface the diagnosis directly to operators
-  reviewing the audit trail)
-- IntentDetail dashboard "Attempt history" panel — the brief
-  sketched a UI showing the attempt-by-attempt diagnosis
-  chain. The data is there (each cycle's
-  `last_resume_context` JSONB) but a dedicated history-fetch
-  endpoint is a future enhancement
-
----
-
 ### Session 2026-06-04 — Claude Code (Hybrid LLM recovery for scripted deploy agents — Option B)
 
 Builds on yesterday's autonomous self-healing loop (migration 020).
@@ -3954,3 +3464,297 @@ Pending follow-ups: none introduced. Future possible iterations:
   workflow file / HARNESS.json runtime drift between the
   template and the project's committed copy, and surfaces
   the gap as an operator suggestion
+
+---
+
+### Session 2026-06-04 — Claude Code (Dynamic harness — LLM-generated stack config at `gestalt init`)
+
+Builds on the prior session's template runtime fix. `gestalt init`
+used to copy a static template with hardcoded TypeScript / Node 22 /
+pnpm / Vitest assumptions into every project. This session makes
+the harness content dynamic: the LLM looks at the project
+description, picks the language / runtime / package manager / test
+framework / framework / database, and the engine substitutes those
+choices into the template at init time.
+
+The result is a harness that actually reflects the project from
+day one — a Python project gets `setup-python` + `pip install` +
+`pytest` in its CI workflow, `Senior Python engineer` as the
+code-agent role, and `pip` as the package manager in the
+ARCHITECTURE.md Stack section.
+
+Changed:
+
+- `packages/server/src/templates/stack-config.ts` (new):
+  - `StackConfig` interface — 14 structured fields the LLM
+    populates from the project description. The two
+    pre-rendered string fields (`stackSection` markdown and
+    `agentPromptExtensionsYaml` YAML) are produced inside
+    `parseStackConfig` so the template engine just runs a flat
+    string substitution (no `{{#if}}` conditional logic
+    required)
+  - `DEFAULT_STACK_CONFIG` — TypeScript / Node 22 / pnpm /
+    Vitest. Used when the LLM call fails OR parse fails. Both
+    pre-rendered fields baked in
+  - `generateStackConfig(description, name)` — calls
+    `getLLMClient` directly (NOT BaseLLMAgent — this runs
+    before the platform LLM registry is wired for the cycle).
+    Uses `temperature: 0.1` for deterministic stack decisions
+    and `maxTokens: 1000` (well under the 2000-default since
+    structured JSON output is compact). NEVER throws — every
+    failure path returns `{ ...DEFAULT_STACK_CONFIG }`
+  - `buildStackPrompt` — concrete Rules section + worked
+    examples of `ciSetupSteps` for Node and Python, so the
+    LLM understands the YAML indentation contract
+  - `parseStackConfig` — defensive on every field via
+    `stringOr` / `nullableString` helpers. The LLM emitting
+    the literal string `"null"` for a nullable field
+    (observed once in scratch testing) is mapped to JS
+    `null` for the consumer's benefit
+  - `stripIndent` + `indentSteps` helpers normalise the LLM's
+    `ciSetupSteps` block: strip common leading whitespace,
+    then re-apply a uniform 6-space indent so every line
+    lands at the depth `steps:` items live at in the
+    workflow. Idempotent — applies to both LLM output AND
+    the hardcoded default
+  - `renderStackSection` — produces the ARCHITECTURE.md
+    Stack section from the structured fields. Null fields
+    (e.g. no Runtime line for a Python project) are filtered
+    so the section reflects only what's true
+  - `renderPromptExtensionsYaml` — produces the
+    `code-agent.prompt_extensions:` YAML lines (with the
+    correct 6-space indent for the `agents.yaml` block).
+    Empty extension list renders as `      []`
+
+- Four template files updated to use stack-driven
+  placeholders:
+  - `templates/corporate-ops-web-mobile/ci/gestalt.yml`:
+    Hardcoded `Setup Node 22 LTS` + `node-version: '22'` +
+    `Setup pnpm` + `pnpm install --frozen-lockfile` + `pnpm
+    test` REMOVED. Replaced with two placeholders:
+    `{{ciSetupSteps}}` at column 0 (the LLM-generated YAML
+    block carries its own indent) and `{{testCmd}}` inside
+    the existing `Run tests` step. The conditional file-
+    presence check was widened to recognise `requirements.txt`
+    / `pyproject.toml` / `go.mod` / `Cargo.toml` so non-Node
+    projects don't print the "no project manifest" warning
+  - `templates/corporate-ops-web-mobile/harness/HARNESS.json`:
+    `stack` object replaced. Legacy `runtime: "node22"` field
+    DROPPED in favour of `nodeVersion: "{{nodeVersion}}"`.
+    Added `testFramework`, `framework`, `frontend`, `database`
+    fields (all `{{placeholder}}`-driven). `architectureStyle`
+    kept as the only hardcoded field
+  - `templates/corporate-ops-web-mobile/harness/agents.yaml`:
+    `code-agent.role` now `"Senior {{language}} engineer"`
+    and `test-agent.goal` references `{{testFramework}}`.
+    `code-agent.prompt_extensions` populated by
+    `{{agentPromptExtensionsYaml}}` (pre-rendered YAML
+    lines from the stack config). The big example block at
+    the end of the file is unchanged
+  - `templates/corporate-ops-web-mobile/harness/AGENTS.md`:
+    Hardcoded "Node 22 LTS / pnpm 9.x" section removed.
+    Replaced with `{{stackSection}}` — the pre-rendered
+    markdown list, plus a one-line note that the Gestalt
+    platform's own pin doesn't apply to user projects
+  - `templates/corporate-ops-web-mobile/docs/ARCHITECTURE.md`:
+    Hardcoded layer-structure + dependency rules section
+    REPLACED with `## Overview` ({{architectureNotes}}) +
+    `## Stack` ({{stackSection}}) + `## Module structure`
+    ({{moduleStructure}}) + `## Key patterns` + `##
+    Dependency rules` (kept generic — no language-specific
+    wording)
+  - `template.json#version` bumped 0.2.0 → 0.3.1 (Option B
+    version-check from the prior session triggers an
+    in-place refresh of the DB row on next boot)
+
+- `packages/agents/generate/src/prompts/code-prompt.ts`:
+  - Architecture-section runtime note updated to read EITHER
+    `harness.stack.nodeVersion` (new template shape — dynamic
+    harness) OR `harness.stack.runtime` (legacy back-compat
+    for projects initialised before this session)
+  - New branch for non-Node languages — when
+    `harness.stack.language` is something other than
+    TypeScript / JavaScript, the prompt emits "Project
+    language: Python, pip as package manager." style. Reads
+    `harness.stack.packageManager` to surface the right tool
+    name
+  - Priority order spelled out in the comment block — the
+    code-agent's runtime context is always grounded in the
+    project's HARNESS.json when populated
+
+- `packages/server/src/routes/projects.ts`
+  (`POST /projects/:id/init-harness`):
+  - Calls `generateStackConfig(projectDescription, project.name)`
+    before `loadTemplate`. Logs the chosen language /
+    packageManager / nodeVersion / testFramework
+  - Threads all 15 stack-driven variables into the
+    `loadTemplate` call. Nullable fields (nodeVersion /
+    buildCmd / framework / frontend / database) render
+    as empty string (or `"N/A"` for nodeVersion) so the
+    template doesn't emit literal `null` text. The
+    `architectureStyle` variable wasn't required — kept
+    hardcoded as "modular-monolith" in HARNESS.json
+
+- `packages/cli/src/commands/init.ts`:
+  - Phase 1 description prompt rewritten with stack-aware
+    guidance: "Describe your project's tech stack and
+    purpose. Include: what the application does,
+    programming language and key frameworks, package
+    manager preference, test framework preference."
+  - Worked example: "A React Native mobile app with a
+    Node.js/Express backend, PostgreSQL database, using
+    npm and Jest." — operators see the kind of content
+    that produces a good stack config
+
+Live verified end-to-end with REAL LLM calls (model: `gpt-4o`,
+~800 tokens per scenario):
+
+- **Boot**: `Refreshed built-in template (version bump)` logged
+  with `previousVersion: "0.2.0"` → `version: "0.3.1"`. DB row
+  in `platform_templates` updated in place (id / slug /
+  isBuiltin / createdAt preserved)
+- **Test 1 — TypeScript/Express/Jest/npm/PostgreSQL**:
+  - Stack returned: `language: TypeScript, nodeVersion: 22,
+    packageManager: npm, installCmd: "npm install --ci",
+    testCmd: "npm test", testFramework: Jest, framework:
+    Express, database: PostgreSQL`
+  - `gestalt.yml`: `actions/setup-node@v4` + `node-version:
+    '22'` + `npm install --ci` + `npm test` (replacing the
+    hardcoded pnpm chain)
+  - `HARNESS.json` stack: `{"language":"TypeScript",
+    "nodeVersion":"22","packageManager":"npm","testFramework":
+    "Jest","framework":"Express","frontend":"","database":
+    "PostgreSQL","architectureStyle":"modular-monolith"}`
+  - `ARCHITECTURE.md` Stack section: `Runtime: Node 22 LTS /
+    Package manager: npm / Test framework: Jest / Backend:
+    Express / Database: PostgreSQL`
+  - `agents.yaml` code-agent role: `Senior TypeScript engineer`,
+    `prompt_extensions` array length: 2 — both stack-relevant
+    rules (e.g. "Use TypeScript strict mode")
+- **Test 2 — Python/FastAPI/pytest/pip**:
+  - Stack returned: `language: Python, nodeVersion: null,
+    packageManager: pip, installCmd: "pip install -r
+    requirements.txt", testCmd: "pytest tests/",
+    testFramework: pytest, framework: FastAPI`
+  - `gestalt.yml`: `actions/setup-python@v5` + `python-version:
+    '3.12'` + `pip install -r requirements.txt` + `pytest
+    tests/` — the LLM correctly chose the Python-specific
+    setup action
+  - `HARNESS.json` stack: `nodeVersion: "N/A"` (placeholder
+    gracefully handles null — no literal `"null"` string in
+    JSON)
+  - `ARCHITECTURE.md` Stack section: `Package manager: pip /
+    Test framework: pytest / Backend: FastAPI` — no Runtime
+    line (correctly omitted because nodeVersion was null)
+  - `agents.yaml` code-agent role: `Senior Python engineer`
+- **Test 3 — React Native / TypeScript / Expo / pnpm**:
+  - Stack returned: `frontend: "React Native", framework:
+    null, packageManager: pnpm, testFramework: Jest,
+    nodeVersion: 22`
+  - `ARCHITECTURE.md` Stack section includes `Frontend:
+    React Native`
+- **Test 4 — LLM endpoint unreachable (fallback)**:
+  - Overrode `config.llm.baseUrl` to `http://localhost:1/v1`
+    (unreachable port) and called `generateStackConfig`
+  - Server logged `LLM call failed { type: 'provider-error',
+    message: 'TypeError: fetch failed', retryable: false }`
+    followed by `Stack config LLM call failed — using
+    defaults` warning. NEVER threw
+  - Returned `language: TypeScript, nodeVersion: 22,
+    packageManager: pnpm, testFramework: Vitest, installCmd:
+    "pnpm install --frozen-lockfile", testCmd: "pnpm test"`
+    — matches `DEFAULT_STACK_CONFIG` exactly
+- **Test 5 — existing trackeros unaffected**: trackeros's
+  committed harness files in its Git repo are NOT touched by
+  the DB row refresh. `init-harness` runs once at project
+  creation; existing projects retain their committed state
+- **YAML validity smoke** — `yaml.parse(gestalt.yml)` and
+  `yaml.parse(agents.yaml)` BOTH succeed for all 3
+  LLM-driven scenarios. Steps array in gestalt.yml is the
+  expected 4-element shape (Checkout / setup-language / run
+  install / Run tests). code-agent.prompt_extensions is a
+  proper YAML array (length 2 in every case)
+
+Decisions made:
+
+- **Stack config NOT persisted in DB.** The committed harness
+  files in the project repo are the authoritative record.
+  Storing the structured config in any DB column would
+  invite drift between "what the LLM picked" and "what the
+  operator actually committed" — same rationale ADR-032
+  uses for treating the Git repo as the project filesystem
+- **`stackSection` + `agentPromptExtensionsYaml` are
+  pre-rendered in `parseStackConfig`.** The brief noted the
+  current `{{name}}`-only engine doesn't support `{{#if}}`
+  conditional blocks. Pre-rendering keeps the engine's
+  one-regex-substitution semantics intact while still
+  letting the template show only the fields that are true
+  for the project (e.g. no Runtime line for Python). The
+  alternative — extending the engine with conditionals —
+  was rejected as over-engineering for one new feature
+- **Placeholder at column 0 + LLM output pre-indented.**
+  The engine does a literal string substitution; if the
+  placeholder lives at column N, only the FIRST line of a
+  multi-line value gets the N-space prefix. Putting the
+  placeholder at column 0 + having `indentSteps` apply
+  uniform indentation across every line in the LLM's
+  output guarantees correct YAML structure regardless of
+  what the LLM emits. Verified with `yaml.parse` against
+  3 distinct stack outputs
+- **`stripIndent` + `indentSteps` are idempotent.** Apply
+  in sequence (strip first, then re-apply) so both the
+  LLM-emitted block (may have any indent) AND the
+  hardcoded default (already 6-space-indented) flow
+  through cleanly. Belt-and-braces — running the helper
+  twice produces the same output
+- **NEVER throws contract on `generateStackConfig`.**
+  `init-harness` is operator-facing; a thrown error here
+  would surface as "init failed" with no clear
+  remediation. Falling back to defaults means the
+  operator gets a TypeScript/Node 22/pnpm/Vitest project
+  even when the LLM is down — they can edit the committed
+  harness files afterwards if needed
+- **Legacy `runtime` field DROPPED from HARNESS.json.**
+  Replaced with `nodeVersion` (more specific). Back-compat
+  for existing projects handled in `code-prompt.ts`'s
+  runtime-note builder — reads BOTH fields. Projects
+  initialised before this session continue to work
+  unchanged; projects initialised after carry the cleaner
+  field name
+- **`generateStackConfig` uses `getLLMClient()` directly,
+  NOT `BaseLLMAgent`.** This runs before any
+  per-correlation context exists (no intent, no orchestrator
+  cycle). Using the platform default LLM client + a simple
+  `complete()` call keeps the dependency surface small.
+  The temperature + maxTokens + correlationId-less request
+  is exactly the right shape for a one-shot stack
+  classification
+
+Pending follow-ups: none introduced. Possible future
+iterations:
+- A "regenerate stack config" CLI subcommand for operators
+  who want to re-run `generateStackConfig` against their
+  existing project's HARNESS.json description (today the
+  generation runs only at init time)
+- Per-project test customisation (e.g. integration vs unit
+  test scripts) — currently `testCmd` is a single string;
+  could be a structured object
+- A dashboard surface for viewing the chosen stack on the
+  project detail page (today operators read HARNESS.json
+  in the repo to see the stack)
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker server image rebuilt; template.json#version 0.3.1
+triggered the version-check re-seed. All 5 verification
+scenarios passed (3 real LLM calls + LLM-failure fallback +
+existing-project untouched). YAML validity confirmed for
+every produced workflow + agents.yaml file. No new
+migrations.
+
+Operator action — pending: none from this session. The
+existing trackeros project remains on its current Node 20
+workflow file (operator action from the prior session
+still applies — the operator may at their discretion
+update trackeros's workflow to Node 22 LTS). New
+`gestalt init` projects from this point forward get
+dynamic stack-driven harness files.

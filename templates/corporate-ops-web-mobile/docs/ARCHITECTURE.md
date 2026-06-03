@@ -1,22 +1,30 @@
 # Architecture — {{projectName}}
 
-## Style: modular monolith
+## Overview
 
-## Layer structure
+{{architectureNotes}}
+
+## Stack
+
+{{stackSection}}
+
+## Module structure
 
 ```
-src/
-├── modules/          # business domain modules — own their data and routes
-├── shared/
-│   ├── db/           # repository implementations
-│   ├── auth/         # authentication + RBAC
-│   └── utils/        # cross-cutting helpers
-└── api/              # route registration
+{{moduleStructure}}
 ```
+
+## Key patterns
+
+- See `AGENTS.md` for stack-specific coding conventions
+- See `docs/GOLDEN_PRINCIPLES.md` for the non-negotiable rules every
+  cycle is checked against
 
 ## Dependency rules
 
-- Modules may only import from each other's index.ts
-- All database access through src/shared/db/ repositories
-- No circular dependencies
-- No direct DB calls outside repository classes
+- Modules import from each other ONLY through their declared public
+  entry point (`index.ts`, `__init__.py`, package root — whatever the
+  stack uses)
+- All database access goes through a repository layer — no inline SQL
+  / ORM calls in route handlers or business logic
+- No circular dependencies between modules
