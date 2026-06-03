@@ -12,6 +12,14 @@ export interface ProjectSummary {
   defaultBranch: string;
   createdBy: string;
   createdAt: string;
+  /** Platform-admin enrichment (Session — project management). Present
+   *  on rows returned to a platform-admin user; omitted for regular
+   *  users (whose `/projects` listing skips the cross-project stats). */
+  memberCount?: number;
+  intentCount?: number;
+  /** ISO string of the most recent intent's `created_at`, or the
+   *  project's `created_at` when no intents exist yet. */
+  lastActivityAt?: string;
 }
 
 // ─── Intent feed ──────────────────────────────────────────────────────────────

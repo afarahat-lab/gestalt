@@ -132,4 +132,15 @@ export class PostgresMaintenanceRunRepository implements MaintenanceRunRepositor
     `;
     return row ? rowToRecord(row) : null;
   }
+
+  async deleteAllForProject(projectId: string): Promise<number> {
+    const db = getDb();
+    const [{ count }] = await db<[{ count: string }]>`
+      WITH deleted AS (
+        DELETE FROM maintenance_runs WHERE project_id = ${projectId} RETURNING 1
+      )
+      SELECT COUNT(*)::text AS count FROM deleted
+    `;
+    return parseInt(count, 10);
+  }
 }

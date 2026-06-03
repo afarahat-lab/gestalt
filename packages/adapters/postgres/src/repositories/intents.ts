@@ -136,4 +136,35 @@ export class PostgresIntentRepository implements IntentRepository {
 
     return { records, total: parseInt(count, 10) };
   }
+
+  async countByProject(projectId: string): Promise<number> {
+    const db = getDb();
+    const [{ count }] = await db<[{ count: string }]>`
+      SELECT COUNT(*)::text AS count FROM intents WHERE project_id = ${projectId}
+    `;
+    return parseInt(count, 10);
+  }
+
+  async countActiveByProject(projectId: string): Promise<number> {
+    const db = getDb();
+    // Non-terminal statuses — anything that could still mutate the
+    // project's Git tree. `escalated` is intentionally NOT here: it's
+    // a paused state awaiting operator intervention but the deploy
+    // chain is not in flight.
+    const [{ count }] = await db<[{ count: string }]>`
+      SELECT COUNT(*)::text AS count FROM intents
+      WHERE project_id = ${projectId}
+        AND status IN ('generating','in-review','deploying','waiting-for-clarification')
+    `;
+    return parseInt(count, 10);
+  }
+
+  async findLatestByProject(projectId: string): Promise<IntentRecord | null> {
+    const db = getDb();
+    const [row] = await db<IntentRecord[]>`
+      SELECT * FROM intents WHERE project_id = ${projectId}
+      ORDER BY created_at DESC LIMIT 1
+    `;
+    return row ?? null;
+  }
 }

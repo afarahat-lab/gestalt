@@ -21,4 +21,6 @@ export class OracleProjectRepository implements ProjectRepository {
   async listAll(): Promise<ProjectRecord[]> { return notImplemented(); }
   async saveCredential(_projectId: string, _token: string): Promise<void> { return notImplemented(); }
   async getCredential(_projectId: string): Promise<string | null> { return notImplemented(); }
+  async delete(_projectId: string): Promise<number> { return notImplemented(); }
+  async deleteAllCredentials(_projectId: string): Promise<number> { return notImplemented(); }
 }

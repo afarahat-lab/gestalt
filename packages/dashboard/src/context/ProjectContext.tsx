@@ -37,6 +37,10 @@ interface ProjectContextValue {
   currentProject: ProjectSummary | null;
   setCurrentProjectId: (id: string) => void;
   loading: boolean;
+  /** Force a re-fetch of `GET /projects`. Used by the Admin Projects
+   *  tab after create/delete so the sidebar selector picks up the
+   *  change without waiting for window-focus refresh. */
+  refresh: () => Promise<void>;
   /**
    * The signed-in user's role on the CURRENT project — `'project-admin'
    * | 'editor' | 'reader'`, or `null` if they're not a member.
@@ -151,7 +155,8 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
     setCurrentProjectId,
     loading,
     currentUserRole,
-  }), [projects, currentProjectId, setCurrentProjectId, loading, currentUserRole]);
+    refresh,
+  }), [projects, currentProjectId, setCurrentProjectId, loading, currentUserRole, refresh]);
 
   return (
     <ProjectContext.Provider value={value}>

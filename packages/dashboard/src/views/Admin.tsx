@@ -17,8 +17,10 @@
  */
 
 import React, { useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useDashboardApi } from '../hooks/useApi';
 import { useCurrentUser } from '../context/CurrentUserContext';
+import { useProject } from '../context/ProjectContext';
 import { ApiError } from '../api/client';
 import type {
   UserSummary, UserDetail, ProjectMember, ProjectSummary, UserRole, ProjectRole,
@@ -423,14 +425,25 @@ function AddUserModal(props: { onClose: () => void; onCreated: () => void }) {
 
 function ProjectsTab() {
   const api = useDashboardApi();
+  const navigate = useNavigate();
+  const { setCurrentProjectId, refresh: refreshContext } = useProject();
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [members, setMembers] = useState<Record<string, ProjectMember[]>>({});
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [search, setSearch] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [deleting, setDeleting] = useState<ProjectSummary | null>(null);
 
-  useEffect(() => {
-    api.listProjects().then((r) => setProjects(r.data)).catch(() => {});
-  }, [api]);
+  async function reload() {
+    try {
+      const r = await api.listProjects();
+      setProjects(r.data);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.body : String(err));
+    }
+  }
+  useEffect(() => { void reload(); /* eslint-disable-next-line */ }, []);
 
   async function expand(projectId: string) {
     if (expanded === projectId) {
@@ -448,36 +461,72 @@ function ProjectsTab() {
     }
   }
 
+  function handleSwitch(p: ProjectSummary) {
+    setCurrentProjectId(p.id);
+    navigate('/');
+  }
+  function handleSettings(p: ProjectSummary) {
+    navigate(`/projects/${p.id}/settings`);
+  }
+
+  const filtered = search.trim()
+    ? projects.filter((p) => p.name.toLowerCase().includes(search.trim().toLowerCase()))
+    : projects;
+
   return (
     <div>
       {error && (
         <div style={styles.errorStrip}>✗ {error}<button style={styles.muteBtn} onClick={() => setError(null)}>dismiss</button></div>
       )}
+      <div style={styles.toolbar}>
+        <button style={styles.primaryBtn} onClick={() => setCreating(true)}>+ Create project</button>
+        <input
+          style={{ ...styles.input, maxWidth: '260px' }}
+          placeholder="Search..."
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
+      </div>
       <div style={styles.card}>
         <table style={styles.table}>
           <thead>
             <tr>
               <th style={styles.th}></th>
-              <th style={styles.th}>Project</th>
-              <th style={styles.th}>Git URL</th>
+              <th style={styles.th}>Name</th>
               <th style={styles.th}>Members</th>
+              <th style={styles.th}>Intents</th>
+              <th style={styles.th}>Last activity</th>
+              <th style={styles.th}>Actions</th>
             </tr>
           </thead>
           <tbody>
-            {projects.length === 0 && (
-              <tr><td colSpan={4} style={styles.empty}>No projects yet — run gestalt init</td></tr>
+            {filtered.length === 0 && (
+              <tr><td colSpan={6} style={styles.empty}>
+                {projects.length === 0 ? 'No projects yet — click + Create project to register one' : 'No projects match your search'}
+              </td></tr>
             )}
-            {projects.map((p) => (
+            {filtered.map((p) => (
               <React.Fragment key={p.id}>
-                <tr style={styles.row} onClick={() => expand(p.id)}>
-                  <td style={styles.td}>{expanded === p.id ? '▼' : '▶'}</td>
-                  <td style={styles.td}>{p.name}</td>
-                  <td style={styles.td}><span style={styles.mono}>{p.gitUrl}</span></td>
-                  <td style={styles.td}>{members[p.id]?.length ?? '—'}</td>
+                <tr style={styles.row}>
+                  <td style={styles.td} onClick={() => void expand(p.id)}>{expanded === p.id ? '▼' : '▶'}</td>
+                  <td style={styles.td} onClick={() => void expand(p.id)}>
+                    <div>{p.name}</div>
+                    <div style={{ color: 'var(--text-dim)', fontSize: '11px' }}><span style={styles.mono}>{p.gitUrl}</span></div>
+                  </td>
+                  <td style={styles.td}>{p.memberCount ?? '—'}</td>
+                  <td style={styles.td}>{p.intentCount ?? '—'}</td>
+                  <td style={styles.td}>{formatRelative(p.lastActivityAt)}</td>
+                  <td style={styles.td}>
+                    <div style={{ display: 'flex', gap: '4px' }}>
+                      <button style={styles.linkBtn} title="Open project settings" onClick={() => handleSettings(p)}>⚙</button>
+                      <button style={styles.linkBtn} title="Switch to this project" onClick={() => handleSwitch(p)}>→</button>
+                      <button style={styles.dangerBtn} title="Delete project" onClick={() => setDeleting(p)}>×</button>
+                    </div>
+                  </td>
                 </tr>
                 {expanded === p.id && (
                   <tr>
-                    <td colSpan={4} style={styles.expanded}>
+                    <td colSpan={6} style={styles.expanded}>
                       <MembersList
                         projectId={p.id}
                         members={members[p.id] ?? []}
@@ -493,6 +542,203 @@ function ProjectsTab() {
             ))}
           </tbody>
         </table>
+      </div>
+      {creating && (
+        <CreateProjectModal
+          onClose={() => setCreating(false)}
+          onCreated={async () => {
+            setCreating(false);
+            await reload();
+            await refreshContext();
+          }}
+        />
+      )}
+      {deleting && (
+        <DeleteProjectModal
+          project={deleting}
+          onClose={() => setDeleting(null)}
+          onDeleted={async () => {
+            setDeleting(null);
+            await reload();
+            await refreshContext();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function formatRelative(iso?: string): string {
+  if (!iso) return '—';
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return '—';
+  const diffMs = Date.now() - then;
+  const sec = Math.floor(diffMs / 1000);
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 30) return `${day}d ago`;
+  return new Date(iso).toLocaleDateString();
+}
+
+function CreateProjectModal(props: { onClose: () => void; onCreated: () => Promise<void> | void }) {
+  const api = useDashboardApi();
+  const [name, setName] = useState('');
+  const [gitUrl, setGitUrl] = useState('');
+  const [defaultBranch, setDefaultBranch] = useState('main');
+  const [gitToken, setGitToken] = useState('');
+  const [description, setDescription] = useState('');
+  const [stage, setStage] = useState<'form' | 'registering' | 'initializing' | 'done'>('form');
+  const [error, setError] = useState<string | null>(null);
+  const [createdName, setCreatedName] = useState<string | null>(null);
+
+  async function submit() {
+    setError(null);
+    if (!name.trim() || !gitUrl.trim() || !gitToken) {
+      setError('Name, Git URL, and Git token are required');
+      return;
+    }
+    setStage('registering');
+    try {
+      const create = await api.createProject({
+        name: name.trim(),
+        gitUrl: gitUrl.trim(),
+        defaultBranch: defaultBranch.trim() || 'main',
+        gitToken,
+      });
+      setStage('initializing');
+      const descToSend = description.trim()
+        || `Project ${name.trim()} created via platform admin`;
+      await api.initProjectHarness(create.data.id, { projectDescription: descToSend });
+      setCreatedName(create.data.name);
+      setStage('done');
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+      setStage('form');
+    }
+  }
+
+  return (
+    <div style={styles.modalBackdrop} onClick={props.onClose}>
+      <div style={{ ...styles.modal, maxWidth: '520px' }} onClick={(e) => e.stopPropagation()}>
+        <h3 style={styles.cardTitle}>Create new project</h3>
+        {error && <div style={styles.errorBanner}>{error}</div>}
+        {stage === 'done' ? (
+          <div>
+            <p style={{ color: 'var(--green)' }}>✓ Project <code>{createdName}</code> created. Harness committed and pushed to {gitUrl}.</p>
+            <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+              <button style={styles.linkBtn} onClick={() => { void props.onCreated(); }}>Close</button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <label style={styles.label}>Project name
+              <input style={styles.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="my-project" autoFocus disabled={stage !== 'form'} />
+            </label>
+            <label style={styles.label}>Git repository URL
+              <input style={styles.input} value={gitUrl} onChange={(e) => setGitUrl(e.target.value)} placeholder="https://github.com/org/repo.git" disabled={stage !== 'form'} />
+            </label>
+            <label style={styles.label}>Default branch
+              <input style={styles.input} value={defaultBranch} onChange={(e) => setDefaultBranch(e.target.value)} placeholder="main" disabled={stage !== 'form'} />
+            </label>
+            <label style={styles.label}>Git token (PAT)
+              <input type="password" style={styles.input} value={gitToken} onChange={(e) => setGitToken(e.target.value)} placeholder="ghp_..." disabled={stage !== 'form'} />
+              <span style={{ color: 'var(--text-dim)', fontSize: '11px' }}>Stored per-project (encrypt at rest is on the roadmap). Needs `repo` + `workflow` scope for GitHub.</span>
+            </label>
+            <label style={styles.label}>Description (optional)
+              <input style={styles.input} value={description} onChange={(e) => setDescription(e.target.value)} placeholder={`Project ${name || '<name>'} created via platform admin`} disabled={stage !== 'form'} />
+            </label>
+            <div style={{ color: 'var(--text-dim)', fontSize: '12px' }}>
+              Template: <strong>★ Corporate Ops Web/Mobile</strong> (only template currently shipped)
+            </div>
+            <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', alignItems: 'center' }}>
+              {stage === 'registering' && <span style={{ color: 'var(--text-dim)' }}>Registering project...</span>}
+              {stage === 'initializing' && <span style={{ color: 'var(--text-dim)' }}>Cloning + writing harness...</span>}
+              <button style={styles.linkBtn} onClick={props.onClose} disabled={stage !== 'form'}>Cancel</button>
+              <button style={styles.primaryBtn} onClick={() => void submit()} disabled={stage !== 'form'}>
+                Create project
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DeleteProjectModal(props: { project: ProjectSummary; onClose: () => void; onDeleted: () => Promise<void> | void }) {
+  const api = useDashboardApi();
+  const [typed, setTyped] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const matches = typed === props.project.name;
+
+  async function submit() {
+    if (!matches) return;
+    setDeleting(true);
+    setError(null);
+    try {
+      await api.deleteProject(props.project.id);
+      await props.onDeleted();
+    } catch (err) {
+      if (err instanceof ApiError) {
+        try {
+          const body = JSON.parse(err.body) as { code?: string; error?: string; activeIntents?: number };
+          if (body.code === 'PROJECT_HAS_ACTIVE_INTENTS') {
+            setError(`Cannot delete — this project has ${body.activeIntents ?? ''} active intents. Wait for them to complete or fail first.`);
+          } else {
+            setError(body.error ?? err.body);
+          }
+        } catch {
+          setError(err.body);
+        }
+      } else {
+        setError(String(err));
+      }
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  return (
+    <div style={styles.modalBackdrop} onClick={props.onClose}>
+      <div style={{ ...styles.modal, maxWidth: '460px' }} onClick={(e) => e.stopPropagation()}>
+        <h3 style={styles.cardTitle}>Delete project "{props.project.name}"?</h3>
+        <p style={{ fontSize: '13px', color: 'var(--text-primary)', margin: '0 0 4px' }}>
+          This will permanently delete:
+        </p>
+        <ul style={{ fontSize: '12px', color: 'var(--text-primary)', marginTop: '4px' }}>
+          <li>{props.project.intentCount ?? 0} intents and their execution history</li>
+          <li>{props.project.memberCount ?? 0} member assignments</li>
+          <li>Git credentials and maintenance run history</li>
+        </ul>
+        <p style={{ fontSize: '12px', color: 'var(--text-dim)' }}>
+          The Git repository itself will <strong>NOT</strong> be deleted.
+        </p>
+        {error && <div style={styles.errorBanner}>{error}</div>}
+        <label style={styles.label}>Type the project name to confirm:
+          <input
+            style={styles.input}
+            value={typed}
+            onChange={(e) => setTyped(e.target.value)}
+            placeholder={props.project.name}
+            autoFocus
+            disabled={deleting}
+          />
+        </label>
+        <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+          <button style={styles.linkBtn} onClick={props.onClose} disabled={deleting}>Cancel</button>
+          <button
+            style={matches ? styles.dangerBtn : { ...styles.dangerBtn, opacity: 0.4, cursor: 'not-allowed' }}
+            onClick={() => void submit()}
+            disabled={!matches || deleting}
+          >
+            {deleting ? 'Deleting...' : 'Delete project'}
+          </button>
+        </div>
       </div>
     </div>
   );

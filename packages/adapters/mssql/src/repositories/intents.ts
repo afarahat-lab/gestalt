@@ -34,4 +34,7 @@ export class MssqlIntentRepository implements IntentRepository {
     limit: number;
     offset: number;
   }): Promise<{ records: IntentRecord[]; total: number }> { return notImplemented(); }
+  async countByProject(_projectId: string): Promise<number> { return notImplemented(); }
+  async countActiveByProject(_projectId: string): Promise<number> { return notImplemented(); }
+  async findLatestByProject(_projectId: string): Promise<IntentRecord | null> { return notImplemented(); }
 }

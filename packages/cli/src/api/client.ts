@@ -98,6 +98,12 @@ export interface ProjectRecord {
   defaultBranch: string;
   createdBy: string;
   createdAt: string;
+  /** Platform-admin enrichment — only present on rows returned to a
+   *  platform-admin user. `gestalt platform projects list` consumes
+   *  these; the regular `gestalt projects list` ignores them. */
+  memberCount?: number;
+  intentCount?: number;
+  lastActivityAt?: string;
 }
 
 // ─── Agents (Step 2 — ADR-037) ───────────────────────────────────────────────
@@ -404,6 +410,13 @@ export class GestaltApiClient {
     projectDescription: string,
   ): Promise<{ data: { committed: boolean; commitSha: string } }> {
     return this.post(`/projects/${projectId}/init-harness`, { projectDescription });
+  }
+
+  /** Platform-admin only — hard-deletes the project row + dependent
+   *  rows. Refuses with HTTP 400 `PROJECT_HAS_ACTIVE_INTENTS` when a
+   *  cycle is in flight. The remote Git repository is NOT deleted. */
+  async deleteProject(projectId: string): Promise<void> {
+    await this.delete(`/projects/${projectId}`);
   }
 
   // ─── Platform LLM registry (Session 3) ────────────────────────────────────

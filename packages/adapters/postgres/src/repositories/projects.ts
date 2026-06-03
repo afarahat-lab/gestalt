@@ -88,4 +88,26 @@ export class PostgresProjectRepository implements ProjectRepository {
     `;
     return row?.token ?? null;
   }
+
+  async delete(projectId: string): Promise<number> {
+    const db = getDb();
+    const [{ count }] = await db<[{ count: string }]>`
+      WITH deleted AS (
+        DELETE FROM projects WHERE id = ${projectId} RETURNING 1
+      )
+      SELECT COUNT(*)::text AS count FROM deleted
+    `;
+    return parseInt(count, 10);
+  }
+
+  async deleteAllCredentials(projectId: string): Promise<number> {
+    const db = getDb();
+    const [{ count }] = await db<[{ count: string }]>`
+      WITH deleted AS (
+        DELETE FROM project_git_credentials WHERE project_id = ${projectId} RETURNING 1
+      )
+      SELECT COUNT(*)::text AS count FROM deleted
+    `;
+    return parseInt(count, 10);
+  }
 }

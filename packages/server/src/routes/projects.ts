@@ -29,6 +29,7 @@ import {
 import { requireRole, checkProjectMembership } from '../auth/middleware';
 import { loadTemplate, resolveTemplatesDir } from '../templates/engine';
 import { applyPipelinePatch } from './project-config';
+import { emitLiveEvent } from '../events';
 
 /** ADR-036 — every project today gets the Tier 1 template. Future
  *  templates can be selected via a `templateId` field on the
@@ -185,11 +186,32 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
     '/projects',
     async (request, reply) => {
       if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
-      const { projects, memberships } = getRepositories();
+      const { projects, memberships, intents } = getRepositories();
 
       if (request.user.role === 'platform-admin') {
+        // Platform-admin sees every project AND gets per-row enrichment
+        // for the management surface: member count, intent count, and
+        // the timestamp of the most recent intent. The dashboard's
+        // Admin → Projects tab consumes these fields directly; regular
+        // users never see them (their listing is per-membership and
+        // doesn't need the cross-project stats).
         const rows = await projects.listAll();
-        return reply.send({ data: rows.map(toPublic) });
+        const enriched = await Promise.all(
+          rows.map(async (p) => {
+            const [memberCount, intentCount, lastIntent] = await Promise.all([
+              memberships.countByProject(p.id),
+              intents.countByProject(p.id),
+              intents.findLatestByProject(p.id),
+            ]);
+            return {
+              ...toPublic(p),
+              memberCount,
+              intentCount,
+              lastActivityAt: (lastIntent?.createdAt ?? p.createdAt).toISOString(),
+            };
+          }),
+        );
+        return reply.send({ data: enriched });
       }
 
       const userMemberships = await memberships.findByUser(request.user.id);
@@ -211,6 +233,86 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
       const project = await projects.findById(request.params.id);
       if (!project) return reply.code(404).send({ error: 'Project not found' });
       return reply.send({ data: toPublic(project) });
+    },
+  );
+
+  // DELETE /projects/:id — platform-admin only.
+  //
+  // Tears down dependent tables in FK-safe order, then deletes the
+  // project row. Refuses on active intents — anything in
+  // `generating | in-review | deploying | waiting-for-clarification`
+  // could mutate the project's Git tree or queue more work, so we
+  // require the operator to wait for those to settle first.
+  // `escalated` and `failed` cycles are fair game (they're paused or
+  // terminal).
+  //
+  // **The remote Git repository is NOT deleted** — the platform only
+  // owns the platform-side data. Audit metadata records the
+  // git url so a future investigator can find the source of truth.
+  app.delete<{ Params: { id: string } }>(
+    '/projects/:id',
+    { preHandler: requireRole('admin') },
+    async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+
+      const { projects, intents, memberships, maintenanceRuns, audit } = getRepositories();
+      const project = await projects.findById(request.params.id);
+      if (!project) return reply.code(404).send({ error: 'Project not found' });
+
+      // Active intents guard — refuse with a typed code so the
+      // dashboard's confirm modal can surface the explanation.
+      const activeCount = await intents.countActiveByProject(project.id);
+      if (activeCount > 0) {
+        return reply.code(400).send({
+          error: 'Cannot delete — this project has active intents. Wait for them to complete or fail first.',
+          code: 'PROJECT_HAS_ACTIVE_INTENTS',
+          activeIntents: activeCount,
+        });
+      }
+
+      const intentCount = await intents.countByProject(project.id);
+
+      try {
+        // Order matters: FK rows go first, then the project row.
+        // intents themselves are NOT cascaded — they remain as
+        // historical data attached by id; the project_id column on
+        // intents already has ON DELETE CASCADE via the schema, so
+        // the projects.delete() at the end takes care of them.
+        // We still tear down rows whose FK constraints would block
+        // the delete OR whose ON DELETE behaviour we don't want to
+        // depend on:
+        await memberships.deleteAllForProject(project.id);
+        await projects.deleteAllCredentials(project.id);
+        await maintenanceRuns.deleteAllForProject(project.id);
+        const deleted = await projects.delete(project.id);
+        if (deleted !== 1) {
+          log.warn({ projectId: project.id, deleted }, 'projects.delete returned 0 — row vanished mid-cleanup');
+        }
+
+        await audit.append({
+          actor: request.user.id,
+          action: 'project.deleted',
+          entityType: 'projects',
+          entityId: project.id,
+          correlationId: request.correlationId,
+          metadata: {
+            name: project.name,
+            gitUrl: project.gitUrl,
+            intentCount,
+            ip: request.ip,
+          },
+        });
+
+        emitLiveEvent('project.deleted', project.id, { projectId: project.id, name: project.name });
+        log.info({ projectId: project.id, name: project.name, intentCount }, 'Project deleted');
+        return reply.code(204).send();
+      } catch (err) {
+        log.error({ err, projectId: project.id }, 'Project deletion failed');
+        return reply.code(500).send({
+          error: 'Failed to delete project',
+          details: err instanceof Error ? err.message : String(err),
+        });
+      }
     },
   );
 

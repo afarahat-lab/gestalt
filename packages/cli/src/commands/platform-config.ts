@@ -3,6 +3,7 @@
  *
  *   gestalt platform llms list/add/set-default/remove/test
  *   gestalt platform secrets list/add/rotate/remove        (Session 4)
+ *   gestalt platform projects list/delete/create           (Session — project mgmt)
  *
  * Session 4 adds an encrypted secrets vault (migration 015). The
  * actual secret VALUE is read by the CLI via `promptSecret` (hidden
@@ -383,6 +384,140 @@ async function resolveSecretByName(
     process.exit(1);
   }
   return match;
+}
+
+// ─── platform projects (cross-project management) ────────────────────────────
+
+/**
+ * `gestalt platform projects list` — table of every registered project
+ * with the platform-admin enrichment fields (member count, intent
+ * count, last activity).
+ *
+ * Unlike `gestalt projects list` (which shows ONLY the current user's
+ * projects via membership), this command requires platform-admin and
+ * always returns the full set.
+ */
+export async function platformProjectsListCommand(
+  options: BaseOptions = {},
+): Promise<void> {
+  const ctx = await openClient(options);
+  if (!ctx) return;
+  const { client, serverUrl } = ctx;
+  try {
+    const res = await client.listProjects();
+    const rows = res.data;
+    if (rows.length === 0) {
+      console.log(c.dim('No projects registered.'));
+      return;
+    }
+    blank();
+    printTable(
+      rows.map((p) => ({
+        name: c.info(p.name),
+        members: String(p.memberCount ?? '—'),
+        intents: String(p.intentCount ?? '—'),
+        activity: formatAge(new Date(p.lastActivityAt ?? p.createdAt)),
+        gitUrl: c.dim(p.gitUrl),
+      })),
+      [
+        { key: 'name',     header: 'Name',          width: 26 },
+        { key: 'members',  header: 'Members',       width: 10 },
+        { key: 'intents',  header: 'Intents',       width: 10 },
+        { key: 'activity', header: 'Last activity', width: 16 },
+        { key: 'gitUrl',   header: 'Git URL',       width: 48 },
+      ],
+    );
+    blank();
+  } catch (err) {
+    handleErr(err, serverUrl, 'Failed to list projects');
+  }
+}
+
+/**
+ * `gestalt platform projects delete <name>` — destructive. Prompts the
+ * operator to type the project name to confirm. Refuses with
+ * `PROJECT_HAS_ACTIVE_INTENTS` when any cycle is in flight; the CLI
+ * surfaces the typed error message so the operator knows to wait or
+ * intervene.
+ */
+export async function platformProjectsDeleteCommand(
+  name: string,
+  options: BaseOptions = {},
+): Promise<void> {
+  const ctx = await openClient(options);
+  if (!ctx) return;
+  const { client, serverUrl } = ctx;
+  try {
+    const res = await client.listProjects();
+    const target = res.data.find((p) => p.name === name);
+    if (!target) {
+      console.log(c.error(`No project named '${name}'. Run: gestalt platform projects list`));
+      process.exit(1);
+    }
+    blank();
+    console.log(c.warn(`Delete project "${target.name}"?`));
+    console.log(c.dim('  This will permanently delete:'));
+    console.log(c.dim(`    • ${target.intentCount ?? 0} intents and their execution history`));
+    console.log(c.dim(`    • ${target.memberCount ?? 0} member assignments`));
+    console.log(c.dim('    • Git credentials and maintenance run history'));
+    console.log(c.dim('  The Git repository itself will NOT be deleted.'));
+    blank();
+    const typed = await prompt('Type the project name to confirm: ');
+    if (typed.trim() !== target.name) {
+      console.log(c.error('Names do not match. Aborted.'));
+      process.exit(1);
+    }
+    await client.deleteProject(target.id);
+    blank();
+    console.log(c.success(`✓ Project deleted: ${target.name}`));
+    blank();
+  } catch (err) {
+    // Surface PROJECT_HAS_ACTIVE_INTENTS explicitly so the operator
+    // gets actionable guidance rather than a JSON dump.
+    if (err instanceof Error && err.message.includes('PROJECT_HAS_ACTIVE_INTENTS')) {
+      console.log(c.error('✗ Cannot delete — this project has active intents.'));
+      console.log(c.dim('  Wait for them to complete or fail, or intervene via `gestalt alerts`.'));
+      process.exit(1);
+    }
+    handleErr(err, serverUrl, `Failed to delete ${name}`);
+  }
+}
+
+/**
+ * `gestalt platform projects create` — interactive. Same shape as
+ * `gestalt init` but auto-assigns the platform-admin as project-admin
+ * and runs the init-harness step inline.
+ */
+export async function platformProjectsCreateCommand(
+  options: BaseOptions = {},
+): Promise<void> {
+  const ctx = await openClient(options);
+  if (!ctx) return;
+  const { client, serverUrl } = ctx;
+  try {
+    const name = (await prompt('Project name: ')).trim();
+    if (!name) { console.log(c.error('Name required')); process.exit(1); }
+    const gitUrl = (await prompt('Git repository URL: ')).trim();
+    if (!gitUrl) { console.log(c.error('Git URL required')); process.exit(1); }
+    const branchInput = (await prompt('Default branch [main]: ')).trim();
+    const defaultBranch = branchInput || 'main';
+    const gitToken = await promptSecret('Git token (PAT): ');
+    if (!gitToken) { console.log(c.error('Git token required')); process.exit(1); }
+    const description = (await prompt('Description (optional): ')).trim()
+      || `Project ${name} created via platform admin`;
+
+    blank();
+    console.log(c.dim('Registering project...'));
+    const created = await client.createProject({ name, gitUrl, defaultBranch, gitToken });
+    console.log(c.dim('Initialising harness (clone + commit + push)...'));
+    await client.initHarness(created.data.id, description);
+    blank();
+    console.log(c.success(`✓ Project created and harness initialised: ${created.data.name}`));
+    console.log(c.dim(`  ${gitUrl} (${defaultBranch})`));
+    blank();
+  } catch (err) {
+    handleErr(err, serverUrl, 'Failed to create project');
+  }
 }
 
 function formatAge(d: Date): string {

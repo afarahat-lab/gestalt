@@ -72,6 +72,25 @@ export interface IntentRepository extends BaseRepository {
    * this path — they get a per-project list scoped by membership.
    */
   listAll(params: { status?: IntentStatus; limit: number; offset: number }): Promise<{ records: IntentRecord[]; total: number }>;
+  /**
+   * Returns the total intent count for a project. Used by the
+   * platform-admin GET /projects enrichment and by the project
+   * delete confirmation modal.
+   */
+  countByProject(projectId: string): Promise<number>;
+  /**
+   * Returns the active intent count for a project — intents in
+   * non-terminal status (generating / in-review / deploying /
+   * waiting-for-clarification). Used by the DELETE /projects/:id
+   * active-intents guard.
+   */
+  countActiveByProject(projectId: string): Promise<number>;
+  /**
+   * Most recent intent for a project, by `created_at DESC`. Used by
+   * the platform-admin GET /projects enrichment to compute
+   * `lastActivityAt`. Returns null when the project has no intents.
+   */
+  findLatestByProject(projectId: string): Promise<IntentRecord | null>;
 }
 
 // ─── Agent execution repository ───────────────────────────────────────────────
@@ -268,6 +287,17 @@ export interface ProjectMembershipRepository extends BaseRepository {
   findMembership(userId: string, projectId: string): Promise<ProjectMembershipRecord | null>;
   /** Used by the "cannot remove the last project-admin" guard in the route. */
   countAdmins(projectId: string): Promise<number>;
+  /**
+   * Returns the total membership count for a project. Used by the
+   * platform-admin GET /projects enrichment.
+   */
+  countByProject(projectId: string): Promise<number>;
+  /**
+   * Deletes every membership row for a project. Called by
+   * DELETE /projects/:id BEFORE the project row itself is removed
+   * so the membership FK doesn't block the cascade.
+   */
+  deleteAllForProject(projectId: string): Promise<number>;
 }
 
 // ─── Local auth credentials repository ────────────────────────────────────────
@@ -312,6 +342,20 @@ export interface ProjectRepository extends BaseRepository {
   // the token never appears in API responses (see routes/projects.ts).
   saveCredential(projectId: string, token: string): Promise<void>;
   getCredential(projectId: string): Promise<string | null>;
+
+  /**
+   * Hard-delete a project row. The route layer is responsible for
+   * tearing down dependent tables (memberships / git credentials /
+   * maintenance runs) BEFORE calling this so foreign-key constraints
+   * succeed. Returns the number of rows deleted (0 or 1).
+   */
+  delete(projectId: string): Promise<number>;
+  /**
+   * Delete every git credential row for a project (PATs can rotate so
+   * the table is not 1:1 with projects). Called by DELETE
+   * /projects/:id before the project row is removed.
+   */
+  deleteAllCredentials(projectId: string): Promise<number>;
 }
 
 // ─── Repository registry ──────────────────────────────────────────────────────
@@ -626,6 +670,12 @@ export interface MaintenanceRunRepository extends BaseRepository {
    * can distinguish 404 from a parsed-but-empty result).
    */
   findById(id: string): Promise<MaintenanceRunRecord | null>;
+  /**
+   * Delete every maintenance_runs row for a project. Called by
+   * DELETE /projects/:id so the project FK doesn't block the cascade.
+   * Returns the number of rows deleted.
+   */
+  deleteAllForProject(projectId: string): Promise<number>;
 }
 
 // ─── Finding attempt repository (ADR-018 idempotency guard) ──────────────────

@@ -26,7 +26,8 @@ export type LiveEventType =
   | 'deployment.updated'
   | 'alert.created'
   | 'alert.acknowledged'
-  | 'maintenance.run-completed';
+  | 'maintenance.run-completed'
+  | 'project.deleted';
 
 export interface LiveEvent {
   type: LiveEventType;

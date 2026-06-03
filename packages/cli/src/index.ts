@@ -31,6 +31,9 @@
  *   gestalt platform secrets add                            — interactive (hidden value)
  *   gestalt platform secrets rotate <name>                  — replace the value
  *   gestalt platform secrets remove <name>                  — delete (SECRET_IN_USE guard)
+ *   gestalt platform projects list                          — cross-project, all stats
+ *   gestalt platform projects create                        — interactive register + init-harness
+ *   gestalt platform projects delete <name>                 — typed-name confirmation
  *   gestalt run "<intent>" [--server <url>] [--priority critical|high|normal|low]
  *   gestalt intent list [--project <name>] [--status <s>] [--limit 20]
  *   gestalt intent show <id> [--watch]                — execution-flow graph
@@ -99,6 +102,8 @@ import {
   platformLlmsTestCommand,
   platformSecretsListCommand, platformSecretsAddCommand,
   platformSecretsRotateCommand, platformSecretsRemoveCommand,
+  platformProjectsListCommand, platformProjectsCreateCommand,
+  platformProjectsDeleteCommand,
 } from './commands/platform-config';
 import {
   usersListCommand, usersAddCommand, usersRoleCommand, usersDeactivateCommand,
@@ -661,6 +666,35 @@ platformSecrets
   .option('--server <url>', 'Server URL (one-shot override for this invocation)')
   .action(async (name: string, opts: { server?: string }) => {
     await platformSecretsRemoveCommand(name, { server: opts.server }).catch(fatalError);
+  });
+
+// gestalt platform projects — cross-project management (platform-admin only)
+const platformProjects = platform
+  .command('projects')
+  .description('Manage projects across the platform. Unlike `gestalt projects list` (which shows your memberships), this shows every project with stats.');
+
+platformProjects
+  .command('list')
+  .description('Table of every project with member count, intent count, and last activity timestamp.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (opts: { server?: string }) => {
+    await platformProjectsListCommand({ server: opts.server }).catch(fatalError);
+  });
+
+platformProjects
+  .command('create')
+  .description('Interactively register a new project. Auto-assigns you as project-admin and runs init-harness inline.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (opts: { server?: string }) => {
+    await platformProjectsCreateCommand({ server: opts.server }).catch(fatalError);
+  });
+
+platformProjects
+  .command('delete <name>')
+  .description('Permanently delete a project (memberships, credentials, maintenance runs). Refuses on active intents. The remote Git repo is NOT touched.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (name: string, opts: { server?: string }) => {
+    await platformProjectsDeleteCommand(name, { server: opts.server }).catch(fatalError);
   });
 
 // gestalt run

@@ -113,4 +113,28 @@ export class PostgresProjectMembershipRepository implements ProjectMembershipRep
     `;
     return parseInt(row.count, 10);
   }
+
+  async countByProject(projectId: string): Promise<number> {
+    const db = getDb();
+    const [row] = await db<[{ count: string }]>`
+      SELECT COUNT(*)::text AS count
+      FROM project_memberships
+      WHERE project_id = ${projectId}
+    `;
+    return parseInt(row.count, 10);
+  }
+
+  async deleteAllForProject(projectId: string): Promise<number> {
+    const db = getDb();
+    // RETURNING-count trick: naked DELETE doesn't surface affected
+    // rows on postgres.js. Same pattern `gcOlderThan` uses in the
+    // deployment-events repo.
+    const [{ count }] = await db<[{ count: string }]>`
+      WITH deleted AS (
+        DELETE FROM project_memberships WHERE project_id = ${projectId} RETURNING 1
+      )
+      SELECT COUNT(*)::text AS count FROM deleted
+    `;
+    return parseInt(count, 10);
+  }
 }

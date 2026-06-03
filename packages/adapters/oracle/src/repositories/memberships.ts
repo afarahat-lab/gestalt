@@ -24,4 +24,6 @@ export class OracleProjectMembershipRepository implements ProjectMembershipRepos
   async findByUser(_userId: string): Promise<ProjectMembershipRecord[]> { return notImplemented(); }
   async findMembership(_userId: string, _projectId: string): Promise<ProjectMembershipRecord | null> { return notImplemented(); }
   async countAdmins(_projectId: string): Promise<number> { return notImplemented(); }
+  async countByProject(_projectId: string): Promise<number> { return notImplemented(); }
+  async deleteAllForProject(_projectId: string): Promise<number> { return notImplemented(); }
 }

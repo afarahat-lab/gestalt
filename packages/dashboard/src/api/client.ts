@@ -94,6 +94,37 @@ export class DashboardApiClient {
     return this.get('/projects');
   }
 
+  /** Platform-admin only — register a new project with its Git
+   *  credentials. The server auto-assigns the creator as
+   *  `project-admin` so they immediately survive the membership-aware
+   *  GET /projects filter. */
+  async createProject(body: {
+    name: string;
+    gitUrl: string;
+    defaultBranch?: string;
+    gitToken: string;
+  }): Promise<{ data: ProjectSummary }> {
+    return this.post('/projects', body);
+  }
+
+  /** Server clones the repo, writes harness files, commits, and
+   *  pushes. Idempotent on the harness commit when the files already
+   *  match the template. */
+  async initProjectHarness(
+    projectId: string,
+    body: { projectDescription: string },
+  ): Promise<{ data: { commitSha: string; pushedTo: string } }> {
+    return this.post(`/projects/${projectId}/init-harness`, body);
+  }
+
+  /** Platform-admin only — hard-deletes the project row + dependent
+   *  rows (memberships, git credentials, maintenance runs). Refuses
+   *  with `PROJECT_HAS_ACTIVE_INTENTS` when any cycle is in flight.
+   *  The remote Git repository is NOT touched. */
+  async deleteProject(projectId: string): Promise<void> {
+    await this.delete(`/projects/${projectId}`);
+  }
+
   // ─── Alerts (additional) ───────────────────────────────────────────────────
 
   async acknowledgeAlert(id: string, notes?: string): Promise<{ data: Alert }> {

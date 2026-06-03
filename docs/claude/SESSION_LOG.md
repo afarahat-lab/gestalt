@@ -11045,3 +11045,293 @@ Decisions:
   under the new one — a tooling task not yet automated.
   Treat the master key as a long-lived secret; document the
   "do not rotate in place" warning in the deployment guide
+
+---
+
+### Session 2026-06-03 — Claude Code (project management in Platform Admin: DELETE /projects/:id + enriched GET /projects + dashboard ProjectsTab rewrite + gestalt platform projects CLI)
+
+Closes the long-standing "platform-admins can't create or delete
+projects from the UI" gap. Adds a typed DELETE endpoint with an
+active-intents guard, enriches GET /projects with cross-project
+stats for platform-admin, rewrites the Admin → Projects tab into a
+full management surface, and ships a `gestalt platform projects`
+CLI group. No new migrations, no new tables — everything sits on the
+existing schema.
+
+Changed:
+
+- `packages/core/src/repository/index.ts`:
+  - `IntentRepository` gained `countByProject(projectId)`,
+    `countActiveByProject(projectId)` (non-terminal statuses only —
+    drives the DELETE guard), `findLatestByProject(projectId)`
+    (`ORDER BY created_at DESC LIMIT 1` — drives `lastActivityAt`)
+  - `ProjectMembershipRepository` gained `countByProject(projectId)`
+    + `deleteAllForProject(projectId)` (returns affected count)
+  - `ProjectRepository` gained `delete(projectId)` + `deleteAllCredentials
+    (projectId)`
+  - `MaintenanceRunRepository` gained `deleteAllForProject(projectId)`
+- `packages/core/src/events/index.ts`: `LiveEventType` union extended
+  with `'project.deleted'` so the SSE stream can carry the new event
+- `packages/adapters/postgres/src/repositories/intents.ts`:
+  implemented the three new methods. `countActiveByProject` uses
+  `WHERE status IN ('generating','in-review','deploying','waiting-for-clarification')`
+  — `escalated` is intentionally NOT in the set (it's paused awaiting
+  operator intervention, deploy chain is not in flight)
+- `packages/adapters/postgres/src/repositories/memberships.ts`:
+  implemented `countByProject` + `deleteAllForProject`. The delete
+  uses the `WITH deleted AS (... RETURNING 1) SELECT COUNT(*)` trick
+  to surface affected-row counts (postgres.js doesn't return them on
+  a naked DELETE — same pattern `gcOlderThan` uses in
+  `deployment-events.ts`)
+- `packages/adapters/postgres/src/repositories/projects.ts`:
+  implemented `delete(id)` + `deleteAllCredentials(id)`. Same
+  affected-count CTE pattern
+- `packages/adapters/postgres/src/repositories/maintenance-runs.ts`:
+  implemented `deleteAllForProject(id)` with the same pattern
+- `packages/adapters/{oracle,mssql}/src/repositories/{intents,
+  memberships,projects,maintenance-runs}.ts`: throw-stubs for every
+  new method so interface drift in core surfaces as a build break
+  here. Same convention every prior session has used
+- `packages/server/src/routes/projects.ts`:
+  - **`GET /projects`** rewritten for the platform-admin branch:
+    parallel `Promise.all(rows.map(...))` that lifts `memberCount`
+    / `intentCount` / `lastActivityAt` per row via the new repo
+    methods. Regular-user branch unchanged — they still see only
+    their per-membership list with no enrichment. The enrichment is
+    intentionally added in a way that the existing `ProjectSummary`
+    type covers via optional fields: clients that don't know to
+    read them just ignore them
+  - **`DELETE /projects/:id`** new route — `requireRole('admin')`
+    preHandler (platform-admin only). Flow:
+    1. Load project; 404 if missing
+    2. `intents.countActiveByProject(id)` — if > 0, return HTTP 400
+       `{ error: '...', code: 'PROJECT_HAS_ACTIVE_INTENTS',
+       activeIntents: N }` so the dashboard's confirm modal can
+       render the typed explanation
+    3. `intents.countByProject(id)` for the audit row
+    4. Tear down in FK-safe order:
+       `memberships.deleteAllForProject` →
+       `projects.deleteAllCredentials` →
+       `maintenanceRuns.deleteAllForProject` → `projects.delete`.
+       `finding_attempts` cascades automatically via its existing
+       ON DELETE CASCADE FK
+    5. Audit row `project.deleted` with `metadata = { name, gitUrl,
+       intentCount, ip }`. The gitUrl is recorded so a future
+       investigator can find the source of truth (the remote repo is
+       NOT deleted by this endpoint — explicit operator decision per
+       the brief)
+    6. `emitLiveEvent('project.deleted', projectId, { projectId, name })`
+       so the dashboard's sidebar selector updates without a refresh
+    7. HTTP 204
+  - **Important architectural detail**: `intents.project_id` is
+    `TEXT NOT NULL` with NO FK constraint (per the original
+    001_initial.sql schema). When a project is deleted, intent rows
+    remain in the DB as orphans. This is intentional historical
+    record — `agent_executions` / `signals` / `artifacts` /
+    `deployment_events` / `interventions` all reference intents
+    (not projects), so the full execution history of past cycles is
+    preserved indefinitely. Operators investigating a past incident
+    can still query `audit_log` + the orphan intent + its execution
+    artifacts after the project itself has been removed
+- `packages/dashboard/src/types.ts`: `ProjectSummary` gained optional
+  `memberCount` / `intentCount` / `lastActivityAt` fields
+- `packages/dashboard/src/api/client.ts`: new `createProject`,
+  `initProjectHarness`, `deleteProject` methods
+- `packages/dashboard/src/context/ProjectContext.tsx`: exposed the
+  existing internal `refresh()` on the context value so the Admin
+  Projects tab can trigger an immediate sidebar selector refresh
+  after create/delete (instead of waiting for the window-focus
+  refresh)
+- `packages/dashboard/src/views/Admin.tsx`: `ProjectsTab` rewritten.
+  Toolbar with `+ Create project` + Search input. Table columns
+  changed from `Project / Git URL / Members` to `Name (with Git
+  URL subtitle) / Members / Intents / Last activity / Actions`.
+  New `formatRelative(iso)` helper renders `42s ago` / `5m ago` /
+  `2h ago` / `3d ago` / falls back to locale date past 30 days.
+  Per-row actions: `⚙` (open project settings via
+  `navigate('/projects/:id/settings')`), `→` (set
+  `currentProjectId` via context + `navigate('/')`), `×` (open
+  delete modal). The pre-existing inline `MembersList`
+  expand-on-click is preserved
+- `CreateProjectModal` (new) — name / Git URL / default branch
+  (default `main`) / Git token (password input) / optional
+  description. Two-stage submission with visible stage labels:
+  `Registering project...` (POST /projects), `Cloning + writing
+  harness...` (POST /projects/:id/init-harness with auto-default
+  description `Project <name> created via platform admin`). Done
+  screen shows `✓ Project <name> created. Harness committed and
+  pushed to <gitUrl>.` and a `Close` button that triggers the
+  parent's `reload()` + `refreshContext()`
+- `DeleteProjectModal` (new) — three-bullet list of what gets
+  deleted (intents + execution history, member assignments, Git
+  credentials + maintenance runs) using the enriched
+  `intentCount` / `memberCount` for accuracy. Explicit "The Git
+  repository itself will NOT be deleted" notice. Requires typing
+  the project name exactly to enable the red `Delete project`
+  button (button shows 40% opacity + `not-allowed` cursor when
+  disabled). Parses `PROJECT_HAS_ACTIVE_INTENTS` from
+  `err.body` and surfaces "Cannot delete — this project has N
+  active intents. Wait for them to complete or fail first."
+  inline without dismissing the modal
+- `packages/cli/src/api/client.ts`:
+  - `ProjectRecord` gained the same optional enrichment fields
+    (memberCount / intentCount / lastActivityAt) so the CLI's
+    `platform projects list` can render them
+  - new `deleteProject(id)` method
+- `packages/cli/src/commands/platform-config.ts`:
+  - new `platformProjectsListCommand` — table via the existing
+    `printTable` helper. Columns: `Name (26) / Members (10) /
+    Intents (10) / Last activity (16) / Git URL (48)`. Empty
+    list prints `No projects registered.`
+  - new `platformProjectsCreateCommand` — interactive prompts
+    (name / git URL / default branch with `main` default /
+    hidden TTY git token via `promptSecret` / optional
+    description). Two-stage flow with `Registering project...`
+    + `Initialising harness (clone + commit + push)...` status
+    lines, then `✓ Project created and harness initialised:
+    <name>`
+  - new `platformProjectsDeleteCommand` — prints the three-
+    bullet "will delete" summary, then prompts `Type the
+    project name to confirm:` and aborts if the typed input
+    doesn't match. Special-cases `PROJECT_HAS_ACTIVE_INTENTS`
+    (parses the error string) → `✗ Cannot delete — this
+    project has active intents.` with a hint pointing at
+    `gestalt alerts`
+- `packages/cli/src/index.ts`: registered `gestalt platform
+  projects` parent + `list / create / delete <name>`
+  subcommands. Top-of-file comment + header docstring updated
+
+Verified live end-to-end (against an existing postgres; no DB
+volume wipe — only the new schema-less code paths needed
+exercising):
+
+- `pnpm -r build` clean across all 12 packages
+- `docker compose up -d --build server` — `Up (healthy)`; new
+  routes register at startup; existing migrations unchanged
+- **Enriched GET /projects** (with a seeded test project that has 1
+  membership + 2 intents): returns `memberCount: 1, intentCount: 2,
+  lastActivityAt: <iso>` — verified via direct curl + jq
+- **Active-intents guard**: inserted one `generating` intent → DELETE
+  returned `{"error":"Cannot delete — this project has active
+  intents. Wait for them to complete or fail first.","code":
+  "PROJECT_HAS_ACTIVE_INTENTS","activeIntents":1}` + HTTP 400. Flipped
+  the intent to `failed` → DELETE returned HTTP 204
+- **Post-delete state inspection**:
+  ```
+  projects                    | 0
+  memberships                 | 0
+  intents (orphans, expected) | 3
+  audit (project.deleted)     | 1
+  ```
+  The 3 intent rows are the intentional historical record. The
+  audit row carries `metadata = { "name":"verify-pm-test",
+  "gitUrl":"https://github.com/example/verify-pm-test.git",
+  "intentCount":3, "ip":"192.168.65.1" }` — no other fields, no
+  leaked credentials
+- **404 path**: bogus UUID returns `{"error":"Project not found"}`
+  + HTTP 404
+- **Auth guards**: no Authorization header → HTTP 401
+  `{"error":"Authentication required"}`. As a regular `user` role
+  → HTTP 403 `{"error":"Platform admin required","code":"FORBIDDEN"}`.
+  The regular user's `GET /projects` returns `{"data":[]}` (their
+  per-membership filter; never reaches the enrichment branch — the
+  enrichment code is gated on `request.user.role === 'platform-admin'`)
+- **CLI populated list**: `gestalt platform projects list` against
+  a seeded `cli-test` project renders:
+  ```
+  Name                        Members     Intents     Last activity     Git URL
+  cli-test                    1           0           0s ago            https://github.com/example/cli-test.git
+  ```
+- **CLI delete with matching name**: pipe `cli-test` to stdin → 6-line
+  confirmation block + `? Type the project name to confirm:` prompt
+  + `✓ Project deleted: cli-test`. Direct DB query confirms the
+  project row is gone
+- **CLI delete with mismatched name**: pipe `WRONG_NAME` to stdin →
+  same confirmation block + `Names do not match. Aborted.` + exit
+  code 1. Direct DB query confirms the project row is still present
+
+Decisions:
+
+- **Active-intents guard rejects `generating | in-review | deploying
+  | waiting-for-clarification`** — the four non-terminal statuses that
+  could mutate the project's Git tree or queue more work. `escalated`
+  is intentionally NOT in the set: it's a paused state awaiting
+  operator intervention via `POST /interventions`, and the deploy
+  chain is not in flight. An operator who wants to delete an
+  escalated-cycle project can do so without first acknowledging the
+  breach (they've decided the project goes; the breach data
+  becomes part of the historical record). Documented in the postgres
+  impl's comment
+- **`memberCount`/`intentCount`/`lastActivityAt` are optional on the
+  shared `ProjectSummary` type.** Regular users get the same TypeScript
+  type but with the fields missing at runtime. The dashboard's
+  pre-existing list view doesn't touch them; the new Admin view falls
+  back to `'—'` when undefined. Could have introduced a separate
+  `PlatformAdminProjectSummary extends ProjectSummary` but the
+  optionality is simpler and the call sites that consume the
+  enrichment (Admin tab + CLI `platform projects list`) are exactly
+  the call sites that know to expect platform-admin returns
+- **Intent rows are intentional orphans on project deletion.**
+  Per ADR-002 (ephemeral workers) and the way the historical record
+  is structured, `agent_executions` / `signals` / `artifacts` /
+  `deployment_events` / `interventions` all FK to intents (not
+  projects). Deleting the project but preserving the intents means
+  the full execution history survives — an operator investigating
+  a past incident months later can still query `audit_log` (for
+  the project.deleted record) + the orphan intents + their
+  artifacts. The 3 orphan intent rows in the verification cycle
+  are the documented expected behaviour
+- **Explicit deletes of `memberships` / `maintenanceRuns` even
+  though some FKs have ON DELETE CASCADE.** `project_memberships.
+  project_id` has CASCADE; the explicit delete is for predictability
+  (the route always knows the row count it removed; the audit-side
+  story is clean). `maintenance_runs.project_id` has NO ON DELETE
+  clause (defaults to NO ACTION which would BLOCK the delete) — the
+  explicit delete is REQUIRED here, not optional. The verification
+  cycle didn't exercise this path because the test project had no
+  maintenance runs, but the code path is structurally identical to
+  the memberships path
+- **`gestalt platform projects list` is distinct from `gestalt
+  projects list`.** The plural `projects` command (existing) shows
+  the current user's per-membership list — operators run it from
+  any role. The new singular-under-platform `projects` command shows
+  every project with cross-project stats — platform-admin only.
+  The CLI top-of-file comment + header docstring document the
+  distinction
+- **Dashboard `[→] Switch to this project` uses the existing
+  `ProjectContext.setCurrentProjectId`.** No new context method.
+  Platform-admins bypass every project membership check server-side,
+  so they can "enter" any project's intent feed / maintenance view
+  / etc. as if they were a member. The Layout sidebar's project
+  selector updates because the same `setCurrentProjectId` writes to
+  localStorage
+- **CreateProjectModal description auto-defaults rather than being
+  required.** The brief specified `Project <name> created via
+  platform admin` as the default. Letting the operator type a
+  custom description is the niche case (most platform-admins
+  creating via the dashboard won't bother); requiring it would
+  add friction
+- **`project.deleted` SSE event payload is minimal: `{ projectId,
+  name }`.** No need to include gitUrl or the intent count — the
+  dashboard's only consumer of this event today is the
+  ProjectContext refresh trigger. Future consumers can add fields
+  to the payload without breaking the existing one
+- **No migration even though we expose new DB-side semantics.**
+  Every new repo method is a different SQL query against existing
+  tables — no schema changes, no enum additions. The schema-level
+  contract didn't move; the API surface did
+
+Build status: `pnpm -r build` clean across all 12 packages. Server
+image rebuilt; new routes register at startup; all 16 migrations
+still apply on first start. CLI rebuilt and the linked binary
+surfaces the new subcommands. Full feature verified end-to-end
+against seeded data; the only path NOT exercised live is the
+`gestalt platform projects create` interactive flow (requires a
+real Git URL + PAT) — verified by inspection that it calls
+`createProject` + `initHarness` against the same routes the
+existing `gestalt init` flow uses, which IS tested live in earlier
+sessions.
+
+No new Pending enhancements introduced. The original "platform-
+admin can't create or delete projects from the UI" gap is now
+fully resolved.
