@@ -11742,3 +11742,274 @@ follow-ups:
   silent listTools empty array". Distinguishing the two would
   require McpClient to surface the underlying connection error
   separately from the listTools-failed-silently path
+
+---
+
+### Session 2026-06-03 — Claude Code (Brief 1: Platform groups — bulk user management, migration 018)
+
+Adds platform-wide groups so a platform-admin can manage user → project
+access in bulk: assign N users to M projects in one action. The
+effective per-project role for a user is the higher of their direct
+`project_memberships.role` and any group-derived role.
+
+Changed:
+
+- `packages/adapters/postgres/src/migrations/018_groups.sql` (new):
+  three tables.
+  - `platform_groups` — `id`, `name UNIQUE`, `description`,
+    `created_by` (nullable FK to `users`), `created_at`
+  - `group_memberships` — `(group_id, user_id)` composite PK with
+    ON DELETE CASCADE on both FKs. Deleting a group removes its
+    members; deleting a user removes them from every group
+  - `group_project_assignments` — `(group_id, project_id)`
+    composite PK with ON DELETE CASCADE on both FKs.
+    `role TEXT CHECK (role IN ('project-admin','editor','reader'))`,
+    `assigned_by` (nullable FK)
+  - Four indexes — per-direction lookups for the effective-membership
+    read path (`user_id` + `group_id` on memberships;
+    `group_id` + `project_id` on assignments)
+- `packages/core/src/repository/index.ts`:
+  - New types: `PlatformGroupRecord`, `GroupMembershipRecord`,
+    `GroupProjectAssignmentRecord`, joined views
+    `GroupMemberWithUser` (= membership + user) and
+    `GroupProjectWithProject` (= assignment + project), and
+    `EffectiveProjectMembership` (`{ projectId, role }`)
+  - `PlatformGroupRepository` interface — 13 methods covering
+    CRUD on groups, members add/remove/list, project assignments
+    set/remove/list, and `getEffectiveMemberships(userId)`
+- `packages/core/src/index.ts`: re-exports all the new types
+- `packages/adapters/postgres/src/repositories/platform-groups.ts`
+  (new): `PostgresPlatformGroupRepository`.
+  - `getEffectiveMemberships(userId)` is the hot-path method —
+    called on every membership check by the auth middleware.
+    Single round-trip: JOIN `group_memberships` →
+    `group_project_assignments` USING (group_id), GROUP BY
+    project_id, project the MAX role-rank via a CASE expression,
+    invert the rank back to the role name. The whole
+    role-precedence logic lives in SQL so the application code just
+    reads `effective_role`
+  - `assignToProject` uses `INSERT ... ON CONFLICT (group_id,
+    project_id) DO UPDATE` so re-assigning with a different role
+    updates in place — operators expect "I changed editor to
+    project-admin" to be one action, not delete + insert
+  - `addMember` uses `ON CONFLICT DO NOTHING` so re-adding an
+    existing member is a no-op (operator clicks twice → no
+    surprise error)
+  - `listMembers` / `listProjectAssignments` do the JOIN to
+    `users` / `projects` server-side via SQL aliasing so the
+    route doesn't need a follow-up N+1 lookup
+- `packages/adapters/{oracle,mssql}/src/repositories/platform-groups.ts`
+  (new): throw-stub `*PlatformGroupRepository` classes for
+  parity. Same convention every prior session has used. Wired
+  through each adapter's `index.ts`
+- `packages/server/src/auth/middleware.ts`:
+  - `requireProjectMembership(userId, role, projectId, minRole)`
+    rewritten. Runs `memberships.findMembership(userId, projectId)`
+    AND `platformGroups.getEffectiveMemberships(userId)` in
+    parallel; picks `max(roleRank(direct), roleRank(group))`; throws
+    `NOT_PROJECT_MEMBER` when both are missing,
+    `INSUFFICIENT_PROJECT_ROLE` when the effective rank is below
+    `minRole`. Returns the direct membership row when present so
+    callers that need to mutate keep the row id; returns null when
+    access is purely group-derived (no mutable surface — operator
+    manages it via the group itself)
+  - `requireRole` preHandler also rewritten to merge direct +
+    group access using the same `pickHigherRole(a, b)` helper.
+    Previously it only consulted direct memberships, so a user
+    with editor access via a group would be wrongly denied at the
+    preHandler step. New helper `pickHigherRole(a, b)` returns the
+    higher-rank role or null
+- `packages/server/src/routes/projects.ts`:
+  - `GET /projects` for non-admin users now returns the UNION of
+    direct memberships and group-derived project access. Two
+    parallel lookups (`memberships.findByUser` +
+    `platformGroups.getEffectiveMemberships`), set-deduped by
+    project id, then `findById` per project. Platform-admin path
+    (server-wide enriched listing) is unchanged
+- `packages/server/src/routes/groups.ts` (new): ten endpoints, all
+  `requireRole('admin')` (platform-admin only):
+  - `GET /platform/groups` — list
+  - `POST /platform/groups` — create. Duplicate name → 409
+    `NAME_TAKEN`. Audit row `platform.group-added`
+  - `PATCH /platform/groups/:id` — rename + description. Rename
+    collision → 409 `NAME_TAKEN`. Audit row
+    `platform.group-updated` with `changedFields` +
+    `previousName` + `newName`
+  - `DELETE /platform/groups/:id` — CASCADE handles both
+    `group_memberships` AND `group_project_assignments`.
+    **Direct `project_memberships` rows are NEVER touched** —
+    only group-derived access disappears. Audit row
+    `platform.group-deleted`
+  - `GET /platform/groups/:id/members` — joined view with user
+    record
+  - `POST /platform/groups/:id/members { userId }` — UPSERT via
+    `ON CONFLICT DO NOTHING`. Audit row
+    `platform.group-member-added`
+  - `DELETE /platform/groups/:id/members/:userId` — audit row
+    `platform.group-member-removed`
+  - `GET /platform/groups/:id/projects` — joined view
+  - `POST /platform/groups/:id/projects { projectId, role }` —
+    UPSERT with role update in place. Audit row
+    `platform.group-project-assigned`
+  - `DELETE /platform/groups/:id/projects/:projectId` — audit
+    row `platform.group-project-removed`
+- `packages/server/src/app.ts`: registers
+  `registerGroupRoutes(app)` after the existing identity routes
+- `packages/dashboard/src/types.ts`: new `PlatformGroup`,
+  `GroupMember`, `GroupProjectAssignment` types
+- `packages/dashboard/src/api/client.ts`: ten typed API methods
+  matching the server routes
+- `packages/dashboard/src/views/Admin.tsx`: new "Groups" tab
+  inserted between "Projects" and "Identity". `GroupsTab`
+  component with:
+  - Toolbar: `+ Create group`
+  - Table: `Name / Members / Intents / Projects / Actions` (member
+    + project counts populated lazily per row from the
+    members/projects endpoints)
+  - Per-row `Manage` + `×` (delete with confirm)
+  - `CreateGroupModal` — name + description
+  - `ManageGroupPanel` — full edit surface in a modal: editable
+    name + description, members list with `+ Add member` (user
+    `<select>` from `/users`) + remove per row, project
+    assignments list with `+ Assign to project` (project +
+    role selects) + change-role per row + remove
+- `packages/cli/src/api/client.ts`: new `PlatformGroupSummary`,
+  `GroupMemberWithUser`, `GroupProjectWithProject` types + nine
+  client methods
+- `packages/cli/src/commands/platform-extras.ts`: eight new
+  exports — `platformGroupsListCommand`,
+  `platformGroupsCreateCommand`, `platformGroupsDeleteCommand`,
+  `platformGroupsShowCommand`, `platformGroupsAddMemberCommand`,
+  `platformGroupsRemoveMemberCommand`,
+  `platformGroupsAssignCommand`, `platformGroupsUnassignCommand`.
+  Helpers `resolveGroupByName` / `resolveUserByEmail` /
+  `resolveProjectByName` so operators never type UUIDs
+- `packages/cli/src/index.ts`: registers `gestalt platform groups`
+  parent + 8 subcommands. Header comment updated
+
+Verified live end-to-end against the running platform:
+
+- `pnpm -r build` clean across all 12 packages
+- `docker compose up -d --build server` — `Up (healthy)`;
+  migration 018 applied in order (`schema_migrations` now lists
+  18 versions). The three new tables visible in `\dt`
+- API: created `verify-group`, added `user@test.local` as a
+  member, assigned the group to a synthetic
+  `group-test-proj` project as editor
+- **Group-derived access in `GET /projects` for the regular
+  user** — login as `user@test.local`, then `GET /projects`
+  returns `[{name: 'group-test-proj'}]` even though the user
+  has NO direct membership row for that project. The group's
+  editor assignment is the source of truth
+- **Effective role enforcement**:
+  - `POST /intents { projectId, text }` as the group editor →
+    HTTP 201 (editor is the minimum role)
+  - `POST /projects/:id/config { pipeline.adapter: 'noop' }` as
+    the group editor → HTTP 403 `INSUFFICIENT_PROJECT_ROLE`
+    `Minimum project role required: project-admin` (the typed
+    error from `requireProjectMembership` — proves the
+    handler-level helper consulted the group access AND
+    correctly rejected because editor < project-admin)
+- **Role precedence (max of direct vs group)**:
+  - Inserted a direct `project_memberships` row giving the user
+    `reader` access to the same project (they're already group
+    editor)
+  - `POST /intents` succeeded → effective role is editor (the
+    higher of direct=reader and group=editor)
+  - Created a SECOND group `cli-test-group`, added the same
+    user, assigned it to the same project as `project-admin`
+    via the CLI
+  - `POST /projects/:id/config` as the user → no longer 403; the
+    auth check passed and the request reached the route handler
+    (which then returned 400 `NO_CREDENTIAL` because the
+    synthetic project has no git credential — unrelated to
+    auth)
+- **CASCADE on group delete**: `DELETE` the `cli-test-group` →
+  `group_memberships` for that group: 1 → 0,
+  `group_project_assignments`: 1 → 0,
+  `verify-group`'s rows untouched (1 each), direct
+  `project_memberships` for the user untouched
+- **Audit rows written for every mutation** —
+  `platform.group-added`, `platform.group-member-added`,
+  `platform.group-project-assigned`,
+  `platform.group-member-removed`,
+  `platform.group-project-removed`, `platform.group-updated`,
+  `platform.group-deleted` all observable in `audit_log`. The
+  raw metadata column shows the typed payload (`groupName`,
+  `userEmail`, `projectName`, `role`, `ip`)
+- **CLI verification**:
+  - `gestalt platform groups list` rendered the 2-group table
+    with member + project counts per row
+  - `gestalt platform groups show verify-group` printed the
+    member email + project assignment with the role
+  - `gestalt platform groups create cli-test-group
+    --description "Created via CLI"` succeeded
+  - `gestalt platform groups assign cli-test-group
+    group-test-proj --role project-admin` and
+    `add-member cli-test-group user@test.local` chained
+    cleanly
+  - `echo "y" | gestalt platform groups delete cli-test-group`
+    confirmed the y/N prompt + cascaded deletion
+
+Decisions:
+
+- **SQL-side role-rank precedence in `getEffectiveMemberships`.**
+  The CASE expression turns the role string into 1/2/3,
+  aggregates with MAX per project, and inverts back. Keeps the
+  precedence logic in one place (the database) and means the
+  application middleware just reads `effective_role`. The
+  alternative — pulling all `(group, project, role)` triples
+  back to the application and doing the max() in JS — is slower
+  for users in many groups and duplicates the rank table.
+  Documented inline
+- **Direct membership wins on identity, group wins on access.**
+  When the auth middleware finds a direct membership row, it
+  returns that row to the caller (so future mutations can
+  reference its id). When access is purely group-derived, it
+  returns null — the caller learns there's no row to mutate.
+  The role check sees the higher of both regardless. The
+  comment block in `requireProjectMembership` documents this
+- **Group delete is CASCADE, direct memberships are
+  preserved.** The brief was explicit: "Deleting a group does
+  NOT remove direct memberships — only the group-derived
+  access is removed." The CASCADE on the FKs covers the group's
+  own tables; `project_memberships` has no FK to groups (and
+  never should). Verified live during cleanup — the user's
+  direct `reader` membership survived the group delete
+- **`requireRole` preHandler also extended.** The brief only
+  explicitly called out `requireProjectMembership`, but every
+  existing `requireRole('operator')` / `requireRole('viewer')`
+  preHandler would have wrongly rejected a user who had editor
+  access via a group. Extending the preHandler to use the same
+  `pickHigherRole` helper means group access works for EVERY
+  route, not just the handful that use the handler-level helper
+- **`UPSERT (ON CONFLICT DO UPDATE)` on assignments — re-assign
+  changes the role in place.** Operators expect "change editor
+  to project-admin" to be one action. UPSERT means the route
+  handles both create-fresh and change-existing without an
+  extra round trip to check. Re-adding a member is `DO NOTHING`
+  (the row exists with no role to change — operators just want
+  it to succeed)
+- **Audit metadata uses lengths only when sensitive fields
+  exist; for groups, the names are non-sensitive operational
+  identifiers** so `groupName`, `userEmail`, `projectName`,
+  `role` are all included. GP-006 still applies — no secret
+  material in metadata
+- **No new SSE events for group changes.** Operators don't
+  watch group lifecycle events live; the dashboard refreshes on
+  panel close. If a future workflow needs a `group.changed`
+  SSE event (e.g. a banner notifying logged-in users their
+  access changed), the event can be added without schema work
+- **The dashboard "Groups" tab sits BETWEEN Projects and
+  Identity** — operationally adjacent to projects (groups
+  affect project access) and BEFORE the cross-cutting identity
+  tab. The 9-tab row uses the existing `flex-wrap` styling
+  introduced in Session 3
+
+Pending follow-ups: none.
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Migration 018 applied. Server image rebuilt. Full feature
+verified end-to-end against the live platform — group-derived
+project access, max-of-roles precedence, CLI flow, CASCADE on
+delete, direct membership survival.

@@ -214,11 +214,23 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
         return reply.send({ data: enriched });
       }
 
-      const userMemberships = await memberships.findByUser(request.user.id);
-      if (userMemberships.length === 0) return reply.send({ data: [] });
+      // Brief 1 — Bulk user management. A regular user's visible
+      // project list is the UNION of their direct memberships AND any
+      // projects they reach via a platform group. The two lookups run
+      // in parallel and then we dedupe by project id.
+      const { platformGroups } = getRepositories();
+      const [userMemberships, groupAccess] = await Promise.all([
+        memberships.findByUser(request.user.id),
+        platformGroups.getEffectiveMemberships(request.user.id),
+      ]);
+      const allProjectIds = new Set<string>([
+        ...userMemberships.map((m) => m.projectId),
+        ...groupAccess.map((g) => g.projectId),
+      ]);
+      if (allProjectIds.size === 0) return reply.send({ data: [] });
 
       const rows = await Promise.all(
-        userMemberships.map((m) => projects.findById(m.projectId)),
+        [...allProjectIds].map((id) => projects.findById(id)),
       );
       const visible = rows.filter((r): r is ProjectRecord => r !== null);
       return reply.send({ data: visible.map(toPublic) });

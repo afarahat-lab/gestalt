@@ -18,3 +18,4 @@ export { MssqlPlatformMcpServerRepository } from './repositories/platform-mcp-se
 export {
   MssqlIdentityConfigRepository, MssqlRoleMappingRepository,
 } from './repositories/identity-config';
+export { MssqlPlatformGroupRepository } from './repositories/platform-groups';

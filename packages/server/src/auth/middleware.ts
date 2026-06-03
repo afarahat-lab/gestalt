@@ -162,23 +162,43 @@ export function requireRole(minimumRole: 'viewer' | 'operator' | 'admin') {
       return;
     }
 
-    const { memberships } = getRepositories();
-    const membership = await memberships.findMembership(user.id, projectId);
-    if (!membership) {
+    // Brief 1 — Bulk user management. Effective role is the higher of
+    // direct membership (project_memberships) and any group-derived
+    // role (platform_groups). The preHandler now mirrors what the
+    // handler-level `requireProjectMembership` computes.
+    const { memberships, platformGroups } = getRepositories();
+    const [direct, groupEffective] = await Promise.all([
+      memberships.findMembership(user.id, projectId),
+      platformGroups.getEffectiveMemberships(user.id),
+    ]);
+    const groupAccess = groupEffective.find((m) => m.projectId === projectId);
+    const effectiveRole = pickHigherRole(direct?.role ?? null, groupAccess?.role ?? null);
+
+    if (!effectiveRole) {
       return reply.code(403).send({
         error: 'Not a member of this project',
         code: 'FORBIDDEN',
       });
     }
 
-    if (minimumRole === 'operator' && membership.role === 'reader') {
+    if (minimumRole === 'operator' && effectiveRole === 'reader') {
       return reply.code(403).send({
         error: 'Editor or project-admin required',
         code: 'FORBIDDEN',
       });
     }
-    // minimumRole === 'viewer' — any membership is sufficient
+    // minimumRole === 'viewer' — any effective role is sufficient
   };
+}
+
+function pickHigherRole(
+  a: ProjectRole | null,
+  b: ProjectRole | null,
+): ProjectRole | null {
+  if (!a && !b) return null;
+  if (!a) return b;
+  if (!b) return a;
+  return PROJECT_ROLE_RANK[a] >= PROJECT_ROLE_RANK[b] ? a : b;
 }
 
 /**
@@ -223,24 +243,40 @@ export async function requireProjectMembership(
 ): Promise<ProjectMembershipRecord | null> {
   if (userPlatformRole === 'platform-admin') return null;
 
-  const { memberships } = getRepositories();
-  const membership = await memberships.findMembership(userId, projectId);
+  // Brief 1 — bulk user management. Effective access is the higher of
+  // the user's direct `project_memberships` row AND any role derived
+  // from `platform_groups`. Both lookups happen in parallel; the
+  // comparison runs against the role-rank scale.
+  const { memberships, platformGroups } = getRepositories();
+  const [direct, groupEffective] = await Promise.all([
+    memberships.findMembership(userId, projectId),
+    platformGroups.getEffectiveMemberships(userId),
+  ]);
 
-  if (!membership) {
+  const directRank = direct ? PROJECT_ROLE_RANK[direct.role] : 0;
+  const groupAccess = groupEffective.find((m) => m.projectId === projectId);
+  const groupRank = groupAccess ? PROJECT_ROLE_RANK[groupAccess.role] : 0;
+  const effectiveRank = Math.max(directRank, groupRank);
+
+  if (effectiveRank === 0) {
     throw new ProjectMembershipError(
       'NOT_PROJECT_MEMBER',
       'You are not a member of this project',
     );
   }
 
-  if (PROJECT_ROLE_RANK[membership.role] < PROJECT_ROLE_RANK[minRole]) {
+  if (effectiveRank < PROJECT_ROLE_RANK[minRole]) {
     throw new ProjectMembershipError(
       'INSUFFICIENT_PROJECT_ROLE',
       `Minimum project role required: ${minRole}`,
     );
   }
 
-  return membership;
+  // Returns the direct membership row when present (callers that
+  // need to mutate use this row's id; group-derived access has no
+  // mutable surface — the operator manages it via the group itself).
+  // Returns null when access is purely group-derived.
+  return direct ?? null;
 }
 
 /**

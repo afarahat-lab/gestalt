@@ -319,6 +319,44 @@ export interface RoleMappingSummary {
   createdAt: string;
 }
 
+// ─── Platform groups (Brief 1 — bulk user management, migration 018) ────────
+
+export interface PlatformGroupSummary {
+  id: string;
+  name: string;
+  description: string | null;
+  createdBy: string | null;
+  createdAt: string;
+}
+
+export interface GroupMemberWithUser {
+  groupId: string;
+  userId: string;
+  addedBy: string | null;
+  addedAt: string;
+  user: {
+    id: string;
+    email: string;
+    displayName: string;
+    role: 'platform-admin' | 'user';
+    deactivatedAt: string | null;
+  };
+}
+
+export interface GroupProjectWithProject {
+  groupId: string;
+  projectId: string;
+  role: 'project-admin' | 'editor' | 'reader';
+  assignedBy: string | null;
+  assignedAt: string;
+  project: {
+    id: string;
+    name: string;
+    gitUrl: string;
+    defaultBranch: string;
+  };
+}
+
 // ─── Deployments (ADR-033 / ADR-034) ─────────────────────────────────────────
 
 export type DeploymentEventType =
@@ -551,6 +589,40 @@ export class GestaltApiClient {
   }
   async removeRoleMapping(id: string): Promise<void> {
     await this.delete(`/platform/identity/role-mappings/${id}`);
+  }
+
+  // ─── Platform groups ──────────────────────────────────────────────────────
+
+  async listPlatformGroups(): Promise<{ data: PlatformGroupSummary[] }> {
+    return this.get('/platform/groups');
+  }
+  async createPlatformGroup(body: { name: string; description?: string | null }): Promise<{ data: PlatformGroupSummary }> {
+    return this.post('/platform/groups', body);
+  }
+  async deletePlatformGroup(id: string): Promise<void> {
+    await this.delete(`/platform/groups/${id}`);
+  }
+  async listGroupMembers(groupId: string): Promise<{ data: GroupMemberWithUser[] }> {
+    return this.get(`/platform/groups/${groupId}/members`);
+  }
+  async addGroupMember(groupId: string, userId: string): Promise<unknown> {
+    return this.post(`/platform/groups/${groupId}/members`, { userId });
+  }
+  async removeGroupMember(groupId: string, userId: string): Promise<void> {
+    await this.delete(`/platform/groups/${groupId}/members/${userId}`);
+  }
+  async listGroupProjects(groupId: string): Promise<{ data: GroupProjectWithProject[] }> {
+    return this.get(`/platform/groups/${groupId}/projects`);
+  }
+  async assignGroupToProject(
+    groupId: string,
+    projectId: string,
+    role: 'project-admin' | 'editor' | 'reader',
+  ): Promise<unknown> {
+    return this.post(`/platform/groups/${groupId}/projects`, { projectId, role });
+  }
+  async unassignGroupFromProject(groupId: string, projectId: string): Promise<void> {
+    await this.delete(`/platform/groups/${groupId}/projects/${projectId}`);
   }
 
   // ─── Platform LLM registry (Session 3) ────────────────────────────────────

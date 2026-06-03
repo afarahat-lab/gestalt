@@ -18,3 +18,4 @@ export { OraclePlatformMcpServerRepository } from './repositories/platform-mcp-s
 export {
   OracleIdentityConfigRepository, OracleRoleMappingRepository,
 } from './repositories/identity-config';
+export { OraclePlatformGroupRepository } from './repositories/platform-groups';

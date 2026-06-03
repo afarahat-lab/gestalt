@@ -27,9 +27,10 @@ import type {
   PlatformLLM, LlmTestResult, PlatformSecret,
   PlatformTemplateSummary, PlatformMcpServer, PlatformMcpTestResult,
   PlatformToolInfo, IdentityState, IdentityProvider, RoleMapping,
+  PlatformGroup, GroupMember, GroupProjectAssignment,
 } from '../types';
 
-type Tab = 'users' | 'projects' | 'llms' | 'secrets' | 'templates' | 'mcp' | 'tools' | 'identity';
+type Tab = 'users' | 'projects' | 'groups' | 'llms' | 'secrets' | 'templates' | 'mcp' | 'tools' | 'identity';
 
 export function Admin() {
   const [tab, setTab] = useState<Tab>('users');
@@ -43,6 +44,7 @@ export function Admin() {
         {([
           ['users', 'Users'],
           ['projects', 'Projects'],
+          ['groups', 'Groups'],
           ['identity', 'Identity'],
           ['llms', 'LLMs'],
           ['secrets', 'Secrets'],
@@ -59,6 +61,7 @@ export function Admin() {
       </div>
       {tab === 'users' && <UsersTab />}
       {tab === 'projects' && <ProjectsTab />}
+      {tab === 'groups' && <GroupsTab />}
       {tab === 'identity' && <IdentityTab />}
       {tab === 'llms' && <LlmsTab />}
       {tab === 'secrets' && <SecretsTab />}
@@ -1423,6 +1426,376 @@ function formatDate(iso: string): string {
   } catch {
     return iso;
   }
+}
+
+// ─── Groups tab (Brief 1 — bulk user management, migration 018) ─────────────
+
+function GroupsTab() {
+  const api = useDashboardApi();
+  const [groups, setGroups] = useState<PlatformGroup[]>([]);
+  // Per-group member + assignment counts populated lazily once the
+  // group is expanded — the list endpoint doesn't carry them.
+  const [memberCounts, setMemberCounts] = useState<Record<string, number>>({});
+  const [projectCounts, setProjectCounts] = useState<Record<string, number>>({});
+  const [managing, setManaging] = useState<PlatformGroup | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const res = await api.listPlatformGroups();
+      setGroups(res.data);
+      // Eager fetch of counts so the table can show "5 / 2" without
+      // requiring a click. Cheap — each group's lookup is two
+      // indexed queries.
+      const counts: { mem: Record<string, number>; proj: Record<string, number> } = { mem: {}, proj: {} };
+      await Promise.all(res.data.map(async (g) => {
+        try {
+          const [m, p] = await Promise.all([
+            api.listGroupMembers(g.id),
+            api.listGroupProjectAssignments(g.id),
+          ]);
+          counts.mem[g.id] = m.data.length;
+          counts.proj[g.id] = p.data.length;
+        } catch { /* leave undefined */ }
+      }));
+      setMemberCounts(counts.mem);
+      setProjectCounts(counts.proj);
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+  useEffect(() => { void load(); /* eslint-disable-next-line */ }, []);
+
+  async function handleDelete(g: PlatformGroup) {
+    if (!window.confirm(`Delete group '${g.name}'? Members keep their direct memberships; only group-derived project access is removed.`)) return;
+    setError(null);
+    try { await api.deletePlatformGroup(g.id); await load(); }
+    catch (err) { setError(err instanceof ApiError ? extractError(err) : String(err)); }
+  }
+
+  if (loading) return <p style={{ color: 'var(--text-dim)' }}>Loading groups...</p>;
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+        <h3 style={styles.cardTitle}>Platform groups ({groups.length})</h3>
+        <button style={styles.primaryBtn} onClick={() => setCreating(true)}>+ Create group</button>
+      </div>
+      <p style={{ color: 'var(--text-dim)', fontSize: '12px', margin: '0 0 12px' }}>
+        Groups let you assign multiple users to multiple projects at once. A member's effective role on a
+        project is the higher of their direct membership AND any group-derived role.
+      </p>
+      {error && <div style={styles.errorBanner}>{error}</div>}
+      <table style={styles.table}>
+        <thead>
+          <tr>
+            <th style={styles.th}>Name</th>
+            <th style={styles.th}>Members</th>
+            <th style={styles.th}>Projects</th>
+            <th style={styles.th}>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {groups.length === 0 && (
+            <tr><td colSpan={4} style={styles.empty}>No groups yet — click + Create group to start</td></tr>
+          )}
+          {groups.map((g) => (
+            <tr key={g.id}>
+              <td style={styles.td}>
+                {g.name}
+                {g.description && <div style={{ color: 'var(--text-dim)', fontSize: '11px' }}>{g.description}</div>}
+              </td>
+              <td style={styles.td}>{memberCounts[g.id] ?? '—'}</td>
+              <td style={styles.td}>{projectCounts[g.id] ?? '—'}</td>
+              <td style={styles.td}>
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  <button style={styles.linkBtn} onClick={() => setManaging(g)}>Manage</button>
+                  <button style={styles.dangerBtn} onClick={() => void handleDelete(g)}>×</button>
+                </div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {creating && (
+        <CreateGroupModal
+          onClose={() => setCreating(false)}
+          onCreated={async () => { setCreating(false); await load(); }}
+        />
+      )}
+      {managing && (
+        <ManageGroupPanel
+          group={managing}
+          onClose={() => setManaging(null)}
+          onChanged={() => void load()}
+        />
+      )}
+    </div>
+  );
+}
+
+function CreateGroupModal(props: { onClose: () => void; onCreated: () => Promise<void> | void }) {
+  const api = useDashboardApi();
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  async function save() {
+    setError(null);
+    if (!name.trim()) { setError('Name is required'); return; }
+    setSaving(true);
+    try {
+      await api.createPlatformGroup({ name: name.trim(), description: description.trim() || null });
+      await props.onCreated();
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally { setSaving(false); }
+  }
+
+  return (
+    <div style={styles.modalBackdrop} onClick={props.onClose}>
+      <div style={{ ...styles.modal, maxWidth: '440px' }} onClick={(e) => e.stopPropagation()}>
+        <h3 style={styles.cardTitle}>Create group</h3>
+        {error && <div style={styles.errorBanner}>{error}</div>}
+        <label style={styles.label}>Name
+          <input style={styles.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="Backend Team" autoFocus />
+        </label>
+        <label style={styles.label}>Description (optional)
+          <input style={styles.input} value={description} onChange={(e) => setDescription(e.target.value)} />
+        </label>
+        <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+          <button style={styles.linkBtn} onClick={props.onClose}>Cancel</button>
+          <button style={styles.primaryBtn} onClick={() => void save()} disabled={saving || !name.trim()}>
+            {saving ? 'Creating...' : 'Create'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ManageGroupPanel(props: {
+  group: PlatformGroup;
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const api = useDashboardApi();
+  const [members, setMembers] = useState<GroupMember[]>([]);
+  const [assignments, setAssignments] = useState<GroupProjectAssignment[]>([]);
+  const [allUsers, setAllUsers] = useState<UserSummary[]>([]);
+  const [allProjects, setAllProjects] = useState<ProjectSummary[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [addingMember, setAddingMember] = useState(false);
+  const [addingProject, setAddingProject] = useState(false);
+  const [editingName, setEditingName] = useState(false);
+  const [draftName, setDraftName] = useState(props.group.name);
+  const [draftDescription, setDraftDescription] = useState(props.group.description ?? '');
+
+  async function reload() {
+    try {
+      const [m, p, u, projRes] = await Promise.all([
+        api.listGroupMembers(props.group.id),
+        api.listGroupProjectAssignments(props.group.id),
+        api.listUsers(),
+        api.listProjects(),
+      ]);
+      setMembers(m.data);
+      setAssignments(p.data);
+      setAllUsers(u.data);
+      setAllProjects(projRes.data);
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    }
+  }
+  useEffect(() => { void reload(); /* eslint-disable-next-line */ }, [props.group.id]);
+
+  async function saveName() {
+    setError(null);
+    try {
+      await api.updatePlatformGroup(props.group.id, {
+        name: draftName.trim(),
+        description: draftDescription.trim() || null,
+      });
+      setEditingName(false);
+      props.onChanged();
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    }
+  }
+  async function removeMember(userId: string) {
+    setError(null);
+    try { await api.removeGroupMember(props.group.id, userId); await reload(); props.onChanged(); }
+    catch (err) { setError(err instanceof ApiError ? extractError(err) : String(err)); }
+  }
+  async function removeAssignment(projectId: string) {
+    setError(null);
+    try { await api.unassignGroupFromProject(props.group.id, projectId); await reload(); props.onChanged(); }
+    catch (err) { setError(err instanceof ApiError ? extractError(err) : String(err)); }
+  }
+  async function changeAssignmentRole(projectId: string, role: 'project-admin' | 'editor' | 'reader') {
+    setError(null);
+    try { await api.assignGroupToProject(props.group.id, projectId, role); await reload(); }
+    catch (err) { setError(err instanceof ApiError ? extractError(err) : String(err)); }
+  }
+
+  const memberUserIds = new Set(members.map((m) => m.userId));
+  const assignedProjectIds = new Set(assignments.map((a) => a.projectId));
+  const availableUsers = allUsers.filter((u) => !memberUserIds.has(u.id));
+  const availableProjects = allProjects.filter((p) => !assignedProjectIds.has(p.id));
+
+  return (
+    <div style={styles.modalBackdrop} onClick={props.onClose}>
+      <div style={{ ...styles.modal, maxWidth: '640px' }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          {editingName ? (
+            <div style={{ flex: 1, display: 'flex', gap: '6px' }}>
+              <input style={styles.input} value={draftName} onChange={(e) => setDraftName(e.target.value)} />
+              <input style={styles.input} value={draftDescription} onChange={(e) => setDraftDescription(e.target.value)} placeholder="Description (optional)" />
+              <button style={styles.primaryBtn} onClick={() => void saveName()}>Save</button>
+              <button style={styles.linkBtn} onClick={() => { setEditingName(false); setDraftName(props.group.name); setDraftDescription(props.group.description ?? ''); }}>Cancel</button>
+            </div>
+          ) : (
+            <h3 style={styles.cardTitle}>{props.group.name}</h3>
+          )}
+          {!editingName && (
+            <button style={styles.linkBtn} onClick={() => setEditingName(true)}>Edit name</button>
+          )}
+        </div>
+        {props.group.description && !editingName && (
+          <p style={{ color: 'var(--text-dim)', fontSize: '12px', margin: '4px 0 0' }}>{props.group.description}</p>
+        )}
+        {error && <div style={styles.errorBanner}>{error}</div>}
+
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '14px' }}>
+          <strong style={{ color: 'var(--text-primary)' }}>Members ({members.length})</strong>
+          <button style={styles.linkBtn} onClick={() => setAddingMember((v) => !v)}>+ Add member</button>
+        </div>
+        {addingMember && (
+          <AddMemberRow
+            users={availableUsers}
+            onCancel={() => setAddingMember(false)}
+            onAdd={async (userId) => {
+              try { await api.addGroupMember(props.group.id, userId); setAddingMember(false); await reload(); props.onChanged(); }
+              catch (err) { setError(err instanceof ApiError ? extractError(err) : String(err)); }
+            }}
+          />
+        )}
+        <table style={{ ...styles.subtable, marginTop: '6px' }}>
+          <tbody>
+            {members.length === 0 && (
+              <tr><td colSpan={3} style={styles.empty}>No members yet</td></tr>
+            )}
+            {members.map((m) => (
+              <tr key={m.userId}>
+                <td style={styles.td}><code>{m.user.email}</code></td>
+                <td style={styles.td}>{m.user.displayName}</td>
+                <td style={styles.td}>
+                  <button style={styles.dangerBtn} onClick={() => void removeMember(m.userId)}>×</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '14px' }}>
+          <strong style={{ color: 'var(--text-primary)' }}>Project assignments ({assignments.length})</strong>
+          <button style={styles.linkBtn} onClick={() => setAddingProject((v) => !v)}>+ Assign to project</button>
+        </div>
+        {addingProject && (
+          <AddProjectAssignmentRow
+            projects={availableProjects}
+            onCancel={() => setAddingProject(false)}
+            onAdd={async (projectId, role) => {
+              try { await api.assignGroupToProject(props.group.id, projectId, role); setAddingProject(false); await reload(); props.onChanged(); }
+              catch (err) { setError(err instanceof ApiError ? extractError(err) : String(err)); }
+            }}
+          />
+        )}
+        <table style={{ ...styles.subtable, marginTop: '6px' }}>
+          <tbody>
+            {assignments.length === 0 && (
+              <tr><td colSpan={3} style={styles.empty}>No project assignments yet</td></tr>
+            )}
+            {assignments.map((a) => (
+              <tr key={a.projectId}>
+                <td style={styles.td}>{a.project.name}</td>
+                <td style={styles.td}>
+                  <select
+                    style={styles.select}
+                    value={a.role}
+                    onChange={(e) => void changeAssignmentRole(a.projectId, e.target.value as 'project-admin' | 'editor' | 'reader')}
+                  >
+                    <option value="reader">Reader</option>
+                    <option value="editor">Editor</option>
+                    <option value="project-admin">Project admin</option>
+                  </select>
+                </td>
+                <td style={styles.td}>
+                  <button style={styles.dangerBtn} onClick={() => void removeAssignment(a.projectId)}>×</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '14px' }}>
+          <button style={styles.linkBtn} onClick={props.onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AddMemberRow(props: {
+  users: UserSummary[];
+  onAdd: (userId: string) => Promise<void> | void;
+  onCancel: () => void;
+}) {
+  const [userId, setUserId] = useState('');
+  return (
+    <div style={{ display: 'flex', gap: '6px', marginTop: '6px', alignItems: 'center' }}>
+      <select style={{ ...styles.select, flex: 1 }} value={userId} onChange={(e) => setUserId(e.target.value)}>
+        <option value="">— pick a user —</option>
+        {props.users.map((u) => (
+          <option key={u.id} value={u.id}>{u.displayName} ({u.email})</option>
+        ))}
+      </select>
+      <button style={styles.primaryBtn} disabled={!userId} onClick={() => void props.onAdd(userId)}>Add</button>
+      <button style={styles.linkBtn} onClick={props.onCancel}>Cancel</button>
+    </div>
+  );
+}
+
+function AddProjectAssignmentRow(props: {
+  projects: ProjectSummary[];
+  onAdd: (projectId: string, role: 'project-admin' | 'editor' | 'reader') => Promise<void> | void;
+  onCancel: () => void;
+}) {
+  const [projectId, setProjectId] = useState('');
+  const [role, setRole] = useState<'project-admin' | 'editor' | 'reader'>('editor');
+  return (
+    <div style={{ display: 'flex', gap: '6px', marginTop: '6px', alignItems: 'center' }}>
+      <select style={{ ...styles.select, flex: 2 }} value={projectId} onChange={(e) => setProjectId(e.target.value)}>
+        <option value="">— pick a project —</option>
+        {props.projects.map((p) => (
+          <option key={p.id} value={p.id}>{p.name}</option>
+        ))}
+      </select>
+      <select style={{ ...styles.select, flex: 1 }} value={role} onChange={(e) => setRole(e.target.value as 'project-admin' | 'editor' | 'reader')}>
+        <option value="reader">Reader</option>
+        <option value="editor">Editor</option>
+        <option value="project-admin">Project admin</option>
+      </select>
+      <button style={styles.primaryBtn} disabled={!projectId} onClick={() => void props.onAdd(projectId, role)}>Assign</button>
+      <button style={styles.linkBtn} onClick={props.onCancel}>Cancel</button>
+    </div>
+  );
 }
 
 function extractError(err: ApiError): string {

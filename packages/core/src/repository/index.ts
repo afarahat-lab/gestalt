@@ -387,6 +387,7 @@ export interface RepositoryRegistry {
   platformMcpServers: PlatformMcpServerRepository;
   identityConfig: IdentityConfigRepository;
   roleMappings: RoleMappingRepository;
+  platformGroups: PlatformGroupRepository;
 }
 
 // ─── Platform LLM registry (migration 014) ───────────────────────────────────
@@ -658,6 +659,95 @@ export interface RoleMappingRepository extends BaseRepository {
     createdBy: string;
   }): Promise<RoleMappingRecord>;
   remove(id: string): Promise<void>;
+}
+
+// ─── Platform groups (Brief 1 — bulk user management, migration 018) ────────
+
+/**
+ * A group is a named bucket of users plus a set of project-role
+ * assignments. Membership in the group implies the union of those
+ * project roles on top of any direct `project_memberships` rows the
+ * user has. Effective role on a project is `max(direct, group-derived)`
+ * — `requireProjectMembership` computes this.
+ */
+export interface PlatformGroupRecord {
+  id: string;
+  name: string;
+  description: string | null;
+  createdBy: string | null;
+  createdAt: Date;
+}
+
+export interface GroupMembershipRecord {
+  groupId: string;
+  userId: string;
+  addedBy: string | null;
+  addedAt: Date;
+}
+
+export interface GroupProjectAssignmentRecord {
+  groupId: string;
+  projectId: string;
+  role: 'project-admin' | 'editor' | 'reader';
+  assignedBy: string | null;
+  assignedAt: Date;
+}
+
+/**
+ * Joined views the routes consume directly — saves the caller from
+ * a follow-up N+1 lookup against `users` / `projects`.
+ */
+export type GroupMemberWithUser = GroupMembershipRecord & { user: UserRecord };
+export type GroupProjectWithProject = GroupProjectAssignmentRecord & { project: ProjectRecord };
+
+/**
+ * Effective per-project access for a single user computed from their
+ * group memberships. The auth middleware merges this with the user's
+ * direct `project_memberships` rows using a role-rank `max(...)`.
+ */
+export interface EffectiveProjectMembership {
+  projectId: string;
+  role: 'project-admin' | 'editor' | 'reader';
+}
+
+export interface PlatformGroupRepository extends BaseRepository {
+  list(): Promise<PlatformGroupRecord[]>;
+  findById(id: string): Promise<PlatformGroupRecord | null>;
+  findByName(name: string): Promise<PlatformGroupRecord | null>;
+  create(params: {
+    name: string;
+    description?: string | null;
+    createdBy: string;
+  }): Promise<PlatformGroupRecord>;
+  update(id: string, params: {
+    name?: string;
+    description?: string | null;
+  }): Promise<PlatformGroupRecord>;
+  delete(id: string): Promise<void>;
+
+  // Members
+  addMember(groupId: string, userId: string, addedBy: string): Promise<void>;
+  removeMember(groupId: string, userId: string): Promise<void>;
+  listMembers(groupId: string): Promise<GroupMemberWithUser[]>;
+
+  // Project assignments
+  assignToProject(
+    groupId: string,
+    projectId: string,
+    role: 'project-admin' | 'editor' | 'reader',
+    assignedBy: string,
+  ): Promise<void>;
+  removeFromProject(groupId: string, projectId: string): Promise<void>;
+  listProjectAssignments(groupId: string): Promise<GroupProjectWithProject[]>;
+
+  /**
+   * Aggregate per-project access for `userId` derived from every
+   * group they're a member of. Returned at most once per project
+   * (the highest role across all the user's groups). The auth
+   * middleware merges this with direct memberships using
+   * `max(roleRank(direct), roleRank(group))`.
+   */
+  getEffectiveMemberships(userId: string): Promise<EffectiveProjectMembership[]>;
 }
 
 // ─── Intervention repository (ADR-021) ───────────────────────────────────────

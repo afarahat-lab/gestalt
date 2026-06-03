@@ -38,6 +38,9 @@
  *   gestalt platform mcp list/add/enable/disable/test/remove    — platform-wide MCP servers
  *   gestalt platform tools list                                 — built-in tool inspector
  *   gestalt platform identity show/configure/reload/...         — corporate identity
+ *   gestalt platform groups list/create/delete/show             — bulk user mgmt (Brief 1)
+ *   gestalt platform groups add-member/remove-member            — group membership
+ *   gestalt platform groups assign/unassign --role <role>       — group → project
  *   gestalt run "<intent>" [--server <url>] [--priority critical|high|normal|low]
  *   gestalt intent list [--project <name>] [--status <s>] [--limit 20]
  *   gestalt intent show <id> [--watch]                — execution-flow graph
@@ -121,6 +124,11 @@ import {
   platformIdentityReloadCommand,
   platformIdentityAddRoleMappingCommand,
   platformIdentityRemoveRoleMappingCommand,
+  platformGroupsListCommand, platformGroupsCreateCommand,
+  platformGroupsDeleteCommand, platformGroupsAddMemberCommand,
+  platformGroupsRemoveMemberCommand,
+  platformGroupsAssignCommand, platformGroupsUnassignCommand,
+  platformGroupsShowCommand,
 } from './commands/platform-extras';
 import {
   usersListCommand, usersAddCommand, usersRoleCommand, usersDeactivateCommand,
@@ -876,6 +884,77 @@ platformIdentity
   .option('--server <url>', 'Server URL (one-shot override for this invocation)')
   .action(async (groupName: string, opts: { server?: string }) => {
     await platformIdentityRemoveRoleMappingCommand(groupName, { server: opts.server }).catch(fatalError);
+  });
+
+// gestalt platform groups — bulk user management (Brief 1 — migration 018)
+const platformGroups = platform
+  .command('groups')
+  .description('Manage platform-wide groups for bulk user / project access management.');
+
+platformGroups
+  .command('list')
+  .description('Table of registered groups with member + project counts.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (opts: { server?: string }) => {
+    await platformGroupsListCommand({ server: opts.server }).catch(fatalError);
+  });
+
+platformGroups
+  .command('create <name>')
+  .description('Create a new group. Members + project assignments are added separately.')
+  .option('--description <text>', 'Group description')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (name: string, opts: { description?: string; server?: string }) => {
+    await platformGroupsCreateCommand(name, { description: opts.description, server: opts.server }).catch(fatalError);
+  });
+
+platformGroups
+  .command('delete <name>')
+  .description('Delete a group (CASCADE removes members + assignments). Direct project memberships are NOT touched.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (name: string, opts: { server?: string }) => {
+    await platformGroupsDeleteCommand(name, { server: opts.server }).catch(fatalError);
+  });
+
+platformGroups
+  .command('show <name>')
+  .description('Print a group\'s members and project assignments.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (name: string, opts: { server?: string }) => {
+    await platformGroupsShowCommand(name, { server: opts.server }).catch(fatalError);
+  });
+
+platformGroups
+  .command('add-member <groupName> <userEmail>')
+  .description('Add a user to a group. They get group-derived access to every project the group is assigned to.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (groupName: string, userEmail: string, opts: { server?: string }) => {
+    await platformGroupsAddMemberCommand(groupName, userEmail, { server: opts.server }).catch(fatalError);
+  });
+
+platformGroups
+  .command('remove-member <groupName> <userEmail>')
+  .description('Remove a user from a group. Their direct project memberships are unaffected.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (groupName: string, userEmail: string, opts: { server?: string }) => {
+    await platformGroupsRemoveMemberCommand(groupName, userEmail, { server: opts.server }).catch(fatalError);
+  });
+
+platformGroups
+  .command('assign <groupName> <projectName>')
+  .description('Assign a group to a project with a given role.')
+  .option('--role <role>', 'Role for the assignment (project-admin|editor|reader)', 'reader')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (groupName: string, projectName: string, opts: { role?: string; server?: string }) => {
+    await platformGroupsAssignCommand(groupName, projectName, { role: opts.role, server: opts.server }).catch(fatalError);
+  });
+
+platformGroups
+  .command('unassign <groupName> <projectName>')
+  .description('Remove a group → project assignment.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (groupName: string, projectName: string, opts: { server?: string }) => {
+    await platformGroupsUnassignCommand(groupName, projectName, { server: opts.server }).catch(fatalError);
   });
 
 // gestalt run

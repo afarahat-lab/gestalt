@@ -20,6 +20,7 @@ import {
   type PlatformTemplateSummary, type PlatformMcpServer,
   type PlatformToolInfo, type IdentityStateResponse,
   type PlatformSecretSummary,
+  type PlatformGroupSummary,
 } from '../api/client';
 import { loadCliConfig, resolveServerUrl } from '../ui/config';
 import {
@@ -490,5 +491,231 @@ export async function platformIdentityRemoveRoleMappingCommand(
     console.log(c.success(`✓ Role mapping removed: ${groupName}`));
   } catch (err) {
     handleErr(err, serverUrl, `Failed to remove mapping ${groupName}`);
+  }
+}
+
+// ─── Platform groups (Brief 1 — bulk user management) ────────────────────────
+
+const VALID_GROUP_ROLES = new Set(['project-admin', 'editor', 'reader']);
+
+async function resolveGroupByName(
+  client: GestaltApiClient,
+  name: string,
+): Promise<PlatformGroupSummary> {
+  const res = await client.listPlatformGroups();
+  const match = res.data.find((g) => g.name === name);
+  if (!match) {
+    console.log(c.error(`No group named '${name}'. Run: gestalt platform groups list`));
+    process.exit(1);
+  }
+  return match;
+}
+
+async function resolveUserByEmail(client: GestaltApiClient, email: string): Promise<{ id: string; email: string }> {
+  const res = await client.listUsers({ search: email });
+  const match = res.data.find((u) => u.email === email);
+  if (!match) {
+    console.log(c.error(`No user with email '${email}'. Run: gestalt users list`));
+    process.exit(1);
+  }
+  return { id: match.id, email: match.email };
+}
+
+async function resolveProjectByName(client: GestaltApiClient, name: string): Promise<{ id: string; name: string }> {
+  const res = await client.listProjects();
+  const match = res.data.find((p) => p.name === name);
+  if (!match) {
+    console.log(c.error(`No project named '${name}'. Run: gestalt projects list`));
+    process.exit(1);
+  }
+  return { id: match.id, name: match.name };
+}
+
+export async function platformGroupsListCommand(options: BaseOptions = {}): Promise<void> {
+  const ctx = await openClient(options);
+  if (!ctx) return;
+  const { client, serverUrl } = ctx;
+  try {
+    const res = await client.listPlatformGroups();
+    if (res.data.length === 0) {
+      console.log(c.dim('No groups registered.'));
+      return;
+    }
+    blank();
+    // Fetch members + projects per row so the count columns are populated.
+    const rows = await Promise.all(res.data.map(async (g) => {
+      const [m, p] = await Promise.all([
+        client.listGroupMembers(g.id).catch(() => ({ data: [] })),
+        client.listGroupProjects(g.id).catch(() => ({ data: [] })),
+      ]);
+      return {
+        name: c.info(g.name),
+        members: String(m.data.length),
+        projects: String(p.data.length),
+        description: g.description ? c.dim(g.description) : c.dim('—'),
+      };
+    }));
+    printTable(rows, [
+      { key: 'name', header: 'Name', width: 24 },
+      { key: 'members', header: 'Members', width: 10 },
+      { key: 'projects', header: 'Projects', width: 10 },
+      { key: 'description', header: 'Description', width: 40 },
+    ]);
+    blank();
+  } catch (err) {
+    handleErr(err, serverUrl, 'Failed to list groups');
+  }
+}
+
+export async function platformGroupsCreateCommand(
+  name: string,
+  options: BaseOptions & { description?: string } = {},
+): Promise<void> {
+  const ctx = await openClient(options);
+  if (!ctx) return;
+  const { client, serverUrl } = ctx;
+  try {
+    await client.createPlatformGroup({ name, description: options.description?.trim() || null });
+    blank();
+    console.log(c.success(`✓ Group created: ${name}`));
+    blank();
+  } catch (err) {
+    handleErr(err, serverUrl, `Failed to create group ${name}`);
+  }
+}
+
+export async function platformGroupsDeleteCommand(name: string, options: BaseOptions = {}): Promise<void> {
+  const ctx = await openClient(options);
+  if (!ctx) return;
+  const { client, serverUrl } = ctx;
+  try {
+    const target = await resolveGroupByName(client, name);
+    if (!(await confirm(`Delete group '${name}'? Members keep their direct memberships; only group-derived project access is removed.`))) {
+      console.log(c.dim('Aborted.'));
+      return;
+    }
+    await client.deletePlatformGroup(target.id);
+    blank();
+    console.log(c.success(`✓ Group deleted: ${name}`));
+    blank();
+  } catch (err) {
+    handleErr(err, serverUrl, `Failed to delete group ${name}`);
+  }
+}
+
+export async function platformGroupsAddMemberCommand(
+  groupName: string,
+  userEmail: string,
+  options: BaseOptions = {},
+): Promise<void> {
+  const ctx = await openClient(options);
+  if (!ctx) return;
+  const { client, serverUrl } = ctx;
+  try {
+    const group = await resolveGroupByName(client, groupName);
+    const user = await resolveUserByEmail(client, userEmail);
+    await client.addGroupMember(group.id, user.id);
+    console.log(c.success(`✓ Added ${userEmail} to group '${groupName}'`));
+  } catch (err) {
+    handleErr(err, serverUrl, `Failed to add member`);
+  }
+}
+
+export async function platformGroupsRemoveMemberCommand(
+  groupName: string,
+  userEmail: string,
+  options: BaseOptions = {},
+): Promise<void> {
+  const ctx = await openClient(options);
+  if (!ctx) return;
+  const { client, serverUrl } = ctx;
+  try {
+    const group = await resolveGroupByName(client, groupName);
+    const user = await resolveUserByEmail(client, userEmail);
+    await client.removeGroupMember(group.id, user.id);
+    console.log(c.success(`✓ Removed ${userEmail} from group '${groupName}'`));
+  } catch (err) {
+    handleErr(err, serverUrl, `Failed to remove member`);
+  }
+}
+
+export async function platformGroupsAssignCommand(
+  groupName: string,
+  projectName: string,
+  options: BaseOptions & { role?: string } = {},
+): Promise<void> {
+  const ctx = await openClient(options);
+  if (!ctx) return;
+  const { client, serverUrl } = ctx;
+  const role = options.role ?? 'reader';
+  if (!VALID_GROUP_ROLES.has(role)) {
+    console.log(c.error(`Invalid role '${role}'. Must be one of: project-admin, editor, reader`));
+    process.exit(1);
+  }
+  try {
+    const group = await resolveGroupByName(client, groupName);
+    const project = await resolveProjectByName(client, projectName);
+    await client.assignGroupToProject(group.id, project.id, role as 'project-admin' | 'editor' | 'reader');
+    console.log(c.success(`✓ Assigned group '${groupName}' to project '${projectName}' as ${role}`));
+  } catch (err) {
+    handleErr(err, serverUrl, 'Failed to assign group');
+  }
+}
+
+export async function platformGroupsUnassignCommand(
+  groupName: string,
+  projectName: string,
+  options: BaseOptions = {},
+): Promise<void> {
+  const ctx = await openClient(options);
+  if (!ctx) return;
+  const { client, serverUrl } = ctx;
+  try {
+    const group = await resolveGroupByName(client, groupName);
+    const project = await resolveProjectByName(client, projectName);
+    await client.unassignGroupFromProject(group.id, project.id);
+    console.log(c.success(`✓ Unassigned group '${groupName}' from project '${projectName}'`));
+  } catch (err) {
+    handleErr(err, serverUrl, 'Failed to unassign group');
+  }
+}
+
+export async function platformGroupsShowCommand(
+  name: string,
+  options: BaseOptions = {},
+): Promise<void> {
+  const ctx = await openClient(options);
+  if (!ctx) return;
+  const { client, serverUrl } = ctx;
+  try {
+    const group = await resolveGroupByName(client, name);
+    const [m, p] = await Promise.all([
+      client.listGroupMembers(group.id),
+      client.listGroupProjects(group.id),
+    ]);
+    blank();
+    console.log(c.info(group.name));
+    if (group.description) console.log(c.dim(`  ${group.description}`));
+    blank();
+    console.log(c.info(`Members (${m.data.length})`));
+    if (m.data.length === 0) {
+      console.log(c.dim('  (none)'));
+    } else {
+      m.data.forEach((row) => {
+        console.log(`  ${row.user.email}  ${c.dim(row.user.displayName)}`);
+      });
+    }
+    blank();
+    console.log(c.info(`Project assignments (${p.data.length})`));
+    if (p.data.length === 0) {
+      console.log(c.dim('  (none)'));
+    } else {
+      p.data.forEach((row) => {
+        console.log(`  ${row.project.name}  ${c.dim(`→ ${row.role}`)}`);
+      });
+    }
+    blank();
+  } catch (err) {
+    handleErr(err, serverUrl, `Failed to show group ${name}`);
   }
 }

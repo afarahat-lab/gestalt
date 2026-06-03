@@ -539,3 +539,30 @@ export interface IdentityState {
   roleMappings: RoleMapping[];
   activeProviders: string[];
 }
+
+// ─── Platform groups (Brief 1 — bulk user management, migration 018) ────────
+
+export interface PlatformGroup {
+  id: string;
+  name: string;
+  description: string | null;
+  createdBy: string | null;
+  createdAt: string;
+}
+
+export interface GroupMember {
+  groupId: string;
+  userId: string;
+  addedBy: string | null;
+  addedAt: string;
+  user: UserSummary;
+}
+
+export interface GroupProjectAssignment {
+  groupId: string;
+  projectId: string;
+  role: 'project-admin' | 'editor' | 'reader';
+  assignedBy: string | null;
+  assignedAt: string;
+  project: ProjectSummary;
+}

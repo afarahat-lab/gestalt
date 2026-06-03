@@ -18,6 +18,7 @@ import type {
   PlatformTemplateSummary, PlatformTemplate, TemplateVariable,
   PlatformMcpServer, PlatformMcpTestResult, PlatformToolInfo,
   IdentityProvider, IdentityState, RoleMapping,
+  PlatformGroup, GroupMember, GroupProjectAssignment,
 } from '../types';
 
 export class DashboardApiClient {
@@ -461,6 +462,45 @@ export class DashboardApiClient {
 
   async removeRoleMapping(id: string): Promise<void> {
     await this.delete(`/platform/identity/role-mappings/${id}`);
+  }
+
+  // ─── Platform groups (Brief 1 — bulk user management) ────────────────────
+
+  async listPlatformGroups(): Promise<{ data: PlatformGroup[] }> {
+    return this.get('/platform/groups');
+  }
+  async createPlatformGroup(body: { name: string; description?: string | null }): Promise<{ data: PlatformGroup }> {
+    return this.post('/platform/groups', body);
+  }
+  async updatePlatformGroup(id: string, body: Partial<{ name: string; description: string | null }>): Promise<{ data: PlatformGroup }> {
+    return this.patch(`/platform/groups/${id}`, body);
+  }
+  async deletePlatformGroup(id: string): Promise<void> {
+    await this.delete(`/platform/groups/${id}`);
+  }
+
+  async listGroupMembers(groupId: string): Promise<{ data: GroupMember[] }> {
+    return this.get(`/platform/groups/${groupId}/members`);
+  }
+  async addGroupMember(groupId: string, userId: string): Promise<{ data: { groupId: string; userId: string } }> {
+    return this.post(`/platform/groups/${groupId}/members`, { userId });
+  }
+  async removeGroupMember(groupId: string, userId: string): Promise<void> {
+    await this.delete(`/platform/groups/${groupId}/members/${userId}`);
+  }
+
+  async listGroupProjectAssignments(groupId: string): Promise<{ data: GroupProjectAssignment[] }> {
+    return this.get(`/platform/groups/${groupId}/projects`);
+  }
+  async assignGroupToProject(
+    groupId: string,
+    projectId: string,
+    role: 'project-admin' | 'editor' | 'reader',
+  ): Promise<{ data: { groupId: string; projectId: string; role: string } }> {
+    return this.post(`/platform/groups/${groupId}/projects`, { projectId, role });
+  }
+  async unassignGroupFromProject(groupId: string, projectId: string): Promise<void> {
+    await this.delete(`/platform/groups/${groupId}/projects/${projectId}`);
   }
 
   // ─── Project config (Approach A — config-as-code) ──────────────────────────

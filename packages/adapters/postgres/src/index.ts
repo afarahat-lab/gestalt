@@ -30,6 +30,7 @@ import { PostgresPlatformMcpServerRepository } from './repositories/platform-mcp
 import {
   PostgresIdentityConfigRepository, PostgresRoleMappingRepository,
 } from './repositories/identity-config';
+import { PostgresPlatformGroupRepository } from './repositories/platform-groups';
 export {
   LastLLMError, CannotDeleteDefaultLLMError,
 } from './repositories/platform-llms';
@@ -71,5 +72,6 @@ export async function createPostgresAdapter(databaseUrl: string): Promise<Reposi
     platformMcpServers: new PostgresPlatformMcpServerRepository(),
     identityConfig:     new PostgresIdentityConfigRepository(),
     roleMappings:       new PostgresRoleMappingRepository(),
+    platformGroups:     new PostgresPlatformGroupRepository(),
   };
 }
