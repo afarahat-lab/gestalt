@@ -287,17 +287,21 @@ export interface AgentTask {
   retryCount?: number;
   /**
    * Source of the originating intent — human-submitted vs. queued by a
-   * maintenance agent. Threaded so the intent-agent can skip the
-   * clarification gate for `maintenance-agent` intents: those are typed
-   * `MaintenanceIntent` objects with a structured prefix and never
-   * vague enough to need operator input (ADR-035).
+   * maintenance agent vs. operator pipeline-feedback resume. Threaded
+   * so the intent-agent can skip the clarification gate for
+   * `maintenance-agent` intents (ADR-035 — typed `MaintenanceIntent`
+   * objects with a structured prefix that never need clarification)
+   * AND so the intent-agent prompt picks the right framing for
+   * `pipeline-feedback` clarifications (CI-failure-specific block,
+   * not a vague-intent-clarification block).
    */
-  intentSource?: 'human' | 'maintenance-agent';
+  intentSource?: 'human' | 'maintenance-agent' | 'pipeline-feedback';
   /**
-   * Optional operator-supplied clarification text. Populated only when
-   * the orchestrator is resuming an intent that was previously paused
-   * with `waiting-for-clarification`. The intent-agent prompt appends
-   * this verbatim under an "Operator clarification" heading.
+   * Optional operator-supplied clarification text. Populated on two
+   * resume paths:
+   *   - waiting-for-clarification: vague intent, operator refines it.
+   *   - pipeline-feedback: CI failed, operator explains what to fix.
+   * `intentSource` tells the prompt builder which framing to use.
    */
   clarification?: string;
   /**

@@ -17,14 +17,40 @@ export function buildIntentPrompt(
   ctx: ContextSnapshot,
   attempt: number,
   clarification?: string,
+  /**
+   * `'pipeline-feedback'` reframes the clarification block as
+   * operator feedback on a CI failure (the previous attempt
+   * produced artifacts that landed in a PR, CI failed; the operator
+   * explained what to fix). All other sources fall back to the
+   * existing "vague-intent clarification" block.
+   */
+  clarificationSource?: 'pipeline-feedback' | 'human' | 'maintenance-agent',
 ): string {
   const retryGuidance =
     attempt > 0
       ? `\n\nIMPORTANT: This is retry attempt ${attempt}. Your previous response could not be parsed as valid JSON or was missing required fields. Ensure your response is pure JSON with no markdown fences, no preamble, and no trailing text.\n`
       : '';
 
-  const clarificationBlock = clarification?.trim()
-    ? `
+  let clarificationBlock = '';
+  const trimmed = clarification?.trim();
+  if (trimmed && clarificationSource === 'pipeline-feedback') {
+    clarificationBlock = `
+
+## CI pipeline failure feedback from operator
+
+The previous attempt produced artifacts that landed in a PR, but the CI
+pipeline rejected them. The operator has provided the following
+description of what went wrong and how to fix it — treat it as
+authoritative guidance for the regeneration:
+
+${trimmed}
+
+Re-extract successCriteria so they reflect the corrected understanding;
+the next code-agent pass must produce artifacts that satisfy BOTH the
+original intent AND this feedback.
+`;
+  } else if (trimmed) {
+    clarificationBlock = `
 
 ## Operator clarification
 
@@ -32,12 +58,12 @@ The original intent was too vague to extract success criteria on the
 first attempt. The operator has supplied the following clarification —
 treat it as the authoritative refinement of the intent:
 
-${clarification.trim()}
+${trimmed}
 
 When extracting successCriteria, base them on the clarification, not on
 the original intent text alone.
-`
-      : '';
+`;
+  }
 
   const body = `Your job is to parse a human intent statement into a structured IntentSpec JSON object.
 

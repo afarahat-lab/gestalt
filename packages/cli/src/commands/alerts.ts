@@ -281,6 +281,85 @@ export async function alertsAbortCommand(
   }
 }
 
+/**
+ * `gestalt alerts pipeline-feedback <alertId>` — for pipeline-failed /
+ * pipeline-timeout alerts. Operator describes what failed and how to
+ * fix it; the server saves the feedback as the intent's clarification
+ * and dispatches a fresh generate cycle on the SAME branch and PR
+ * (no new PR is opened). See ADR / session log 2026-06-03.
+ */
+export async function alertsPipelineFeedbackCommand(
+  alertId: string,
+  options: { server?: string; feedback?: string } = {},
+): Promise<void> {
+  const config = await loadCliConfig();
+  const serverUrl = resolveServerUrl(options, config);
+  if (!config.token) {
+    console.log(c.error('Not authenticated. Run: gestalt login'));
+    process.exit(1);
+  }
+  const client = new GestaltApiClient({ serverUrl, token: config.token });
+  try {
+    const alert = await fetchAlertByIdOrPrefix(client, alertId);
+    if (!alert) {
+      console.log(c.error(`No alert with id (or id-prefix) '${alertId}'.`));
+      process.exit(1);
+    }
+    if (alert.type !== 'pipeline-failed' && alert.type !== 'pipeline-timeout') {
+      console.log(c.error(`Alert '${alert.id}' is type '${alert.type}' — pipeline-feedback only handles pipeline-failed / pipeline-timeout.`));
+      console.log(c.dim(`  For other alert types, see: gestalt alerts fix / dismiss / resume / abort / acknowledge.`));
+      process.exit(1);
+    }
+
+    // Surface the context the operator needs to reason about the failure.
+    const ctx = alert.context as Record<string, unknown> | null | undefined;
+    const branch = typeof ctx?.['branch'] === 'string' ? (ctx['branch'] as string) : null;
+    const prUrl = typeof ctx?.['prUrl'] === 'string' ? (ctx['prUrl'] as string) : null;
+    const prNumber = typeof ctx?.['prNumber'] === 'number' ? (ctx['prNumber'] as number) : null;
+    const runId = typeof ctx?.['runId'] === 'string' ? (ctx['runId'] as string) : null;
+    const pipelineStatus = typeof ctx?.['pipelineStatus'] === 'string' ? (ctx['pipelineStatus'] as string) : null;
+
+    blank();
+    console.log(c.dim(`Alert:    ${alert.title}`));
+    if (alert.intentText) console.log(c.dim(`Intent:   "${truncate(alert.intentText, 80)}"`));
+    if (branch) console.log(c.dim(`Branch:   ${branch}`));
+    if (prNumber !== null) console.log(c.dim(`PR:       #${prNumber}${prUrl ? '  ' + prUrl : ''}`));
+    if (runId) console.log(c.dim(`Run ID:   ${runId}`));
+    if (pipelineStatus) console.log(c.dim(`Status:   ${pipelineStatus}`));
+    blank();
+
+    let feedback = (options.feedback ?? '').trim();
+    if (feedback === '') {
+      feedback = (await prompt('Describe what failed and how to fix it')).trim();
+    }
+    if (feedback === '') {
+      console.log(c.error('Feedback is required.'));
+      process.exit(1);
+    }
+
+    blank();
+    console.log(c.dim('Submitting feedback ...'));
+    const res = await client.submitPipelineFeedback(alert.id, feedback);
+    blank();
+    const resumedOn = res.data.branch ?? branch ?? 'existing branch';
+    console.log(c.success(`✓ Fix submitted — platform resuming on branch ${resumedOn}`));
+    console.log(c.dim(`  intentId: ${res.data.intentId}`));
+    console.log(c.dim(`  status:   ${res.data.status}`));
+    if (res.data.prNumber !== null) {
+      console.log(c.dim(`  PR:       #${res.data.prNumber}${res.data.prUrl ? '  ' + res.data.prUrl : ''}`));
+    }
+    console.log(c.dim('  Run: gestalt status  to watch progress'));
+    blank();
+  } catch (err) {
+    if (isConnectivityError(err)) {
+      printConnectionError(serverUrl);
+    } else {
+      console.log(c.error(`Failed to submit feedback: ${err instanceof Error ? err.message : String(err)}`));
+    }
+    process.exit(1);
+  }
+}
+
 export async function alertsAcknowledgeCommand(
   alertId: string,
   options: { server?: string; notes?: string } = {},
@@ -445,8 +524,19 @@ function printAlertDetail(alert: AlertSummary): void {
   blank();
   divider();
   console.log(`  ${c.bold('Available actions:')}`);
-  console.log(`    ${c.dim('gestalt alerts fix     ')} ${alert.id.slice(0, 8)}    — submit a fix intent`);
-  console.log(`    ${c.dim('gestalt alerts dismiss ')} ${alert.id.slice(0, 8)}    — acknowledge without action`);
+  const idPrefix = alert.id.slice(0, 8);
+  if (alert.type === 'pipeline-failed' || alert.type === 'pipeline-timeout') {
+    console.log(`    ${c.dim('gestalt alerts pipeline-feedback')} ${idPrefix}    — fix and retry on same branch (no new PR)`);
+    console.log(`    ${c.dim('gestalt alerts dismiss          ')} ${idPrefix}    — acknowledge without action`);
+  } else if (alert.type === 'GOLDEN_PRINCIPLE_BREACH') {
+    console.log(`    ${c.dim('gestalt alerts resume      ')} ${idPrefix}    — false positive; resume deploy`);
+    console.log(`    ${c.dim('gestalt alerts abort       ')} ${idPrefix}    — real breach; mark failed`);
+    console.log(`    ${c.dim('gestalt alerts acknowledge ')} ${idPrefix}    — record notes + mark failed`);
+    console.log(`    ${c.dim('gestalt alerts dismiss     ')} ${idPrefix}    — acknowledge without action`);
+  } else {
+    console.log(`    ${c.dim('gestalt alerts fix     ')} ${idPrefix}    — submit a fix intent`);
+    console.log(`    ${c.dim('gestalt alerts dismiss ')} ${idPrefix}    — acknowledge without action`);
+  }
   blank();
 }
 

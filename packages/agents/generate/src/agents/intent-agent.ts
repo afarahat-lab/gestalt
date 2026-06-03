@@ -43,7 +43,12 @@ export class IntentAgent extends BaseLLMAgent {
 
     for (let attempt = 0; attempt <= MAX_INTERNAL_RETRIES; attempt++) {
       try {
-        const rawPrompt = buildIntentPrompt(task.contextSnapshot, attempt, task.clarification);
+        const rawPrompt = buildIntentPrompt(
+          task.contextSnapshot,
+          attempt,
+          task.clarification,
+          task.intentSource,
+        );
         const prompt = applyAgentConfig(rawPrompt, agentConfig);
         const raw = await this.callLLM(prompt, agentConfig, task.correlationId);
         const spec = parseIntentSpec(raw, task.correlationId, rawIntentText);
@@ -190,9 +195,14 @@ function validateIntentSpec(spec: IntentSpec): void {
 function needsClarification(
   spec: IntentSpec,
   rawIntentText: string,
-  intentSource: 'human' | 'maintenance-agent' | undefined,
+  intentSource: 'human' | 'maintenance-agent' | 'pipeline-feedback' | undefined,
 ): ClarificationNeeded | null {
   if (intentSource === 'maintenance-agent') return null;
+  // Pipeline-feedback resume — the operator already supplied
+  // clarification text (their CI-failure description). The intent
+  // is by definition already actionable; pausing again for
+  // vague-intent clarification would loop.
+  if (intentSource === 'pipeline-feedback') return null;
   if (rawIntentText.startsWith(MAINTENANCE_PREFIX)) return null;
 
   const suggestions = [

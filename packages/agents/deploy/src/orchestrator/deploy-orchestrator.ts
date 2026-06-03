@@ -168,6 +168,7 @@ async function handleDeployTask(
           branch: payload.branch,
           prUrl: payload.prUrl,
           prNumber: payload.prNumber,
+          intentText: payload.intentText,
         }),
         (r) => r.signals,
         childLog,

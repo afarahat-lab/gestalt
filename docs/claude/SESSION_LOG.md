@@ -12399,3 +12399,338 @@ lodash, failure path with a fake package). No live LLM cycle
 verification this session — the container-side smoke is the
 proof; the next routine project cycle will surface the
 end-to-end path.
+
+---
+
+### Session 2026-06-03 — Claude Code (pipeline failure alerts + resume-on-same-branch feedback loop)
+
+Closes the long-standing "the platform tells me the pipeline
+failed, but I have no way to respond" gap. A CI failure no
+longer silently transitions the intent to `failed` with a
+signal — the pipeline-agent now creates a typed alert carrying
+the branch / PR / run id / status context, the operator
+responds via a new dashboard card OR CLI subcommand describing
+the fix, and the platform resumes the cycle on the SAME branch
+and PR. The squash-merge history reads naturally because the
+follow-up commit lands as a `fix:` commit on the same branch
+the original `feat:` commit lived on; CI is re-triggered on the
+existing PR (no new PR opened).
+
+Changed (7 fixes per the brief):
+
+- **Fix 1 — pipeline-agent creates alerts** in
+  `packages/agents/deploy/src/agents/pipeline-agent.ts`:
+  - `PipelineAgentInput` gained optional `intentText?: string`
+    (threaded from `deploy-orchestrator.ts` via `payload.intentText`
+    so the alert title/description can quote it)
+  - New `createPipelineFailureAlert(...)` helper writes an
+    alert with `type: 'pipeline-failed' | 'pipeline-timeout'`,
+    `severity: 'high'`, `requiredAction: 'provide-feedback'`,
+    `context: { intentId, branch, prUrl, prNumber, runId,
+    pipelineStatus, adapter }`. Emits `alert.created` SSE so
+    the dashboard's sidebar badge updates instantly. Failure
+    non-fatal — a failed `alerts.create` writes a WARN log
+    and the cycle proceeds (the intent is already failing;
+    missing alert is worse UX, not data loss)
+  - `quoteIntent(text, max)` truncation helper for the alert
+    title
+  - Failed / cancelled branch calls the helper with
+    `alertType: 'pipeline-failed', pipelineStatus: <github
+    status>`; timeout branch calls it with
+    `alertType: 'pipeline-timeout', pipelineStatus: 'timeout'`
+
+- **Fix 2 — intent branch fields** (migration 019 + repo):
+  - `packages/adapters/postgres/src/migrations/019_intent_branch.sql`
+    (new): `ALTER TABLE intents ADD COLUMN branch_name TEXT,
+    pr_number INTEGER, pr_url TEXT;`. All nullable; pure
+    schema only (no `schema_migrations` writes)
+  - `packages/core/src/repository/index.ts`: `IntentRecord`
+    gained `branchName: string | null, prNumber: number | null,
+    prUrl: string | null`; `create()` Omit excludes them;
+    new `IntentRepository.saveBranchInfo(id, { branchName,
+    prNumber?, prUrl? })`
+  - `AlertType` union extended with `'pipeline-failed'` +
+    `'pipeline-timeout'`; `AlertRequiredAction` gained
+    `'provide-feedback'`
+  - postgres impl in `intents.ts`: `UPDATE intents SET
+    branch_name, pr_number, pr_url, updated_at RETURNING *`
+  - oracle + mssql get `saveBranchInfo` throw-stubs for
+    interface parity (the established pattern from prior
+    sessions)
+
+- **Fix 3 — POST /alerts/:id/pipeline-feedback route** in
+  `packages/server/src/oversight/routes.ts`:
+  - `requireRole('operator')` preHandler +
+    `checkProjectMembership(reply, ..., intent.projectId,
+    'editor')` (handler level, because the projectId lives
+    on the intent record loaded via `alert.context.intentId`)
+  - Validates: feedback non-empty string (400
+    `INVALID_FEEDBACK`); alert type ∈ {pipeline-failed,
+    pipeline-timeout} (400 `INVALID_ALERT_TYPE`); alert exists
+    (404); intent exists (404)
+  - Calls `intents.saveClarification(intent.id, feedback)` so
+    the resume cycle's intent-agent picks up the operator's
+    fix description via the existing `clarification` plumbing
+  - Dispatches `generate:intent` with:
+    ```
+    { intentId, projectId, text, clarification: feedback,
+      source: 'pipeline-feedback',
+      resumeOnBranch: intent.branchName ?? undefined,
+      prNumber: intent.prNumber ?? undefined,
+      prUrl: intent.prUrl ?? undefined }
+    ```
+  - Transitions intent to `generating`; acknowledges alert
+    atomically (so the dashboard card disappears the moment
+    the resume kicks off)
+  - Audit row `alert.pipeline-feedback-submitted` metadata:
+    `{ type, intentId, feedbackLength, branch, prNumber, ip }`
+    — **the feedback TEXT never reaches audit_log (GP-006)**
+  - Returns `{ data: { intentId, status: 'generating',
+    branch, prNumber, prUrl } }`
+
+- **Fix 4 — generate orchestrator + intent-agent prompt**:
+  - `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+    `IntentTaskPayload.source` extended with
+    `'pipeline-feedback'`; new optionals `resumeOnBranch?,
+    prNumber?, prUrl?`. After clone, if
+    `payload.resumeOnBranch`: `await repo.fetch('origin',
+    branch); await repo.checkout(['-B', branch,
+    \`origin/${branch}\`])` with a try/catch fallback to
+    default branch (WARN log) so a stale resume payload
+    against a deleted branch doesn't abort the cycle
+  - `IntentSource` union widened to include
+    `'pipeline-feedback'`; threaded into `DrivePlanOptions`
+    + AgentTask
+  - `gate:review` dispatch payload forwards `resumeOnBranch`
+    / `prNumber` / `prUrl` so the gate's retry leg AND the
+    successful-pass-dispatch-to-pr-agent both carry them
+    through
+  - `packages/agents/generate/src/prompts/intent-prompt.ts`:
+    `buildIntentPrompt` signature gains optional
+    `clarificationSource`. When
+    `clarificationSource === 'pipeline-feedback'`: prompt
+    uses "## CI pipeline failure feedback from operator"
+    heading framing the operator's text as actionable CI-fix
+    guidance instead of vague-intent clarification
+  - `packages/agents/generate/src/agents/intent-agent.ts`:
+    `needsClarification(..., intentSource)` returns `null`
+    for `'pipeline-feedback'` so the clarification gate
+    doesn't loop (the operator already supplied context)
+  - `packages/agents/generate/src/types.ts`:
+    `AgentTask.intentSource` widened with
+    `'pipeline-feedback'`; clarification JSDoc updated
+
+- **Fix 5 — pr-agent resume path** in
+  `packages/agents/deploy/src/agents/pr-agent.ts`:
+  - `PRAgentInput` gained optional `resumeOnBranch?,
+    prNumber?, prUrl?`
+  - `const isResume = Boolean(input.resumeOnBranch)` — split
+    point. If resume: `repo.fetch('origin', branch);
+    repo.checkout(['-B', branch, \`origin/${branch}\`])`;
+    write artifacts; commit subject
+    `fix: address CI failure — <intent line> [gestalt
+    <corr8>]` (vs the legacy `feat:` prefix); push to
+    existing branch; call `resumePushResult(...)` which
+    records `pr-opened` with `metadata: { resume: true,
+    adapter: 'resume' }`, persists branch info, emits
+    `deployment.updated`, returns the input's existing
+    PR coords (NO new PR opened)
+  - Fresh path: existing default-branch checkout + new
+    branch logic preserved; `openPR` now also calls
+    `saveBranchInfo` after appending the deployment event
+    (so the resume path has data to read from on the NEXT
+    cycle)
+  - `saveBranchInfo` wrapped in try/catch — DB blip doesn't
+    fail the PR push
+
+- **Fix 6 — Dashboard Alerts view** in
+  `packages/dashboard/src/views/Alerts.tsx`:
+  - `PIPELINE_TYPES = new Set(['pipeline-failed',
+    'pipeline-timeout'])`
+  - New `PipelineBody` component: extracts
+    `intentText, branch, prUrl, prNumber, runId,
+    pipelineStatus` from context JSONB; renders intent line
+    + KV row (Branch, PR (clickable link), Run ID, Status)
+  - New `PipelineFeedbackBlock` component: textarea +
+    "retry with fix ▶" button, disabled when empty;
+    `submittingMode === 'pipeline'` shows "submitting..."
+    while the request is in flight
+  - `pipelineFeedback: Record<string, string>` state keyed
+    by alert.id (each card has independent input);
+    `handlePipelineFeedback(alert)` calls
+    `submitPipelineFeedback`, shows
+    `✓ Fix submitted — resuming on branch <branchName>` for
+    1.5s, then removes the card from the list
+  - `canFix && !isPipelineAlert` guard on FixIntentBlock so
+    pipeline alerts don't show both blocks (operators
+    provide CI-fix context via the pipeline block; the
+    generic fix-intent flow doesn't apply)
+  - `TypeGlyph` extended:
+    `pipeline-failed → ✗ red, pipeline-timeout → ⏱ amber`
+  - `AlertBody` switches on type → routes the two new types
+    to `PipelineBody`
+
+- **Fix 7 — CLI `gestalt alerts pipeline-feedback <alertId>`**:
+  - New `alertsPipelineFeedbackCommand` in
+    `packages/cli/src/commands/alerts.ts`. Resolves the
+    alert via the existing `fetchAlertByIdOrPrefix` (8-char
+    prefix supported); refuses non-pipeline alert types with
+    a friendly error directing the operator to the right
+    subcommand; surfaces the alert context (intent text,
+    branch, PR, run ID, pipeline status) before prompting;
+    accepts `--feedback <text>` flag OR prompts when omitted;
+    rejects empty feedback; calls
+    `submitPipelineFeedback` on the typed client method;
+    prints `✓ Fix submitted — platform resuming on branch
+    <branch>` + intentId + status + PR link + a hint to
+    `gestalt status` for watching progress
+  - `gestalt alerts show <prefix>` "Available actions"
+    footer now routes pipeline alerts to
+    `pipeline-feedback` + `dismiss`, GP_BREACH alerts to
+    `resume / abort / acknowledge / dismiss`, everything
+    else to the legacy `fix / dismiss`
+  - `packages/cli/src/api/client.ts`: new
+    `submitPipelineFeedback(id, feedback): Promise<{ data:
+    { intentId, status, branch, prNumber, prUrl } }>`
+  - `packages/cli/src/index.ts`: registered
+    `gestalt alerts pipeline-feedback <alertId>
+    [--feedback <text>] [--server <url>]`
+
+Live verified against `trackeros` (synthetic seed +
+production code paths):
+
+- Migration 019 applied on first boot; `\d intents`
+  confirms three new columns
+- **API smoke** (curl + DB inspection):
+  - `GET /alerts/<id>` enrichment for pipeline-failed
+    returns intentId + full context (branch, prUrl,
+    prNumber, runId, pipelineStatus, adapter)
+  - `POST /alerts/:id/pipeline-feedback` happy path returns
+    200 with `{ intentId, status: 'generating', branch,
+    prNumber, prUrl }`
+  - **Atomic side effects confirmed via DB**:
+    - alert acknowledged (acked = true, acknowledged_by =
+      admin user)
+    - intent transitioned `deploying → generating`
+    - `branch_name` + `pr_number` preserved on intent row
+    - `clarification` saved (116 chars matches feedback
+      length)
+    - BullMQ `bull:gestalt-generate:active` has the resume
+      job
+  - **Server logs**: WARN line confirming
+    `resumeOnBranch` was threaded into the orchestrator and
+    `repo.fetch + checkout -B` were attempted (the
+    synthetic branch doesn't exist on GitHub, so
+    fallback-to-default fired as designed); the full
+    generate cycle then ran against the default branch and
+    the intent reached `in-review`
+- **Validation paths**:
+  - missing feedback → 400 `INVALID_FEEDBACK`
+  - empty (whitespace-only) feedback → 400 same
+  - non-existent alert → 404 "Alert not found"
+  - wrong alert type (clarification-needed) → 400
+    `INVALID_ALERT_TYPE` with the message "Alert type
+    'X' does not accept pipeline-feedback"
+- **GP-006 audit verification**: `audit_log` rows for
+  `alert.pipeline-feedback-submitted` carry only
+  `{ type, intentId, feedbackLength, branch, prNumber, ip }`
+  — direct SQL probe
+  `metadata::text LIKE '%cross-env NODE_ENV=test%'` (the
+  actual feedback content) returns 0 rows
+- **CLI exercised end-to-end** against a seeded
+  pipeline-timeout alert:
+  - `gestalt alerts list` table shows the alert with
+    `[high]` badge + 8-char prefix
+  - `gestalt alerts show <prefix>` renders title/description
+    + the new Available actions footer routing to
+    `pipeline-feedback`
+  - `gestalt alerts pipeline-feedback <prefix> --feedback
+    "..."` displays the alert context (Alert / Intent /
+    Branch / PR / Run ID / Status) then submits and prints
+    `✓ Fix submitted — platform resuming on branch
+    gestalt/verify-cli-pfb-add-an-absolute` with intentId,
+    status, PR link, and the gestalt-status hint
+- **Dashboard bundle** rebuilds cleanly with the new
+  `PipelineBody` + `PipelineFeedbackBlock` (Vite output:
+  `index-6WNPE_qB.js` 349 KB)
+- Clean up: 2 synthetic alerts + 2 synthetic intents
+  removed after verification; audit_log probe rows
+  scrubbed; trackeros DB back to clean baseline
+
+Decisions made:
+
+- **Reuse `intents.clarification` for pipeline feedback**
+  (the brief was explicit). The `source` field on the
+  BullMQ payload (`'pipeline-feedback'`) is what
+  distinguishes "vague intent clarification" from "CI fix
+  guidance" — the intent-agent's prompt builder switches
+  framing on that field. No new column; back-compat with
+  every existing clarification path
+- **Resume-on-branch is a payload optional**, not a new
+  task type. The generate orchestrator's `handleIntentTask`
+  branches on `payload.resumeOnBranch` after the clone but
+  BEFORE the agent loop, so the entire downstream cycle
+  (intent → design → context → code → test → gate → pr)
+  operates on the existing branch's working tree
+  transparently. The pr-agent's `isResume` check then takes
+  the no-new-PR path. Three orchestrators see the field;
+  none of them special-case beyond "checkout the branch
+  instead of the default"
+- **Graceful fallback when the branch can't be checked
+  out**. The generate orchestrator wraps the
+  `repo.fetch + checkout` in try/catch — on failure it
+  logs WARN and proceeds against the default branch. Two
+  reasons: (1) the operator may have manually deleted the
+  branch on GitHub; (2) the prior PR was merged + branch
+  deleted by GitHub's auto-delete. In both cases the
+  resume becomes a fresh PR, which is still better than
+  failing the intent
+- **GP-006 strictly**: audit metadata carries
+  `feedbackLength` (number), NOT `feedback` (text). Same
+  pattern as the clarification audit shipped in May; the
+  feedback text lives on `intents.clarification` and can
+  be queried by a forensics operator
+- **Pipeline-failed AND pipeline-timeout both produce the
+  feedback alert.** Timeout is also actionable by the
+  operator ("the test suite needs longer; raise the CI
+  timeout"); the alert title + pipelineStatus context
+  field tell them which case they're handling
+- **Commit subject is `fix:` on resume**, not `feat:`.
+  Conventional-commits convention pairs the `fix:` prefix
+  with the squash-merge history of the original `feat:`
+  PR, so when GitHub squash-merges the PR after a
+  successful resume cycle the commit list reads:
+  `<original feat commit> + <one or more fix commits>` —
+  the operator sees the iterative trajectory clearly
+- **The dashboard suppresses FixIntentBlock on pipeline
+  alerts.** Operators who want to submit a completely
+  fresh intent rather than fix the current one can do so
+  via `gestalt run` or the intents UI — but the
+  pipeline-alert card is structurally about "fix THIS
+  cycle", so cluttering it with both options would
+  invite the wrong action
+- **CLI's `alerts show` Available actions footer now
+  type-aware** rather than always printing the legacy
+  fix/dismiss pair. Catches the operator who comes in via
+  `alerts show <prefix>` and would otherwise be unaware
+  the `pipeline-feedback` subcommand exists for this
+  alert type
+- **`PipelineFeedbackBlock` button disabled until value
+  trimmed non-empty** — empty submission is invalid
+  server-side anyway; surfacing the disabled state in the
+  UI prevents a wasted round-trip
+
+Build status: `pnpm -r build` clean across all 12
+packages. Docker server image rebuilt; migration 019
+applied. Full Stage 1 (validation matrix) + Stage 2
+(happy path + side effects + worker pickup + GP-006
+audit) + Stage 3 (CLI end-to-end) verified live against
+real postgres + real BullMQ + real server logs. The
+resume-on-branch code path was exercised with a
+synthetic branch (the orchestrator's WARN + fallback
+fired as designed); end-to-end push-to-existing-branch
+verification requires a real failing CI cycle on
+trackeros and is deferred to the next routine deploy
+test.
+
+No new Pending enhancements introduced.

@@ -1,22 +1,14 @@
-# SUMMARY.md — design-chat context bundle
+# SUMMARY.md — paste this into the design chat
 
-_DERIVED FILE — DO NOT EDIT BY HAND._
-
-This file is regenerated from `STATE.md` (current platform state) and
-the last three entries in `SESSION_LOG.md` (recent history). The
-platform owner pastes it into the design chat when returning for
-architecture discussions.
-
-To regenerate after a session: combine the body of `STATE.md` (skip
-header through last-updated line) with the last three `### Session`
-entries from `SESSION_LOG.md`.
+_This file is regenerated from `STATE.md` + the last 3 entries of
+`SESSION_LOG.md`. **Do not edit by hand** — re-run the regeneration
+recipe in `CLAUDE.md` after every session._
 
 ---
 
-
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-03 (Claude Code — pr-agent syncs `pnpm-lock.yaml` after writing artifacts so CI's `--frozen-lockfile` always passes. New shared `execCommand(cmd, args, cwd, timeoutMs)` helper in `packages/agents/deploy/src/agents/exec.ts` — spawn-based, no shell, 2-minute default timeout, surfaces a 400-char stderr tail on non-zero exit. pr-agent's `maybeSyncLockfile(workDir)` stats `package.json` then runs `pnpm install --no-frozen-lockfile`; ENOENT skips (no Node project yet), other failures log WARN and continue (CI is the real source of truth — don't block PR creation over a lockfile sync hiccup). Dockerfile production stage swapped `corepack prepare pnpm@9.15.4 --activate` for `npm install -g pnpm@9.15.4` so the runtime `gestalt` user has pnpm 9.15.4 on PATH (corepack caches per-user; root activation wouldn't reach gestalt and the auto-fetched latest pnpm requires Node 22's `node:sqlite`). Template `gestalt.yml` gains a graceful fallback: if `pnpm-lock.yaml` is missing, emit a `::warning::` and run `pnpm install` without `--frozen-lockfile` so first-CI doesn't hard-fail. context-fixer.ts is unchanged — the ADR-018 path guard restricts it to `docs/*` and `AGENTS.md`, so it can never reach a `package.json` write path. Smoke test inside the rebuilt container: `pnpm 9.15.4` callable, real `pnpm install --no-frozen-lockfile` produces a 384-byte `pnpm-lock.yaml@9.0` for a lodash dependency)
+**Last updated:** 2026-06-03 (Claude Code — Pipeline failure alerts + resume-on-same-branch feedback loop (migration 019): `intents` gains `branch_name TEXT`, `pr_number INTEGER`, `pr_url TEXT` (all nullable); new `IntentRepository.saveBranchInfo`; pipeline-agent creates `pipeline-failed` / `pipeline-timeout` alerts (severity high, requiredAction `provide-feedback`) carrying intentId + branch + prUrl + prNumber + runId + pipelineStatus in context JSONB; new `AlertType` values + `AlertRequiredAction: 'provide-feedback'`; pr-agent persists branch info on fresh-PR path and dispatches a new `resumeOnBranch` flow: when set, fetch + `checkout -B <branch> origin/<branch>`, push to existing branch, NO new PR — reuses the input's `prNumber`/`prUrl`, writes a `pr-opened` event with `metadata.resume: true` so the timeline narrates "fix push" vs original; commit subject becomes `fix: address CI failure — <intent line> [gestalt <corr8>]`. Generate orchestrator threads `resumeOnBranch`/`prNumber`/`prUrl` payload optionals through `drivePlan` → gate's `dispatchDeployPR` → deploy:pr; on resume, fetches + checks out the existing remote branch with WARN-and-fall-through-to-default safety. intent-agent prompt picks up new `clarificationSource: 'pipeline-feedback'` framing ("## CI pipeline failure feedback from operator"); `needsClarification` short-circuits for `pipeline-feedback` to avoid re-pausing. New route `POST /alerts/:id/pipeline-feedback` (`requireRole('operator')` + `checkProjectMembership(editor)`) validates type ∈ {pipeline-failed, pipeline-timeout}, calls `intents.saveClarification(intent.id, feedback)`, dispatches `generate:intent` with full resume payload, transitions to `generating`, acknowledges alert atomically — audit `alert.pipeline-feedback-submitted` carries `feedbackLength + branch + prNumber + intentId + type + ip` ONLY (GP-006). Dashboard Alerts view: new `PipelineBody` (intent line + branch + PR link + run id + pipeline status KV header) and `PipelineFeedbackBlock` (textarea + "retry with fix ▶" button) rendered ABOVE Dismiss for the two new types; new TypeGlyph (✗ red for failed, ⏱ amber for timeout); FixIntentBlock suppressed for pipeline alerts (operators provide CI-fix context via the new block instead). CLI: new `gestalt alerts pipeline-feedback <alertId> [--feedback <text>]` subcommand — displays branch/PR/runId/status context then submits; `gestalt alerts show` Available actions footer routes pipeline alerts to `pipeline-feedback` + `dismiss`. Live verified end-to-end: 4 validation paths (400/404), happy path (200 with intentId + status: generating + branch + PR), atomic ack + clarification persist (116 chars), worker pickup with `resumeOnBranch` log line, GP-006 audit metadata. PRE-EXISTING: pr-agent syncs `pnpm-lock.yaml` after writing artifacts so CI's `--frozen-lockfile` always passes. New shared `execCommand(cmd, args, cwd, timeoutMs)` helper in `packages/agents/deploy/src/agents/exec.ts` — spawn-based, no shell, 2-minute default timeout, surfaces a 400-char stderr tail on non-zero exit. pr-agent's `maybeSyncLockfile(workDir)` stats `package.json` then runs `pnpm install --no-frozen-lockfile`; ENOENT skips (no Node project yet), other failures log WARN and continue (CI is the real source of truth — don't block PR creation over a lockfile sync hiccup). Dockerfile production stage swapped `corepack prepare pnpm@9.15.4 --activate` for `npm install -g pnpm@9.15.4` so the runtime `gestalt` user has pnpm 9.15.4 on PATH (corepack caches per-user; root activation wouldn't reach gestalt and the auto-fetched latest pnpm requires Node 22's `node:sqlite`). Template `gestalt.yml` gains a graceful fallback: if `pnpm-lock.yaml` is missing, emit a `::warning::` and run `pnpm install` without `--frozen-lockfile` so first-CI doesn't hard-fail. context-fixer.ts is unchanged — the ADR-018 path guard restricts it to `docs/*` and `AGENTS.md`, so it can never reach a `package.json` write path. Smoke test inside the rebuilt container: `pnpm 9.15.4` callable, real `pnpm install --no-frozen-lockfile` produces a 384-byte `pnpm-lock.yaml@9.0` for a lodash dependency)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -2916,278 +2908,7 @@ enforced"):
 
 ---
 
-## Recent session log (last 3 entries)
-
-### Session 2026-06-03 — Claude Code (Brief 1: Platform groups — bulk user management, migration 018)
-
-Adds platform-wide groups so a platform-admin can manage user → project
-access in bulk: assign N users to M projects in one action. The
-effective per-project role for a user is the higher of their direct
-`project_memberships.role` and any group-derived role.
-
-Changed:
-
-- `packages/adapters/postgres/src/migrations/018_groups.sql` (new):
-  three tables.
-  - `platform_groups` — `id`, `name UNIQUE`, `description`,
-    `created_by` (nullable FK to `users`), `created_at`
-  - `group_memberships` — `(group_id, user_id)` composite PK with
-    ON DELETE CASCADE on both FKs. Deleting a group removes its
-    members; deleting a user removes them from every group
-  - `group_project_assignments` — `(group_id, project_id)`
-    composite PK with ON DELETE CASCADE on both FKs.
-    `role TEXT CHECK (role IN ('project-admin','editor','reader'))`,
-    `assigned_by` (nullable FK)
-  - Four indexes — per-direction lookups for the effective-membership
-    read path (`user_id` + `group_id` on memberships;
-    `group_id` + `project_id` on assignments)
-- `packages/core/src/repository/index.ts`:
-  - New types: `PlatformGroupRecord`, `GroupMembershipRecord`,
-    `GroupProjectAssignmentRecord`, joined views
-    `GroupMemberWithUser` (= membership + user) and
-    `GroupProjectWithProject` (= assignment + project), and
-    `EffectiveProjectMembership` (`{ projectId, role }`)
-  - `PlatformGroupRepository` interface — 13 methods covering
-    CRUD on groups, members add/remove/list, project assignments
-    set/remove/list, and `getEffectiveMemberships(userId)`
-- `packages/core/src/index.ts`: re-exports all the new types
-- `packages/adapters/postgres/src/repositories/platform-groups.ts`
-  (new): `PostgresPlatformGroupRepository`.
-  - `getEffectiveMemberships(userId)` is the hot-path method —
-    called on every membership check by the auth middleware.
-    Single round-trip: JOIN `group_memberships` →
-    `group_project_assignments` USING (group_id), GROUP BY
-    project_id, project the MAX role-rank via a CASE expression,
-    invert the rank back to the role name. The whole
-    role-precedence logic lives in SQL so the application code just
-    reads `effective_role`
-  - `assignToProject` uses `INSERT ... ON CONFLICT (group_id,
-    project_id) DO UPDATE` so re-assigning with a different role
-    updates in place — operators expect "I changed editor to
-    project-admin" to be one action, not delete + insert
-  - `addMember` uses `ON CONFLICT DO NOTHING` so re-adding an
-    existing member is a no-op (operator clicks twice → no
-    surprise error)
-  - `listMembers` / `listProjectAssignments` do the JOIN to
-    `users` / `projects` server-side via SQL aliasing so the
-    route doesn't need a follow-up N+1 lookup
-- `packages/adapters/{oracle,mssql}/src/repositories/platform-groups.ts`
-  (new): throw-stub `*PlatformGroupRepository` classes for
-  parity. Same convention every prior session has used. Wired
-  through each adapter's `index.ts`
-- `packages/server/src/auth/middleware.ts`:
-  - `requireProjectMembership(userId, role, projectId, minRole)`
-    rewritten. Runs `memberships.findMembership(userId, projectId)`
-    AND `platformGroups.getEffectiveMemberships(userId)` in
-    parallel; picks `max(roleRank(direct), roleRank(group))`; throws
-    `NOT_PROJECT_MEMBER` when both are missing,
-    `INSUFFICIENT_PROJECT_ROLE` when the effective rank is below
-    `minRole`. Returns the direct membership row when present so
-    callers that need to mutate keep the row id; returns null when
-    access is purely group-derived (no mutable surface — operator
-    manages it via the group itself)
-  - `requireRole` preHandler also rewritten to merge direct +
-    group access using the same `pickHigherRole(a, b)` helper.
-    Previously it only consulted direct memberships, so a user
-    with editor access via a group would be wrongly denied at the
-    preHandler step. New helper `pickHigherRole(a, b)` returns the
-    higher-rank role or null
-- `packages/server/src/routes/projects.ts`:
-  - `GET /projects` for non-admin users now returns the UNION of
-    direct memberships and group-derived project access. Two
-    parallel lookups (`memberships.findByUser` +
-    `platformGroups.getEffectiveMemberships`), set-deduped by
-    project id, then `findById` per project. Platform-admin path
-    (server-wide enriched listing) is unchanged
-- `packages/server/src/routes/groups.ts` (new): ten endpoints, all
-  `requireRole('admin')` (platform-admin only):
-  - `GET /platform/groups` — list
-  - `POST /platform/groups` — create. Duplicate name → 409
-    `NAME_TAKEN`. Audit row `platform.group-added`
-  - `PATCH /platform/groups/:id` — rename + description. Rename
-    collision → 409 `NAME_TAKEN`. Audit row
-    `platform.group-updated` with `changedFields` +
-    `previousName` + `newName`
-  - `DELETE /platform/groups/:id` — CASCADE handles both
-    `group_memberships` AND `group_project_assignments`.
-    **Direct `project_memberships` rows are NEVER touched** —
-    only group-derived access disappears. Audit row
-    `platform.group-deleted`
-  - `GET /platform/groups/:id/members` — joined view with user
-    record
-  - `POST /platform/groups/:id/members { userId }` — UPSERT via
-    `ON CONFLICT DO NOTHING`. Audit row
-    `platform.group-member-added`
-  - `DELETE /platform/groups/:id/members/:userId` — audit row
-    `platform.group-member-removed`
-  - `GET /platform/groups/:id/projects` — joined view
-  - `POST /platform/groups/:id/projects { projectId, role }` —
-    UPSERT with role update in place. Audit row
-    `platform.group-project-assigned`
-  - `DELETE /platform/groups/:id/projects/:projectId` — audit
-    row `platform.group-project-removed`
-- `packages/server/src/app.ts`: registers
-  `registerGroupRoutes(app)` after the existing identity routes
-- `packages/dashboard/src/types.ts`: new `PlatformGroup`,
-  `GroupMember`, `GroupProjectAssignment` types
-- `packages/dashboard/src/api/client.ts`: ten typed API methods
-  matching the server routes
-- `packages/dashboard/src/views/Admin.tsx`: new "Groups" tab
-  inserted between "Projects" and "Identity". `GroupsTab`
-  component with:
-  - Toolbar: `+ Create group`
-  - Table: `Name / Members / Intents / Projects / Actions` (member
-    + project counts populated lazily per row from the
-    members/projects endpoints)
-  - Per-row `Manage` + `×` (delete with confirm)
-  - `CreateGroupModal` — name + description
-  - `ManageGroupPanel` — full edit surface in a modal: editable
-    name + description, members list with `+ Add member` (user
-    `<select>` from `/users`) + remove per row, project
-    assignments list with `+ Assign to project` (project +
-    role selects) + change-role per row + remove
-- `packages/cli/src/api/client.ts`: new `PlatformGroupSummary`,
-  `GroupMemberWithUser`, `GroupProjectWithProject` types + nine
-  client methods
-- `packages/cli/src/commands/platform-extras.ts`: eight new
-  exports — `platformGroupsListCommand`,
-  `platformGroupsCreateCommand`, `platformGroupsDeleteCommand`,
-  `platformGroupsShowCommand`, `platformGroupsAddMemberCommand`,
-  `platformGroupsRemoveMemberCommand`,
-  `platformGroupsAssignCommand`, `platformGroupsUnassignCommand`.
-  Helpers `resolveGroupByName` / `resolveUserByEmail` /
-  `resolveProjectByName` so operators never type UUIDs
-- `packages/cli/src/index.ts`: registers `gestalt platform groups`
-  parent + 8 subcommands. Header comment updated
-
-Verified live end-to-end against the running platform:
-
-- `pnpm -r build` clean across all 12 packages
-- `docker compose up -d --build server` — `Up (healthy)`;
-  migration 018 applied in order (`schema_migrations` now lists
-  18 versions). The three new tables visible in `\dt`
-- API: created `verify-group`, added `user@test.local` as a
-  member, assigned the group to a synthetic
-  `group-test-proj` project as editor
-- **Group-derived access in `GET /projects` for the regular
-  user** — login as `user@test.local`, then `GET /projects`
-  returns `[{name: 'group-test-proj'}]` even though the user
-  has NO direct membership row for that project. The group's
-  editor assignment is the source of truth
-- **Effective role enforcement**:
-  - `POST /intents { projectId, text }` as the group editor →
-    HTTP 201 (editor is the minimum role)
-  - `POST /projects/:id/config { pipeline.adapter: 'noop' }` as
-    the group editor → HTTP 403 `INSUFFICIENT_PROJECT_ROLE`
-    `Minimum project role required: project-admin` (the typed
-    error from `requireProjectMembership` — proves the
-    handler-level helper consulted the group access AND
-    correctly rejected because editor < project-admin)
-- **Role precedence (max of direct vs group)**:
-  - Inserted a direct `project_memberships` row giving the user
-    `reader` access to the same project (they're already group
-    editor)
-  - `POST /intents` succeeded → effective role is editor (the
-    higher of direct=reader and group=editor)
-  - Created a SECOND group `cli-test-group`, added the same
-    user, assigned it to the same project as `project-admin`
-    via the CLI
-  - `POST /projects/:id/config` as the user → no longer 403; the
-    auth check passed and the request reached the route handler
-    (which then returned 400 `NO_CREDENTIAL` because the
-    synthetic project has no git credential — unrelated to
-    auth)
-- **CASCADE on group delete**: `DELETE` the `cli-test-group` →
-  `group_memberships` for that group: 1 → 0,
-  `group_project_assignments`: 1 → 0,
-  `verify-group`'s rows untouched (1 each), direct
-  `project_memberships` for the user untouched
-- **Audit rows written for every mutation** —
-  `platform.group-added`, `platform.group-member-added`,
-  `platform.group-project-assigned`,
-  `platform.group-member-removed`,
-  `platform.group-project-removed`, `platform.group-updated`,
-  `platform.group-deleted` all observable in `audit_log`. The
-  raw metadata column shows the typed payload (`groupName`,
-  `userEmail`, `projectName`, `role`, `ip`)
-- **CLI verification**:
-  - `gestalt platform groups list` rendered the 2-group table
-    with member + project counts per row
-  - `gestalt platform groups show verify-group` printed the
-    member email + project assignment with the role
-  - `gestalt platform groups create cli-test-group
-    --description "Created via CLI"` succeeded
-  - `gestalt platform groups assign cli-test-group
-    group-test-proj --role project-admin` and
-    `add-member cli-test-group user@test.local` chained
-    cleanly
-  - `echo "y" | gestalt platform groups delete cli-test-group`
-    confirmed the y/N prompt + cascaded deletion
-
-Decisions:
-
-- **SQL-side role-rank precedence in `getEffectiveMemberships`.**
-  The CASE expression turns the role string into 1/2/3,
-  aggregates with MAX per project, and inverts back. Keeps the
-  precedence logic in one place (the database) and means the
-  application middleware just reads `effective_role`. The
-  alternative — pulling all `(group, project, role)` triples
-  back to the application and doing the max() in JS — is slower
-  for users in many groups and duplicates the rank table.
-  Documented inline
-- **Direct membership wins on identity, group wins on access.**
-  When the auth middleware finds a direct membership row, it
-  returns that row to the caller (so future mutations can
-  reference its id). When access is purely group-derived, it
-  returns null — the caller learns there's no row to mutate.
-  The role check sees the higher of both regardless. The
-  comment block in `requireProjectMembership` documents this
-- **Group delete is CASCADE, direct memberships are
-  preserved.** The brief was explicit: "Deleting a group does
-  NOT remove direct memberships — only the group-derived
-  access is removed." The CASCADE on the FKs covers the group's
-  own tables; `project_memberships` has no FK to groups (and
-  never should). Verified live during cleanup — the user's
-  direct `reader` membership survived the group delete
-- **`requireRole` preHandler also extended.** The brief only
-  explicitly called out `requireProjectMembership`, but every
-  existing `requireRole('operator')` / `requireRole('viewer')`
-  preHandler would have wrongly rejected a user who had editor
-  access via a group. Extending the preHandler to use the same
-  `pickHigherRole` helper means group access works for EVERY
-  route, not just the handful that use the handler-level helper
-- **`UPSERT (ON CONFLICT DO UPDATE)` on assignments — re-assign
-  changes the role in place.** Operators expect "change editor
-  to project-admin" to be one action. UPSERT means the route
-  handles both create-fresh and change-existing without an
-  extra round trip to check. Re-adding a member is `DO NOTHING`
-  (the row exists with no role to change — operators just want
-  it to succeed)
-- **Audit metadata uses lengths only when sensitive fields
-  exist; for groups, the names are non-sensitive operational
-  identifiers** so `groupName`, `userEmail`, `projectName`,
-  `role` are all included. GP-006 still applies — no secret
-  material in metadata
-- **No new SSE events for group changes.** Operators don't
-  watch group lifecycle events live; the dashboard refreshes on
-  panel close. If a future workflow needs a `group.changed`
-  SSE event (e.g. a banner notifying logged-in users their
-  access changed), the event can be added without schema work
-- **The dashboard "Groups" tab sits BETWEEN Projects and
-  Identity** — operationally adjacent to projects (groups
-  affect project access) and BEFORE the cross-cutting identity
-  tab. The 9-tab row uses the existing `flex-wrap` styling
-  introduced in Session 3
-
-Pending follow-ups: none.
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Migration 018 applied. Server image rebuilt. Full feature
-verified end-to-end against the live platform — group-derived
-project access, max-of-roles precedence, CLI flow, CASCADE on
-delete, direct membership survival.
-
----
+## Recent session log entries
 
 ### Session 2026-06-03 — Claude Code (surface group assignments in project member views)
 
@@ -3572,3 +3293,338 @@ lodash, failure path with a fake package). No live LLM cycle
 verification this session — the container-side smoke is the
 proof; the next routine project cycle will surface the
 end-to-end path.
+
+---
+
+### Session 2026-06-03 — Claude Code (pipeline failure alerts + resume-on-same-branch feedback loop)
+
+Closes the long-standing "the platform tells me the pipeline
+failed, but I have no way to respond" gap. A CI failure no
+longer silently transitions the intent to `failed` with a
+signal — the pipeline-agent now creates a typed alert carrying
+the branch / PR / run id / status context, the operator
+responds via a new dashboard card OR CLI subcommand describing
+the fix, and the platform resumes the cycle on the SAME branch
+and PR. The squash-merge history reads naturally because the
+follow-up commit lands as a `fix:` commit on the same branch
+the original `feat:` commit lived on; CI is re-triggered on the
+existing PR (no new PR opened).
+
+Changed (7 fixes per the brief):
+
+- **Fix 1 — pipeline-agent creates alerts** in
+  `packages/agents/deploy/src/agents/pipeline-agent.ts`:
+  - `PipelineAgentInput` gained optional `intentText?: string`
+    (threaded from `deploy-orchestrator.ts` via `payload.intentText`
+    so the alert title/description can quote it)
+  - New `createPipelineFailureAlert(...)` helper writes an
+    alert with `type: 'pipeline-failed' | 'pipeline-timeout'`,
+    `severity: 'high'`, `requiredAction: 'provide-feedback'`,
+    `context: { intentId, branch, prUrl, prNumber, runId,
+    pipelineStatus, adapter }`. Emits `alert.created` SSE so
+    the dashboard's sidebar badge updates instantly. Failure
+    non-fatal — a failed `alerts.create` writes a WARN log
+    and the cycle proceeds (the intent is already failing;
+    missing alert is worse UX, not data loss)
+  - `quoteIntent(text, max)` truncation helper for the alert
+    title
+  - Failed / cancelled branch calls the helper with
+    `alertType: 'pipeline-failed', pipelineStatus: <github
+    status>`; timeout branch calls it with
+    `alertType: 'pipeline-timeout', pipelineStatus: 'timeout'`
+
+- **Fix 2 — intent branch fields** (migration 019 + repo):
+  - `packages/adapters/postgres/src/migrations/019_intent_branch.sql`
+    (new): `ALTER TABLE intents ADD COLUMN branch_name TEXT,
+    pr_number INTEGER, pr_url TEXT;`. All nullable; pure
+    schema only (no `schema_migrations` writes)
+  - `packages/core/src/repository/index.ts`: `IntentRecord`
+    gained `branchName: string | null, prNumber: number | null,
+    prUrl: string | null`; `create()` Omit excludes them;
+    new `IntentRepository.saveBranchInfo(id, { branchName,
+    prNumber?, prUrl? })`
+  - `AlertType` union extended with `'pipeline-failed'` +
+    `'pipeline-timeout'`; `AlertRequiredAction` gained
+    `'provide-feedback'`
+  - postgres impl in `intents.ts`: `UPDATE intents SET
+    branch_name, pr_number, pr_url, updated_at RETURNING *`
+  - oracle + mssql get `saveBranchInfo` throw-stubs for
+    interface parity (the established pattern from prior
+    sessions)
+
+- **Fix 3 — POST /alerts/:id/pipeline-feedback route** in
+  `packages/server/src/oversight/routes.ts`:
+  - `requireRole('operator')` preHandler +
+    `checkProjectMembership(reply, ..., intent.projectId,
+    'editor')` (handler level, because the projectId lives
+    on the intent record loaded via `alert.context.intentId`)
+  - Validates: feedback non-empty string (400
+    `INVALID_FEEDBACK`); alert type ∈ {pipeline-failed,
+    pipeline-timeout} (400 `INVALID_ALERT_TYPE`); alert exists
+    (404); intent exists (404)
+  - Calls `intents.saveClarification(intent.id, feedback)` so
+    the resume cycle's intent-agent picks up the operator's
+    fix description via the existing `clarification` plumbing
+  - Dispatches `generate:intent` with:
+    ```
+    { intentId, projectId, text, clarification: feedback,
+      source: 'pipeline-feedback',
+      resumeOnBranch: intent.branchName ?? undefined,
+      prNumber: intent.prNumber ?? undefined,
+      prUrl: intent.prUrl ?? undefined }
+    ```
+  - Transitions intent to `generating`; acknowledges alert
+    atomically (so the dashboard card disappears the moment
+    the resume kicks off)
+  - Audit row `alert.pipeline-feedback-submitted` metadata:
+    `{ type, intentId, feedbackLength, branch, prNumber, ip }`
+    — **the feedback TEXT never reaches audit_log (GP-006)**
+  - Returns `{ data: { intentId, status: 'generating',
+    branch, prNumber, prUrl } }`
+
+- **Fix 4 — generate orchestrator + intent-agent prompt**:
+  - `packages/agents/generate/src/orchestrator/orchestrator.ts`:
+    `IntentTaskPayload.source` extended with
+    `'pipeline-feedback'`; new optionals `resumeOnBranch?,
+    prNumber?, prUrl?`. After clone, if
+    `payload.resumeOnBranch`: `await repo.fetch('origin',
+    branch); await repo.checkout(['-B', branch,
+    \`origin/${branch}\`])` with a try/catch fallback to
+    default branch (WARN log) so a stale resume payload
+    against a deleted branch doesn't abort the cycle
+  - `IntentSource` union widened to include
+    `'pipeline-feedback'`; threaded into `DrivePlanOptions`
+    + AgentTask
+  - `gate:review` dispatch payload forwards `resumeOnBranch`
+    / `prNumber` / `prUrl` so the gate's retry leg AND the
+    successful-pass-dispatch-to-pr-agent both carry them
+    through
+  - `packages/agents/generate/src/prompts/intent-prompt.ts`:
+    `buildIntentPrompt` signature gains optional
+    `clarificationSource`. When
+    `clarificationSource === 'pipeline-feedback'`: prompt
+    uses "## CI pipeline failure feedback from operator"
+    heading framing the operator's text as actionable CI-fix
+    guidance instead of vague-intent clarification
+  - `packages/agents/generate/src/agents/intent-agent.ts`:
+    `needsClarification(..., intentSource)` returns `null`
+    for `'pipeline-feedback'` so the clarification gate
+    doesn't loop (the operator already supplied context)
+  - `packages/agents/generate/src/types.ts`:
+    `AgentTask.intentSource` widened with
+    `'pipeline-feedback'`; clarification JSDoc updated
+
+- **Fix 5 — pr-agent resume path** in
+  `packages/agents/deploy/src/agents/pr-agent.ts`:
+  - `PRAgentInput` gained optional `resumeOnBranch?,
+    prNumber?, prUrl?`
+  - `const isResume = Boolean(input.resumeOnBranch)` — split
+    point. If resume: `repo.fetch('origin', branch);
+    repo.checkout(['-B', branch, \`origin/${branch}\`])`;
+    write artifacts; commit subject
+    `fix: address CI failure — <intent line> [gestalt
+    <corr8>]` (vs the legacy `feat:` prefix); push to
+    existing branch; call `resumePushResult(...)` which
+    records `pr-opened` with `metadata: { resume: true,
+    adapter: 'resume' }`, persists branch info, emits
+    `deployment.updated`, returns the input's existing
+    PR coords (NO new PR opened)
+  - Fresh path: existing default-branch checkout + new
+    branch logic preserved; `openPR` now also calls
+    `saveBranchInfo` after appending the deployment event
+    (so the resume path has data to read from on the NEXT
+    cycle)
+  - `saveBranchInfo` wrapped in try/catch — DB blip doesn't
+    fail the PR push
+
+- **Fix 6 — Dashboard Alerts view** in
+  `packages/dashboard/src/views/Alerts.tsx`:
+  - `PIPELINE_TYPES = new Set(['pipeline-failed',
+    'pipeline-timeout'])`
+  - New `PipelineBody` component: extracts
+    `intentText, branch, prUrl, prNumber, runId,
+    pipelineStatus` from context JSONB; renders intent line
+    + KV row (Branch, PR (clickable link), Run ID, Status)
+  - New `PipelineFeedbackBlock` component: textarea +
+    "retry with fix ▶" button, disabled when empty;
+    `submittingMode === 'pipeline'` shows "submitting..."
+    while the request is in flight
+  - `pipelineFeedback: Record<string, string>` state keyed
+    by alert.id (each card has independent input);
+    `handlePipelineFeedback(alert)` calls
+    `submitPipelineFeedback`, shows
+    `✓ Fix submitted — resuming on branch <branchName>` for
+    1.5s, then removes the card from the list
+  - `canFix && !isPipelineAlert` guard on FixIntentBlock so
+    pipeline alerts don't show both blocks (operators
+    provide CI-fix context via the pipeline block; the
+    generic fix-intent flow doesn't apply)
+  - `TypeGlyph` extended:
+    `pipeline-failed → ✗ red, pipeline-timeout → ⏱ amber`
+  - `AlertBody` switches on type → routes the two new types
+    to `PipelineBody`
+
+- **Fix 7 — CLI `gestalt alerts pipeline-feedback <alertId>`**:
+  - New `alertsPipelineFeedbackCommand` in
+    `packages/cli/src/commands/alerts.ts`. Resolves the
+    alert via the existing `fetchAlertByIdOrPrefix` (8-char
+    prefix supported); refuses non-pipeline alert types with
+    a friendly error directing the operator to the right
+    subcommand; surfaces the alert context (intent text,
+    branch, PR, run ID, pipeline status) before prompting;
+    accepts `--feedback <text>` flag OR prompts when omitted;
+    rejects empty feedback; calls
+    `submitPipelineFeedback` on the typed client method;
+    prints `✓ Fix submitted — platform resuming on branch
+    <branch>` + intentId + status + PR link + a hint to
+    `gestalt status` for watching progress
+  - `gestalt alerts show <prefix>` "Available actions"
+    footer now routes pipeline alerts to
+    `pipeline-feedback` + `dismiss`, GP_BREACH alerts to
+    `resume / abort / acknowledge / dismiss`, everything
+    else to the legacy `fix / dismiss`
+  - `packages/cli/src/api/client.ts`: new
+    `submitPipelineFeedback(id, feedback): Promise<{ data:
+    { intentId, status, branch, prNumber, prUrl } }>`
+  - `packages/cli/src/index.ts`: registered
+    `gestalt alerts pipeline-feedback <alertId>
+    [--feedback <text>] [--server <url>]`
+
+Live verified against `trackeros` (synthetic seed +
+production code paths):
+
+- Migration 019 applied on first boot; `\d intents`
+  confirms three new columns
+- **API smoke** (curl + DB inspection):
+  - `GET /alerts/<id>` enrichment for pipeline-failed
+    returns intentId + full context (branch, prUrl,
+    prNumber, runId, pipelineStatus, adapter)
+  - `POST /alerts/:id/pipeline-feedback` happy path returns
+    200 with `{ intentId, status: 'generating', branch,
+    prNumber, prUrl }`
+  - **Atomic side effects confirmed via DB**:
+    - alert acknowledged (acked = true, acknowledged_by =
+      admin user)
+    - intent transitioned `deploying → generating`
+    - `branch_name` + `pr_number` preserved on intent row
+    - `clarification` saved (116 chars matches feedback
+      length)
+    - BullMQ `bull:gestalt-generate:active` has the resume
+      job
+  - **Server logs**: WARN line confirming
+    `resumeOnBranch` was threaded into the orchestrator and
+    `repo.fetch + checkout -B` were attempted (the
+    synthetic branch doesn't exist on GitHub, so
+    fallback-to-default fired as designed); the full
+    generate cycle then ran against the default branch and
+    the intent reached `in-review`
+- **Validation paths**:
+  - missing feedback → 400 `INVALID_FEEDBACK`
+  - empty (whitespace-only) feedback → 400 same
+  - non-existent alert → 404 "Alert not found"
+  - wrong alert type (clarification-needed) → 400
+    `INVALID_ALERT_TYPE` with the message "Alert type
+    'X' does not accept pipeline-feedback"
+- **GP-006 audit verification**: `audit_log` rows for
+  `alert.pipeline-feedback-submitted` carry only
+  `{ type, intentId, feedbackLength, branch, prNumber, ip }`
+  — direct SQL probe
+  `metadata::text LIKE '%cross-env NODE_ENV=test%'` (the
+  actual feedback content) returns 0 rows
+- **CLI exercised end-to-end** against a seeded
+  pipeline-timeout alert:
+  - `gestalt alerts list` table shows the alert with
+    `[high]` badge + 8-char prefix
+  - `gestalt alerts show <prefix>` renders title/description
+    + the new Available actions footer routing to
+    `pipeline-feedback`
+  - `gestalt alerts pipeline-feedback <prefix> --feedback
+    "..."` displays the alert context (Alert / Intent /
+    Branch / PR / Run ID / Status) then submits and prints
+    `✓ Fix submitted — platform resuming on branch
+    gestalt/verify-cli-pfb-add-an-absolute` with intentId,
+    status, PR link, and the gestalt-status hint
+- **Dashboard bundle** rebuilds cleanly with the new
+  `PipelineBody` + `PipelineFeedbackBlock` (Vite output:
+  `index-6WNPE_qB.js` 349 KB)
+- Clean up: 2 synthetic alerts + 2 synthetic intents
+  removed after verification; audit_log probe rows
+  scrubbed; trackeros DB back to clean baseline
+
+Decisions made:
+
+- **Reuse `intents.clarification` for pipeline feedback**
+  (the brief was explicit). The `source` field on the
+  BullMQ payload (`'pipeline-feedback'`) is what
+  distinguishes "vague intent clarification" from "CI fix
+  guidance" — the intent-agent's prompt builder switches
+  framing on that field. No new column; back-compat with
+  every existing clarification path
+- **Resume-on-branch is a payload optional**, not a new
+  task type. The generate orchestrator's `handleIntentTask`
+  branches on `payload.resumeOnBranch` after the clone but
+  BEFORE the agent loop, so the entire downstream cycle
+  (intent → design → context → code → test → gate → pr)
+  operates on the existing branch's working tree
+  transparently. The pr-agent's `isResume` check then takes
+  the no-new-PR path. Three orchestrators see the field;
+  none of them special-case beyond "checkout the branch
+  instead of the default"
+- **Graceful fallback when the branch can't be checked
+  out**. The generate orchestrator wraps the
+  `repo.fetch + checkout` in try/catch — on failure it
+  logs WARN and proceeds against the default branch. Two
+  reasons: (1) the operator may have manually deleted the
+  branch on GitHub; (2) the prior PR was merged + branch
+  deleted by GitHub's auto-delete. In both cases the
+  resume becomes a fresh PR, which is still better than
+  failing the intent
+- **GP-006 strictly**: audit metadata carries
+  `feedbackLength` (number), NOT `feedback` (text). Same
+  pattern as the clarification audit shipped in May; the
+  feedback text lives on `intents.clarification` and can
+  be queried by a forensics operator
+- **Pipeline-failed AND pipeline-timeout both produce the
+  feedback alert.** Timeout is also actionable by the
+  operator ("the test suite needs longer; raise the CI
+  timeout"); the alert title + pipelineStatus context
+  field tell them which case they're handling
+- **Commit subject is `fix:` on resume**, not `feat:`.
+  Conventional-commits convention pairs the `fix:` prefix
+  with the squash-merge history of the original `feat:`
+  PR, so when GitHub squash-merges the PR after a
+  successful resume cycle the commit list reads:
+  `<original feat commit> + <one or more fix commits>` —
+  the operator sees the iterative trajectory clearly
+- **The dashboard suppresses FixIntentBlock on pipeline
+  alerts.** Operators who want to submit a completely
+  fresh intent rather than fix the current one can do so
+  via `gestalt run` or the intents UI — but the
+  pipeline-alert card is structurally about "fix THIS
+  cycle", so cluttering it with both options would
+  invite the wrong action
+- **CLI's `alerts show` Available actions footer now
+  type-aware** rather than always printing the legacy
+  fix/dismiss pair. Catches the operator who comes in via
+  `alerts show <prefix>` and would otherwise be unaware
+  the `pipeline-feedback` subcommand exists for this
+  alert type
+- **`PipelineFeedbackBlock` button disabled until value
+  trimmed non-empty** — empty submission is invalid
+  server-side anyway; surfacing the disabled state in the
+  UI prevents a wasted round-trip
+
+Build status: `pnpm -r build` clean across all 12
+packages. Docker server image rebuilt; migration 019
+applied. Full Stage 1 (validation matrix) + Stage 2
+(happy path + side effects + worker pickup + GP-006
+audit) + Stage 3 (CLI end-to-end) verified live against
+real postgres + real BullMQ + real server logs. The
+resume-on-branch code path was exercised with a
+synthetic branch (the orchestrator's WARN + fallback
+fired as designed); end-to-end push-to-existing-branch
+verification requires a real failing CI cycle on
+trackeros and is deferred to the next routine deploy
+test.
+
+No new Pending enhancements introduced.

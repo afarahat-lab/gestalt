@@ -287,6 +287,133 @@ export async function registerOversightRoutes(app: FastifyInstance): Promise<voi
     },
   );
 
+  // POST /alerts/:id/pipeline-feedback — pipeline failure resume flow.
+  // The operator's feedback is persisted to the same intent's
+  // `clarification` column and the cycle re-dispatches on the SAME
+  // branch + PR. pr-agent on the retry leg pushes the fix commit to
+  // the existing branch and skips `createPullRequest`. This is
+  // distinct from `/fix-intent` (which creates a NEW intent + a fresh
+  // branch); pipeline-feedback re-uses the failing intent so the
+  // existing PR + CI run history stays intact.
+  app.post<{ Params: { id: string }; Body: { feedback?: unknown } }>(
+    '/alerts/:id/pipeline-feedback',
+    { preHandler: requireRole('operator') },
+    async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+      const body = request.body ?? {};
+      const feedback = typeof body.feedback === 'string' ? body.feedback.trim() : '';
+      if (!feedback) {
+        return reply.code(400).send({
+          error: 'feedback is required (describe what failed and how to fix it)',
+          code: 'INVALID_FEEDBACK',
+        });
+      }
+
+      const { alerts, intents, audit } = getRepositories();
+      const existing = await alerts.findById(request.params.id);
+      if (!existing) return reply.code(404).send({ error: 'Alert not found' });
+      if (existing.acknowledgedAt) {
+        return reply.code(409).send({ error: 'Alert already acknowledged' });
+      }
+      if (existing.type !== 'pipeline-failed' && existing.type !== 'pipeline-timeout') {
+        return reply.code(400).send({
+          error: `Alert type '${existing.type}' does not accept pipeline-feedback`,
+          code: 'INVALID_ALERT_TYPE',
+        });
+      }
+
+      // Read intentId out of the context (pipeline-agent puts it
+      // there) and load the intent — we need its projectId + the
+      // persisted branch coordinates pr-agent saved.
+      const ctx = existing.context ?? {};
+      const intentId = typeof ctx['intentId'] === 'string' ? (ctx['intentId'] as string) : null;
+      if (!intentId) {
+        return reply.code(400).send({
+          error: 'Alert has no intentId in context — cannot resume',
+          code: 'INVALID_ALERT_CONTEXT',
+        });
+      }
+      const intent = await intents.findById(intentId);
+      if (!intent) return reply.code(404).send({ error: 'Intent not found' });
+
+      // Editor minimum — the resume cycle will commit code on the
+      // project's repo. Mirrors the fix-intent route's check.
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, intent.projectId, 'editor')) return;
+
+      // Persist the feedback to intents.clarification so the generate
+      // orchestrator reads it on every dispatch (including any
+      // subsequent gate-retry legs) — same survives-the-payload
+      // guarantee migration 006 introduced for vague-intent
+      // clarification.
+      await intents.saveClarification(intent.id, feedback);
+
+      // Build the resume dispatch. `source: 'pipeline-feedback'`
+      // routes the intent-agent prompt to the CI-failure framing.
+      // `resumeOnBranch` + `prNumber` + `prUrl` are read off the
+      // intent row (pr-agent persisted them on the original cycle).
+      const config = loadConfig();
+      const message: TaskMessage = {
+        id: crypto.randomUUID(),
+        correlationId: intent.correlationId,
+        type: 'generate:intent',
+        sourceAgent: 'orchestrator',
+        targetAgent: 'intent-agent',
+        priority: 'normal' as TaskPriority,
+        payload: {
+          intentId: intent.id,
+          projectId: intent.projectId,
+          text: intent.text,
+          clarification: feedback,
+          source: 'pipeline-feedback',
+          resumeOnBranch: intent.branchName ?? undefined,
+          prNumber: intent.prNumber ?? undefined,
+          prUrl: intent.prUrl ?? undefined,
+        },
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      };
+      await dispatch(message, config.queue);
+      await intents.updateStatus(intent.id, 'generating');
+
+      const ack = await alerts.acknowledge(existing.id, request.user.id);
+
+      await audit.append({
+        actor: request.user.id,
+        action: 'alert.pipeline-feedback-submitted',
+        entityType: 'alerts',
+        entityId: ack.id,
+        correlationId: intent.correlationId,
+        metadata: {
+          type: ack.type,
+          intentId: intent.id,
+          feedbackLength: feedback.length,
+          branch: intent.branchName,
+          prNumber: intent.prNumber,
+          ip: request.ip,
+        },
+      });
+
+      emitLiveEvent('intent.status-changed', intent.correlationId, {
+        intentId: intent.id, status: 'generating',
+      });
+      emitLiveEvent('alert.acknowledged', ack.correlationId, { alertId: ack.id });
+      log.info(
+        { alertId: ack.id, intentId: intent.id, branch: intent.branchName, prNumber: intent.prNumber },
+        'Pipeline feedback submitted — resuming cycle on existing branch',
+      );
+
+      return reply.send({
+        data: {
+          intentId: intent.id,
+          status: 'generating',
+          branch: intent.branchName,
+          prNumber: intent.prNumber,
+          prUrl: intent.prUrl,
+        },
+      });
+    },
+  );
+
   // POST /interventions lives in routes/interventions.ts now (ADR-021,
   // migration 011). The earlier 501 stub used to point operators at the
   // clarification endpoint; that flow is still right for vague intents,

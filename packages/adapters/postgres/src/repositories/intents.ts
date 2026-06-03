@@ -88,6 +88,27 @@ export class PostgresIntentRepository implements IntentRepository {
     return row;
   }
 
+  async saveBranchInfo(
+    id: string,
+    params: { branchName: string; prNumber?: number | null; prUrl?: string | null },
+  ): Promise<IntentRecord> {
+    const db = getDb();
+    // We always set branchName; prNumber / prUrl are set when supplied
+    // (they may not be known at the time of the call — e.g. a NoOp
+    // adapter or a not-yet-completed PR open).
+    const [row] = await db<IntentRecord[]>`
+      UPDATE intents
+      SET branch_name = ${params.branchName},
+          pr_number   = ${params.prNumber ?? null},
+          pr_url      = ${params.prUrl ?? null},
+          updated_at  = NOW()
+      WHERE id = ${id}
+      RETURNING *
+    `;
+    if (!row) throw new Error(`Intent ${id} not found`);
+    return row;
+  }
+
   async list(params: {
     projectId: string;
     status?: IntentStatus;

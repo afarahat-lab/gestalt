@@ -150,6 +150,20 @@ export class DashboardApiClient {
     });
   }
 
+  /**
+   * Pipeline-feedback resume flow. The operator's feedback is
+   * persisted to the same intent's clarification column and the cycle
+   * re-dispatches on the SAME branch + PR. Distinct from
+   * `submitAlertFixIntent` — that one creates a NEW intent + fresh
+   * branch.
+   */
+  async submitPipelineFeedback(
+    alertId: string,
+    feedback: string,
+  ): Promise<{ data: { intentId: string; status: string; branch: string | null; prNumber: number | null; prUrl: string | null } }> {
+    return this.post(`/alerts/${alertId}/pipeline-feedback`, { feedback });
+  }
+
   async dismissAlert(id: string, notes?: string): Promise<{ data: Alert }> {
     return this.post(`/alerts/${id}/acknowledge`, { notes: notes ?? '' });
   }

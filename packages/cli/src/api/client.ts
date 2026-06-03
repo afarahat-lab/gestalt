@@ -890,6 +890,28 @@ export class GestaltApiClient {
     return this.post(`/alerts/${id}/acknowledge`, { notes: notes ?? '' });
   }
 
+  /**
+   * Pipeline-failed / pipeline-timeout feedback — operator describes the
+   * fix; server saves to intent.clarification, dispatches a fresh
+   * generate cycle on the SAME branch (resumeOnBranch), and
+   * acknowledges the alert atomically. See ADR / session log
+   * 2026-06-03 (pipeline failure alerts).
+   */
+  async submitPipelineFeedback(
+    id: string,
+    feedback: string,
+  ): Promise<{
+    data: {
+      intentId: string;
+      status: string;
+      branch: string | null;
+      prNumber: number | null;
+      prUrl: string | null;
+    };
+  }> {
+    return this.post(`/alerts/${id}/pipeline-feedback`, { feedback });
+  }
+
   // ─── Interventions (ADR-021) ──────────────────────────────────────────────
 
   async submitIntervention(params: {

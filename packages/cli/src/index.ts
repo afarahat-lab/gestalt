@@ -89,6 +89,7 @@ import {
 import {
   alertsListCommand, alertsShowCommand, alertsFixCommand, alertsDismissCommand,
   alertsResumeCommand, alertsAbortCommand, alertsAcknowledgeCommand,
+  alertsPipelineFeedbackCommand,
 } from './commands/alerts';
 import {
   agentsListCommand, agentsValidateCommand, agentsActiveCommand,
@@ -531,6 +532,15 @@ alerts
   .option('--notes <text>', 'Notes describing why this breach occurred (required; prompts if omitted)')
   .action(async (alertId: string, opts: { server?: string; notes?: string }) => {
     await alertsAcknowledgeCommand(alertId, { server: opts.server, notes: opts.notes }).catch(fatalError);
+  });
+
+alerts
+  .command('pipeline-feedback <alertId>')
+  .description('Provide a fix for a pipeline-failed / pipeline-timeout alert — resumes the cycle on the SAME branch and PR (no new PR opened)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--feedback <text>', 'Description of what failed and how to fix it (prompts if omitted)')
+  .action(async (alertId: string, opts: { server?: string; feedback?: string }) => {
+    await alertsPipelineFeedbackCommand(alertId, { server: opts.server, feedback: opts.feedback }).catch(fatalError);
   });
 
 // gestalt agents — read + validate agents.yaml from the project repo (ADR-037)

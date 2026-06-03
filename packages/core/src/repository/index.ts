@@ -51,10 +51,20 @@ export interface IntentRecord {
   createdAt: Date;
   updatedAt: Date;
   resolvedAt: Date | null;
+  /**
+   * Branch / PR coordinates assigned by pr-agent after the first
+   * push. Migration 019. Populated for cycles that reached deploy;
+   * stays NULL forever on intents that failed at gate or never
+   * dispatched to deploy. Used by the pipeline-feedback flow to
+   * resume on the SAME branch + PR rather than opening a new one.
+   */
+  branchName: string | null;
+  prNumber: number | null;
+  prUrl: string | null;
 }
 
 export interface IntentRepository extends BaseRepository {
-  create(intent: Omit<IntentRecord, 'createdAt' | 'updatedAt' | 'resolvedAt' | 'clarification'>): Promise<IntentRecord>;
+  create(intent: Omit<IntentRecord, 'createdAt' | 'updatedAt' | 'resolvedAt' | 'clarification' | 'branchName' | 'prNumber' | 'prUrl'>): Promise<IntentRecord>;
   findById(id: string): Promise<IntentRecord | null>;
   findByCorrelationId(correlationId: string): Promise<IntentRecord | null>;
   updateStatus(id: string, status: IntentStatus): Promise<IntentRecord>;
@@ -65,6 +75,17 @@ export interface IntentRepository extends BaseRepository {
    * same text.
    */
   saveClarification(id: string, clarification: string): Promise<IntentRecord>;
+  /**
+   * Persists the PR branch + (optional) PR number/URL after pr-agent
+   * opens the PR (migration 019). Read back by the pipeline-feedback
+   * flow so the orchestrator + pr-agent resume on the SAME branch.
+   * Idempotent — passing the same values is a no-op.
+   */
+  saveBranchInfo(id: string, params: {
+    branchName: string;
+    prNumber?: number | null;
+    prUrl?: string | null;
+  }): Promise<IntentRecord>;
   list(params: { projectId: string; status?: IntentStatus; limit: number; offset: number }): Promise<{ records: IntentRecord[]; total: number }>;
   /**
    * Server-wide intent list (no project filter). Used by the
@@ -822,14 +843,38 @@ export type AlertType =
   | 'clarification-needed'
   | 'GOLDEN_PRINCIPLE_BREACH'
   | 'promotion-pending'
-  | 'maintenance-stuck';
+  | 'maintenance-stuck'
+  /**
+   * Pipeline run reported `failed` or `cancelled`. Pipeline-agent
+   * creates this alert before transitioning the intent to `failed`
+   * so operators see the CI failure in the Alerts view and can
+   * submit feedback via `POST /alerts/:id/pipeline-feedback`.
+   * Resume happens on the SAME branch + PR (intent.branchName is
+   * read on the retry leg).
+   */
+  | 'pipeline-failed'
+  /**
+   * Pipeline did not complete within the polling window.
+   * Distinct from `pipeline-failed` because the operator may want
+   * to investigate the CI infrastructure itself rather than the
+   * generated code.
+   */
+  | 'pipeline-timeout';
 
 export type AlertRequiredAction =
   | 'provide-clarification'
   | 'acknowledge-breach'
   | 'approve-promotion'
   | 'reject-promotion'
-  | 'review-manually';
+  | 'review-manually'
+  /**
+   * Operator submits free-text feedback describing what went
+   * wrong and how to fix it. Currently used by pipeline-failed
+   * and pipeline-timeout alerts; the feedback is persisted to
+   * `intents.clarification` and routed back through the generate
+   * cycle with `source: 'pipeline-feedback'`.
+   */
+  | 'provide-feedback';
 
 export interface AlertRecord {
   id: string;

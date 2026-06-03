@@ -78,7 +78,18 @@ interface IntentTaskPayload {
   clarification?: string;
   ambiguityId?: string;
   resume?: boolean;
-  source?: 'human' | 'maintenance-agent';
+  source?: 'human' | 'maintenance-agent' | 'pipeline-feedback';
+  /**
+   * Pipeline-feedback resume flow. When set, the orchestrator
+   * checks out this branch after the per-cycle clone so the
+   * code-agent's regeneration sits on top of the existing
+   * branch's history. The pr-agent dispatch carries the same
+   * branch (+ prNumber/prUrl) so pr-agent pushes to the same
+   * branch + reuses the open PR rather than creating a new one.
+   */
+  resumeOnBranch?: string;
+  prNumber?: number;
+  prUrl?: string;
   /**
    * Quality-gate retry context. Populated only when the gate dispatched
    * this task on a failed verdict (the feedback loop). The orchestrator
@@ -190,7 +201,14 @@ async function handleIntentTask(
     }
     const projectId = payload.projectId ?? intentRecord.projectId;
     const intentText = payload.text ?? intentRecord.text;
-    const intentSource: 'human' | 'maintenance-agent' =
+    // `intentSource` carries the dispatch trigger forward to the
+    // intent-agent so its clarification gate + prompt framing pick
+    // the right path. The DB-side `intentRecord.source` is the
+    // SUBMITTING source (human / maintenance) and never changes;
+    // `payload.source` is the DISPATCH source (which is the same on
+    // a fresh submit but flips to `pipeline-feedback` on the resume
+    // leg). We prefer payload.source for resume context.
+    const intentSource: 'human' | 'maintenance-agent' | 'pipeline-feedback' =
       payload.source ?? intentRecord.source;
 
     project = await projects.findById(projectId);
@@ -212,16 +230,40 @@ async function handleIntentTask(
       childLog.info({ projectId: project.id, workDir }, 'Cloning project repo for cycle');
       await simpleGit().clone(cloneUrl, workDir);
 
-      // Make sure we are on the project's default branch before agents start
-      // mutating the tree.
       const repo = simpleGit(workDir);
-      const branches = await repo.branch();
-      if (branches.current !== project.defaultBranch) {
+
+      if (payload.resumeOnBranch) {
+        // Pipeline-feedback resume flow — fetch + checkout the existing
+        // branch so the code-agent's regeneration sits on top of the
+        // history that's already in the open PR. pr-agent will later
+        // push the fix commit to this same branch and skip
+        // createPullRequest.
         try {
-          await repo.checkout(project.defaultBranch);
-        } catch {
-          // Branch may not exist on the remote yet (brand-new repo); fall
-          // back to whatever clone landed on.
+          await repo.fetch('origin', payload.resumeOnBranch);
+          await repo.checkout(['-B', payload.resumeOnBranch, `origin/${payload.resumeOnBranch}`]);
+          childLog.info(
+            { branch: payload.resumeOnBranch, prNumber: payload.prNumber ?? null },
+            'Resuming cycle on existing branch (pipeline-feedback)',
+          );
+        } catch (err) {
+          // If the branch vanished (operator deleted it on GitHub) fall
+          // through to the default-branch path — the cycle still runs.
+          childLog.warn(
+            { err: err instanceof Error ? err.message : String(err), branch: payload.resumeOnBranch },
+            'Failed to checkout resumeOnBranch — falling back to default branch',
+          );
+        }
+      } else {
+        // Make sure we are on the project's default branch before agents
+        // start mutating the tree.
+        const branches = await repo.branch();
+        if (branches.current !== project.defaultBranch) {
+          try {
+            await repo.checkout(project.defaultBranch);
+          } catch {
+            // Branch may not exist on the remote yet (brand-new repo);
+            // fall back to whatever clone landed on.
+          }
         }
       }
 
@@ -387,6 +429,13 @@ async function handleIntentTask(
         retryCount,
         projectId,
         text: intentText,
+        // Pipeline-feedback resume: forward to the gate so it can pass
+        // through to its `deploy:pr` dispatch on a pass verdict. pr-agent
+        // then sees `resumeOnBranch` and pushes to the existing branch
+        // instead of opening a new PR.
+        resumeOnBranch: payload.resumeOnBranch,
+        prNumber: payload.prNumber,
+        prUrl: payload.prUrl,
       },
       createdAt: new Date(),
       expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),
@@ -431,7 +480,7 @@ async function handleIntentTask(
  * the flag and skipping the gate dispatch).
  */
 interface DrivePlanOptions {
-  intentSource: 'human' | 'maintenance-agent';
+  intentSource: 'human' | 'maintenance-agent' | 'pipeline-feedback';
   clarification?: string;
   /**
    * ADR-039 — per-cycle MCP client cache. Keyed by `serverName`.

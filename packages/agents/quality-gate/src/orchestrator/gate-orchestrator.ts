@@ -77,6 +77,14 @@ interface GateTaskPayload {
   retryCount?: number;
   projectId?: string;
   text?: string;
+  /**
+   * Pipeline-feedback resume — forwarded from the generate orchestrator
+   * so this gate dispatch can carry it through to `deploy:pr`. pr-agent
+   * then pushes to the same branch instead of opening a new PR.
+   */
+  resumeOnBranch?: string;
+  prNumber?: number;
+  prUrl?: string;
 }
 
 /**
@@ -582,6 +590,12 @@ async function dispatchDeployPR(args: {
         path: a.path,
         content: a.content,
       })),
+      // Pipeline-feedback resume — forwarded so pr-agent pushes to
+      // the existing branch + reuses the open PR instead of opening
+      // a new one. All three optional; undefined → normal flow.
+      resumeOnBranch: payload.resumeOnBranch,
+      prNumber: payload.prNumber,
+      prUrl: payload.prUrl,
     },
     createdAt: new Date(),
     expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),

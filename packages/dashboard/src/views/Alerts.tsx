@@ -33,6 +33,8 @@ const FIX_TYPES: ReadonlyArray<string> = [
   'clarification-needed', 'maintenance-stuck', 'GOLDEN_PRINCIPLE_BREACH', 'gate-failed-max-retries',
 ];
 
+const PIPELINE_TYPES: ReadonlyArray<string> = ['pipeline-failed', 'pipeline-timeout'];
+
 export function Alerts() {
   const api = useDashboardApi();
   const { currentProjectId } = useProject();
@@ -47,6 +49,7 @@ export function Alerts() {
   // so opening two cards at once doesn't share input.
   const [clarification, setClarification] = useState<Record<string, string>>({});
   const [additionalContext, setAdditionalContext] = useState<Record<string, string>>({});
+  const [pipelineFeedback, setPipelineFeedback] = useState<Record<string, string>>({});
   const [dismissNotes, setDismissNotes] = useState<Record<string, string>>({});
   const [submitting, setSubmitting] = useState<Record<string, string | null>>({});
   const [confirmation, setConfirmation] = useState<Record<string, string>>({});
@@ -125,6 +128,36 @@ export function Alerts() {
       }, 1800);
     } catch (err) {
       browserAlert(`Failed to submit fix intent: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setSubmitting((s) => ({ ...s, [alert.id]: null }));
+    }
+  };
+
+  /**
+   * Pipeline-feedback resume. The operator describes what went wrong
+   * + how to fix it; the platform re-runs on the SAME branch + PR.
+   * Distinct from `handleFixIntent` (which creates a brand-new intent
+   * and a fresh branch).
+   */
+  const handlePipelineFeedback = async (alert: Alert): Promise<void> => {
+    const feedback = (pipelineFeedback[alert.id] ?? '').trim();
+    if (!feedback) {
+      browserAlert('Describe what failed and how to fix it before submitting.');
+      return;
+    }
+    setSubmitting((s) => ({ ...s, [alert.id]: 'pipeline' }));
+    try {
+      const res = await api.submitPipelineFeedback(alert.id, feedback);
+      const branchLabel = res.data.branch ? ` on branch ${res.data.branch}` : '';
+      setConfirmation((c) => ({ ...c, [alert.id]: `✓ Fix submitted — resuming${branchLabel}` }));
+      setPipelineFeedback((s) => ({ ...s, [alert.id]: '' }));
+      setTimeout(() => {
+        setConfirmation((c) => { const n = { ...c }; delete n[alert.id]; return n; });
+        setExpanded(null);
+        void load();
+      }, 1800);
+    } catch (err) {
+      browserAlert(`Failed to submit pipeline feedback: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       setSubmitting((s) => ({ ...s, [alert.id]: null }));
     }
@@ -247,6 +280,7 @@ export function Alerts() {
             {sorted.map((alert) => {
               const isExpanded = expanded === alert.id;
               const canFix = FIX_TYPES.includes(alert.type);
+              const isPipelineAlert = PIPELINE_TYPES.includes(alert.type);
               const confirmText = confirmation[alert.id];
               const busy = submitting[alert.id] !== null && submitting[alert.id] !== undefined;
               return (
@@ -296,12 +330,22 @@ export function Alerts() {
                           busy={busy}
                         />
                       )}
-                      {canFix && (
+                      {canFix && !isPipelineAlert && (
                         <FixIntentBlock
                           alert={alert}
                           value={additionalContext[alert.id] ?? ''}
                           onChange={(v) => setAdditionalContext((s) => ({ ...s, [alert.id]: v }))}
                           onSubmit={() => void handleFixIntent(alert)}
+                          submittingMode={submitting[alert.id] ?? null}
+                          busy={busy}
+                        />
+                      )}
+                      {isPipelineAlert && (
+                        <PipelineFeedbackBlock
+                          alert={alert}
+                          value={pipelineFeedback[alert.id] ?? ''}
+                          onChange={(v) => setPipelineFeedback((s) => ({ ...s, [alert.id]: v }))}
+                          onSubmit={() => void handlePipelineFeedback(alert)}
                           submittingMode={submitting[alert.id] ?? null}
                           busy={busy}
                         />
@@ -361,6 +405,8 @@ function TypeGlyph({ alert }: { alert: Alert }) {
     alert.type === 'maintenance-stuck'        ? { glyph: '⚙', color: 'var(--amber)' } :
     alert.type === 'GOLDEN_PRINCIPLE_BREACH'  ? { glyph: '⛔', color: 'var(--red)' } :
     alert.type === 'gate-failed-max-retries'  ? { glyph: '✗', color: 'var(--red)' } :
+    alert.type === 'pipeline-failed'          ? { glyph: '✗', color: 'var(--red)' } :
+    alert.type === 'pipeline-timeout'         ? { glyph: '⏱', color: 'var(--amber)' } :
                                                 { glyph: '!',  color: 'var(--text-dim)' };
   return (
     <span style={{
@@ -396,6 +442,7 @@ function AlertBody({ alert }: { alert: Alert }) {
   if (alert.type === 'clarification-needed') return <ClarificationBody alert={alert} />;
   if (alert.type === 'maintenance-stuck')    return <MaintenanceStuckBody alert={alert} />;
   if (alert.type === 'GOLDEN_PRINCIPLE_BREACH') return <BreachBody alert={alert} />;
+  if (alert.type === 'pipeline-failed' || alert.type === 'pipeline-timeout') return <PipelineBody alert={alert} />;
   return (
     <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '12px' }}>
       {alert.description}
@@ -486,6 +533,48 @@ function BreachBody({ alert }: { alert: Alert }) {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * pipeline-failed / pipeline-timeout body — extracts intent text +
+ * branch + PR coordinates + run id + pipeline status from the alert
+ * context. The submit button (the PipelineFeedbackBlock below)
+ * sends the operator's feedback to the resume route which retries
+ * on the SAME branch.
+ */
+function PipelineBody({ alert }: { alert: Alert }) {
+  const ctx = alert.context ?? {};
+  const intentText = typeof ctx['intentText'] === 'string' ? (ctx['intentText'] as string) : null;
+  const branch = typeof ctx['branch'] === 'string' ? (ctx['branch'] as string) : null;
+  const prUrl = typeof ctx['prUrl'] === 'string' ? (ctx['prUrl'] as string) : null;
+  const prNumber = typeof ctx['prNumber'] === 'number' ? (ctx['prNumber'] as number) : null;
+  const runId = ctx['runId'] != null ? String(ctx['runId']) : null;
+  const pipelineStatus = typeof ctx['pipelineStatus'] === 'string' ? (ctx['pipelineStatus'] as string) : null;
+
+  return (
+    <div style={{ marginBottom: '12px' }}>
+      {intentText && (
+        <p style={{ margin: '0 0 10px', fontSize: '12px', color: 'var(--text-secondary)' }}>
+          <strong style={{ color: 'var(--text-primary)' }}>Intent:</strong>{' '}
+          "{intentText.length > 100 ? intentText.slice(0, 97) + '...' : intentText}"
+        </p>
+      )}
+      <div style={{ display: 'flex', gap: '14px', flexWrap: 'wrap', fontSize: '12px' }}>
+        {branch && <KV label="Branch"><code>{branch}</code></KV>}
+        {prNumber !== null && (
+          <KV label="PR">
+            {prUrl ? (
+              <a href={prUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--blue)' }}>
+                #{prNumber} ↗
+              </a>
+            ) : <>#{prNumber}</>}
+          </KV>
+        )}
+        {runId && <KV label="Run">{runId}</KV>}
+        {pipelineStatus && <KV label="Status"><code>{pipelineStatus}</code></KV>}
+      </div>
     </div>
   );
 }
@@ -597,6 +686,35 @@ function FixIntentBlock({ alert, value, onChange, onSubmit, submittingMode, busy
       <div style={{ marginTop: '8px' }}>
         <Button onClick={onSubmit} disabled={busy}>
           {submittingMode === 'fix' ? 'submitting...' : 'submit fix intent ▶'}
+        </Button>
+      </div>
+    </ActionBlock>
+  );
+}
+
+/**
+ * pipeline-failed / pipeline-timeout — operator describes what went
+ * wrong and how to fix it. The platform re-runs on the SAME branch
+ * and PR (no new PR), so the existing CI history stays intact.
+ */
+function PipelineFeedbackBlock({ alert, value, onChange, onSubmit, submittingMode, busy }: {
+  alert: Alert; value: string;
+  onChange: (v: string) => void;
+  onSubmit: () => void;
+  submittingMode: string | null;
+  busy: boolean;
+}) {
+  return (
+    <ActionBlock title="Provide feedback to fix and retry on the same branch" alert={alert}>
+      <textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="What went wrong and how to fix it? (e.g. 'Add NODE_ENV=test to the test script', 'The import path is wrong — should be ../shared/utils')"
+        style={{ ...textareaStyle, minHeight: '80px' }}
+      />
+      <div style={{ marginTop: '8px' }}>
+        <Button onClick={onSubmit} disabled={busy || !value.trim()}>
+          {submittingMode === 'pipeline' ? 'submitting...' : 'retry with fix ▶'}
         </Button>
       </div>
     </ActionBlock>
