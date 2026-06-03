@@ -64,7 +64,15 @@ WORKDIR /app
 # remotes (HTTPS+PAT still works without it but most operators use both).
 RUN apk add --no-cache git openssh-client
 
-RUN corepack enable && corepack prepare pnpm@9.15.4 --activate
+# Install pnpm globally via npm rather than corepack — corepack caches
+# per-user (`~/.cache/node/corepack/...`) so an activation as root
+# doesn't carry to the `gestalt` runtime user, and a fresh
+# `pnpm install` invocation by `gestalt` would auto-download the
+# LATEST pnpm (which requires Node 22+ for `node:sqlite`). A
+# straight `npm install -g pnpm@9.15.4` lands at /usr/local/bin/pnpm
+# and is callable by every user without per-user activation.
+# Required by pr-agent (lockfile sync after writing artifacts).
+RUN npm install -g pnpm@9.15.4
 
 COPY package.json pnpm-workspace.yaml ./
 

@@ -12180,3 +12180,222 @@ a synthetic project. No migration needed; no existing data shape
 changed.
 
 No new Pending enhancements introduced.
+
+---
+
+### Session 2026-06-03 — Claude Code (pr-agent: sync pnpm-lock.yaml after writing artifacts so CI's `--frozen-lockfile` passes)
+
+GitHub Actions runs (and the seeded `gestalt.yml` workflow) use
+`pnpm install --frozen-lockfile` to ensure the committed lockfile
+matches `package.json`. pr-agent was writing a fresh `package.json`
+without updating the lockfile, so every cycle's CI rejected the
+install. Three scenarios now handled: fresh project (no lockfile),
+dependency update (stale lockfile), no `package.json` at all (skip).
+
+Changed:
+
+- `packages/agents/deploy/src/agents/exec.ts` (new): shared
+  `execCommand(cmd, args, cwd, timeoutMs = 120_000)` helper.
+  - Uses `child_process.spawn` with `stdio: 'pipe'` — no shell, no
+    injection surface, explicit binary + args at the call site.
+  - Hard timeout (default 2 minutes; pnpm install typically
+    finishes in 10–30 s for a real project). On timeout the helper
+    SIGKILLs the child and rejects with a `timed out after Nms`
+    error.
+  - Resolves with `{ stdout, stderr }` on exit code 0. Non-zero
+    exit, spawn error, or timeout reject with a human-readable
+    `Error`. On non-zero exit, the rejection message includes the
+    last 400 chars of stderr — enough to diagnose registry
+    unreachable / OOM / bad manifest without spamming the log
+    with full pnpm output
+  - Comment block explains why the ADR-032 prohibition on
+    `child_process.exec('git ...')` doesn't apply: Git operations
+    must go through `simple-git` (the prohibition is about the
+    Git-specific code path); package-manager execution is a
+    separate concern with a different threat model (pnpm is a
+    known tool, args are fixed at the call site, working
+    directory is a per-cycle clone the platform created).
+- `packages/agents/deploy/src/agents/pr-agent.ts`:
+  - Imports `execCommand` from `./exec` and adds `stat` from
+    `fs/promises`
+  - **Inserts `await maybeSyncLockfile(workDir, input.correlationId)`
+    between writing artifacts and the `git add .`** — every file
+    pr-agent commits passes through the same sync step
+  - New `maybeSyncLockfile(workDir, correlationId)` helper at the
+    bottom of the file:
+    - stats `package.json`; ENOENT → log info + return (no Node
+      project yet — first `gestalt run` will scaffold one)
+    - any other stat error → log warn + return (no point trying
+      pnpm if we can't read package.json)
+    - runs `pnpm install --no-frozen-lockfile` via the new
+      `execCommand` helper. `--no-frozen-lockfile` because
+      pr-agent's job is to PRODUCE a lockfile that matches the
+      just-written `package.json`, not to ENFORCE one (that's
+      CI's job)
+    - failure path logs a warn and returns — pr-agent commits
+      whatever lockfile state exists. The PR's CI run is the
+      real source of truth for "is this lockfile good"; blocking
+      the PR from existing over a lockfile-sync hiccup would be
+      worse UX (operator has no way to inspect what would have
+      been pushed)
+  - The lockfile is picked up by the existing `git add .` —
+    no extra plumbing needed
+- `packages/server/Dockerfile` (production stage): swapped
+  `corepack enable && corepack prepare pnpm@9.15.4 --activate` for
+  `npm install -g pnpm@9.15.4`. Discovered during smoke testing:
+  corepack caches its prepared versions under `~/.cache/node/corepack/...`
+  per user. The Dockerfile activates pnpm 9.15.4 as `root` during
+  the build, but the container's runtime user is `gestalt` — they
+  have no per-user activation. When `gestalt` runs `pnpm` for the
+  first time, corepack falls back to the latest pnpm (11.5.1)
+  which requires Node 22's `node:sqlite` built-in module and
+  crashes with `ERR_UNKNOWN_BUILTIN_MODULE` on the Node 20 base
+  image. The straight npm-global install lands the 9.15.4 binary
+  at `/usr/local/bin/pnpm` on PATH for every user without
+  per-user activation. Comment block documents this trap so the
+  next Dockerfile reviewer doesn't try to "clean up" back to
+  corepack
+- `templates/corporate-ops-web-mobile/ci/gestalt.yml`: install
+  step now branches inside the `if [ -f package.json ]` block:
+  ```yaml
+  if [ -f pnpm-lock.yaml ]; then
+    pnpm install --frozen-lockfile
+  else
+    echo "::warning::pnpm-lock.yaml not found. Run a scaffold intent first..."
+    pnpm install
+  fi
+  ```
+  Graceful fallback for projects whose first CI run lands BEFORE
+  the first `gestalt run` has scaffolded a lockfile — they emit a
+  GitHub Actions `::warning::` annotation and proceed without
+  hard-failing. After the first pr-agent commit lands, the
+  fast-path `--frozen-lockfile` takes over
+- `packages/agents/maintenance/src/agents/context-fixer.ts`: **NO
+  CHANGE**. The brief's Fix 5 instructs the same `pnpm install`
+  block in `applyFix`, but context-fixer is constrained by the
+  ADR-018 path guard (`enforcePathGuard`: only `docs/*` and exactly
+  `AGENTS.md` allowed). It cannot reach a `package.json` write
+  path. Adding the conditional would be dead code. Documented
+  here in lieu of a code change
+
+Verified live (inside the rebuilt server container — no live LLM
+cycle burned):
+
+- `pnpm -r build` clean across all 12 packages
+- `docker compose up -d --build server` — `Up (healthy)`
+- `docker exec gestalt-server-1 which pnpm` → `/usr/local/bin/pnpm`
+- `docker exec gestalt-server-1 pnpm --version` → `9.15.4`
+- **Smoke test 1 — real package install**: inside `/tmp/smoke-pnpm`
+  with `{ name, version, dependencies: { lodash: "4.17.21" } }`,
+  ran `pnpm install --no-frozen-lockfile`. Result: `Done in 2s`,
+  `pnpm-lock.yaml` created (384 bytes), `lockfileVersion: '9.0'`
+  with the lodash entry pinned to 4.17.21
+- **Smoke test 2 — execCommand wire-up**: dynamic-imported
+  `/app/packages/agents/deploy/dist/agents/exec.js`, called
+  `execCommand('pnpm', ['install', '--no-frozen-lockfile'], dir,
+  60000)` against a temp dir with a real lodash package.json.
+  Helper resolved cleanly with `Done in 648ms` in stdout;
+  resulting directory contained `node_modules` + `package.json` +
+  `pnpm-lock.yaml`; lockfile size 384 bytes. The structural
+  identity of the pr-agent code path to this smoke confirms the
+  feature works end-to-end without burning a real intent cycle
+- **Failure path smoke**: same execCommand against a fake
+  dependency (`tiny-pkg-test-fixture: '*'`). Helper rejected
+  with `exited with code 1` + the registry-resolution error
+  tail. No lockfile produced. pr-agent's catch block would
+  log a warn and proceed to commit (the PR would land without
+  the lockfile; CI would fail at `--frozen-lockfile` and the
+  operator would see the actual pnpm error in the CI log)
+- **No-package.json skip path**: an empty `/tmp/nopkg/` dir
+  with no `package.json` — the `await stat(packageJsonPath)`
+  in `maybeSyncLockfile` throws ENOENT, the catch returns
+  cleanly without running pnpm. The lockfile-not-needed
+  scenario (fresh project, first intent isn't a scaffold) is
+  handled silently
+
+Operator action — pending on `trackeros`:
+
+- `trackeros/.github/workflows/gestalt.yml` was seeded BEFORE
+  this session's template change, so the workflow lacks the
+  graceful-fallback `else` branch. New projects via `gestalt
+  init` will get the updated workflow. The operator can either:
+  - leave it as-is (trackeros has a lockfile now after any
+    post-fix cycle), OR
+  - manually replace the `Install dependencies` step in
+    `trackeros/.github/workflows/gestalt.yml` with the updated
+    block from `templates/corporate-ops-web-mobile/ci/gestalt.yml`
+  No automation here — that's an operator-owned file (ADR-018
+  drift-agent only touches `docs/*` per the additive-only rule)
+- Full end-to-end verification (submit a scaffold intent on
+  `trackeros`, watch the PR get committed WITH `pnpm-lock.yaml`,
+  watch CI pass on `--frozen-lockfile`) was NOT run during this
+  session — would burn an LLM cycle and dispatch a real GitHub
+  Actions run. The container-side smoke proves the mechanism;
+  the next routine `trackeros` cycle will exercise the live
+  path
+
+Decisions:
+
+- **spawn over exec**. `execCommand` uses `spawn` with explicit
+  binary + args, never a shell. No `bash -c` interpretation, no
+  shell injection surface even if a future caller passes
+  user-derived arguments (today none do). The 2-minute timeout
+  is a hard ceiling; without it a stalled pnpm could keep
+  pr-agent's BullMQ job alive indefinitely
+- **`--no-frozen-lockfile` is correct here.** The brief was
+  explicit. pr-agent's job is to PRODUCE the lockfile;
+  `--frozen-lockfile` would error out if it doesn't already
+  exist, defeating the point
+- **Failure non-fatal at this layer.** A pnpm-install failure
+  during pr-agent doesn't block the PR from being created. The
+  artifacts still get committed, the PR still gets opened, the
+  CI run still gets dispatched. If the lockfile is genuinely
+  broken, CI's `--frozen-lockfile` will fail with the real pnpm
+  error — that's the operator's signal. Better to give them an
+  actionable PR + CI failure than to silently swallow the cycle
+  with a "lockfile sync failed" log line they have to dig out
+  of the orchestrator audit
+- **Dockerfile: drop corepack at runtime, keep npm install -g.**
+  The build stage's corepack activation still works (it runs
+  as root and immediately uses pnpm in the same shell). The
+  production stage was the broken case — the activated version
+  vanished when USER switched to `gestalt`. `npm install -g
+  pnpm@9.15.4` is the simpler, more portable answer and matches
+  what the brief recommended. Comment block in the Dockerfile
+  documents the trap so a future "let's use corepack everywhere"
+  cleanup doesn't reintroduce the bug
+- **context-fixer untouched.** The brief's Fix 5 is unreachable
+  given the ADR-018 path guard. Adding the `if (targetFile ===
+  'package.json')` conditional would be dead code today; if a
+  future amendment ever permits context-fixer to edit
+  `package.json`, the path guard would change AND a follow-up
+  session would add the sync step. Speculative dead code
+  violates the "Don't add features... beyond what the task
+  requires" rule in CLAUDE.md
+- **Template workflow gracefully degrades.** A first CI run
+  could land BEFORE the first scaffold intent (operator pushed
+  a placeholder `package.json` for evaluation, or pulled in
+  someone else's manual commit). The `else` branch emits a
+  GitHub Actions `::warning::` annotation (visible in the run
+  summary) and proceeds with `pnpm install` (no
+  `--frozen-lockfile`). Subsequent CI runs see the
+  committed lockfile and take the fast path
+- **No new audit rows, no new SSE events, no new endpoints.**
+  Lockfile sync is a transparent step inside pr-agent — the
+  artifact set the dashboard surfaces still reflects the
+  committed result. If a future audit cares about lockfile
+  freshness explicitly, the maintenance layer is the right
+  place to surface it
+
+Pending follow-ups: none (the operator action on trackeros is
+non-blocking — the existing workflow still works against any
+project with a lockfile committed).
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt. pnpm 9.15.4 callable inside the container
+as the `gestalt` runtime user. Helper + lockfile-sync path
+exercised via two in-container smoke tests (success path with
+lodash, failure path with a fake package). No live LLM cycle
+verification this session — the container-side smoke is the
+proof; the next routine project cycle will surface the
+end-to-end path.

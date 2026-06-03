@@ -14,7 +14,7 @@
  * the intent to `failed`.
  */
 
-import { mkdtemp, mkdir, rm, writeFile } from 'fs/promises';
+import { mkdtemp, mkdir, rm, stat, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
 import { tmpdir } from 'os';
 import { simpleGit, type SimpleGit } from 'simple-git';
@@ -23,6 +23,7 @@ import {
 } from '@gestalt/core';
 import { resolvePipelineAdapter } from '../adapters/resolver';
 import { authenticatedGitUrl, branchNameFor } from './util';
+import { execCommand } from './exec';
 
 const log = createContextLogger({ module: 'pr-agent' });
 
@@ -86,6 +87,22 @@ export async function runPRAgent(input: PRAgentInput): Promise<PRAgentResult> {
       await mkdir(dirname(full), { recursive: true });
       await writeFile(full, artifact.content, 'utf8');
     }
+
+    // Sync the lockfile against the freshly-written package.json so the
+    // CI's `pnpm install --frozen-lockfile` step passes. Three cases:
+    //
+    //   1. Fresh project — code-agent scaffolded package.json; this run
+    //      creates pnpm-lock.yaml for the first time.
+    //   2. Dependency update — package.json gained/lost an entry; this
+    //      run rewrites the lockfile to match.
+    //   3. No package.json yet — skip (the dispatched intent was
+    //      something else; first `gestalt run` will scaffold one).
+    //
+    // Failure is non-fatal: pr-agent commits whatever lockfile state
+    // exists and pushes the PR. The dispatched CI run will surface a
+    // real lockfile mismatch (if any) — better there than blocking the
+    // PR from existing.
+    await maybeSyncLockfile(workDir, input.correlationId);
 
     await repo.addConfig('user.name', 'Gestalt Platform');
     await repo.addConfig('user.email', 'platform@gestalt.local');
@@ -174,6 +191,51 @@ function commitMessageFor(input: PRAgentInput): string {
   return intentLine
     ? `feat: ${intentLine} [gestalt ${input.correlationId.slice(0, 8)}]`
     : `feat: generated artifacts [gestalt ${input.correlationId.slice(0, 8)}]`;
+}
+
+/**
+ * Sync the project's `pnpm-lock.yaml` against `package.json` so the
+ * dispatched CI run's `pnpm install --frozen-lockfile` passes.
+ *
+ * Three skip paths:
+ *   - `package.json` is missing — no Node project yet, nothing to do.
+ *   - `pnpm` isn't on the runner — log a warning and proceed; the CI
+ *     will surface any actual mismatch.
+ *   - Install fails for any other reason (registry timeout, OOM, bad
+ *     manifest) — log a warning and proceed; CI is the source of
+ *     truth for "is this lockfile actually good".
+ *
+ * Skipping is intentional: a lockfile sync failure here is not worth
+ * blocking the PR from being created. The PR's CI run is the real
+ * verification.
+ */
+async function maybeSyncLockfile(workDir: string, correlationId: string): Promise<void> {
+  const packageJsonPath = join(workDir, 'package.json');
+  try {
+    await stat(packageJsonPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      log.info({ correlationId }, 'No package.json present — skipping pnpm install');
+      return;
+    }
+    log.warn({ err, correlationId }, 'Could not stat package.json — skipping pnpm install');
+    return;
+  }
+
+  log.info({ correlationId, workDir }, 'Running pnpm install to sync lockfile');
+  try {
+    // `--no-frozen-lockfile` — pr-agent's job is to PRODUCE a lockfile
+    // that matches the just-written package.json, not to enforce one.
+    // CI does the enforcement via `--frozen-lockfile` against the
+    // committed result.
+    await execCommand('pnpm', ['install', '--no-frozen-lockfile'], workDir);
+    log.info({ correlationId }, 'pnpm install completed');
+  } catch (err) {
+    log.warn(
+      { err: err instanceof Error ? err.message : String(err), correlationId },
+      'pnpm install failed — committing without lockfile update',
+    );
+  }
 }
 
 function bodyFor(input: PRAgentInput): string {

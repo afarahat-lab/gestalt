@@ -47,7 +47,13 @@ jobs:
       - name: Install dependencies
         run: |
           if [ -f package.json ]; then
-            pnpm install --frozen-lockfile
+            if [ -f pnpm-lock.yaml ]; then
+              pnpm install --frozen-lockfile
+            else
+              echo "::warning::pnpm-lock.yaml not found. Run a scaffold intent first so pr-agent generates the lockfile."
+              echo "Attempting install without --frozen-lockfile so this CI run can still proceed..."
+              pnpm install
+            fi
           else
             echo "No package.json found — skipping install (run gestalt run to scaffold the project)"
           fi

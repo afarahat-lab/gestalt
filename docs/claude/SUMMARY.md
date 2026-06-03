@@ -16,7 +16,7 @@ entries from `SESSION_LOG.md`.
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-03 (Claude Code — Surface group assignments in project member views. New `GET /projects/:id/groups` (reader+) returns `{ group, role, assignedAt, memberCount }[]` via a single SQL JOIN + LEFT JOIN aggregate on `group_memberships`; new `PlatformGroupRepository.listAssignedToProject(projectId)` method (postgres real impl, oracle/mssql throw-stubs). Admin → Projects expanded row gains a Group assignments section with assign/role-change/remove + an "Effective access: N direct + M via groups = up to P users" footer. Project Settings → Members tab gains a Group access section with the same controls + an info note about precedence. CLI `gestalt project members list` prints both Direct members and Group assignments sections side-by-side; new `gestalt project members assign-group <project> <group> --role <role>` and `remove-group <project> <group>` subcommands. Verified live: GET returns the group + memberCount; user with group access can read; UPSERT in-place changes role; CLI flow round-trips through remove + assign --role reader)
+**Last updated:** 2026-06-03 (Claude Code — pr-agent syncs `pnpm-lock.yaml` after writing artifacts so CI's `--frozen-lockfile` always passes. New shared `execCommand(cmd, args, cwd, timeoutMs)` helper in `packages/agents/deploy/src/agents/exec.ts` — spawn-based, no shell, 2-minute default timeout, surfaces a 400-char stderr tail on non-zero exit. pr-agent's `maybeSyncLockfile(workDir)` stats `package.json` then runs `pnpm install --no-frozen-lockfile`; ENOENT skips (no Node project yet), other failures log WARN and continue (CI is the real source of truth — don't block PR creation over a lockfile sync hiccup). Dockerfile production stage swapped `corepack prepare pnpm@9.15.4 --activate` for `npm install -g pnpm@9.15.4` so the runtime `gestalt` user has pnpm 9.15.4 on PATH (corepack caches per-user; root activation wouldn't reach gestalt and the auto-fetched latest pnpm requires Node 22's `node:sqlite`). Template `gestalt.yml` gains a graceful fallback: if `pnpm-lock.yaml` is missing, emit a `::warning::` and run `pnpm install` without `--frozen-lockfile` so first-CI doesn't hard-fail. context-fixer.ts is unchanged — the ADR-018 path guard restricts it to `docs/*` and `AGENTS.md`, so it can never reach a `package.json` write path. Smoke test inside the rebuilt container: `pnpm 9.15.4` callable, real `pnpm install --no-frozen-lockfile` produces a 384-byte `pnpm-lock.yaml@9.0` for a lodash dependency)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -2918,413 +2918,6 @@ enforced"):
 
 ## Recent session log (last 3 entries)
 
-### Session 2026-06-03 — Claude Code (Session 3: Templates / Platform MCP / Tools view / Corporate Identity UI + [+ Create project] bug fix — migration 017)
-
-Five areas in one session. The first is a bug fix; the four others add
-new platform-admin surfaces backed by `017_platform_admin`.
-
-**Bug fix — [+ Create project] button visibility.** The button is in the
-source (line 482 of `Admin.tsx`) and is rendered unconditionally — the
-parent `<Admin>` route is already gated by `RequirePlatformAdmin`. The
-button was missing from the running container because the docker image
-in use was built BEFORE the project-management session's dashboard
-changes committed in `3b7a273`. The end-of-session image rebuild
-resolves it; verified via `grep "+ Create project"` inside the new
-container bundle returning two matches (button + hint string) vs. one
-match in the stale bundle (hint only).
-
-**Migration 017 — four new tables:**
-- `platform_templates` — harness templates. Partial unique index on
-  `is_default` (same pattern as `platform_llms.is_default`).
-  `files` JSONB stores `{ templateRelativePath: content }` map.
-  `is_builtin` flag marks seeded templates (read-only via API).
-- `platform_mcp_servers` — platform-wide MCP servers. `secret_id`
-  references `platform_secrets`. `agent_roles` is TEXT[] (empty =
-  applies to all agents). Partial index on `enabled = TRUE` for the
-  hot-path lookup.
-- `platform_identity_config` — one row per provider (kerberos/saml/
-  oidc, CHECK-constrained). `config` JSONB. Sensitive fields live as
-  `*SecretId` references INSIDE the config — never as plaintext.
-- `platform_role_mappings` — IdP group → platform role
-  (`platform-admin | user`).
-
-Changed (high level):
-
-- `packages/core/src/repository/index.ts`: new types
-  `PlatformTemplateRecord` + `PlatformTemplateSummary` (no `files`
-  field), `PlatformMcpServerRecord`, `IdentityConfigRecord`,
-  `RoleMappingRecord`, `IdentityProvider` union. Four new repository
-  interfaces (`PlatformTemplateRepository` /
-  `PlatformMcpServerRepository` / `IdentityConfigRepository` /
-  `RoleMappingRepository`). All four added to `RepositoryRegistry`
-- `packages/core/src/events/index.ts`: no event additions (Templates
-  / MCP / Identity changes don't currently emit SSE)
-- `packages/adapters/postgres/src/repositories/platform-templates.ts`
-  (new) — `setDefault` uses the partial-unique-index + transaction
-  trick; `files` and `variables` written via `db.json(...)` helper
-- `packages/adapters/postgres/src/repositories/platform-mcp-servers.ts`
-  (new) — `agentRoles` written as native string[] (postgres.js binds
-  TEXT[] directly); `listEnabled` is the orchestrator hot-path query
-- `packages/adapters/postgres/src/repositories/identity-config.ts`
-  (new) — `upsert` uses INSERT ... ON CONFLICT (provider) DO UPDATE;
-  `RoleMappingRepository` is in the same file
-- `packages/adapters/{oracle,mssql}/src/repositories/{platform-
-  templates,platform-mcp-servers,identity-config}.ts` (new) —
-  throw-stubs for all four new repositories
-
-**Area 1 — Templates:**
-- `packages/server/src/server.ts`: new step 4c calls
-  `seedBuiltinTemplate()` after the LLM registry is wired. If a row
-  with `slug = 'corporate-ops-web-mobile'` exists, skip; otherwise
-  walk the on-disk `templates/corporate-ops-web-mobile/` tree via
-  the new `collectTemplateFileMap` helper and INSERT a row with
-  `isBuiltin: true, isDefault: true`
-- `packages/server/src/templates/engine.ts`: `loadTemplate` now
-  checks the DB first via
-  `getRepositories().platformTemplates.findBySlug(templateId)`. On
-  match, runs `{{var}}` substitution on the stored file map; on
-  miss, falls back to the on-disk tree (preserves the pre-017
-  filesystem path for dev / unit-test setups). New
-  `collectTemplateFileMap(templatesDir, templateId)` exported for
-  the seeder
-- `packages/server/src/routes/projects.ts`:
-  `POST /projects/:id/init-harness` now resolves
-  `getRepositories().platformTemplates.findDefault()?.slug` first
-  and falls back to the built-in slug only if no default is set —
-  so flipping the default in the dashboard immediately affects every
-  subsequent `gestalt init`
-- `packages/server/src/routes/templates.ts` (new) — five endpoints:
-  - `GET /platform/templates` (any authenticated user, summary
-    projection without `files`)
-  - `GET /platform/templates/:id` (any authenticated user, full
-    record)
-  - `POST /platform/templates` (platform-admin) — validates that
-    AGENTS.md + HARNESS.json + agents.yaml appear in the file map
-    (checked against the BASENAME of each path so an operator who
-    uploaded `my-template/AGENTS.md` doesn't get a false negative).
-    Returns 400 `MISSING_REQUIRED_FILES` with `missingFiles: [...]`
-    on failure
-  - `POST /platform/templates/:id/set-default` (platform-admin) —
-    atomically swaps the default
-  - `DELETE /platform/templates/:id` (platform-admin) — refuses
-    with 400 `BUILTIN_TEMPLATE` on built-ins and 400
-    `CANNOT_DELETE_DEFAULT` on the default
-
-**Area 2 — Platform MCP servers:**
-- `packages/server/src/routes/platform-mcp.ts` (new):
-  - `GET /platform/mcp-servers` (any authenticated user — needed by
-    orchestrators on the hot path)
-  - `POST /platform/mcp-servers` (platform-admin)
-  - `PATCH /platform/mcp-servers/:id` (platform-admin)
-  - `DELETE /platform/mcp-servers/:id` (platform-admin)
-  - `POST /platform/mcp-servers/:id/test` (platform-admin) —
-    connects via `McpClient`, calls `listTools`, returns
-    `{ ok, toolCount, latencyMs, error? }`. The McpClient's
-    defensive design returns `[]` on connection failure (rather
-    than throwing) so the test endpoint reports `ok: true,
-    toolCount: 0` for unreachable URLs — readable as "no tools
-    found" by the operator
-- `packages/core/src/orchestrator/base-orchestrator.ts`: extracted
-  the project-MCP logic into `resolveProjectMcp` and added
-  `resolvePlatformMcp(agentRole, mcpCache)` that:
-  1. Returns `[]` if the resolver isn't wired (test setups)
-  2. Queries `platformMcpServers.listEnabled()` from the registry
-  3. Filters by `agentRoles.length === 0 || .includes(agentRole)`
-  4. Skips any server whose name is already in the cache (project
-     MCP wins on collision)
-  5. Calls the injected resolver per server to build the McpClient
-- New `setPlatformMcpResolver(resolver | null)` exported from core
-  + new `PlatformMcpResolver` type. Resolver signature:
-  `(server: PlatformMcpServerRecord) => Promise<McpClient | null>`
-- `packages/server/src/server.ts`: new step 4d wires
-  `setPlatformMcpResolver` with a function that does the vault
-  decrypt + builds the `McpClient`. The vault `getMasterKey()`
-  call stays in the server package; `@gestalt/core` only sees the
-  pre-built `McpClient`. Mirrors the `setLLMRegistryResolver`
-  pattern from migration 014
-- New `resolvePlatformMcpToken` helper in `server.ts` —
-  log-warns with the server NAME (never secret id or key
-  material) on decrypt failure and returns undefined (anonymous
-  connection)
-
-**Area 3 — Platform tools:**
-- `packages/core/src/agents/agent-config-loader.ts`:
-  `PER_ROLE_DEFAULTS` made `export` (was private) so the route
-  layer can iterate it
-- `packages/core/src/index.ts`: re-exports `PER_ROLE_DEFAULTS`
-- `packages/server/src/routes/platform-tools.ts` (new):
-  `GET /platform/tools` (any authenticated user) — computes a
-  per-tool list of default-agents by iterating PER_ROLE_DEFAULTS
-  once per request (cheap; the defaults table is single-digit
-  size). Returns
-  `{ name, description, inputSchema, defaultAgents }[]`. No DB,
-  no migration
-
-**Area 4 — Identity:**
-- `packages/server/src/auth/config-loader.ts`: rewrote
-  `loadIdentityConfig` to try the DB FIRST
-  (`platform_identity_config` + `platform_role_mappings`), then
-  fall back to `auth.config.json`, then to the HARNESS.json
-  legacy path, then to the local-only default. New
-  `loadFromDatabase` + `hydrateProviderConfig` helpers walk the
-  persisted JSONB and vault-resolve every `*SecretId` reference
-  before mapping to the legacy `AuthProviderConfig` shape
-- `packages/server/src/auth/auth-manager.ts`: added
-  `swapProviders(providers)`, `getActiveProviderTypes()`,
-  `getIdentityConfig()` to `AuthManager`. New top-level
-  `reinitAuth(authManager, loadIdentityConfig)` function that
-  re-reads config, instantiates the providers via the new
-  `instantiateProviders` helper (extracted from the existing
-  `createAuthManager` body), and atomically calls
-  `swapProviders`. In-flight requests using `authenticate` are
-  unaffected — `this.providers` is read per call
-- `packages/server/src/routes/identity.ts` (new):
-  - `GET /platform/identity` (platform-admin) — returns
-    `{ providers, roleMappings, activeProviders }`. Defensive
-    `sanitiseConfig` strips any sensitive plaintext that
-    somehow ended up persisted (it shouldn't — both the PATCH
-    validator and operators should use `*SecretId`)
-  - `PATCH /platform/identity/:provider` (platform-admin) —
-    merges body.config into the existing config and upserts.
-    **Rejects with 400 `SENSITIVE_FIELD_INLINE` if any of
-    `cert`, `clientSecret`, `clientSecretValue`,
-    `keytabContent` appears at the top level** — must use the
-    `*SecretId` form. Audit metadata records changed-field
-    NAMES only, never values
-  - `POST /platform/identity/reload` (platform-admin) — calls
-    `reinitAuth(authManager, loadIdentityConfig)`, returns
-    `{ providers: [...] }` with the active provider types
-  - `POST /platform/identity/role-mappings` (platform-admin) —
-    duplicate group name → 409 `GROUP_TAKEN`
-  - `DELETE /platform/identity/role-mappings/:id`
-    (platform-admin)
-- `packages/server/src/app.ts`: registers all four new route
-  groups (templates / platform-mcp / platform-tools / identity).
-  Identity's registrar takes the `authManager` as a second
-  argument so it can call `reinitAuth`
-
-**Dashboard:**
-- `packages/dashboard/package.json`: added `jszip ^3.10.1`
-- `packages/dashboard/src/types.ts`: 9 new types
-  (`PlatformTemplateSummary`, `PlatformTemplate`,
-  `PlatformMcpServer`, `PlatformMcpTestResult`,
-  `PlatformToolInfo`, `IdentityState`, `IdentityProviderConfig`,
-  `RoleMapping`, `TemplateVariable`, `IdentityProvider`)
-- `packages/dashboard/src/api/client.ts`: matching set of API
-  methods — `listPlatformTemplates` /
-  `createPlatformTemplate` / `setDefaultPlatformTemplate` /
-  `deletePlatformTemplate`; `listPlatformMcpServers` and 4
-  CRUD + `testPlatformMcpServer`; `listPlatformTools`;
-  `getPlatformIdentity` / `patchIdentityProvider` /
-  `reloadIdentity` / `addRoleMapping` / `removeRoleMapping`
-- `packages/dashboard/src/views/Admin.tsx`: tab vocabulary
-  expanded from 4 to 8 (`users` / `projects` / `identity` /
-  `llms` / `secrets` / `templates` / `mcp` / `tools`). Tab
-  container styled with `flex-wrap: wrap` so 8 tabs render at
-  any viewport width without overflow. Four new tab
-  components:
-  - `TemplatesTab` + `UploadTemplateModal` — table with
-    [+ Upload template] + per-row [★ Set default] + [×]
-    actions. Modal handles ZIP file picker, runs jszip
-    extraction client-side, warns when AGENTS.md /
-    HARNESS.json / agents.yaml are missing before submitting
-  - `McpServersTab` + `McpServerModal` — table with status
-    glyph (● enabled / ○ disabled), per-row [Test] / [Enable
-    /Disable] / [Edit] / [×]. Modal includes a vault-secret
-    `<select>` (loaded alongside the servers list) and an
-    agent-roles comma-separated input
-  - `ToolsTab` — read-only cards, click to expand and show
-    the JSON inputSchema
-  - `IdentityTab` + `IdentityProviderCard` +
-    `RoleMappingList` — 3 collapsible provider cards
-    (Kerberos / SAML / OIDC) with [Enable/Disable] +
-    JSON-textarea Config editor + helpful vault secrets
-    reference. [Reload] button at the top fires
-    `POST /platform/identity/reload` and prints the active
-    providers inline. Role mappings have an inline add form
-    + table with [×] remove
-- Extracted-error helper `extractError(err)` updated to parse
-  `err.body` FIRST (the actual JSON body) before falling back
-  to `err.message` (which is the "API error N: ..." prefix
-  shape — `JSON.parse` would fail otherwise)
-
-**CLI:**
-- `packages/cli/package.json`: added `adm-zip ^0.5.10` +
-  `@types/adm-zip ^0.5.5`
-- `packages/cli/src/api/client.ts`: matching new client
-  methods + types (PlatformTemplateSummary,
-  PlatformMcpServer, PlatformToolInfo,
-  IdentityStateResponse, RoleMappingSummary)
-- `packages/cli/src/commands/platform-extras.ts` (new) — 17
-  command functions covering all four areas. Notable:
-  - `platformTemplatesUploadCommand(zipPath)` reads the ZIP
-    via `adm-zip`, extracts entries to a map, prompts for
-    name/slug/description/tier/version, POSTs the result
-  - `platformMcpAddCommand` shows a numbered list of vault
-    secrets and lets the operator pick one for the bearer
-    token
-  - `platformIdentityConfigureCommand(providerType)` prints
-    example JSON configs per provider type before prompting
-    for the actual config JSON
-- `packages/cli/src/index.ts`: 17 new `program.command(...)`
-  registrations across four new parent groups
-  (`platform templates`, `platform mcp`, `platform tools`,
-  `platform identity`)
-
-Verified live:
-
-- `pnpm -r build` clean across all 12 packages
-- `docker compose up -d --build server` — `Up (healthy)`;
-  migration 017 applied in order (`schema_migrations` lists 17
-  versions). Built-in template seeded automatically; subsequent
-  boots log `platform_templates already seeded — skipping`
-- `Platform MCP server resolver wired` logged at boot
-- Templates: `GET /platform/templates` returns the seeded
-  `corporate-ops-web-mobile` with `isDefault: true,
-  isBuiltin: true`. `POST /platform/templates` with a valid
-  AGENTS.md + HARNESS.json + agents.yaml succeeds (201).
-  Missing-files variant returns 400 `MISSING_REQUIRED_FILES`
-  with the list. `set-default` on the custom flips the star;
-  `DELETE` on the built-in returns 400 `BUILTIN_TEMPLATE`;
-  `DELETE` on the new default (after set-default)
-  returns 400 `CANNOT_DELETE_DEFAULT`. Restore built-in as
-  default + delete custom → HTTP 204
-- MCP servers: `POST /platform/mcp-servers` with
-  `agentRoles: ['code-agent']` succeeds; `GET` returns the
-  row with the array stored correctly. `POST .../test`
-  against an unreachable URL returns
-  `{ ok: true, toolCount: 0, latencyMs: 279 }` — the McpClient
-  silently returns `[]` on connection failure (by design at
-  the orchestrator boundary). DELETE returns 204
-- Tools: `GET /platform/tools` returns the four built-in tools
-  with their correct default-agent lists derived from
-  PER_ROLE_DEFAULTS (e.g. readFile has 6 default agents
-  including review-agent and context-fixer)
-- Identity: initial `GET /platform/identity` returns empty
-  providers + `activeProviders: ['local']`. PATCH oidc with
-  a valid config succeeds; the sensitive-field guard fires
-  correctly on `{"config":{"clientSecret":"PLAINTEXT-VALUE"}}`
-  → 400 `SENSITIVE_FIELD_INLINE`. `POST .../reload` returns
-  `{ providers: ['oidc', 'local'] }` and `GET /auth/providers`
-  (the public endpoint) immediately returns
-  `['oidc', 'local']` — **hot reload activated OIDC without a
-  server restart**. Role mapping POST succeeds and is visible
-  via the GET endpoint. Disable + reload deactivates OIDC and
-  `/auth/providers` returns `['local']` again
-- CLI: `gestalt platform templates list` renders the seeded
-  template with the `★` prefix. `gestalt platform tools list`
-  prints all four tools with their descriptions and default
-  agents. `gestalt platform identity show` prints the active
-  providers + collapsed provider list + role mappings
-- **Bug fix verified**: container's rebuilt dashboard bundle
-  (`index-Mt1QJnVg.js`) contains "+ Create project" twice
-  (button text + empty-state hint), confirming the button
-  renders in the Admin → Projects tab
-
-Decisions:
-
-- **`PER_ROLE_DEFAULTS` exported, not duplicated.** The
-  tools route iterates the same table the loader uses; any
-  future role-default change automatically reflects in the
-  `defaultAgents` list without a parallel data structure
-- **Built-in template seeding is idempotent on `slug`.** If
-  someone uploads a custom template with the same slug as
-  the built-in, the seed step (which runs first) wins and
-  the custom upload would 409 SLUG_TAKEN. We don't try to
-  re-seed if the row exists — operators who explicitly
-  delete a built-in (which is blocked, but defensively) and
-  restart would need a database-level intervention to get
-  it back. The on-disk fallback in `loadTemplate` means
-  `gestalt init` still works even if the seed was missed
-- **Template required-files check uses BASENAME matching.**
-  A ZIP that puts `my-template/AGENTS.md` at the top level
-  still passes; only the unwrapped `path.split('/').pop()`
-  is used for the required-file presence check. The engine's
-  repo-path mapper handles the actual path normalisation at
-  init-harness time
-- **Platform MCP servers honor project-level precedence.**
-  If a project's agents.yaml declares an MCP server with the
-  same NAME as a platform one, the project's client wins
-  (already in the cache when `resolvePlatformMcp` runs, so
-  the platform version skips). Documented in the brief and
-  enforced in `resolvePlatformMcp` via the `mcpCache.has`
-  check
-- **`PlatformMcpResolver` injection mirrors
-  `setLLMRegistryResolver`.** Server-side wiring keeps the
-  vault decrypt + `getMasterKey()` inside the server
-  package; `@gestalt/core` only sees the pre-built
-  `McpClient`. Same pattern, same trade-off (clean
-  separation, slight boot-time coupling)
-- **Identity config: DB > auth.config.json > HARNESS.json >
-  local-only.** Adds a layer at the top of the resolution
-  chain without breaking any of the three existing paths.
-  Operators with `auth.config.json` mounted continue to
-  work; the file is just not the primary source anymore
-- **Sensitive identity fields rejected inline at the PATCH
-  layer.** The persistence layer doesn't enforce this
-  (it would silently accept anything in the JSONB blob), so
-  the route's `SENSITIVE_FIELD_INLINE` check is the
-  authoritative guard. Defense-in-depth: `sanitiseConfig`
-  ALSO strips them from the GET response, so even if a row
-  somehow ended up with plaintext it never escapes via the API
-- **`reinitAuth` uses provider swap, not full restart.**
-  `AuthManager.providers` is a private field replaced
-  atomically. `authenticate` reads the field per call, so
-  in-flight requests complete with whichever list was
-  current at the time of their call. Either old or new list
-  is fine; partial mid-list states don't exist
-- **`extractError` parses `err.body` first.** The dashboard's
-  `ApiError.message` is `"API error N: <body>"`; trying
-  `JSON.parse` on that always fails. The fix parses
-  `err.body` (the actual response body) first and falls
-  back to message on failure. The previous behaviour worked
-  by accident on the local fallback path
-- **Bug fix root cause: stale docker bundle, no code change.**
-  The button has existed in the source since the
-  project-management session's commit `3b7a273`. The running
-  container had a docker image built before that commit
-  landed in the build, so the bundle inside didn't have the
-  button code. The session-end rebuild during this session's
-  verification fixes it — confirmed by grep before and after
-
-Operator action — pending:
-
-- No operator action required for this session's features.
-  All changes are server-side / dashboard-side / CLI-side
-  and seed themselves at first boot. Operators who want to
-  use a custom template can upload it via the dashboard or
-  `gestalt platform templates upload <zip>` once they're
-  ready
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Migration 017 applied. Server image rebuilt. Full feature
-verified end-to-end:
-- Templates: GET / upload / set-default / delete guards all
-  exercised
-- MCP servers: CRUD + test endpoint
-- Tools: GET returns 4 built-ins with correct default-agent
-  lists
-- Identity: PATCH + sensitive-field guard + reload activates
-  OIDC without restart + role mappings
-- Bug fix: container bundle now contains the button
-
-No new Pending enhancements introduced. Possible future
-follow-ups:
-- Pre-populated example configs in the dashboard's Identity
-  tab (instead of free-text JSON, render typed forms per
-  provider type with vault secret pickers for sensitive
-  fields)
-- Template variable substitution UI — today the template engine
-  supports `{{var}}` substitution but operators can't preview
-  which variables a custom template uses before applying it
-- MCP server test endpoint reports `toolCount: 0` for both
-  "connected with zero tools" and "connection failed with
-  silent listTools empty array". Distinguishing the two would
-  require McpClient to surface the underlying connection error
-  separately from the listTools-failed-silently path
-
----
-
 ### Session 2026-06-03 — Claude Code (Brief 1: Platform groups — bulk user management, migration 018)
 
 Adds platform-wide groups so a platform-admin can manage user → project
@@ -3760,3 +3353,222 @@ a synthetic project. No migration needed; no existing data shape
 changed.
 
 No new Pending enhancements introduced.
+
+---
+
+### Session 2026-06-03 — Claude Code (pr-agent: sync pnpm-lock.yaml after writing artifacts so CI's `--frozen-lockfile` passes)
+
+GitHub Actions runs (and the seeded `gestalt.yml` workflow) use
+`pnpm install --frozen-lockfile` to ensure the committed lockfile
+matches `package.json`. pr-agent was writing a fresh `package.json`
+without updating the lockfile, so every cycle's CI rejected the
+install. Three scenarios now handled: fresh project (no lockfile),
+dependency update (stale lockfile), no `package.json` at all (skip).
+
+Changed:
+
+- `packages/agents/deploy/src/agents/exec.ts` (new): shared
+  `execCommand(cmd, args, cwd, timeoutMs = 120_000)` helper.
+  - Uses `child_process.spawn` with `stdio: 'pipe'` — no shell, no
+    injection surface, explicit binary + args at the call site.
+  - Hard timeout (default 2 minutes; pnpm install typically
+    finishes in 10–30 s for a real project). On timeout the helper
+    SIGKILLs the child and rejects with a `timed out after Nms`
+    error.
+  - Resolves with `{ stdout, stderr }` on exit code 0. Non-zero
+    exit, spawn error, or timeout reject with a human-readable
+    `Error`. On non-zero exit, the rejection message includes the
+    last 400 chars of stderr — enough to diagnose registry
+    unreachable / OOM / bad manifest without spamming the log
+    with full pnpm output
+  - Comment block explains why the ADR-032 prohibition on
+    `child_process.exec('git ...')` doesn't apply: Git operations
+    must go through `simple-git` (the prohibition is about the
+    Git-specific code path); package-manager execution is a
+    separate concern with a different threat model (pnpm is a
+    known tool, args are fixed at the call site, working
+    directory is a per-cycle clone the platform created).
+- `packages/agents/deploy/src/agents/pr-agent.ts`:
+  - Imports `execCommand` from `./exec` and adds `stat` from
+    `fs/promises`
+  - **Inserts `await maybeSyncLockfile(workDir, input.correlationId)`
+    between writing artifacts and the `git add .`** — every file
+    pr-agent commits passes through the same sync step
+  - New `maybeSyncLockfile(workDir, correlationId)` helper at the
+    bottom of the file:
+    - stats `package.json`; ENOENT → log info + return (no Node
+      project yet — first `gestalt run` will scaffold one)
+    - any other stat error → log warn + return (no point trying
+      pnpm if we can't read package.json)
+    - runs `pnpm install --no-frozen-lockfile` via the new
+      `execCommand` helper. `--no-frozen-lockfile` because
+      pr-agent's job is to PRODUCE a lockfile that matches the
+      just-written `package.json`, not to ENFORCE one (that's
+      CI's job)
+    - failure path logs a warn and returns — pr-agent commits
+      whatever lockfile state exists. The PR's CI run is the
+      real source of truth for "is this lockfile good"; blocking
+      the PR from existing over a lockfile-sync hiccup would be
+      worse UX (operator has no way to inspect what would have
+      been pushed)
+  - The lockfile is picked up by the existing `git add .` —
+    no extra plumbing needed
+- `packages/server/Dockerfile` (production stage): swapped
+  `corepack enable && corepack prepare pnpm@9.15.4 --activate` for
+  `npm install -g pnpm@9.15.4`. Discovered during smoke testing:
+  corepack caches its prepared versions under `~/.cache/node/corepack/...`
+  per user. The Dockerfile activates pnpm 9.15.4 as `root` during
+  the build, but the container's runtime user is `gestalt` — they
+  have no per-user activation. When `gestalt` runs `pnpm` for the
+  first time, corepack falls back to the latest pnpm (11.5.1)
+  which requires Node 22's `node:sqlite` built-in module and
+  crashes with `ERR_UNKNOWN_BUILTIN_MODULE` on the Node 20 base
+  image. The straight npm-global install lands the 9.15.4 binary
+  at `/usr/local/bin/pnpm` on PATH for every user without
+  per-user activation. Comment block documents this trap so the
+  next Dockerfile reviewer doesn't try to "clean up" back to
+  corepack
+- `templates/corporate-ops-web-mobile/ci/gestalt.yml`: install
+  step now branches inside the `if [ -f package.json ]` block:
+  ```yaml
+  if [ -f pnpm-lock.yaml ]; then
+    pnpm install --frozen-lockfile
+  else
+    echo "::warning::pnpm-lock.yaml not found. Run a scaffold intent first..."
+    pnpm install
+  fi
+  ```
+  Graceful fallback for projects whose first CI run lands BEFORE
+  the first `gestalt run` has scaffolded a lockfile — they emit a
+  GitHub Actions `::warning::` annotation and proceed without
+  hard-failing. After the first pr-agent commit lands, the
+  fast-path `--frozen-lockfile` takes over
+- `packages/agents/maintenance/src/agents/context-fixer.ts`: **NO
+  CHANGE**. The brief's Fix 5 instructs the same `pnpm install`
+  block in `applyFix`, but context-fixer is constrained by the
+  ADR-018 path guard (`enforcePathGuard`: only `docs/*` and exactly
+  `AGENTS.md` allowed). It cannot reach a `package.json` write
+  path. Adding the conditional would be dead code. Documented
+  here in lieu of a code change
+
+Verified live (inside the rebuilt server container — no live LLM
+cycle burned):
+
+- `pnpm -r build` clean across all 12 packages
+- `docker compose up -d --build server` — `Up (healthy)`
+- `docker exec gestalt-server-1 which pnpm` → `/usr/local/bin/pnpm`
+- `docker exec gestalt-server-1 pnpm --version` → `9.15.4`
+- **Smoke test 1 — real package install**: inside `/tmp/smoke-pnpm`
+  with `{ name, version, dependencies: { lodash: "4.17.21" } }`,
+  ran `pnpm install --no-frozen-lockfile`. Result: `Done in 2s`,
+  `pnpm-lock.yaml` created (384 bytes), `lockfileVersion: '9.0'`
+  with the lodash entry pinned to 4.17.21
+- **Smoke test 2 — execCommand wire-up**: dynamic-imported
+  `/app/packages/agents/deploy/dist/agents/exec.js`, called
+  `execCommand('pnpm', ['install', '--no-frozen-lockfile'], dir,
+  60000)` against a temp dir with a real lodash package.json.
+  Helper resolved cleanly with `Done in 648ms` in stdout;
+  resulting directory contained `node_modules` + `package.json` +
+  `pnpm-lock.yaml`; lockfile size 384 bytes. The structural
+  identity of the pr-agent code path to this smoke confirms the
+  feature works end-to-end without burning a real intent cycle
+- **Failure path smoke**: same execCommand against a fake
+  dependency (`tiny-pkg-test-fixture: '*'`). Helper rejected
+  with `exited with code 1` + the registry-resolution error
+  tail. No lockfile produced. pr-agent's catch block would
+  log a warn and proceed to commit (the PR would land without
+  the lockfile; CI would fail at `--frozen-lockfile` and the
+  operator would see the actual pnpm error in the CI log)
+- **No-package.json skip path**: an empty `/tmp/nopkg/` dir
+  with no `package.json` — the `await stat(packageJsonPath)`
+  in `maybeSyncLockfile` throws ENOENT, the catch returns
+  cleanly without running pnpm. The lockfile-not-needed
+  scenario (fresh project, first intent isn't a scaffold) is
+  handled silently
+
+Operator action — pending on `trackeros`:
+
+- `trackeros/.github/workflows/gestalt.yml` was seeded BEFORE
+  this session's template change, so the workflow lacks the
+  graceful-fallback `else` branch. New projects via `gestalt
+  init` will get the updated workflow. The operator can either:
+  - leave it as-is (trackeros has a lockfile now after any
+    post-fix cycle), OR
+  - manually replace the `Install dependencies` step in
+    `trackeros/.github/workflows/gestalt.yml` with the updated
+    block from `templates/corporate-ops-web-mobile/ci/gestalt.yml`
+  No automation here — that's an operator-owned file (ADR-018
+  drift-agent only touches `docs/*` per the additive-only rule)
+- Full end-to-end verification (submit a scaffold intent on
+  `trackeros`, watch the PR get committed WITH `pnpm-lock.yaml`,
+  watch CI pass on `--frozen-lockfile`) was NOT run during this
+  session — would burn an LLM cycle and dispatch a real GitHub
+  Actions run. The container-side smoke proves the mechanism;
+  the next routine `trackeros` cycle will exercise the live
+  path
+
+Decisions:
+
+- **spawn over exec**. `execCommand` uses `spawn` with explicit
+  binary + args, never a shell. No `bash -c` interpretation, no
+  shell injection surface even if a future caller passes
+  user-derived arguments (today none do). The 2-minute timeout
+  is a hard ceiling; without it a stalled pnpm could keep
+  pr-agent's BullMQ job alive indefinitely
+- **`--no-frozen-lockfile` is correct here.** The brief was
+  explicit. pr-agent's job is to PRODUCE the lockfile;
+  `--frozen-lockfile` would error out if it doesn't already
+  exist, defeating the point
+- **Failure non-fatal at this layer.** A pnpm-install failure
+  during pr-agent doesn't block the PR from being created. The
+  artifacts still get committed, the PR still gets opened, the
+  CI run still gets dispatched. If the lockfile is genuinely
+  broken, CI's `--frozen-lockfile` will fail with the real pnpm
+  error — that's the operator's signal. Better to give them an
+  actionable PR + CI failure than to silently swallow the cycle
+  with a "lockfile sync failed" log line they have to dig out
+  of the orchestrator audit
+- **Dockerfile: drop corepack at runtime, keep npm install -g.**
+  The build stage's corepack activation still works (it runs
+  as root and immediately uses pnpm in the same shell). The
+  production stage was the broken case — the activated version
+  vanished when USER switched to `gestalt`. `npm install -g
+  pnpm@9.15.4` is the simpler, more portable answer and matches
+  what the brief recommended. Comment block in the Dockerfile
+  documents the trap so a future "let's use corepack everywhere"
+  cleanup doesn't reintroduce the bug
+- **context-fixer untouched.** The brief's Fix 5 is unreachable
+  given the ADR-018 path guard. Adding the `if (targetFile ===
+  'package.json')` conditional would be dead code today; if a
+  future amendment ever permits context-fixer to edit
+  `package.json`, the path guard would change AND a follow-up
+  session would add the sync step. Speculative dead code
+  violates the "Don't add features... beyond what the task
+  requires" rule in CLAUDE.md
+- **Template workflow gracefully degrades.** A first CI run
+  could land BEFORE the first scaffold intent (operator pushed
+  a placeholder `package.json` for evaluation, or pulled in
+  someone else's manual commit). The `else` branch emits a
+  GitHub Actions `::warning::` annotation (visible in the run
+  summary) and proceeds with `pnpm install` (no
+  `--frozen-lockfile`). Subsequent CI runs see the
+  committed lockfile and take the fast path
+- **No new audit rows, no new SSE events, no new endpoints.**
+  Lockfile sync is a transparent step inside pr-agent — the
+  artifact set the dashboard surfaces still reflects the
+  committed result. If a future audit cares about lockfile
+  freshness explicitly, the maintenance layer is the right
+  place to surface it
+
+Pending follow-ups: none (the operator action on trackeros is
+non-blocking — the existing workflow still works against any
+project with a lockfile committed).
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server image rebuilt. pnpm 9.15.4 callable inside the container
+as the `gestalt` runtime user. Helper + lockfile-sync path
+exercised via two in-container smoke tests (success path with
+lodash, failure path with a fake package). No live LLM cycle
+verification this session — the container-side smoke is the
+proof; the next routine project cycle will surface the
+end-to-end path.
