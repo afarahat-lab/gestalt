@@ -139,6 +139,51 @@ openssl rand -hex 64
 openssl rand -hex 32
 ```
 
+### Generate the master key for the encrypted secrets vault
+
+The platform's secrets vault (Session 4, migration 015) encrypts API
+keys at rest with AES-256-GCM. The encryption key — the **master key** —
+is loaded once at server startup and is required for any secret
+operation. In production, a missing master key is a **fatal startup
+error**.
+
+```bash
+# Generate a 32-byte master key, base64-encoded (256 bits — required
+# size for AES-256). Keep this file out of version control.
+openssl rand -base64 32 > master.key
+chmod 600 master.key
+```
+
+Then expose it to the server with one of these mechanisms (the server
+checks them in this order):
+
+1. `GESTALT_MASTER_KEY` environment variable — base64-encoded value
+2. `/etc/gestalt/master.key` mounted into the container
+3. `./master.key` in the cwd (dev-only auto-generation if missing)
+
+The recommended production setup mounts the host-side file:
+
+```yaml
+# docker-compose.yml — uncomment the volume and the env-var stays unused
+services:
+  server:
+    volumes:
+      - ./master.key:/etc/gestalt/master.key:ro
+```
+
+**Operational warnings:**
+
+- **Back up the master key out of band.** If it is lost, every
+  encrypted secret in the database becomes unreadable. There is no
+  recovery path — operators would have to re-enter every API key
+  after generating a fresh master key.
+- **Do not rotate the master key in place.** Rotation requires
+  decrypting every secret with the old key and re-encrypting under the
+  new key — a tooling task not yet automated by the platform. Treat
+  the master key as a long-lived secret.
+- **Never commit master.key.** Add it to `.gitignore` (the platform
+  template already excludes it).
+
 ---
 
 ## Step 5 — Configure database

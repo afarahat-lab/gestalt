@@ -513,18 +513,22 @@ export async function getLLMClientForModel(modelString?: string): Promise<LLMCli
   const cached = _registryClients.get(cacheKey);
   if (cached) return cached;
 
-  const apiKey = process.env[registered.apiKeyEnv] ?? '';
-  if (!apiKey) {
+  // The resolver returned the FULLY RESOLVED API key — the server's
+  // injected resolver (Session 4 — vault precedence) does the
+  // `secret_id → vault decrypt` OR `apiKeyEnv → process.env` lookup
+  // before handing us the string. We never see which storage path
+  // the operator chose.
+  if (!registered.apiKey) {
     log.warn(
-      { modelString, apiKeyEnv: registered.apiKeyEnv },
-      'Registered LLM apiKeyEnv resolved to empty string — LLM calls will likely fail',
+      { modelString },
+      'Registered LLM apiKey resolved to empty string — vault secret unset, env var empty, or both — LLM calls will likely fail',
     );
   }
   const overrideConfig: LLMConfig = {
     ..._defaultConfig,
     model: registered.modelString,
     baseUrl: registered.baseUrl,
-    apiKey,
+    apiKey: registered.apiKey,
   };
   const client = new LLMClient(overrideConfig);
   _registryClients.set(cacheKey, client);
@@ -536,15 +540,17 @@ export async function getLLMClientForModel(modelString?: string): Promise<LLMCli
 }
 
 /**
- * Minimal shape the resolver returns — exactly what the registry
- * stores. Defined locally so `llm/index.ts` doesn't import from
- * `repository/index.ts` (sibling import would be fine for now but the
- * narrower contract makes the dependency direction explicit).
+ * Minimal shape the resolver returns — modelString + baseUrl from
+ * the registry row, plus the RESOLVED API key (the server-side
+ * resolver did either a vault decrypt or a `process.env[apiKeyEnv]`
+ * lookup before constructing this object). Defined locally so
+ * `llm/index.ts` does not import from `repository/index.ts` or
+ * `secrets/vault.ts` — keeps dependency direction explicit.
  */
 interface RegistryEntry {
   modelString: string;
   baseUrl: string;
-  apiKeyEnv: string;
+  apiKey: string;
 }
 
 type RegistryResolver = (modelString: string) => Promise<RegistryEntry | null>;

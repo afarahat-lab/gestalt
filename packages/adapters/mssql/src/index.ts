@@ -12,3 +12,4 @@ export { MssqlAgentExecutionLogRepository } from './repositories/execution-logs'
 export { MssqlProjectMembershipRepository } from './repositories/memberships';
 export { MssqlInterventionRepository } from './repositories/interventions';
 export { MssqlPlatformLLMRepository } from './repositories/platform-llms';
+export { MssqlPlatformSecretRepository } from './repositories/platform-secrets';

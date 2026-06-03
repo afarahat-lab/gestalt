@@ -24,9 +24,11 @@ import { PostgresAgentExecutionLogRepository } from './repositories/execution-lo
 import { PostgresProjectMembershipRepository } from './repositories/memberships';
 import { PostgresInterventionRepository } from './repositories/interventions';
 import { PostgresPlatformLLMRepository } from './repositories/platform-llms';
+import { PostgresPlatformSecretRepository } from './repositories/platform-secrets';
 export {
   LastLLMError, CannotDeleteDefaultLLMError,
 } from './repositories/platform-llms';
+export { SecretInUseError } from './repositories/platform-secrets';
 import { runMigrations } from './migrations/runner';
 
 export { closeDb, pingDb };
@@ -59,5 +61,6 @@ export async function createPostgresAdapter(databaseUrl: string): Promise<Reposi
     memberships:      new PostgresProjectMembershipRepository(),
     interventions:    new PostgresInterventionRepository(),
     platformLlms:     new PostgresPlatformLLMRepository(),
+    platformSecrets:  new PostgresPlatformSecretRepository(),
   };
 }

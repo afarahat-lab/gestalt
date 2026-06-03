@@ -8,7 +8,7 @@ the historical record of how the state evolved._
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-03 (Claude Code — Platform LLM registry (migration 014): `platform_llms` table + `GET/POST/PATCH/DELETE/test /platform/llms`; first-boot seed from .env; `getLLMClientForModel` consults the registry; `gestalt platform llms list/add/set-default/remove/test`; dashboard Admin gains "LLMs" tab. Tools tab dropped from Project Settings — tool assignment now per-agent inside the Agents tab; model field becomes a registry-sourced dropdown with a custom-string escape hatch)
+**Last updated:** 2026-06-03 (Claude Code — Platform secrets vault (migrations 015 + 016): `platform_secrets` table with AES-256-GCM ciphertext + IV + auth tag; master key loaded at server boot (env var → /etc/gestalt/master.key → ./master.key dev auto-gen; fatal in prod); `GET/POST/PATCH/DELETE /platform/secrets` — values NEVER returned; LLM rows reference a secret via new nullable `secret_id` column; vault decrypt runs at LLM-call time via `setLLMRegistryResolver`; SECRET_IN_USE guard refuses delete; `gestalt platform secrets list/add/rotate/remove` with hidden TTY value entry; dashboard Admin gains "Secrets" tab + LLM-modal source picker (vault vs env var); audit metadata carries name + lengths only — never ciphertext/IV/auth-tag/value (GP-006))
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -22,12 +22,13 @@ the historical record of how the state evolved._
   are summarised in the "Session log" entries dated 2026-05-29 / 30
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
-- All fourteen migrations apply on startup: `001_initial`, `002_local_auth`,
+- All sixteen migrations apply on startup: `001_initial`, `002_local_auth`,
   `003_projects`, `004_deployments`, `005_maintenance`,
   `006_intent_clarification`, `007_execution_logs`,
   `008_finding_attempts`, `009_execution_log_model`,
   `010_user_management`, `011_interventions`, `012_tool_calls`,
-  `013_auto_merge`, `014_llm_registry`
+  `013_auto_merge`, `014_llm_registry`, `015_secrets_vault`,
+  `016_relax_llm_apikey_env`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
 - **Dashboard SPA reachable in the browser, deep-linkable, no path
@@ -956,6 +957,171 @@ the historical record of how the state evolved._
     collapses the dropdown to a free-text input with a "Back
     to list" button. The legacy free-text input remains
     available via the escape hatch for unregistered models
+- **Platform secrets vault (Session 4, 2026-06-03 — migrations
+  015 + 016).** Replaces the env-var-only API-key path with an
+  encrypted-at-rest vault. Operators enter the API key VALUE
+  once (via dashboard or `gestalt platform secrets add`),
+  reference it from any LLM in the registry, and rotate it
+  later without touching the server's environment. Secret
+  values are NEVER returned by any API — not even to
+  platform-admin.
+  - **Master key** loaded once at server boot in step 1b
+    (BEFORE the database is initialised). Three sources tried
+    in order: `GESTALT_MASTER_KEY` env (base64), then
+    `/etc/gestalt/master.key`, then `./master.key` in cwd. In
+    dev (NODE_ENV !== 'production') a fresh key is auto-
+    generated in `./master.key` with mode 0600 + a loud
+    warning log; in production a missing key is a fatal
+    startup error (so a misconfigured deployment surfaces
+    before any secret operation touches the wrong key). The
+    in-memory key lives in
+    `packages/server/src/secrets/index.ts` behind
+    `setMasterKey` / `getMasterKey`; the latter throws if
+    called before set so a misordered import can never
+    silently encrypt with a zero key
+  - **AES-256-GCM** via Node's built-in `crypto` —
+    `encryptSecret(value, masterKey)` returns
+    `{ encrypted, iv, authTag }` as base64 strings, with a
+    fresh 96-bit IV per call (never reused).
+    `decryptSecret(secret, masterKey)` throws a single
+    generic `"decryption failed: bad key or corrupt data"`
+    on any failure path so error-message side channels can't
+    leak which of bad-key vs tampered-ciphertext vs
+    wrong-auth-tag is the cause. Both helpers live in
+    `packages/core/src/secrets/vault.ts`
+  - **`platform_secrets` table** (migration 015) — `id`,
+    `name` (unique), `description`, `encrypted`, `iv`,
+    `auth_tag`, `created_by` (nullable FK to `users`),
+    timestamps. Migration 016 then drops the
+    `platform_llms.api_key_env` NOT NULL constraint so a
+    vault-only LLM row can carry `apiKeyEnv = NULL`.
+    `platform_llms.secret_id UUID REFERENCES
+    platform_secrets(id) ON DELETE SET NULL` + partial
+    btree index for the SECRET_IN_USE guard scan
+  - **`PlatformSecretRepository`** in `@gestalt/core` with
+    `create`, `update`, `findById`, `findByName`, `list`,
+    `delete`, `findReferencingLlms`. **`list()` uses a
+    narrow SQL projection that omits `encrypted` / `iv` /
+    `auth_tag`** — defense-in-depth so even an accidental
+    server-side log of the full row never carries
+    ciphertext. The public-facing `PlatformSecretSummary`
+    type is the result. `delete()` runs inside `db.begin`:
+    queries `platform_llms WHERE secret_id = ${id}`,
+    throws `SecretInUseError(id, llmNames)` if any match.
+    Oracle + mssql adapters get the standard throw-stubs
+  - **Routes in
+    `packages/server/src/routes/secrets.ts`** — all
+    `requireRole('admin')`:
+    - `GET /platform/secrets` — list of summaries (no
+      ciphertext). Audit row NOT written on read
+    - `POST /platform/secrets` — body
+      `{ name, value, description? }`. Encrypts with the
+      master key, persists, returns the public summary.
+      Audit row `secret.created` carries `name +
+      descriptionLength + ip` ONLY — value/encrypted/iv/
+      authTag NEVER reach `audit_log` (GP-006)
+    - `PATCH /platform/secrets/:id` — body
+      `{ name?, value?, description? }`. Supports rename,
+      rotate (fresh IV), description-edit. Audit row
+      `secret.updated` records `changedFields` so an
+      operator can later see WHO rotated WHEN without
+      learning the value
+    - `DELETE /platform/secrets/:id` — refuses with HTTP
+      400 `SECRET_IN_USE` + `llmNames: [...]` when any LLM
+      references the secret. Verified live: deleting a
+      referenced secret returns the typed code with the
+      LLM name; flipping the LLM's source to env-var first
+      then re-deleting returns HTTP 204
+  - **LLM resolver wires vault into `getLLMClientForModel`.**
+    The server-side resolver (`setLLMRegistryResolver` at
+    step 4b) now calls a new `resolveLlmApiKey(llm)` helper:
+    `secretId` wins → vault decrypt under the master key.
+    Failure (missing secret / bad ciphertext / unreachable
+    master key) is logged at WARN with the LLM NAME only
+    (never the secret id, never key material) and falls
+    through to `process.env[apiKeyEnv]`. Empty string when
+    neither resolves — the LLM call surfaces an actionable
+    401 instead. Pre-resolution happens server-side so the
+    `llm` module stays free of vault / repository imports;
+    the registry cache key becomes `<model>|<baseUrl>` so
+    rotating a secret invalidates correctly on the next
+    `setLLMRegistryResolver` swap
+  - **`POST /platform/llms`** now requires at least one of
+    `apiKeyEnv` or `secretId` (returns 400
+    `INVALID_API_KEY_SOURCE` otherwise). `PATCH` accepts
+    either field independently nullable so an operator can
+    flip an existing LLM from env var to vault without
+    re-registering. The `/test` endpoint mirrors the
+    runtime resolver via a parallel `resolveTestApiKey`
+    helper so a "test" click reflects exactly what an
+    agent call would see
+  - **CLI `gestalt platform secrets`** (admin-only):
+    - `list` — table of `name / description / age`. The
+      footer line spells out "Values are never displayed.
+      Use `rotate <name>` to replace a value."
+    - `add` — interactive: name, description, hidden TTY
+      value entry via `promptSecret`, hidden confirm,
+      mismatch errors. Value never echoed
+    - `rotate <name>` — name resolution, "old value
+      unrecoverable" warning, hidden new value + confirm
+    - `remove <name>` — confirm prompt; surfaces
+      `SECRET_IN_USE` with the LLM names so the operator
+      knows which references to clear first
+  - **CLI `gestalt platform llms add`** gained the source
+    picker — `1 = vault secret` (lists secrets, pick by
+    name) or `2 = env var` (free-text). `llms list` shows
+    a "Key source" column rendering `🔒 vault` / `env:
+    VAR` / `(unset)`. `llms test` failure messages now
+    branch on whether the LLM uses a vault secret, an env
+    var, or neither so the operator sees actionable
+    guidance
+  - **Dashboard Admin gains 4th "Secrets" tab** with table
+    + Add / Edit-or-Rotate / Remove modals. The Add modal
+    requires confirm-match before saving; the Edit modal
+    leaves the value blank by default ("leave blank to
+    keep the current value — entering a new value is
+    irreversible"); the Remove path surfaces SECRET_IN_USE
+    with the LLM list inline. The LLMs tab's add/edit
+    modal gains a radio-pair "API key source" — vault
+    (select from existing + "+ Create new secret" link
+    that opens the Add Secret modal inline) or env var
+    (free-text). The Key source column on the LLMs table
+    renders `🔒 vault` or `env: VAR_NAME`
+  - **GP-006 compliance verified live.** `audit_log`
+    rows for `secret.created` / `.updated` / `.deleted`
+    + `platform.llm-updated` carry only `name`,
+    `descriptionLength`, `changedFields`, `ip` — direct
+    SQL probe `metadata::text LIKE '%verify-test-key%'`
+    returns the name (expected; that's documented in
+    the metadata) but `LIKE '%VERIFY-1234%'` (the actual
+    secret value) returns zero matches anywhere in the
+    audit_log. Ciphertext column in `platform_secrets` is
+    36 chars base64 ≠ plaintext; rotating the value
+    produces a different ciphertext + a different IV
+    (post-rotation row inspection confirmed)
+  - **docker-compose seeded** with a commented-out
+    `./master.key:/etc/gestalt/master.key:ro` mount and
+    `GESTALT_MASTER_KEY` env-var placeholder. Operators
+    uncomment one after creating the host-side key
+    (`openssl rand -base64 32 > master.key && chmod 600
+    master.key`). `.gitignore` now excludes `master.key`
+    (and `auth.config.json` / `krb5.keytab` from the
+    prior identity session, which had been overlooked).
+    Deployment guide gained a "Generate the master key"
+    block with the openssl recipe + back-up-out-of-band
+    warning + the "do not rotate in place" note
+  - **First-boot smoke verified end-to-end.** Fresh
+    `./master.key` auto-generated on docker rebuild
+    (mode 0600, 45 bytes); migrations 015 + 016 applied
+    in order; `GET /platform/secrets` returns
+    `{ data: [] }`; `POST` creates a secret with
+    response containing NO encrypted/iv/authTag fields;
+    direct DB inspection confirms ciphertext is not
+    plaintext; LLM created with `secretId: <uuid>,
+    apiKeyEnv: null`; DELETE secret while referenced
+    returns 400 `SECRET_IN_USE` with `llmNames`;
+    PATCH LLM to clear `secretId` + set `apiKeyEnv` then
+    DELETE secret returns HTTP 204
 - **Tools tab merged into Agents tab (Session 3 — UX).** The
   standalone Tools tab is gone from `/app/projects/:id/settings`;
   tool assignment IS agent config. Each agent's expanded card
@@ -1963,6 +2129,26 @@ the historical record of how the state evolved._
   CHECK; `notes` nullable and stores the operator's
   acknowledge-breach text (audit_log carries only the length,
   per GP-006)
+- `platformLlms` — list, findById, findByName, findDefault,
+  findByModelString, create, update, delete, setDefault, count.
+  Migration 014. Partial unique index `WHERE is_default = TRUE`
+  enforces "at most one default" at the DB layer; `setDefault`
+  runs inside `db.begin` to clear the existing default and set
+  the new one atomically. `delete` refuses on the only row
+  (`LastLLMError`) and on the default (`CannotDeleteDefaultLLMError`).
+  Migration 016 dropped the `api_key_env` NOT NULL constraint
+  so vault-only rows carry `apiKeyEnv = null, secretId = <uuid>`
+- `platformSecrets` — create, update, findById, findByName,
+  list, delete, findReferencingLlms. Migration 015.
+  **`list()` uses a narrow projection that OMITS `encrypted` /
+  `iv` / `auth_tag`** — defense-in-depth so a server-side log
+  of the full record never carries ciphertext. `delete()` runs
+  inside `db.begin`: scans `platform_llms WHERE secret_id =
+  $1`, throws `SecretInUseError(id, llmNames)` if any match
+  (the route catches it and returns 400 `SECRET_IN_USE` with
+  the LLM names in the body). The IV is regenerated on every
+  PATCH that touches `value` so rotation produces fresh
+  ciphertext — never reused
 
 **CLI install:**
 - `@gestalt/cli` is private — not on npm

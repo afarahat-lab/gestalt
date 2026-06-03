@@ -12,3 +12,4 @@ export { OracleAgentExecutionLogRepository } from './repositories/execution-logs
 export { OracleProjectMembershipRepository } from './repositories/memberships';
 export { OracleInterventionRepository } from './repositories/interventions';
 export { OraclePlatformLLMRepository } from './repositories/platform-llms';
+export { OraclePlatformSecretRepository } from './repositories/platform-secrets';

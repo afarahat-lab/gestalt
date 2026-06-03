@@ -25,13 +25,14 @@
 
 import type { FastifyInstance } from 'fastify';
 import {
-  getRepositories, createContextLogger,
+  getRepositories, createContextLogger, decryptSecret,
   type PlatformLLMRecord,
 } from '@gestalt/core';
 import {
   LastLLMError, CannotDeleteDefaultLLMError,
 } from '@gestalt/adapter-postgres';
 import { requireRole } from '../auth/middleware';
+import { getMasterKey } from '../secrets/index';
 
 const log = createContextLogger({ module: 'routes:platform-config' });
 
@@ -43,7 +44,10 @@ interface CreateLLMBody {
   provider?: unknown;
   modelString?: unknown;
   baseUrl?: unknown;
+  /** Legacy env-var name. At least one of apiKeyEnv or secretId must be set. */
   apiKeyEnv?: unknown;
+  /** Vault secret id (Session 4 — preferred). Takes precedence at call time. */
+  secretId?: unknown;
   isDefault?: unknown;
   description?: unknown;
 }
@@ -54,6 +58,7 @@ interface UpdateLLMBody {
   modelString?: unknown;
   baseUrl?: unknown;
   apiKeyEnv?: unknown;
+  secretId?: unknown;
   isDefault?: unknown;
   description?: unknown;
 }
@@ -107,6 +112,7 @@ export async function registerPlatformConfigRoutes(app: FastifyInstance): Promis
             modelString: created.modelString,
             isDefault: created.isDefault,
             apiKeyEnv: created.apiKeyEnv,
+            secretId: created.secretId,
             ip: request.ip,
           },
         });
@@ -240,14 +246,19 @@ export async function registerPlatformConfigRoutes(app: FastifyInstance): Promis
       const existing = await platformLlms.findById(request.params.id);
       if (!existing) return reply.code(404).send({ error: 'LLM not found' });
 
-      const apiKey = process.env[existing.apiKeyEnv] ?? '';
+      // Vault secret wins when set; otherwise fall back to env var.
+      // Same resolution path as `resolveLlmApiKey` in server.ts so
+      // the test result reflects what an agent call would actually
+      // see at run time.
+      const apiKey = await resolveTestApiKey(existing);
       if (!apiKey) {
+        const errorMsg = existing.secretId
+          ? `Vault secret unset or decrypt failed; apiKeyEnv ${existing.apiKeyEnv ? `'${existing.apiKeyEnv}' is empty` : 'is not configured'}`
+          : existing.apiKeyEnv
+            ? `Environment variable '${existing.apiKeyEnv}' is empty — set it in the server .env`
+            : 'No API key source configured (neither secretId nor apiKeyEnv)';
         return reply.send({
-          data: {
-            ok: false,
-            latencyMs: 0,
-            error: `Environment variable '${existing.apiKeyEnv}' is empty — set it in the server .env`,
-          },
+          data: { ok: false, latencyMs: 0, error: errorMsg },
         });
       }
 
@@ -319,7 +330,8 @@ function validateCreateBody(body: CreateLLMBody): ValidationResult<{
   provider: string;
   modelString: string;
   baseUrl: string;
-  apiKeyEnv: string;
+  apiKeyEnv: string | null;
+  secretId: string | null;
   isDefault: boolean;
   description: string | null;
 }> {
@@ -335,8 +347,18 @@ function validateCreateBody(body: CreateLLMBody): ValidationResult<{
   if (typeof body.baseUrl !== 'string' || !body.baseUrl.trim()) {
     return { ok: false, code: 'INVALID_BASE_URL', error: 'baseUrl is required (non-empty string)' };
   }
-  if (typeof body.apiKeyEnv !== 'string' || !body.apiKeyEnv.trim()) {
-    return { ok: false, code: 'INVALID_API_KEY_ENV', error: 'apiKeyEnv is required (non-empty string, e.g. OPENAI_API_KEY)' };
+  // Either-or: apiKeyEnv OR secretId. Both are also acceptable
+  // (secretId wins at call time); at least one must be supplied.
+  const hasApiKeyEnv = typeof body.apiKeyEnv === 'string' && body.apiKeyEnv.trim() !== '';
+  const hasSecretId = typeof body.secretId === 'string' && body.secretId.trim() !== '';
+  if (!hasApiKeyEnv && !hasSecretId) {
+    return { ok: false, code: 'INVALID_API_KEY_SOURCE', error: 'At least one of apiKeyEnv or secretId must be supplied (secretId is preferred)' };
+  }
+  if (body.apiKeyEnv !== undefined && body.apiKeyEnv !== null && typeof body.apiKeyEnv !== 'string') {
+    return { ok: false, code: 'INVALID_API_KEY_ENV', error: 'apiKeyEnv must be a string or null' };
+  }
+  if (body.secretId !== undefined && body.secretId !== null && typeof body.secretId !== 'string') {
+    return { ok: false, code: 'INVALID_SECRET_ID', error: 'secretId must be a string (UUID) or null' };
   }
   if (body.isDefault !== undefined && typeof body.isDefault !== 'boolean') {
     return { ok: false, code: 'INVALID_IS_DEFAULT', error: 'isDefault must be a boolean' };
@@ -351,7 +373,8 @@ function validateCreateBody(body: CreateLLMBody): ValidationResult<{
       provider: body.provider,
       modelString: body.modelString.trim(),
       baseUrl: body.baseUrl.trim().replace(/\/$/, ''),
-      apiKeyEnv: body.apiKeyEnv.trim(),
+      apiKeyEnv: hasApiKeyEnv ? (body.apiKeyEnv as string).trim() : null,
+      secretId: hasSecretId ? (body.secretId as string).trim() : null,
       isDefault: body.isDefault === true,
       description: typeof body.description === 'string' ? body.description : null,
     },
@@ -363,13 +386,15 @@ function validateUpdateBody(body: UpdateLLMBody): ValidationResult<Partial<{
   provider: string;
   modelString: string;
   baseUrl: string;
-  apiKeyEnv: string;
+  apiKeyEnv: string | null;
+  secretId: string | null;
   isDefault: boolean;
   description: string | null;
 }>> {
   const out: Partial<{
     name: string; provider: string; modelString: string;
-    baseUrl: string; apiKeyEnv: string; isDefault: boolean; description: string | null;
+    baseUrl: string; apiKeyEnv: string | null; secretId: string | null;
+    isDefault: boolean; description: string | null;
   }> = {};
   if (body.name !== undefined) {
     if (typeof body.name !== 'string' || !body.name.trim()) return { ok: false, code: 'INVALID_NAME', error: 'name must be a non-empty string' };
@@ -390,8 +415,24 @@ function validateUpdateBody(body: UpdateLLMBody): ValidationResult<Partial<{
     out.baseUrl = body.baseUrl.trim().replace(/\/$/, '');
   }
   if (body.apiKeyEnv !== undefined) {
-    if (typeof body.apiKeyEnv !== 'string' || !body.apiKeyEnv.trim()) return { ok: false, code: 'INVALID_API_KEY_ENV', error: 'apiKeyEnv must be a non-empty string' };
-    out.apiKeyEnv = body.apiKeyEnv.trim();
+    if (body.apiKeyEnv === null) {
+      out.apiKeyEnv = null;
+    } else if (typeof body.apiKeyEnv !== 'string') {
+      return { ok: false, code: 'INVALID_API_KEY_ENV', error: 'apiKeyEnv must be a string or null' };
+    } else {
+      const trimmed = body.apiKeyEnv.trim();
+      out.apiKeyEnv = trimmed === '' ? null : trimmed;
+    }
+  }
+  if (body.secretId !== undefined) {
+    if (body.secretId === null) {
+      out.secretId = null;
+    } else if (typeof body.secretId !== 'string') {
+      return { ok: false, code: 'INVALID_SECRET_ID', error: 'secretId must be a string or null' };
+    } else {
+      const trimmed = body.secretId.trim();
+      out.secretId = trimmed === '' ? null : trimmed;
+    }
   }
   if (body.isDefault !== undefined) {
     if (typeof body.isDefault !== 'boolean') return { ok: false, code: 'INVALID_IS_DEFAULT', error: 'isDefault must be a boolean' };
@@ -402,4 +443,29 @@ function validateUpdateBody(body: UpdateLLMBody): ValidationResult<Partial<{
     out.description = body.description as string | null;
   }
   return { ok: true, fields: out };
+}
+
+/**
+ * API key resolution for the `test` endpoint. Mirrors the
+ * `resolveLlmApiKey` helper in server.ts (which feeds the live LLM
+ * client). Vault wins when set; falls back to env var. Errors during
+ * vault decrypt are caught and yield empty string so the test reports
+ * an actionable error rather than 500ing.
+ */
+async function resolveTestApiKey(llm: PlatformLLMRecord): Promise<string> {
+  if (llm.secretId) {
+    const secret = await getRepositories().platformSecrets.findById(llm.secretId);
+    if (secret) {
+      try {
+        return decryptSecret(
+          { encrypted: secret.encrypted, iv: secret.iv, authTag: secret.authTag },
+          getMasterKey(),
+        );
+      } catch {
+        // Fall through to env var.
+      }
+    }
+  }
+  if (llm.apiKeyEnv) return process.env[llm.apiKeyEnv] ?? '';
+  return '';
 }

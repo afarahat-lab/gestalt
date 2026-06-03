@@ -421,7 +421,10 @@ export interface PlatformLLM {
   provider: string;
   modelString: string;
   baseUrl: string;
-  apiKeyEnv: string;
+  /** Legacy env-var name. Null when the LLM uses a vault secret. */
+  apiKeyEnv: string | null;
+  /** Vault secret reference (Session 4 — migration 015). */
+  secretId: string | null;
   isDefault: boolean;
   description: string | null;
   createdAt: string;
@@ -432,4 +435,18 @@ export interface LlmTestResult {
   ok: boolean;
   latencyMs: number;
   error?: string;
+}
+
+// ─── Platform secrets vault (Session 4, migration 015) ───────────────────────
+//
+// Secret VALUES are never returned by any API — `PlatformSecret` carries
+// only the metadata the dashboard needs to render the management surface.
+// To rotate, POST a new value via PATCH; to view, you can't.
+
+export interface PlatformSecret {
+  id: string;
+  name: string;
+  description: string | null;
+  createdAt: string;
+  updatedAt: string;
 }

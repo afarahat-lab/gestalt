@@ -338,21 +338,26 @@ export interface RepositoryRegistry {
   memberships: ProjectMembershipRepository;
   interventions: InterventionRepository;
   platformLlms: PlatformLLMRepository;
+  platformSecrets: PlatformSecretRepository;
 }
 
 // ─── Platform LLM registry (migration 014) ───────────────────────────────────
 
 /**
  * One LLM entry as managed by platform-admin. The API key VALUE is
- * never persisted — `apiKeyEnv` is the NAME of the env var the server
- * reads at LLM call time. This is a platform-level resource (not
- * per-project) so the dashboard's project-settings dropdown can show
- * the same options for every project.
+ * never persisted in this table — it lives either as an env var
+ * (legacy `apiKeyEnv` — the env var NAME, not its value) or as an
+ * encrypted blob in `platform_secrets` referenced by `secretId`
+ * (migration 015 — preferred).
  *
  * Single-default invariant: the partial unique index on `is_default`
  * enforces "at most one default" at the DB layer; the application is
  * responsible for ensuring "at least one default" (the server's
  * first-boot seed creates one from the .env config).
+ *
+ * API key resolution at LLM call time: `secretId` wins when both are
+ * set; otherwise fall back to `process.env[apiKeyEnv]`. See
+ * `resolveApiKey` in the LLM layer.
  */
 export interface PlatformLLMRecord {
   id: string;
@@ -360,7 +365,15 @@ export interface PlatformLLMRecord {
   provider: string;
   modelString: string;
   baseUrl: string;
-  apiKeyEnv: string;
+  /** Legacy env-var-name path. Null when the row uses a vault secret. */
+  apiKeyEnv: string | null;
+  /**
+   * Vault secret reference (migration 015). Null when the row uses
+   * the legacy `apiKeyEnv` path. When BOTH are set, `secretId` wins
+   * at LLM call time — operators migrating off env vars can flip
+   * `secretId` without immediately clearing `apiKeyEnv`.
+   */
+  secretId: string | null;
   isDefault: boolean;
   description: string | null;
   createdAt: Date;
@@ -387,6 +400,84 @@ export interface PlatformLLMRepository extends BaseRepository {
   /** Atomically clears the existing default + flips the named id to default. */
   setDefault(id: string): Promise<PlatformLLMRecord>;
   count(): Promise<number>;
+}
+
+// ─── Platform secrets vault (migration 015) ──────────────────────────────────
+
+/**
+ * Internal repository shape — carries the encrypted ciphertext,
+ * initialization vector, and GCM auth tag. This shape is read by the
+ * server's vault-decrypt path ONLY (the route handlers that resolve
+ * an LLM's API key at call time). It MUST NEVER be returned to a
+ * client by any API route.
+ *
+ * The public-safe surface is `PlatformSecretSummary` below — `list()`
+ * returns that shape; route handlers convert by stripping the
+ * `encrypted`, `iv`, `authTag` fields before sending.
+ */
+export interface PlatformSecretRecord {
+  id: string;
+  name: string;
+  description: string | null;
+  encrypted: string;
+  iv: string;
+  authTag: string;
+  createdBy: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/**
+ * Public-safe summary — has NONE of the encrypted columns. The
+ * `list()` query in the postgres impl selects only these columns
+ * directly so the ciphertext never even leaves the database.
+ */
+export interface PlatformSecretSummary {
+  id: string;
+  name: string;
+  description: string | null;
+  createdBy: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface PlatformSecretRepository extends BaseRepository {
+  create(params: {
+    name: string;
+    description?: string | null;
+    encrypted: string;
+    iv: string;
+    authTag: string;
+    createdBy: string;
+  }): Promise<PlatformSecretRecord>;
+  update(id: string, params: {
+    name?: string;
+    description?: string | null;
+    encrypted?: string;
+    iv?: string;
+    authTag?: string;
+  }): Promise<PlatformSecretRecord>;
+  /** Full record — DO NOT return to clients. Used internally only. */
+  findById(id: string): Promise<PlatformSecretRecord | null>;
+  /** Full record — DO NOT return to clients. Used by route validation. */
+  findByName(name: string): Promise<PlatformSecretRecord | null>;
+  /**
+   * Public-safe list. The SQL projection MUST omit the encrypted
+   * columns so the ciphertext never even leaves Postgres.
+   */
+  list(): Promise<PlatformSecretSummary[]>;
+  /**
+   * Throws if the secret is referenced by any `platform_llms` row.
+   * The route handler catches `SecretInUseError` and translates to
+   * 400 `SECRET_IN_USE` with the list of LLM names.
+   */
+  delete(id: string): Promise<void>;
+  /**
+   * List `platform_llms` rows that reference this secret via the
+   * `secret_id` column. Used by `delete()` for the SECRET_IN_USE
+   * guard and by the dashboard's delete-confirm panel.
+   */
+  findReferencingLlms(secretId: string): Promise<Array<{ id: string; name: string }>>;
 }
 
 // ─── Intervention repository (ADR-021) ───────────────────────────────────────

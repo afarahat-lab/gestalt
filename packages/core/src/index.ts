@@ -19,6 +19,12 @@ export { ok, err } from './types';
 // Tools (ADR-038)
 export { FILE_TOOL_DEFINITIONS, executeFileTool } from './tools/file-tools';
 
+// Platform secrets vault (Session 4 — migration 015)
+export {
+  loadMasterKey, encryptSecret, decryptSecret,
+} from './secrets/vault';
+export type { EncryptedSecret } from './secrets/vault';
+
 // MCP — Model Context Protocol (ADR-039)
 export { McpClient } from './tools/mcp-client';
 export { resolveMcpClients } from './tools/mcp-resolver';
@@ -84,6 +90,7 @@ export type {
   ProjectMembershipRecord,
   InterventionRecord, InterventionAction,
   PlatformLLMRecord, PlatformLLMRepository,
+  PlatformSecretRecord, PlatformSecretSummary, PlatformSecretRepository,
   RepositoryRegistry,
   IntentRepository, AgentExecutionRepository,
   ArtifactRepository, SignalRepository,

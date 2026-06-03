@@ -17,6 +17,11 @@ services:
       - SERVER_BASE_URL=${SERVER_BASE_URL:-http://localhost:3000}
       - SESSION_TTL_MINUTES=${SESSION_TTL_MINUTES:-480}
       - LOG_LEVEL=${LOG_LEVEL:-info}
+      # Session 4 — encrypted secrets vault.
+      # Provide GESTALT_MASTER_KEY here OR mount /etc/gestalt/master.key
+      # below. In dev (NODE_ENV != production) a fresh key is auto-
+      # generated in ./master.key on first boot with a loud warning.
+      # - GESTALT_MASTER_KEY=${GESTALT_MASTER_KEY}
     depends_on:
       postgres:
         condition: service_healthy
@@ -34,6 +39,11 @@ services:
       # Uncomment the lines below after creating the host-side files.
       # - ./auth.config.json:/etc/gestalt/auth.config.json:ro
       # - ./krb5.keytab:/etc/gestalt/krb5.keytab:ro
+      # Session 4 — master key for the encrypted secrets vault.
+      # Generate once with: openssl rand -base64 32 > master.key
+      # Then chmod 600 master.key and back it up out of band — if this
+      # key is lost, every encrypted secret becomes unreadable.
+      # - ./master.key:/etc/gestalt/master.key:ro
 
   postgres:
     image: postgres:15-alpine

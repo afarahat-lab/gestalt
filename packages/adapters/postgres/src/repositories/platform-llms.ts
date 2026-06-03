@@ -21,7 +21,8 @@ interface PlatformLLMRow {
   provider: string;
   modelString: string;
   baseUrl: string;
-  apiKeyEnv: string;
+  apiKeyEnv: string | null;
+  secretId: string | null;
   isDefault: boolean;
   description: string | null;
   createdAt: Date;
@@ -36,6 +37,7 @@ function rowToRecord(row: PlatformLLMRow): PlatformLLMRecord {
     modelString: row.modelString,
     baseUrl: row.baseUrl,
     apiKeyEnv: row.apiKeyEnv,
+    secretId: row.secretId,
     isDefault: row.isDefault,
     description: row.description,
     createdAt: row.createdAt,
@@ -111,13 +113,14 @@ export class PostgresPlatformLLMRepository implements PlatformLLMRepository {
       const [row] = await sql<PlatformLLMRow[]>`
         INSERT INTO platform_llms (
           name, provider, model_string, base_url, api_key_env,
-          is_default, description
+          secret_id, is_default, description
         ) VALUES (
           ${llm.name},
           ${llm.provider},
           ${llm.modelString},
           ${llm.baseUrl},
           ${llm.apiKeyEnv},
+          ${llm.secretId},
           ${llm.isDefault},
           ${llm.description}
         )
@@ -149,6 +152,7 @@ export class PostgresPlatformLLMRepository implements PlatformLLMRepository {
       if (updates.modelString !== undefined) setParts.push(sql`model_string = ${updates.modelString}`);
       if (updates.baseUrl !== undefined)     setParts.push(sql`base_url = ${updates.baseUrl}`);
       if (updates.apiKeyEnv !== undefined)   setParts.push(sql`api_key_env = ${updates.apiKeyEnv}`);
+      if (updates.secretId !== undefined)    setParts.push(sql`secret_id = ${updates.secretId}`);
       if (updates.isDefault !== undefined)   setParts.push(sql`is_default = ${updates.isDefault}`);
       if (updates.description !== undefined) setParts.push(sql`description = ${updates.description}`);
       setParts.push(sql`updated_at = NOW()`);

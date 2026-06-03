@@ -34,3 +34,9 @@ Thumbs.db
 logs/
 *.log
 npm-debug.log*
+
+# Session 4 — encrypted secrets vault master key. NEVER commit this.
+master.key
+# Auth fixtures (Session — corporate identity)
+auth.config.json
+krb5.keytab

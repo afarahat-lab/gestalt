@@ -18,7 +18,9 @@
 import {
   loadConfig, createLLMClient, setRepositories, createContextLogger,
   setLLMRegistryResolver, getRepositories,
+  loadMasterKey, decryptSecret,
 } from '@gestalt/core';
+import { setMasterKey, getMasterKey } from './secrets/index';
 import { createPostgresAdapter, closeDb } from '@gestalt/adapter-postgres';
 import { startOrchestratorWorker } from '@gestalt/agents-generate';
 import { startGateWorker } from '@gestalt/agents-quality-gate';
@@ -36,6 +38,15 @@ export async function startServer(): Promise<void> {
   // 1. Config
   const config = loadConfig();
   log.info({ nodeEnv: config.server.nodeEnv, port: config.server.port }, 'Config loaded');
+
+  // 1b. Master key — must load BEFORE any database operation that
+  // might touch encrypted material. In production a missing key is a
+  // fatal startup error (preventing accidental key rotation that
+  // would orphan existing secrets); in dev a fresh key is generated
+  // with a loud warning.
+  const masterKey = await loadMasterKey();
+  setMasterKey(masterKey);
+  log.info('Master key loaded');
 
   // 2 + 3. Database
   log.info({ adapter: config.database.adapter }, 'Initialising database...');
@@ -66,10 +77,11 @@ export async function startServer(): Promise<void> {
   setLLMRegistryResolver(async (modelString) => {
     const match = await getRepositories().platformLlms.findByModelString(modelString);
     if (!match) return null;
+    const apiKey = await resolveLlmApiKey(match);
     return {
       modelString: match.modelString,
       baseUrl: match.baseUrl,
-      apiKeyEnv: match.apiKeyEnv,
+      apiKey,
     };
   });
   log.info('Platform LLM registry resolver wired');
@@ -148,6 +160,10 @@ async function seedPlatformLlmsIfEmpty(
     modelString: llmConfig.model,
     baseUrl: llmConfig.baseUrl,
     apiKeyEnv: 'LLM_API_KEY',
+    // Seeded row uses the legacy env-var path; operators can migrate
+    // to a vault secret later via the Admin → LLMs → Edit modal or
+    // `gestalt platform llms` CLI.
+    secretId: null,
     isDefault: true,
     description: 'Seeded from server .env config on first boot',
   });
@@ -155,6 +171,45 @@ async function seedPlatformLlmsIfEmpty(
     { model: llmConfig.model, baseUrl: llmConfig.baseUrl },
     'Seeded default LLM from .env config',
   );
+}
+
+/**
+ * Resolve an LLM's API key at call time. `secretId` wins when set
+ * (vault decrypt under the master key); otherwise fall back to
+ * `process.env[apiKeyEnv]`. Empty string when neither is configured
+ * — the LLM call will fail with a 401 from the provider and surface
+ * an actionable error in the orchestrator log.
+ *
+ * Decryption errors (bad master key / corrupt ciphertext) are NOT
+ * thrown here — they're logged with the LLM name (NOT the secret
+ * id, NOT any key material) and an empty string returned. This lets
+ * an operator who loses access to one vault secret keep using
+ * OTHER LLMs that decrypt cleanly, instead of the whole platform
+ * stalling.
+ */
+async function resolveLlmApiKey(
+  llm: { id: string; name: string; secretId: string | null; apiKeyEnv: string | null },
+): Promise<string> {
+  if (llm.secretId) {
+    const secret = await getRepositories().platformSecrets.findById(llm.secretId);
+    if (secret) {
+      try {
+        return decryptSecret(
+          { encrypted: secret.encrypted, iv: secret.iv, authTag: secret.authTag },
+          getMasterKey(),
+        );
+      } catch (err) {
+        log.warn(
+          { err: err instanceof Error ? err.message : String(err), llmName: llm.name },
+          'Vault decrypt failed — falling back to apiKeyEnv if set',
+        );
+      }
+    } else {
+      log.warn({ llmName: llm.name, secretId: llm.secretId }, 'Vault secret referenced by LLM not found');
+    }
+  }
+  if (llm.apiKeyEnv) return process.env[llm.apiKeyEnv] ?? '';
+  return '';
 }
 
 /**

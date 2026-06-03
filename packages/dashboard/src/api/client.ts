@@ -14,7 +14,7 @@ import type {
   UserSummary, UserDetail, MembershipSummary, ProjectMember,
   CreateUserParams, UserRole, ProjectRole,
   ProjectConfigResponse, EditableAgentConfig, ProjectConfigCustomAgent,
-  PlatformLLM, LlmTestResult,
+  PlatformLLM, LlmTestResult, PlatformSecret,
 } from '../types';
 
 export class DashboardApiClient {
@@ -272,7 +272,10 @@ export class DashboardApiClient {
     provider: string;
     modelString: string;
     baseUrl: string;
-    apiKeyEnv: string;
+    /** Legacy env-var name. At least one of apiKeyEnv or secretId must be set. */
+    apiKeyEnv?: string;
+    /** Vault secret id (Session 4 — migration 015). Preferred. */
+    secretId?: string;
     isDefault?: boolean;
     description?: string | null;
   }): Promise<{ data: PlatformLLM }> {
@@ -283,8 +286,8 @@ export class DashboardApiClient {
     id: string,
     body: Partial<{
       name: string; provider: string; modelString: string;
-      baseUrl: string; apiKeyEnv: string; isDefault: boolean;
-      description: string | null;
+      baseUrl: string; apiKeyEnv: string | null; secretId: string | null;
+      isDefault: boolean; description: string | null;
     }>,
   ): Promise<{ data: PlatformLLM }> {
     return this.patch(`/platform/llms/${id}`, body);
@@ -296,6 +299,34 @@ export class DashboardApiClient {
 
   async testPlatformLlm(id: string): Promise<{ data: LlmTestResult }> {
     return this.post(`/platform/llms/${id}/test`, {});
+  }
+
+  // ─── Platform secrets vault (Session 4 — migration 015) ───────────────────
+  //
+  // Note: secret VALUES are never returned by any API. The list/get/create/
+  // update endpoints all return only the metadata fields in `PlatformSecret`.
+
+  async listPlatformSecrets(): Promise<{ data: PlatformSecret[] }> {
+    return this.get('/platform/secrets');
+  }
+
+  async createPlatformSecret(body: {
+    name: string;
+    value: string;
+    description?: string | null;
+  }): Promise<{ data: PlatformSecret }> {
+    return this.post('/platform/secrets', body);
+  }
+
+  async updatePlatformSecret(
+    id: string,
+    body: Partial<{ name: string; value: string; description: string | null }>,
+  ): Promise<{ data: PlatformSecret }> {
+    return this.patch(`/platform/secrets/${id}`, body);
+  }
+
+  async deletePlatformSecret(id: string): Promise<void> {
+    await this.delete(`/platform/secrets/${id}`);
   }
 
   // ─── Project config (Approach A — config-as-code) ──────────────────────────

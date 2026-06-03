@@ -1,14 +1,15 @@
 /**
  * Admin view — platform-admin only.
  *
- * Three tabs:
+ * Four tabs:
  *   - Users: list / create / role-toggle / deactivate, plus inline
  *     per-user project memberships
  *   - Projects: per-project member list with role change + add/remove
  *   - LLMs (Session 3): platform LLM registry — Add / Edit / Test /
- *     Set default / Remove. The actual API key VALUE is never read
- *     here; operators set `apiKeyEnv` and the server reads the env
- *     at LLM call time
+ *     Set default / Remove
+ *   - Secrets (Session 4): encrypted vault — Add / Rotate / Remove.
+ *     Values are never displayed; admins enter them once and reference
+ *     them from LLM registrations
  *
  * Route guarded by `RequirePlatformAdmin` in App.tsx; the Admin nav
  * link in Layout is rendered only when `currentUser.role ===
@@ -21,10 +22,10 @@ import { useCurrentUser } from '../context/CurrentUserContext';
 import { ApiError } from '../api/client';
 import type {
   UserSummary, UserDetail, ProjectMember, ProjectSummary, UserRole, ProjectRole,
-  PlatformLLM, LlmTestResult,
+  PlatformLLM, LlmTestResult, PlatformSecret,
 } from '../types';
 
-type Tab = 'users' | 'projects' | 'llms';
+type Tab = 'users' | 'projects' | 'llms' | 'secrets';
 
 export function Admin() {
   const [tab, setTab] = useState<Tab>('users');
@@ -32,7 +33,7 @@ export function Admin() {
     <div style={styles.page}>
       <div style={styles.header}>
         <h1 style={styles.title}>Admin</h1>
-        <p style={styles.subtitle}>Platform users, project memberships, and LLM registry</p>
+        <p style={styles.subtitle}>Platform users, project memberships, LLM registry, and the encrypted secrets vault</p>
       </div>
       <div style={styles.tabs}>
         <button
@@ -47,10 +48,15 @@ export function Admin() {
           style={tab === 'llms' ? { ...styles.tab, ...styles.tabActive } : styles.tab}
           onClick={() => setTab('llms')}
         >LLMs</button>
+        <button
+          style={tab === 'secrets' ? { ...styles.tab, ...styles.tabActive } : styles.tab}
+          onClick={() => setTab('secrets')}
+        >Secrets</button>
       </div>
       {tab === 'users' && <UsersTab />}
       {tab === 'projects' && <ProjectsTab />}
       {tab === 'llms' && <LlmsTab />}
+      {tab === 'secrets' && <SecretsTab />}
     </div>
   );
 }
@@ -666,7 +672,7 @@ function LlmsTab() {
             <th style={styles.th}>Name</th>
             <th style={styles.th}>Provider</th>
             <th style={styles.th}>Model</th>
-            <th style={styles.th}>Env var</th>
+            <th style={styles.th}>Key source</th>
             <th style={styles.th}>Default</th>
             <th style={styles.th}>Actions</th>
           </tr>
@@ -682,7 +688,7 @@ function LlmsTab() {
                 </td>
                 <td style={styles.td}>{l.provider}</td>
                 <td style={styles.td} title={l.baseUrl}>{l.modelString}</td>
-                <td style={styles.td}><code>{l.apiKeyEnv}</code></td>
+                <td style={styles.td}>{formatKeySource(l)}</td>
                 <td style={styles.td}>{l.isDefault ? '★' : ''}</td>
                 <td style={styles.td}>
                   <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
@@ -731,10 +737,31 @@ function LlmModal(props: {
   const [provider, setProvider] = useState<ProviderId>((props.existing?.provider as ProviderId) ?? 'openai');
   const [modelString, setModelString] = useState(props.existing?.modelString ?? '');
   const [baseUrl, setBaseUrl] = useState(props.existing?.baseUrl ?? PROVIDER_PRESETS[(props.existing?.provider as ProviderId) ?? 'openai']);
+  const [keySource, setKeySource] = useState<'vault' | 'env'>(
+    props.existing?.secretId ? 'vault' : 'env',
+  );
+  const [secretId, setSecretId] = useState<string>(props.existing?.secretId ?? '');
   const [apiKeyEnv, setApiKeyEnv] = useState(props.existing?.apiKeyEnv ?? '');
   const [description, setDescription] = useState(props.existing?.description ?? '');
   const [isDefault, setIsDefault] = useState(props.existing?.isDefault ?? false);
+  const [secrets, setSecrets] = useState<PlatformSecret[]>([]);
+  const [secretsError, setSecretsError] = useState<string | null>(null);
+  const [creatingInlineSecret, setCreatingInlineSecret] = useState(false);
   const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await api.listPlatformSecrets();
+        if (!cancelled) setSecrets(res.data);
+      } catch (err) {
+        if (!cancelled) setSecretsError(err instanceof ApiError ? extractError(err) : String(err));
+      }
+    })().catch(() => undefined);
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function handleProvider(p: ProviderId) {
     setProvider(p);
@@ -747,19 +774,36 @@ function LlmModal(props: {
     }
   }
 
+  function saveDisabled(): boolean {
+    if (saving) return true;
+    if (!name.trim() || !modelString.trim() || !baseUrl.trim()) return true;
+    if (keySource === 'vault') return !secretId;
+    return !apiKeyEnv.trim();
+  }
+
   async function save() {
     setSaving(true);
     try {
+      // Build the body so the unused source's field is explicitly
+      // null on update (clears any stale value), or omitted on create.
+      const body = {
+        name, provider, modelString, baseUrl,
+        isDefault, description: description || null,
+        ...(keySource === 'vault'
+          ? { secretId, apiKeyEnv: null as string | null }
+          : { apiKeyEnv, secretId: null as string | null }),
+      };
       if (props.existing) {
-        await api.updatePlatformLlm(props.existing.id, {
-          name, provider, modelString, baseUrl, apiKeyEnv,
-          isDefault, description: description || null,
-        });
+        await api.updatePlatformLlm(props.existing.id, body);
       } else {
-        await api.createPlatformLlm({
-          name, provider, modelString, baseUrl, apiKeyEnv,
+        // For create, omit the explicit-null entry so the server's
+        // either-or validation sees only the active source.
+        const createBody: Parameters<typeof api.createPlatformLlm>[0] = {
+          name, provider, modelString, baseUrl,
           isDefault, description: description || null,
-        });
+          ...(keySource === 'vault' ? { secretId } : { apiKeyEnv }),
+        };
+        await api.createPlatformLlm(createBody);
       }
       props.onSaved();
     } catch (err) {
@@ -767,6 +811,12 @@ function LlmModal(props: {
     } finally {
       setSaving(false);
     }
+  }
+
+  async function handleInlineSecretCreated(newSecret: PlatformSecret) {
+    setSecrets((prev) => [newSecret, ...prev]);
+    setSecretId(newSecret.id);
+    setCreatingInlineSecret(false);
   }
 
   return (
@@ -787,12 +837,63 @@ function LlmModal(props: {
         <label style={styles.label}>Base URL
           <input style={styles.input} value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder={PROVIDER_PRESETS[provider]} />
         </label>
-        <label style={styles.label}>API key env var (NAME, not value)
-          <input style={styles.input} value={apiKeyEnv} onChange={(e) => setApiKeyEnv(e.target.value)} placeholder="OPENAI_API_KEY" />
-        </label>
-        <p style={{ color: 'var(--text-dim)', fontSize: '11px', margin: 0 }}>
-          The actual API key value lives only in the server's environment — it is never persisted in the registry.
-        </p>
+
+        <div style={styles.sourceBlock}>
+          <div style={styles.sourceHeader}>API key source</div>
+          <label style={styles.radioRow}>
+            <input
+              type="radio"
+              name="key-source"
+              checked={keySource === 'vault'}
+              onChange={() => setKeySource('vault')}
+            />
+            <span>Vault secret (recommended) — encrypted at rest</span>
+          </label>
+          {keySource === 'vault' && (
+            <div style={styles.sourceBody}>
+              {secretsError && <div style={styles.errorBanner}>{secretsError}</div>}
+              {secrets.length === 0 ? (
+                <p style={{ color: 'var(--text-dim)', fontSize: '12px', margin: '4px 0' }}>
+                  No secrets in the vault yet. Create one to continue.
+                </p>
+              ) : (
+                <select style={styles.select} value={secretId} onChange={(e) => setSecretId(e.target.value)}>
+                  <option value="">— select a secret —</option>
+                  {secrets.map((s) => (
+                    <option key={s.id} value={s.id}>{s.name}{s.description ? ` — ${s.description}` : ''}</option>
+                  ))}
+                </select>
+              )}
+              <button
+                style={{ ...styles.linkBtn, padding: 0, marginTop: '6px' }}
+                onClick={() => setCreatingInlineSecret(true)}
+              >+ Create new secret</button>
+            </div>
+          )}
+          <label style={styles.radioRow}>
+            <input
+              type="radio"
+              name="key-source"
+              checked={keySource === 'env'}
+              onChange={() => setKeySource('env')}
+            />
+            <span>Environment variable (legacy)</span>
+          </label>
+          {keySource === 'env' && (
+            <div style={styles.sourceBody}>
+              <input
+                style={styles.input}
+                value={apiKeyEnv}
+                onChange={(e) => setApiKeyEnv(e.target.value)}
+                placeholder="OPENAI_API_KEY (env-var NAME, not value)"
+              />
+              <p style={{ color: 'var(--text-dim)', fontSize: '11px', margin: '4px 0 0' }}>
+                The server reads the env value at LLM call time. Nothing is persisted in the registry.
+              </p>
+            </div>
+          )}
+        </div>
+
         <label style={styles.label}>Description (optional)
           <input style={styles.input} value={description ?? ''} onChange={(e) => setDescription(e.target.value)} />
         </label>
@@ -802,13 +903,274 @@ function LlmModal(props: {
         </label>
         <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
           <button style={styles.linkBtn} onClick={props.onClose}>Cancel</button>
-          <button style={styles.primaryBtn} onClick={() => void save()} disabled={saving || !name.trim() || !modelString.trim() || !baseUrl.trim() || !apiKeyEnv.trim()}>
+          <button style={styles.primaryBtn} onClick={() => void save()} disabled={saveDisabled()}>
             {saving ? 'Saving...' : (props.existing ? 'Update' : 'Add LLM')}
+          </button>
+        </div>
+
+        {creatingInlineSecret && (
+          <AddSecretModal
+            onClose={() => setCreatingInlineSecret(false)}
+            onCreated={(s) => void handleInlineSecretCreated(s)}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function formatKeySource(llm: PlatformLLM): React.ReactNode {
+  if (llm.secretId) {
+    return <span style={{ color: 'var(--green)' }}>🔒 vault</span>;
+  }
+  if (llm.apiKeyEnv) {
+    return <code style={{ color: 'var(--text-dim)' }}>env: {llm.apiKeyEnv}</code>;
+  }
+  return <span style={{ color: 'var(--red)' }}>(unset)</span>;
+}
+
+// ─── Secrets tab (Session 4 — migration 015) ─────────────────────────────────
+
+function SecretsTab() {
+  const api = useDashboardApi();
+  const [secrets, setSecrets] = useState<PlatformSecret[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState<PlatformSecret | null>(null);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const res = await api.listPlatformSecrets();
+      setSecrets(res.data);
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+  useEffect(() => { void load(); /* eslint-disable-next-line */ }, []);
+
+  async function handleDelete(s: PlatformSecret) {
+    if (!window.confirm(`Remove secret '${s.name}'? This cannot be undone.`)) return;
+    setError(null);
+    try {
+      await api.deletePlatformSecret(s.id);
+      await load();
+    } catch (err) {
+      // Surface the SECRET_IN_USE error with the list of referencing LLMs
+      if (err instanceof ApiError) {
+        try {
+          const body = JSON.parse(err.message) as { code?: string; llmNames?: string[]; error?: string };
+          if (body.code === 'SECRET_IN_USE' && body.llmNames) {
+            setError(`Cannot remove: secret is used by LLM(s) ${body.llmNames.join(', ')}. Edit each LLM first to switch its key source.`);
+            return;
+          }
+          setError(body.error ?? err.message);
+          return;
+        } catch {
+          setError(err.message);
+          return;
+        }
+      }
+      setError(String(err));
+    }
+  }
+
+  if (loading) return <p style={{ color: 'var(--text-dim)' }}>Loading secrets...</p>;
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+        <h3 style={styles.cardTitle}>Encrypted secrets vault ({secrets.length})</h3>
+        <button style={styles.primaryBtn} onClick={() => { setCreating(true); setEditing(null); }}>+ Add secret</button>
+      </div>
+      <p style={{ color: 'var(--text-dim)', fontSize: '12px', margin: '0 0 12px' }}>
+        Secret values are encrypted with the server's master key (AES-256-GCM) and are never displayed
+        after they are saved. To replace a value, use <em>Rotate</em>.
+      </p>
+      {error && <div style={styles.errorBanner}>{error}</div>}
+      <table style={styles.table}>
+        <thead>
+          <tr>
+            <th style={styles.th}>Name</th>
+            <th style={styles.th}>Description</th>
+            <th style={styles.th}>Created</th>
+            <th style={styles.th}>Updated</th>
+            <th style={styles.th}>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {secrets.length === 0 && (
+            <tr><td colSpan={5} style={styles.empty}>No secrets stored yet</td></tr>
+          )}
+          {secrets.map((s) => (
+            <tr key={s.id}>
+              <td style={styles.td}><code>{s.name}</code></td>
+              <td style={styles.td}>{s.description ?? <span style={{ color: 'var(--text-dim)' }}>—</span>}</td>
+              <td style={styles.td}>{formatDate(s.createdAt)}</td>
+              <td style={styles.td}>{formatDate(s.updatedAt)}</td>
+              <td style={styles.td}>
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  <button style={styles.linkBtn} onClick={() => { setEditing(s); setCreating(false); }}>Edit / rotate</button>
+                  <button style={styles.dangerBtn} onClick={() => void handleDelete(s)}>×</button>
+                </div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {creating && (
+        <AddSecretModal
+          onClose={() => setCreating(false)}
+          onCreated={() => { setCreating(false); void load(); }}
+        />
+      )}
+      {editing && (
+        <EditSecretModal
+          existing={editing}
+          onClose={() => setEditing(null)}
+          onSaved={() => { setEditing(null); void load(); }}
+        />
+      )}
+    </div>
+  );
+}
+
+function AddSecretModal(props: {
+  onClose: () => void;
+  onCreated: (secret: PlatformSecret) => void;
+}) {
+  const api = useDashboardApi();
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [value, setValue] = useState('');
+  const [confirmValue, setConfirmValue] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  async function save() {
+    setError(null);
+    if (!name.trim() || !value) { setError('Name and value are required'); return; }
+    if (value !== confirmValue) { setError('Values do not match'); return; }
+    setSaving(true);
+    try {
+      const res = await api.createPlatformSecret({ name: name.trim(), value, description: description.trim() || null });
+      props.onCreated(res.data);
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div style={styles.modalBackdrop} onClick={props.onClose}>
+      <div style={{ ...styles.modal, maxWidth: '480px' }} onClick={(e) => e.stopPropagation()}>
+        <h3 style={styles.cardTitle}>Add secret</h3>
+        <p style={{ color: 'var(--text-dim)', fontSize: '12px', margin: 0 }}>
+          The value is encrypted at rest and will not be shown again after you save.
+        </p>
+        {error && <div style={styles.errorBanner}>{error}</div>}
+        <label style={styles.label}>Name
+          <input style={styles.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="openai-prod-key" autoFocus />
+        </label>
+        <label style={styles.label}>Description (optional)
+          <input style={styles.input} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Production OpenAI API key" />
+        </label>
+        <label style={styles.label}>Secret value
+          <input type="password" style={styles.input} value={value} onChange={(e) => setValue(e.target.value)} />
+        </label>
+        <label style={styles.label}>Confirm value
+          <input type="password" style={styles.input} value={confirmValue} onChange={(e) => setConfirmValue(e.target.value)} />
+        </label>
+        <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+          <button style={styles.linkBtn} onClick={props.onClose}>Cancel</button>
+          <button style={styles.primaryBtn} onClick={() => void save()} disabled={saving || !name.trim() || !value || value !== confirmValue}>
+            {saving ? 'Saving...' : 'Save secret'}
           </button>
         </div>
       </div>
     </div>
   );
+}
+
+function EditSecretModal(props: {
+  existing: PlatformSecret;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const api = useDashboardApi();
+  const [name, setName] = useState(props.existing.name);
+  const [description, setDescription] = useState(props.existing.description ?? '');
+  const [newValue, setNewValue] = useState('');
+  const [confirmValue, setConfirmValue] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  async function save() {
+    setError(null);
+    if (newValue && newValue !== confirmValue) {
+      setError('Values do not match');
+      return;
+    }
+    setSaving(true);
+    try {
+      const body: Partial<{ name: string; value: string; description: string | null }> = {};
+      if (name.trim() !== props.existing.name) body.name = name.trim();
+      if ((description.trim() || null) !== props.existing.description) body.description = description.trim() || null;
+      if (newValue) body.value = newValue;
+      if (Object.keys(body).length === 0) { props.onClose(); return; }
+      await api.updatePlatformSecret(props.existing.id, body);
+      props.onSaved();
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div style={styles.modalBackdrop} onClick={props.onClose}>
+      <div style={{ ...styles.modal, maxWidth: '480px' }} onClick={(e) => e.stopPropagation()}>
+        <h3 style={styles.cardTitle}>Edit secret</h3>
+        {error && <div style={styles.errorBanner}>{error}</div>}
+        <label style={styles.label}>Name
+          <input style={styles.input} value={name} onChange={(e) => setName(e.target.value)} />
+        </label>
+        <label style={styles.label}>Description
+          <input style={styles.input} value={description} onChange={(e) => setDescription(e.target.value)} />
+        </label>
+        <div style={styles.sourceBlock}>
+          <div style={styles.sourceHeader}>Rotate value (optional)</div>
+          <p style={{ color: 'var(--text-dim)', fontSize: '11px', margin: '0 0 6px' }}>
+            Leave both fields blank to keep the current value. Setting a new value is irreversible — the old value cannot be recovered.
+          </p>
+          <label style={styles.label}>New value
+            <input type="password" style={styles.input} value={newValue} onChange={(e) => setNewValue(e.target.value)} />
+          </label>
+          <label style={styles.label}>Confirm new value
+            <input type="password" style={styles.input} value={confirmValue} onChange={(e) => setConfirmValue(e.target.value)} />
+          </label>
+        </div>
+        <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+          <button style={styles.linkBtn} onClick={props.onClose}>Cancel</button>
+          <button style={styles.primaryBtn} onClick={() => void save()} disabled={saving}>
+            {saving ? 'Saving...' : 'Save changes'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function formatDate(iso: string): string {
+  try {
+    return new Date(iso).toLocaleString();
+  } catch {
+    return iso;
+  }
 }
 
 function extractError(err: ApiError): string {
@@ -935,4 +1297,13 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: '4px', padding: '6px 8px', fontFamily: 'var(--font-mono)', fontSize: '12px',
     color: 'var(--text-primary)', marginTop: '4px',
   },
+  sourceBlock: {
+    border: '1px solid var(--border)', borderRadius: '4px',
+    padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: '6px',
+  },
+  sourceHeader: {
+    color: 'var(--text-dim)', fontSize: '11px', textTransform: 'uppercase',
+    letterSpacing: '0.5px', fontFamily: 'var(--font-mono)',
+  },
+  sourceBody: { paddingLeft: '24px', display: 'flex', flexDirection: 'column' },
 };

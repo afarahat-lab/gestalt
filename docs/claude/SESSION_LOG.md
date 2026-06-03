@@ -10684,3 +10684,364 @@ implicitly opened by this session:
   against (OpenAI, Anthropic, Ollama, vLLM) all accept
   `Bearer`. Capture as a follow-up if Azure ADFS or other
   non-OpenAI-shape providers come up
+
+---
+
+### Session 2026-06-03 — Claude Code (platform secrets vault: encrypted API keys end-to-end — migrations 015 + 016)
+
+Replaces the env-var-only API-key pattern with an encrypted-at-rest
+vault. Operators enter API key VALUES once (dashboard or CLI),
+reference them from any LLM in the registry, rotate without
+touching the server's environment. Secret values are NEVER returned
+by any API endpoint.
+
+Changed:
+
+- `packages/adapters/postgres/src/migrations/015_secrets_vault.sql`
+  (new): `platform_secrets` table — `id`, `name` UNIQUE,
+  `description`, `encrypted`/`iv`/`auth_tag` TEXT (base64),
+  `created_by` nullable FK to `users(id) ON DELETE SET NULL`,
+  timestamps. `platform_llms` gains nullable `secret_id UUID
+  REFERENCES platform_secrets(id) ON DELETE SET NULL` plus a
+  partial btree index for the SECRET_IN_USE guard scan
+- `packages/adapters/postgres/src/migrations/016_relax_llm_apikey_env.sql`
+  (new): `ALTER TABLE platform_llms ALTER COLUMN api_key_env
+  DROP NOT NULL;`. Migration 015 added the column as a sibling
+  of the existing NOT NULL `api_key_env` so existing rows
+  weren't disturbed; migration 016 relaxes the constraint now
+  that the application layer's either-or validator
+  (`INVALID_API_KEY_SOURCE`) is the authoritative check. A new
+  vault-only LLM row carries `apiKeyEnv = null, secretId =
+  <uuid>`
+- `packages/core/src/secrets/vault.ts` (new): AES-256-GCM
+  encryption helpers. `loadMasterKey()` checks
+  `GESTALT_MASTER_KEY` (base64) → `/etc/gestalt/master.key` →
+  `./master.key` in cwd; in dev (`NODE_ENV !== 'production'`)
+  auto-generates a fresh 32-byte key into `./master.key` with
+  mode 0600 + a WARN log; in production a missing key is a
+  **fatal startup error** (so a misconfigured deployment
+  surfaces at boot, not on the first secret operation).
+  `encryptSecret(value, masterKey)` uses a fresh 96-bit IV per
+  call (never reused) and returns `{ encrypted, iv, authTag }`
+  as base64 strings. `decryptSecret(secret, masterKey)` throws
+  a single generic message `"decryption failed: bad key or
+  corrupt data"` on any failure — error side channels can't
+  leak whether the cause was a bad key, tampered ciphertext, or
+  wrong auth tag
+- `packages/core/src/repository/index.ts`:
+  - `PlatformLLMRecord.apiKeyEnv: string` → `string | null` +
+    new `secretId: string | null`
+  - new `PlatformSecretRecord` (full row including encrypted
+    columns) + `PlatformSecretSummary` (public-safe; no
+    ciphertext)
+  - new `PlatformSecretRepository` interface — `create`,
+    `update`, `findById`, `findByName`, `list` (returns
+    `PlatformSecretSummary[]`), `delete` (throws
+    `SecretInUseError`), `findReferencingLlms`
+  - `RepositoryRegistry` gained `platformSecrets`
+- `packages/core/src/index.ts`: exports `loadMasterKey`,
+  `encryptSecret`, `decryptSecret`, `EncryptedSecret`, the new
+  record + repository types
+- `packages/adapters/postgres/src/repositories/platform-secrets.ts`
+  (new): `PostgresPlatformSecretRepository`. `list()` uses a
+  narrow SQL projection that omits `encrypted` / `iv` /
+  `auth_tag` — defense-in-depth so even an accidental
+  server-side log of the full row never carries ciphertext.
+  `delete()` runs inside `db.begin`: queries `platform_llms
+  WHERE secret_id = $1`, throws `SecretInUseError(id,
+  llmNames)` if any rows match. Module also exports the typed
+  error class for the route layer to instanceof-check
+- `packages/adapters/postgres/src/repositories/platform-llms.ts`:
+  - `PlatformLLMRow.apiKeyEnv: string | null`; new `secretId:
+    string | null`
+  - `create` INSERT includes `secret_id`
+  - `update` setParts includes the `secretId` branch
+- `packages/adapters/postgres/src/index.ts`: wires the new
+  postgres impl; re-exports `SecretInUseError`
+- `packages/adapters/{oracle,mssql}/src/repositories/platform-secrets.ts`
+  (new): throw-stub `*PlatformSecretRepository` classes for
+  interface parity. Wired through each adapter's `index.ts`
+- `packages/server/src/secrets/index.ts` (new): module-scope
+  `_masterKey: Buffer | null`. `setMasterKey(key)`,
+  `getMasterKey(): Buffer` (throws when called before set so a
+  misordered import can never silently encrypt with a zero
+  key), `_resetMasterKey()` for tests
+- `packages/server/src/server.ts`:
+  - New step 1b — **`loadMasterKey()` + `setMasterKey()` runs
+    BEFORE step 2 (database init)** so any subsequent
+    operation that touches encrypted material has a valid key
+  - Step 4b wire-up extended: `setLLMRegistryResolver` now
+    calls a new `resolveLlmApiKey(match)` helper that
+    pre-resolves the API key server-side (vault decrypt under
+    the master key, OR env-var lookup) and passes the
+    resolved string to the LLM registry via the resolver's
+    new `apiKey` field. Keeps the `llm/` module free of vault
+    / repository dependencies
+  - `seedPlatformLlmsIfEmpty` extended with `secretId: null`
+    on the seeded row (legacy env-var path; operators migrate
+    to vault later via the dashboard / CLI)
+  - new `resolveLlmApiKey(llm)` helper at the bottom — vault
+    decrypt wrapped in try/catch with WARN log carrying the
+    LLM NAME ONLY (never the secret id or key material) on
+    failure; falls through to `process.env[apiKeyEnv]`;
+    returns empty string when neither resolves so the LLM
+    call surfaces an actionable 401
+- `packages/core/src/llm/index.ts`:
+  - `RegistryEntry` shape changed from `{ modelString,
+    baseUrl, apiKeyEnv }` to `{ modelString, baseUrl, apiKey
+    }` (pre-resolved). The cleaner shape keeps the LLM module
+    unaware of where the key came from
+  - `getLLMClientForModel` reads `registered.apiKey`
+    directly; cache key remains `${model}|${baseUrl}` so two
+    registrations of the same model name against different
+    endpoints get distinct clients
+- `packages/server/src/routes/secrets.ts` (new): all four
+  endpoints `requireRole('admin')`:
+  - `GET /platform/secrets` — list summaries (no
+    ciphertext); no audit row on read
+  - `POST /platform/secrets` — body `{ name, value,
+    description? }`. Encrypts with the master key, persists.
+    Audit row `secret.created` metadata carries `name +
+    descriptionLength + ip` ONLY (GP-006 —
+    value/encrypted/iv/authTag NEVER reach `audit_log`)
+  - `PATCH /platform/secrets/:id` — partial update; supports
+    rename, rotate (fresh IV), description-edit. Audit
+    metadata records `changedFields` so an operator can
+    later answer who-rotated-what-when without learning the
+    value
+  - `DELETE /platform/secrets/:id` — catches
+    `SecretInUseError`; returns HTTP 400 `SECRET_IN_USE`
+    with `llmNames: string[]` so the operator can clear the
+    references in one trip
+  - `toPublic()` helper strips encrypted columns from POST/
+    PATCH responses (the repository's list path already
+    excludes them at the SQL level)
+- `packages/server/src/app.ts`: registers
+  `registerSecretsRoutes(app)`
+- `packages/server/src/routes/platform-config.ts`:
+  - Extended body interfaces to include `secretId?: unknown`
+  - `validateCreateBody`: requires at least one of
+    `apiKeyEnv` or `secretId` → `INVALID_API_KEY_SOURCE`
+    (400)
+  - `validateUpdateBody`: `apiKeyEnv` and `secretId` both
+    independently nullable so an operator can flip an
+    existing LLM from env var to vault without re-registering
+  - `POST /platform/llms/:id/test` now resolves the API key
+    through a new `resolveTestApiKey(existing)` helper that
+    mirrors `server.ts:resolveLlmApiKey` so the test reflects
+    what an agent call would actually see at runtime
+- `packages/cli/src/api/client.ts`:
+  - `PlatformLLM.apiKeyEnv: string` → `string | null`; new
+    `secretId: string | null`
+  - new `PlatformSecretSummary` type + `listPlatformSecrets`
+    / `createPlatformSecret` / `updatePlatformSecret` /
+    `deletePlatformSecret` methods
+- `packages/cli/src/commands/platform-config.ts`:
+  - `platformLlmsAddCommand` gained the source picker — `1
+    = vault secret` (lists existing secrets via
+    `listPlatformSecrets`, operator picks by name) or `2 =
+    env var` (free-text input)
+  - `platformLlmsListCommand` table gained a "Key source"
+    column showing `vault` / `env: VAR_NAME` / `(unset)`
+  - `platformLlmsTestCommand` failure message now branches
+    on whether the LLM uses a secret id, an env-var name, or
+    neither
+  - new `platformSecretsListCommand` — table with `name /
+    description / age`; footer line states "values are never
+    displayed; use `rotate <name>` to replace"
+  - new `platformSecretsAddCommand` — interactive: name,
+    description, hidden TTY value via `promptSecret`, hidden
+    confirm, mismatch error
+  - new `platformSecretsRotateCommand` — resolves by name,
+    "old value unrecoverable" warning, hidden new value +
+    confirm
+  - new `platformSecretsRemoveCommand` — confirm prompt;
+    surfaces `SECRET_IN_USE` with LLM names so the operator
+    knows which references to clear first
+  - helpers `resolveSecretByName` + `formatAge`
+- `packages/cli/src/index.ts`: registers `gestalt platform
+  secrets` parent + `list / add / rotate / remove`
+  subcommands. Top-of-file command comment updated
+- `packages/dashboard/src/types.ts`:
+  - `PlatformLLM.apiKeyEnv: string | null`; new `secretId:
+    string | null`
+  - new `PlatformSecret` interface (id, name, description,
+    timestamps — no value field; values are never returned)
+- `packages/dashboard/src/api/client.ts`:
+  - typed bodies for `createPlatformLlm` / `updatePlatformLlm`
+    now accept either `apiKeyEnv` (string) or `secretId`
+    (uuid); update accepts both as `string | null`
+  - new `listPlatformSecrets` / `createPlatformSecret` /
+    `updatePlatformSecret` / `deletePlatformSecret` methods
+- `packages/dashboard/src/views/Admin.tsx`:
+  - 4th `Tab` value `'secrets'` added; sidebar tab + render
+    branch added
+  - `LlmsTab` table: replaced the `Env var` column with a
+    `Key source` column rendered by a new `formatKeySource(l)`
+    helper — `🔒 vault` (green), `env: VAR_NAME` (dim), or
+    `(unset)` (red)
+  - `LlmModal` rewritten: source picker is a radio pair —
+    "Vault secret (recommended)" populates a `<select>` of
+    existing secrets PLUS an inline `+ Create new secret`
+    link that opens an `AddSecretModal`; OR "Environment
+    variable (legacy)" with the free-text input. The form
+    submits the active source's value and explicit `null`
+    for the inactive on update (clears stale value); create
+    omits the inactive entry so the server's either-or
+    validator sees only the active source
+  - new `SecretsTab` — table (name, description, created,
+    updated), `+ Add secret` button, per-row `Edit / rotate`
+    + `× Delete`. Delete handler parses `SECRET_IN_USE`
+    errors and surfaces the LLM list inline. Tab includes
+    the explanatory note "values are encrypted with the
+    server's master key and are never displayed after they
+    are saved; to replace a value use Rotate"
+  - new `AddSecretModal` — name, description, hidden value
+    + confirm-match before save; reusable from both the
+    Secrets tab and the LLM modal's inline link
+  - new `EditSecretModal` — name + description always
+    editable; rotate-value section is optional with the
+    "leave blank to keep the current value" note + the
+    "irreversible — old value cannot be recovered" warning
+  - new style entries `sourceBlock` / `sourceHeader` /
+    `sourceBody` for the source-picker container
+- `docker-compose.yml`: server service gained
+  - commented `- GESTALT_MASTER_KEY=${GESTALT_MASTER_KEY}` env
+  - commented `- ./master.key:/etc/gestalt/master.key:ro`
+    volume mount alongside the existing identity-config
+    mounts, with an inline operational note about the
+    `openssl rand -base64 32 > master.key` recipe + chmod
+    600 + back-up-out-of-band warning + "do not rotate in
+    place" caveat
+- `.gitignore`: now excludes `master.key`, `auth.config.json`,
+  `krb5.keytab` — three secret-bearing files that should
+  NEVER be committed regardless of where in the working tree
+  they land
+- `docs/guides/deployment.md`: new "Generate the master key
+  for the encrypted secrets vault" section under Step 4
+  (Configure environment). Documents the three master-key
+  source mechanisms, the `openssl rand -base64 32 >
+  master.key` recipe, the recommended docker-compose volume
+  mount, and three operational warnings: back up the key out
+  of band; do not rotate in place (no automated re-encrypt
+  tooling yet); never commit `master.key`
+
+Verified live end-to-end against an existing `trackeros`-style
+postgres:
+
+- `pnpm -r build` clean across all 12 packages
+- `docker compose up -d --build server` — `Up (healthy)`;
+  `/health` 200; `/auth/me` 200 with existing token
+- Master key auto-generated on first boot (dev mode): server
+  logs the WARN block; `docker exec gestalt-server-1 ls -la
+  /app/master.key` shows `-rw------- gestalt gestalt 45 Jun 3
+  11:09` (mode 0600, 45 bytes — 32 raw bytes base64-encoded)
+- Migrations applied in order: log shows `Applying migration
+  015_secrets_vault` then `Applying migration
+  016_relax_llm_apikey_env` then `Migration applied` for both.
+  `schema_migrations` table lists all 16 versions
+- `\d platform_secrets` confirms the table shape
+- `\d platform_llms` confirms `secret_id UUID REFERENCES
+  platform_secrets(id) ON DELETE SET NULL` + the partial
+  `idx_platform_llms_secret_id` index + `api_key_env`
+  nullable
+- **`GET /platform/secrets`** returns `{"data":[]}`
+- **`POST /platform/secrets`** with `{"name":"verify-test-key",
+  "value":"sk-VERIFY-1234-secret-value","description":"Created
+  during Session 4 live verification"}` returns
+  `{"data":{"id":"…","name":"verify-test-key","description":
+  "…","createdBy":"…","createdAt":"…","updatedAt":"…"}}` —
+  **no encrypted/iv/authTag fields in the response**
+- **Direct DB inspection**: `length(encrypted) = 36`,
+  `length(iv) = 16`, `length(auth_tag) = 24`, `position('VERIFY'
+  in encrypted) = 0` — ciphertext does NOT contain the
+  plaintext substring (confirmed real encryption, not just
+  storage)
+- **Audit row** for `secret.created`: `metadata =
+  {"name":"verify-test-key","descriptionLength":42,"ip":
+  "192.168.65.1"}` — no value, no encrypted, no iv, no
+  authTag (GP-006 verified)
+- **`POST /platform/llms`** with `{"name":"verify-vault-llm",
+  …,"secretId":"<uuid>","description":"vault-sourced LLM for
+  verification"}` (no `apiKeyEnv`) returns the new LLM with
+  `apiKeyEnv: null, secretId: "<uuid>"` — vault-only row
+- **`DELETE /platform/secrets/<id>`** while referenced
+  returns HTTP 400 with `{"error":"Secret is in use by 1
+  LLM(s): verify-vault-llm","code":"SECRET_IN_USE","llmNames":
+  ["verify-vault-llm"]}` — typed code with the LLM name
+- **Rotation**: PATCH with new value produces a fresh
+  ciphertext — direct DB probe before/after confirms
+  ciphertext bytes changed (and the IV is also fresh; the
+  encrypt helper generates a new 96-bit IV per call so the
+  same plaintext under the same key would still produce
+  distinct ciphertext)
+- **Flip-and-delete**: PATCH LLM to `{secretId: null,
+  apiKeyEnv: "LLM_API_KEY"}` — DB confirms `api_key_env =
+  'LLM_API_KEY', secret_id = NULL`. Re-DELETE of the secret
+  returns HTTP 204
+- **`audit_log` text scan**: `metadata::text LIKE
+  '%VERIFY-1234%'` (the actual secret VALUE substring)
+  returns 0 rows across every action — confirms the value
+  text never reaches the audit table via any mutation
+- All 12 packages still build clean after the live cycle
+
+Decisions:
+
+- **Two migrations (015 + 016) instead of one.** Migration
+  015 adds the `secret_id` column as a sibling of the
+  pre-existing NOT NULL `api_key_env` so all existing rows
+  survive a re-apply. Migration 016 then relaxes the NOT
+  NULL once the application layer's either-or validator
+  (`INVALID_API_KEY_SOURCE`) is the authoritative check.
+  Splitting them keeps each migration trivially reversible
+  and avoids a soft-coupling between schema and route logic
+- **Audit metadata never carries the encrypted bytes,
+  IV, auth tag, or value.** Only `name` (for human
+  searchability), lengths (for "did the operator paste a
+  full key or a typo"), and `changedFields` (for
+  who-rotated-what-when). GP-006 verified by direct
+  audit_log text scan
+- **`list()` projection omits encrypted columns at the
+  SQL level**, not just at the application toPublic shim.
+  Defense-in-depth so even an accidental server-side log
+  of the full row never carries ciphertext. The dashboard's
+  `GET /platform/secrets` response is structurally a
+  `PlatformSecretSummary[]` with no encrypted fields to
+  redact
+- **Master key loaded BEFORE the database is initialised.**
+  Step 1b runs after config load but before
+  `createPostgresAdapter`. This ensures a misconfigured
+  deployment surfaces the key error at boot, not on the
+  first secret-bearing read after migrations have applied
+- **Resolver injection rather than vault import inside
+  `llm/`.** The `setLLMRegistryResolver` callback is the
+  exact boundary where vault decryption belongs — server-
+  side, with master key in scope. The `llm/` module sees
+  only the pre-resolved string. Two consequences: the LLM
+  client code never imports `crypto`, and the same
+  resolver pattern will absorb future key sources (Vault,
+  Kubernetes secrets, AWS KMS, etc.) without touching the
+  LLM module
+- **Generic `"decryption failed: bad key or corrupt data"`
+  error.** Distinguishing bad-key from tampered-auth-tag
+  would be useful debugging signal, but each distinct
+  failure mode is a side channel an attacker can probe.
+  Single message; details go to the server log at WARN
+  level
+- **Dev auto-generation is in cwd, not /etc/.** Operators
+  running `pnpm dev` shouldn't need root to bootstrap the
+  vault. The 0600 file mode is set explicitly so the
+  generated file is at least restricted to the user. In
+  production, the volume mount of `/etc/gestalt/master.key`
+  takes precedence and the cwd file is never created
+- **Did NOT migrate the seeded LLM to a vault secret on
+  the upgrade path.** Existing operators have a working
+  `LLM_API_KEY` env var; the seed row keeps using it. They
+  migrate at their convenience via the dashboard's "Edit
+  LLM" modal or `gestalt platform llms` CLI
+- **No vault-side rotation tooling for the master key
+  itself.** Rotating the master key would require
+  decrypting every secret with the old key and re-encrypting
+  under the new one — a tooling task not yet automated.
+  Treat the master key as a long-lived secret; document the
+  "do not rotate in place" warning in the deployment guide

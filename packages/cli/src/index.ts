@@ -27,6 +27,10 @@
  *   gestalt platform llms set-default <name>
  *   gestalt platform llms remove <name>
  *   gestalt platform llms test <name>                       — reachability check
+ *   gestalt platform secrets list                           — encrypted vault
+ *   gestalt platform secrets add                            — interactive (hidden value)
+ *   gestalt platform secrets rotate <name>                  — replace the value
+ *   gestalt platform secrets remove <name>                  — delete (SECRET_IN_USE guard)
  *   gestalt run "<intent>" [--server <url>] [--priority critical|high|normal|low]
  *   gestalt intent list [--project <name>] [--status <s>] [--limit 20]
  *   gestalt intent show <id> [--watch]                — execution-flow graph
@@ -93,6 +97,8 @@ import {
   platformLlmsListCommand, platformLlmsAddCommand,
   platformLlmsSetDefaultCommand, platformLlmsRemoveCommand,
   platformLlmsTestCommand,
+  platformSecretsListCommand, platformSecretsAddCommand,
+  platformSecretsRotateCommand, platformSecretsRemoveCommand,
 } from './commands/platform-config';
 import {
   usersListCommand, usersAddCommand, usersRoleCommand, usersDeactivateCommand,
@@ -618,6 +624,43 @@ platformLlms
   .option('--server <url>', 'Server URL (one-shot override for this invocation)')
   .action(async (name: string, opts: { server?: string }) => {
     await platformLlmsTestCommand(name, { server: opts.server }).catch(fatalError);
+  });
+
+// gestalt platform secrets — encrypted vault (Session 4 — migration 015)
+const platformSecrets = platform
+  .command('secrets')
+  .description('Manage the encrypted secrets vault. Values are encrypted under a server master key and NEVER returned by any API.');
+
+platformSecrets
+  .command('list')
+  .description('Table of stored secrets — names, descriptions, updated timestamps. Values are never displayed.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (opts: { server?: string }) => {
+    await platformSecretsListCommand({ server: opts.server }).catch(fatalError);
+  });
+
+platformSecrets
+  .command('add')
+  .description('Interactively register a secret. Hidden TTY input + confirmation; the value never appears on stdout.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (opts: { server?: string }) => {
+    await platformSecretsAddCommand({ server: opts.server }).catch(fatalError);
+  });
+
+platformSecrets
+  .command('rotate <name>')
+  .description('Replace a secret\'s value with a fresh one. The old value is unrecoverable after rotation.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (name: string, opts: { server?: string }) => {
+    await platformSecretsRotateCommand(name, { server: opts.server }).catch(fatalError);
+  });
+
+platformSecrets
+  .command('remove <name>')
+  .description('Delete a secret. Refuses if the secret is referenced by any LLM (SECRET_IN_USE).')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (name: string, opts: { server?: string }) => {
+    await platformSecretsRemoveCommand(name, { server: opts.server }).catch(fatalError);
   });
 
 // gestalt run
