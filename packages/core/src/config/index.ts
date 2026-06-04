@@ -37,6 +37,14 @@ export interface LLMConfig {
   model: string;
   timeoutMs: number;
   maxRetries: number;
+  /**
+   * Wire shape — see `LLMApiShape` in the repository module. Optional
+   * because the platform default `.env`-driven seed doesn't know
+   * about per-row registry shape; clients constructed from a
+   * registry row (`getLLMClientForModel`) populate it explicitly.
+   * Defaults to `'chat-completions'` when unset.
+   */
+  apiShape?: 'chat-completions' | 'responses';
 }
 
 export interface AuthConfig {

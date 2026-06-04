@@ -21,13 +21,15 @@
  */
 
 import type { FastifyInstance } from 'fastify';
+import { access, writeFile } from 'fs/promises';
 import {
   getRepositories, createContextLogger,
-  encryptSecret, type PlatformSecretRecord, type PlatformSecretSummary,
+  encryptSecret, decryptSecret,
+  type PlatformSecretRecord, type PlatformSecretSummary,
 } from '@gestalt/core';
 import { SecretInUseError } from '@gestalt/adapter-postgres';
 import { requireRole } from '../auth/middleware';
-import { getMasterKey } from '../secrets/index';
+import { getMasterKey, setMasterKey } from '../secrets/index';
 
 const log = createContextLogger({ module: 'routes:secrets' });
 
@@ -45,14 +47,18 @@ interface UpdateBody {
 
 export async function registerSecretsRoutes(app: FastifyInstance): Promise<void> {
 
-  // GET /platform/secrets — public-safe summaries only
+  // GET /platform/secrets — public-safe summaries only + last-rotation metadata
   app.get(
     '/platform/secrets',
     { preHandler: requireRole('admin') },
     async (request, reply) => {
       if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
-      const records = await getRepositories().platformSecrets.list();
-      return reply.send({ data: records });
+      const { platformSecrets, keyRotations } = getRepositories();
+      const [records, lastRotation] = await Promise.all([
+        platformSecrets.list(),
+        keyRotations.findLatest(),
+      ]);
+      return reply.send({ data: records, lastRotation: lastRotation ?? null });
     },
   );
 
@@ -189,6 +195,150 @@ export async function registerSecretsRoutes(app: FastifyInstance): Promise<void>
           details: err instanceof Error ? err.message : String(err),
         });
       }
+    },
+  );
+
+  // POST /platform/secrets/rotate-key — atomic master-key rotation
+  //
+  // Re-encrypts every row in `platform_secrets` under a new master key
+  // inside a single DB transaction. All-or-nothing: if any decryption
+  // or re-encryption throws, the transaction rolls back and the old
+  // key stays active.
+  //
+  // Flow:
+  //   1. Validate newKey is base64 of exactly 32 bytes
+  //   2. Inside a single DB transaction (PlatformSecretRepository.rotateMasterKey):
+  //      - SELECT all rows
+  //      - For each: decrypt with current getMasterKey(), re-encrypt with newKey, UPDATE
+  //   3. On successful commit:
+  //      - setMasterKey(newKey) so future encryptSecret calls use it
+  //      - Persist to file if master.key file is the source (so a restart picks it up)
+  //      - Create a keyRotations log row
+  //   4. Audit metadata: { secretCount: N } only — NEVER key material
+  app.post<{ Body: { newKey?: unknown } }>(
+    '/platform/secrets/rotate-key',
+    { preHandler: requireRole('admin') },
+    async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+      const body = request.body ?? {};
+      if (typeof body.newKey !== 'string' || !body.newKey.trim()) {
+        return reply.code(400).send({
+          error: 'newKey is required (base64-encoded 32 bytes)',
+          code: 'INVALID_KEY_FORMAT',
+        });
+      }
+      let newKeyBuffer: Buffer;
+      try {
+        newKeyBuffer = Buffer.from(body.newKey.trim(), 'base64');
+      } catch {
+        return reply.code(400).send({
+          error: 'newKey must be base64-encoded',
+          code: 'INVALID_KEY_FORMAT',
+        });
+      }
+      if (newKeyBuffer.length !== 32) {
+        return reply.code(400).send({
+          error: `newKey must decode to 32 bytes; got ${newKeyBuffer.length}`,
+          code: 'INVALID_KEY_LENGTH',
+        });
+      }
+
+      const currentKey = getMasterKey();
+      // Refuse a no-op rotation. Lets the operator detect copy-paste
+      // mistakes (re-supplied the old key) before any data changes.
+      if (currentKey.equals(newKeyBuffer)) {
+        return reply.code(400).send({
+          error: 'newKey matches the current master key — no rotation needed',
+          code: 'KEY_UNCHANGED',
+        });
+      }
+
+      const { platformSecrets, keyRotations, audit } = getRepositories();
+
+      let rotatedCount: number;
+      try {
+        rotatedCount = await platformSecrets.rotateMasterKey((record) => {
+          // Decrypt with the current key; re-encrypt under the new key
+          // with a fresh IV. encryptSecret guarantees IV freshness.
+          const plaintext = decryptSecret(
+            { encrypted: record.encrypted, iv: record.iv, authTag: record.authTag },
+            currentKey,
+          );
+          return encryptSecret(plaintext, newKeyBuffer);
+        });
+      } catch (err) {
+        // Transaction was rolled back inside the repository — the
+        // master key in memory is still the old one, every row is
+        // still encrypted under it. Surface a clean failure.
+        log.error({ err }, 'Master key rotation failed — transaction rolled back');
+        return reply.code(500).send({
+          error: 'Rotation failed — no secrets were changed',
+          details: err instanceof Error ? err.message : String(err),
+          code: 'ROTATION_FAILED',
+        });
+      }
+
+      // Transaction committed — every row is now encrypted under the
+      // NEW key. Flip the in-memory key BEFORE any further vault
+      // operation so subsequent encryptions match the ciphertext.
+      setMasterKey(newKeyBuffer);
+
+      // Persist to file (if file-sourced). When the env var is set,
+      // we cannot update it from the server — surface a clear warning
+      // so the operator updates their secret manager / deployment.
+      if (!process.env['GESTALT_MASTER_KEY']) {
+        const candidates = ['/etc/gestalt/master.key', './master.key'];
+        let persisted = false;
+        for (const path of candidates) {
+          try {
+            await access(path);
+            await writeFile(path, body.newKey.trim() + '\n', { mode: 0o600 });
+            log.info({ path }, 'Master key file updated after rotation');
+            persisted = true;
+            break;
+          } catch {
+            // Try next candidate.
+          }
+        }
+        if (!persisted) {
+          log.warn(
+            'Master key rotated in memory but no master.key file found to update. ' +
+              'Server restart will fall back to env var or auto-generate (dev) — ' +
+              'persist the new key out of band.',
+          );
+        }
+      } else {
+        log.warn(
+          'Master key rotated in memory only — GESTALT_MASTER_KEY env var is set. ' +
+            'Update the env var to persist the rotation across restarts.',
+        );
+      }
+
+      // Create the audit log row + the rotation-log row.
+      const rotationRecord = await keyRotations.create({
+        rotatedBy: request.user.id,
+        secretCount: rotatedCount,
+      });
+      await audit.append({
+        actor: request.user.id,
+        action: 'secrets.key-rotated',
+        entityType: 'platform_secrets',
+        entityId: rotationRecord.id,
+        correlationId: request.correlationId,
+        // GP-006 — secretCount only, never any key material.
+        metadata: { secretCount: rotatedCount, ip: request.ip },
+      });
+      log.info(
+        { rotated: rotatedCount, rotationId: rotationRecord.id },
+        'Master key rotated',
+      );
+
+      return reply.send({
+        data: {
+          rotated: rotatedCount,
+          rotatedAt: rotationRecord.rotatedAt.toISOString(),
+        },
+      });
     },
   );
 

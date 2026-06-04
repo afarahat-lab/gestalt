@@ -166,6 +166,53 @@ export class PostgresPlatformSecretRepository implements PlatformSecretRepositor
       SELECT id, name FROM platform_llms WHERE secret_id = ${secretId} ORDER BY name
     `;
   }
+
+  /**
+   * Returns every secret with full ciphertext columns. Used EXCLUSIVELY
+   * by the master key rotation endpoint for diagnostic / inspection.
+   * NEVER expose results in any API response.
+   */
+  async findAllRaw(): Promise<PlatformSecretRecord[]> {
+    const db = getDb();
+    const rows = await db<PlatformSecretRow[]>`
+      SELECT * FROM platform_secrets ORDER BY created_at
+    `;
+    return rows.map(rowToRecord);
+  }
+
+  /**
+   * Atomically re-encrypt every row under a new master key. The whole
+   * SELECT + UPDATE loop runs inside `db.begin` so any thrown
+   * `reencryptFn` (e.g. decryption failure on a corrupt row) rolls
+   * back the entire rotation — leaves all rows encrypted under the
+   * OLD key, master key in the server stays the old one.
+   */
+  async rotateMasterKey(
+    reencryptFn: (record: PlatformSecretRecord) => {
+      encrypted: string; iv: string; authTag: string;
+    },
+  ): Promise<number> {
+    const db = getDb();
+    let count = 0;
+    await db.begin(async (sql) => {
+      const rows = await sql<PlatformSecretRow[]>`
+        SELECT * FROM platform_secrets ORDER BY created_at
+      `;
+      for (const row of rows) {
+        const fresh = reencryptFn(rowToRecord(row));
+        await sql`
+          UPDATE platform_secrets
+          SET encrypted  = ${fresh.encrypted},
+              iv         = ${fresh.iv},
+              auth_tag   = ${fresh.authTag},
+              updated_at = NOW()
+          WHERE id = ${row.id}
+        `;
+        count++;
+      }
+    });
+    return count;
+  }
 }
 
 /**

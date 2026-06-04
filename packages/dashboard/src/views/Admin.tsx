@@ -24,11 +24,13 @@ import { useProject } from '../context/ProjectContext';
 import { ApiError } from '../api/client';
 import type {
   UserSummary, UserDetail, ProjectMember, ProjectSummary, UserRole, ProjectRole,
-  PlatformLLM, LlmTestResult, PlatformSecret,
-  PlatformTemplateSummary, PlatformMcpServer, PlatformMcpTestResult,
+  PlatformLLM, LLMApiShape, LlmTestResult, PlatformSecret, KeyRotation,
+  PlatformTemplateSummary, PlatformTemplate,
+  PlatformMcpServer, PlatformMcpTestResult,
   PlatformToolInfo, IdentityState, IdentityProvider, RoleMapping,
   PlatformGroup, GroupMember, GroupProjectAssignment, ProjectGroupAssignment,
   SelfHealingConfig,
+  GitRepoSummary,
 } from '../types';
 
 type Tab = 'users' | 'projects' | 'groups' | 'llms' | 'secrets' | 'self-healing' | 'templates' | 'mcp' | 'tools' | 'identity';
@@ -596,30 +598,99 @@ function formatRelative(iso?: string): string {
   return new Date(iso).toLocaleDateString();
 }
 
+type TokenMode = 'vault' | 'new';
+
 function CreateProjectModal(props: { onClose: () => void; onCreated: () => Promise<void> | void }) {
   const api = useDashboardApi();
   const [name, setName] = useState('');
   const [gitUrl, setGitUrl] = useState('');
   const [defaultBranch, setDefaultBranch] = useState('main');
-  const [gitToken, setGitToken] = useState('');
   const [description, setDescription] = useState('');
   const [stage, setStage] = useState<'form' | 'registering' | 'initializing' | 'done'>('form');
   const [error, setError] = useState<string | null>(null);
   const [createdName, setCreatedName] = useState<string | null>(null);
 
+  // Token credential mode + state
+  const [tokenMode, setTokenMode] = useState<TokenMode>('vault');
+  const [secrets, setSecrets] = useState<PlatformSecret[]>([]);
+  const [secretsLoading, setSecretsLoading] = useState(true);
+  const [selectedSecretId, setSelectedSecretId] = useState<string>('');
+  const [newToken, setNewToken] = useState('');
+  const [saveToVault, setSaveToVault] = useState(true);
+  const [newSecretName, setNewSecretName] = useState('');
+  // Repo browser
+  const [browseOpen, setBrowseOpen] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await api.listPlatformSecrets();
+        if (cancelled) return;
+        setSecrets(res.data);
+        // Default mode: vault when secrets exist, new otherwise.
+        if (res.data.length === 0) setTokenMode('new');
+        else if (!selectedSecretId) setSelectedSecretId(res.data[0].id);
+      } catch (err) {
+        // Non-fatal — operator can still use the "new token" path.
+        if (cancelled) return;
+        setSecrets([]);
+        setTokenMode('new');
+      } finally {
+        if (!cancelled) setSecretsLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Auto-default the new-secret name from the project name so the
+  // operator can hit Save without typing it explicitly.
+  useEffect(() => {
+    if (saveToVault && !newSecretName && name.trim()) {
+      setNewSecretName(`${name.trim()} Git PAT`);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [name, saveToVault]);
+
+  const canBrowseRepos = tokenMode === 'vault' && Boolean(selectedSecretId);
+
   async function submit() {
     setError(null);
-    if (!name.trim() || !gitUrl.trim() || !gitToken) {
-      setError('Name, Git URL, and Git token are required');
+    if (!name.trim() || !gitUrl.trim()) {
+      setError('Name and Git URL are required');
       return;
     }
+    if (tokenMode === 'vault' && !selectedSecretId) {
+      setError('Pick a vault secret or switch to "Enter new token"');
+      return;
+    }
+    if (tokenMode === 'new' && !newToken.trim()) {
+      setError('Enter a Git PAT or switch to "Use saved secret"');
+      return;
+    }
+    if (tokenMode === 'new' && saveToVault && !newSecretName.trim()) {
+      setError('Provide a name for the new vault secret');
+      return;
+    }
+
     setStage('registering');
     try {
+      // Build the credential payload — exactly one of the three modes.
+      const credBody: { gitToken?: string; gitSecretId?: string; newSecret?: { name: string; value: string } } = {};
+      if (tokenMode === 'vault') {
+        credBody.gitSecretId = selectedSecretId;
+      } else if (saveToVault) {
+        credBody.newSecret = { name: newSecretName.trim(), value: newToken };
+      } else {
+        credBody.gitToken = newToken;
+      }
+
       const create = await api.createProject({
         name: name.trim(),
         gitUrl: gitUrl.trim(),
         defaultBranch: defaultBranch.trim() || 'main',
-        gitToken,
+        ...credBody,
       });
       setStage('initializing');
       const descToSend = description.trim()
@@ -633,9 +704,15 @@ function CreateProjectModal(props: { onClose: () => void; onCreated: () => Promi
     }
   }
 
+  function pickRepo(repo: GitRepoSummary) {
+    setGitUrl(repo.cloneUrl);
+    setDefaultBranch(repo.defaultBranch || 'main');
+    setBrowseOpen(false);
+  }
+
   return (
     <div style={styles.modalBackdrop} onClick={props.onClose}>
-      <div style={{ ...styles.modal, maxWidth: '520px' }} onClick={(e) => e.stopPropagation()}>
+      <div style={{ ...styles.modal, maxWidth: '560px' }} onClick={(e) => e.stopPropagation()}>
         <h3 style={styles.cardTitle}>Create new project</h3>
         {error && <div style={styles.errorBanner}>{error}</div>}
         {stage === 'done' ? (
@@ -651,15 +728,114 @@ function CreateProjectModal(props: { onClose: () => void; onCreated: () => Promi
               <input style={styles.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="my-project" autoFocus disabled={stage !== 'form'} />
             </label>
             <label style={styles.label}>Git repository URL
-              <input style={styles.input} value={gitUrl} onChange={(e) => setGitUrl(e.target.value)} placeholder="https://github.com/org/repo.git" disabled={stage !== 'form'} />
+              <div style={{ display: 'flex', gap: '6px' }}>
+                <input
+                  style={{ ...styles.input, flex: 1 }}
+                  value={gitUrl}
+                  onChange={(e) => setGitUrl(e.target.value)}
+                  placeholder="https://github.com/org/repo.git"
+                  disabled={stage !== 'form'}
+                />
+                <button
+                  type="button"
+                  style={{ ...styles.linkBtn, opacity: canBrowseRepos ? 1 : 0.5, cursor: canBrowseRepos ? 'pointer' : 'not-allowed' }}
+                  onClick={() => canBrowseRepos && setBrowseOpen(true)}
+                  disabled={!canBrowseRepos || stage !== 'form'}
+                  title={canBrowseRepos ? 'Browse GitHub repos with the selected vault secret' : 'Select a vault secret first to enable repo browsing'}
+                >
+                  Browse repos ▾
+                </button>
+              </div>
             </label>
             <label style={styles.label}>Default branch
               <input style={styles.input} value={defaultBranch} onChange={(e) => setDefaultBranch(e.target.value)} placeholder="main" disabled={stage !== 'form'} />
             </label>
-            <label style={styles.label}>Git token (PAT)
-              <input type="password" style={styles.input} value={gitToken} onChange={(e) => setGitToken(e.target.value)} placeholder="ghp_..." disabled={stage !== 'form'} />
-              <span style={{ color: 'var(--text-dim)', fontSize: '11px' }}>Stored per-project (encrypt at rest is on the roadmap). Needs `repo` + `workflow` scope for GitHub.</span>
-            </label>
+
+            {/* Token source picker */}
+            <div style={{ marginTop: '8px', padding: '10px', background: 'var(--bg-subtle)', borderRadius: '4px' }}>
+              <div style={{ fontSize: '12px', fontWeight: 600, marginBottom: '6px' }}>Git access token</div>
+              <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'center', marginBottom: '8px' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '12px' }}>
+                  <input
+                    type="radio"
+                    name="tokenMode"
+                    checked={tokenMode === 'vault'}
+                    onChange={() => setTokenMode('vault')}
+                    disabled={stage !== 'form' || secretsLoading || secrets.length === 0}
+                  />
+                  Use saved secret
+                </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '12px' }}>
+                  <input
+                    type="radio"
+                    name="tokenMode"
+                    checked={tokenMode === 'new'}
+                    onChange={() => setTokenMode('new')}
+                    disabled={stage !== 'form'}
+                  />
+                  Enter new token
+                </label>
+              </div>
+
+              {tokenMode === 'vault' && (
+                <div>
+                  {secretsLoading ? (
+                    <div style={{ fontSize: '12px', color: 'var(--text-dim)' }}>Loading secrets…</div>
+                  ) : secrets.length === 0 ? (
+                    <div style={{ fontSize: '12px', color: 'var(--text-dim)' }}>
+                      No vault secrets yet — switch to "Enter new token" or create one via the Secrets tab.
+                    </div>
+                  ) : (
+                    <select
+                      style={styles.input}
+                      value={selectedSecretId}
+                      onChange={(e) => setSelectedSecretId(e.target.value)}
+                      disabled={stage !== 'form'}
+                    >
+                      {secrets.map((s) => (
+                        <option key={s.id} value={s.id}>{s.name}</option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+              )}
+
+              {tokenMode === 'new' && (
+                <div>
+                  <input
+                    type="password"
+                    style={styles.input}
+                    value={newToken}
+                    onChange={(e) => setNewToken(e.target.value)}
+                    placeholder="ghp_..."
+                    autoComplete="new-password"
+                    disabled={stage !== 'form'}
+                  />
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '12px', marginTop: '6px' }}>
+                    <input
+                      type="checkbox"
+                      checked={saveToVault}
+                      onChange={(e) => setSaveToVault(e.target.checked)}
+                      disabled={stage !== 'form'}
+                    />
+                    Save to vault (encrypt at rest, reusable across projects)
+                  </label>
+                  {saveToVault && (
+                    <input
+                      style={{ ...styles.input, marginTop: '6px' }}
+                      value={newSecretName}
+                      onChange={(e) => setNewSecretName(e.target.value)}
+                      placeholder={`${name || '<project>'} Git PAT`}
+                      disabled={stage !== 'form'}
+                    />
+                  )}
+                  <div style={{ fontSize: '11px', color: 'var(--text-dim)', marginTop: '4px' }}>
+                    Needs `repo` + `workflow` scope for GitHub.
+                  </div>
+                </div>
+              )}
+            </div>
+
             <label style={styles.label}>Description (optional)
               <input style={styles.input} value={description} onChange={(e) => setDescription(e.target.value)} placeholder={`Project ${name || '<name>'} created via platform admin`} disabled={stage !== 'form'} />
             </label>
@@ -676,6 +852,111 @@ function CreateProjectModal(props: { onClose: () => void; onCreated: () => Promi
             </div>
           </>
         )}
+      </div>
+      {browseOpen && (
+        <RepoBrowserModal
+          secretId={selectedSecretId}
+          onPick={pickRepo}
+          onClose={() => setBrowseOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * GitHub repo browser modal. Lists the operator's accessible
+ * repositories via `GET /platform/git/repos` (server-side proxy
+ * that decrypts the vault secret and calls the GitHub API).
+ *
+ * The decrypted PAT NEVER reaches the browser — only the
+ * repo metadata.
+ */
+function RepoBrowserModal(props: {
+  secretId: string;
+  onPick: (repo: GitRepoSummary) => void;
+  onClose: () => void;
+}) {
+  const api = useDashboardApi();
+  const [repos, setRepos] = useState<GitRepoSummary[] | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [search, setSearch] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await api.listGitRepos(props.secretId, 'github');
+        if (cancelled) return;
+        setRepos(res.data);
+      } catch (err) {
+        if (cancelled) return;
+        setError(err instanceof ApiError ? extractError(err) : String(err));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.secretId]);
+
+  const filtered = repos
+    ? repos.filter((r) =>
+        search.trim() === ''
+          ? true
+          : r.fullName.toLowerCase().includes(search.toLowerCase()),
+      )
+    : [];
+
+  return (
+    <div style={{ ...styles.modalBackdrop, zIndex: 60 }} onClick={props.onClose}>
+      <div style={{ ...styles.modal, maxWidth: '600px', maxHeight: '80vh', display: 'flex', flexDirection: 'column' }} onClick={(e) => e.stopPropagation()}>
+        <h3 style={styles.cardTitle}>Select repository</h3>
+        {loading && <div style={{ color: 'var(--text-dim)' }}>Fetching repositories…</div>}
+        {error && <div style={styles.errorBanner}>Could not list repos: {error}</div>}
+        {!loading && !error && (
+          <>
+            <input
+              style={styles.input}
+              placeholder="Search repos..."
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              autoFocus
+            />
+            <div style={{ overflowY: 'auto', maxHeight: '50vh', marginTop: '8px' }}>
+              {filtered.length === 0 ? (
+                <div style={{ color: 'var(--text-dim)', fontSize: '12px', padding: '8px' }}>
+                  No matching repositories.
+                </div>
+              ) : (
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+                  <tbody>
+                    {filtered.map((r) => (
+                      <tr
+                        key={r.fullName}
+                        style={{ borderBottom: '1px solid var(--border)', cursor: 'pointer' }}
+                        onClick={() => props.onPick(r)}
+                      >
+                        <td style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
+                          {r.private ? '🔒' : '📖'}
+                        </td>
+                        <td style={{ padding: '6px 8px', fontFamily: 'var(--font-mono)' }}>{r.fullName}</td>
+                        <td style={{ padding: '6px 8px', color: 'var(--text-dim)' }}>{r.defaultBranch}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+            <div style={{ fontSize: '11px', color: 'var(--text-dim)', marginTop: '8px' }}>
+              🔒 = private &nbsp;&nbsp; 📖 = public
+            </div>
+          </>
+        )}
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '8px' }}>
+          <button style={styles.linkBtn} onClick={props.onClose}>Close</button>
+        </div>
       </div>
     </div>
   );
@@ -1045,6 +1326,7 @@ function LlmsTab() {
             <th style={styles.th}>Name</th>
             <th style={styles.th}>Provider</th>
             <th style={styles.th}>Model</th>
+            <th style={styles.th}>API shape</th>
             <th style={styles.th}>Key source</th>
             <th style={styles.th}>Default</th>
             <th style={styles.th}>Actions</th>
@@ -1061,6 +1343,13 @@ function LlmsTab() {
                 </td>
                 <td style={styles.td}>{l.provider}</td>
                 <td style={styles.td} title={l.baseUrl}>{l.modelString}</td>
+                <td style={styles.td}>
+                  {l.apiShape === 'responses' ? (
+                    <span style={{ color: 'var(--purple, #a855f7)', fontFamily: 'var(--font-mono)' }}>responses</span>
+                  ) : (
+                    <span style={{ color: 'var(--text-dim)', fontFamily: 'var(--font-mono)' }}>chat-completions</span>
+                  )}
+                </td>
                 <td style={styles.td}>{formatKeySource(l)}</td>
                 <td style={styles.td}>{l.isDefault ? '★' : ''}</td>
                 <td style={styles.td}>
@@ -1115,6 +1404,7 @@ function LlmModal(props: {
   );
   const [secretId, setSecretId] = useState<string>(props.existing?.secretId ?? '');
   const [apiKeyEnv, setApiKeyEnv] = useState(props.existing?.apiKeyEnv ?? '');
+  const [apiShape, setApiShape] = useState<LLMApiShape>(props.existing?.apiShape ?? 'chat-completions');
   const [description, setDescription] = useState(props.existing?.description ?? '');
   const [isDefault, setIsDefault] = useState(props.existing?.isDefault ?? false);
   const [secrets, setSecrets] = useState<PlatformSecret[]>([]);
@@ -1160,7 +1450,7 @@ function LlmModal(props: {
       // Build the body so the unused source's field is explicitly
       // null on update (clears any stale value), or omitted on create.
       const body = {
-        name, provider, modelString, baseUrl,
+        name, provider, modelString, baseUrl, apiShape,
         isDefault, description: description || null,
         ...(keySource === 'vault'
           ? { secretId, apiKeyEnv: null as string | null }
@@ -1172,7 +1462,7 @@ function LlmModal(props: {
         // For create, omit the explicit-null entry so the server's
         // either-or validation sees only the active source.
         const createBody: Parameters<typeof api.createPlatformLlm>[0] = {
-          name, provider, modelString, baseUrl,
+          name, provider, modelString, baseUrl, apiShape,
           isDefault, description: description || null,
           ...(keySource === 'vault' ? { secretId } : { apiKeyEnv }),
         };
@@ -1267,6 +1557,19 @@ function LlmModal(props: {
           )}
         </div>
 
+        <label style={styles.label}>API request shape
+          <select
+            style={styles.input}
+            value={apiShape}
+            onChange={(e) => setApiShape(e.target.value as LLMApiShape)}
+          >
+            <option value="chat-completions">chat-completions — legacy max_tokens + temperature (gpt-4o, gpt-4-turbo, gpt-3.5, Ollama, vLLM)</option>
+            <option value="responses">responses — max_completion_tokens (reasoning models: gpt-5*, o1, o3)</option>
+          </select>
+          <p style={{ color: 'var(--text-dim)', fontSize: '11px', margin: '4px 0 0' }}>
+            OpenAI's reasoning-class models reject <code>max_tokens</code> and ignore <code>temperature</code>. Pick "responses" when this LLM is gpt-5*, o1, or o3.
+          </p>
+        </label>
         <label style={styles.label}>Description (optional)
           <input style={styles.input} value={description ?? ''} onChange={(e) => setDescription(e.target.value)} />
         </label>
@@ -1307,16 +1610,19 @@ function formatKeySource(llm: PlatformLLM): React.ReactNode {
 function SecretsTab() {
   const api = useDashboardApi();
   const [secrets, setSecrets] = useState<PlatformSecret[]>([]);
+  const [lastRotation, setLastRotation] = useState<KeyRotation | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<PlatformSecret | null>(null);
+  const [rotating, setRotating] = useState(false);
 
   async function load() {
     setLoading(true);
     try {
       const res = await api.listPlatformSecrets();
       setSecrets(res.data);
+      setLastRotation(res.lastRotation);
     } catch (err) {
       setError(err instanceof ApiError ? extractError(err) : String(err));
     } finally {
@@ -1394,6 +1700,11 @@ function SecretsTab() {
           ))}
         </tbody>
       </table>
+      <MasterKeySection
+        secretCount={secrets.length}
+        lastRotation={lastRotation}
+        onRotate={() => setRotating(true)}
+      />
       {creating && (
         <AddSecretModal
           onClose={() => setCreating(false)}
@@ -1407,6 +1718,210 @@ function SecretsTab() {
           onSaved={() => { setEditing(null); void load(); }}
         />
       )}
+      {rotating && (
+        <RotateKeyModal
+          secretCount={secrets.length}
+          onClose={() => setRotating(false)}
+          onRotated={() => { setRotating(false); void load(); }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── Master Key card + rotation modal (Brief 2 — migration 021) ─────────────
+
+function MasterKeySection(props: {
+  secretCount: number;
+  lastRotation: KeyRotation | null;
+  onRotate: () => void;
+}) {
+  return (
+    <div style={{
+      marginTop: '32px',
+      padding: '16px',
+      border: '1px solid var(--border)',
+      borderRadius: '6px',
+      background: 'var(--bg-subtle)',
+    }}>
+      <h3 style={styles.cardTitle}>Master Key</h3>
+      <div style={{ display: 'grid', gridTemplateColumns: '120px 1fr', gap: '8px', alignItems: 'baseline' }}>
+        <span style={{ color: 'var(--text-dim)', fontSize: '12px' }}>Status:</span>
+        <span><span style={{ color: 'var(--green)' }}>●</span> Active</span>
+        <span style={{ color: 'var(--text-dim)', fontSize: '12px' }}>Last rotated:</span>
+        <span>
+          {props.lastRotation
+            ? <>{formatRelative(props.lastRotation.rotatedAt)} <span style={{ color: 'var(--text-dim)' }}>
+                ({props.lastRotation.secretCount} secret{props.lastRotation.secretCount === 1 ? '' : 's'})
+              </span></>
+            : <span style={{ color: 'var(--text-dim)' }}>Never</span>}
+        </span>
+      </div>
+      <div style={{ marginTop: '12px', display: 'flex', alignItems: 'center', gap: '12px' }}>
+        <button style={styles.primaryBtn} onClick={props.onRotate}>
+          Rotate master key
+        </button>
+        <span style={{ color: 'var(--text-dim)', fontSize: '12px' }}>
+          ⚠ Rotation re-encrypts all {props.secretCount} secret{props.secretCount === 1 ? '' : 's'} atomically.
+          Back up your current key before proceeding.
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function RotateKeyModal(props: {
+  secretCount: number;
+  onClose: () => void;
+  onRotated: () => void;
+}) {
+  const api = useDashboardApi();
+  // Three-step modal: warning → new-key reveal → result
+  const [step, setStep] = useState<1 | 2 | 3>(1);
+  const [backedUp, setBackedUp] = useState(false);
+  const [savedNewKey, setSavedNewKey] = useState(false);
+  const [newKey, setNewKey] = useState<string>('');
+  const [rotating, setRotating] = useState(false);
+  const [result, setResult] = useState<{ rotated: number } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  // Generate the key client-side on Step 2 mount. Browsers expose
+  // crypto.getRandomValues; we encode to base64 via btoa.
+  useEffect(() => {
+    if (step === 2 && !newKey) {
+      const bytes = crypto.getRandomValues(new Uint8Array(32));
+      const binary = String.fromCharCode(...bytes);
+      setNewKey(btoa(binary));
+    }
+  }, [step, newKey]);
+
+  async function rotate() {
+    setRotating(true);
+    setError(null);
+    try {
+      const res = await api.rotateMasterKey(newKey);
+      setResult({ rotated: res.data.rotated });
+      setStep(3);
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+      setStep(3);
+    } finally {
+      setRotating(false);
+    }
+  }
+
+  async function copyKey() {
+    try {
+      await navigator.clipboard.writeText(newKey);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Clipboard API can fail under hardened permissions; fall back
+      // to user selecting + copying manually
+    }
+  }
+
+  return (
+    <div style={styles.modalBackdrop} onClick={props.onClose}>
+      <div style={{ ...styles.modal, maxWidth: '560px' }} onClick={(e) => e.stopPropagation()}>
+        <h3 style={styles.cardTitle}>Rotate master key</h3>
+        {error && step === 3 && <div style={styles.errorBanner}>{error}</div>}
+
+        {step === 1 && (
+          <>
+            <p style={{ color: 'var(--text-dim)', fontSize: '13px' }}>
+              ⚠ <strong>Before you continue</strong>
+            </p>
+            <p style={{ margin: '6px 0 12px' }}>
+              Rotating the master key re-encrypts {props.secretCount} secret{props.secretCount === 1 ? '' : 's'}.
+              If you lose the new key, all secrets are unrecoverable.
+            </p>
+            <label style={{ display: 'flex', gap: '8px', alignItems: 'center', fontSize: '13px' }}>
+              <input
+                type="checkbox"
+                checked={backedUp}
+                onChange={(e) => setBackedUp(e.target.checked)}
+              />
+              I have backed up my current master.key
+            </label>
+            <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '16px' }}>
+              <button style={styles.linkBtn} onClick={props.onClose}>Cancel</button>
+              <button
+                style={styles.primaryBtn}
+                onClick={() => setStep(2)}
+                disabled={!backedUp}
+              >
+                Continue →
+              </button>
+            </div>
+          </>
+        )}
+
+        {step === 2 && (
+          <>
+            <p style={{ color: 'var(--text-dim)', fontSize: '13px', margin: '0 0 6px' }}>
+              New master key (auto-generated):
+            </p>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <input
+                style={{ ...styles.input, fontFamily: 'var(--font-mono)', fontSize: '12px' }}
+                value={newKey}
+                readOnly
+              />
+              <button style={styles.linkBtn} onClick={() => void copyKey()}>
+                {copied ? 'Copied ✓' : 'Copy'}
+              </button>
+            </div>
+            <p style={{ margin: '12px 0', color: 'var(--red)', fontSize: '13px' }}>
+              ⚠ Save this key NOW — it will not be shown again.
+            </p>
+            <label style={{ display: 'flex', gap: '8px', alignItems: 'center', fontSize: '13px' }}>
+              <input
+                type="checkbox"
+                checked={savedNewKey}
+                onChange={(e) => setSavedNewKey(e.target.checked)}
+              />
+              I have saved the new key securely
+            </label>
+            <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '16px' }}>
+              <button style={styles.linkBtn} onClick={() => setStep(1)} disabled={rotating}>← Back</button>
+              <button
+                style={styles.dangerBtn}
+                onClick={() => void rotate()}
+                disabled={!savedNewKey || rotating}
+              >
+                {rotating ? 'Rotating...' : `Rotate ${props.secretCount} secret${props.secretCount === 1 ? '' : 's'} →`}
+              </button>
+            </div>
+          </>
+        )}
+
+        {step === 3 && (
+          <>
+            {result && !error ? (
+              <p style={{ color: 'var(--green)', fontSize: '14px' }}>
+                ✓ Master key rotated: {result.rotated} secret{result.rotated === 1 ? '' : 's'} re-encrypted
+              </p>
+            ) : (
+              <p style={{ color: 'var(--red)', fontSize: '14px' }}>
+                ✗ Rotation failed — no secrets were changed
+              </p>
+            )}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '16px' }}>
+              <button
+                style={styles.primaryBtn}
+                onClick={() => {
+                  if (result && !error) props.onRotated();
+                  else props.onClose();
+                }}
+              >
+                Close
+              </button>
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -2077,6 +2592,11 @@ function TemplatesTab() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
+  // Brief 3 — clicking a template row expands a detail panel showing
+  // file list + per-variable usage. The full record is lazy-loaded
+  // (the list endpoint omits `files` to keep responses small).
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [detailCache, setDetailCache] = useState<Record<string, PlatformTemplate | 'loading'>>({});
 
   async function load() {
     setLoading(true);
@@ -2101,6 +2621,22 @@ function TemplatesTab() {
     setError(null);
     try { await api.deletePlatformTemplate(t.id); await load(); }
     catch (err) { setError(err instanceof ApiError ? extractError(err) : String(err)); }
+  }
+
+  async function toggleExpand(t: PlatformTemplateSummary) {
+    if (expandedId === t.id) { setExpandedId(null); return; }
+    setExpandedId(t.id);
+    // Lazy-load the full record on first expansion
+    if (!detailCache[t.id]) {
+      setDetailCache((c) => ({ ...c, [t.id]: 'loading' }));
+      try {
+        const res = await api.getPlatformTemplate(t.id);
+        setDetailCache((c) => ({ ...c, [t.id]: res.data }));
+      } catch (err) {
+        setDetailCache((c) => { const next = { ...c }; delete next[t.id]; return next; });
+        setError(err instanceof ApiError ? extractError(err) : String(err));
+      }
+    }
   }
 
   if (loading) return <p style={{ color: 'var(--text-dim)' }}>Loading templates...</p>;
@@ -2131,28 +2667,47 @@ function TemplatesTab() {
           {rows.length === 0 && (
             <tr><td colSpan={6} style={styles.empty}>No templates registered yet</td></tr>
           )}
-          {rows.map((t) => (
-            <tr key={t.id}>
-              <td style={styles.td}>
-                {t.name}
-                {t.description && <div style={{ color: 'var(--text-dim)', fontSize: '11px' }}>{t.description}</div>}
-              </td>
-              <td style={styles.td}><code>{t.slug}</code></td>
-              <td style={styles.td}>{t.tier}{t.isBuiltin ? ' (built-in)' : ''}</td>
-              <td style={styles.td}>{t.version}</td>
-              <td style={styles.td}>{t.isDefault ? '★' : ''}</td>
-              <td style={styles.td}>
-                <div style={{ display: 'flex', gap: '6px' }}>
-                  {!t.isDefault && (
-                    <button style={styles.linkBtn} onClick={() => void handleSetDefault(t)}>★ Set default</button>
-                  )}
-                  {!t.isBuiltin && (
-                    <button style={styles.dangerBtn} onClick={() => void handleDelete(t)}>×</button>
-                  )}
-                </div>
-              </td>
-            </tr>
-          ))}
+          {rows.map((t) => {
+            const isExpanded = expandedId === t.id;
+            const detail = detailCache[t.id];
+            return (
+              <React.Fragment key={t.id}>
+                <tr
+                  onClick={() => void toggleExpand(t)}
+                  style={{ cursor: 'pointer', background: isExpanded ? 'var(--bg-subtle)' : undefined }}
+                >
+                  <td style={styles.td}>
+                    <span style={{ marginRight: '6px', color: 'var(--text-dim)', fontSize: '10px' }}>
+                      {isExpanded ? '▼' : '▶'}
+                    </span>
+                    {t.name}
+                    {t.description && <div style={{ color: 'var(--text-dim)', fontSize: '11px' }}>{t.description}</div>}
+                  </td>
+                  <td style={styles.td}><code>{t.slug}</code></td>
+                  <td style={styles.td}>{t.tier}{t.isBuiltin ? ' (built-in)' : ''}</td>
+                  <td style={styles.td}>{t.version}</td>
+                  <td style={styles.td}>{t.isDefault ? '★' : ''}</td>
+                  <td style={styles.td} onClick={(e) => e.stopPropagation()}>
+                    <div style={{ display: 'flex', gap: '6px' }}>
+                      {!t.isDefault && (
+                        <button style={styles.linkBtn} onClick={() => void handleSetDefault(t)}>★ Set default</button>
+                      )}
+                      {!t.isBuiltin && (
+                        <button style={styles.dangerBtn} onClick={() => void handleDelete(t)}>×</button>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+                {isExpanded && (
+                  <tr>
+                    <td colSpan={6} style={{ ...styles.td, padding: 0, background: 'var(--bg-subtle)' }}>
+                      <TemplateDetailPanel detail={detail} />
+                    </td>
+                  </tr>
+                )}
+              </React.Fragment>
+            );
+          })}
         </tbody>
       </table>
       {uploading && (
@@ -2175,6 +2730,9 @@ function UploadTemplateModal(props: { onClose: () => void; onUploaded: () => Pro
   const [files, setFiles] = useState<Record<string, string> | null>(null);
   const [fileNames, setFileNames] = useState<string[]>([]);
   const [missing, setMissing] = useState<string[]>([]);
+  // Brief 3 — variable detection preview before upload
+  const [detectedVars, setDetectedVars] = useState<Array<{ name: string; auto: boolean }>>([]);
+  const [serverWarnings, setServerWarnings] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -2182,6 +2740,7 @@ function UploadTemplateModal(props: { onClose: () => void; onUploaded: () => Pro
 
   async function handleZip(e: React.ChangeEvent<HTMLInputElement>) {
     setError(null);
+    setServerWarnings([]);
     const file = e.target.files?.[0];
     if (!file) return;
     try {
@@ -2196,6 +2755,17 @@ function UploadTemplateModal(props: { onClose: () => void; onUploaded: () => Pro
       setFileNames(Object.keys(extracted).sort());
       const basenames = new Set(Object.keys(extracted).map((p) => p.split('/').pop() ?? p));
       setMissing(REQUIRED_BASENAMES.filter((b) => !basenames.has(b)));
+      // Scan extracted content for {{varName}} placeholders and tag
+      // each one as auto-provided OR undocumented.
+      const allVars = new Set<string>();
+      for (const content of Object.values(extracted)) {
+        for (const m of content.matchAll(/\{\{(\w+)\}\}/g)) {
+          allVars.add(m[1]!);
+        }
+      }
+      setDetectedVars(
+        [...allVars].sort().map((v) => ({ name: v, auto: AUTO_VARIABLES_CLIENT.has(v) })),
+      );
     } catch (err) {
       setError(`Failed to read ZIP: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -2203,6 +2773,7 @@ function UploadTemplateModal(props: { onClose: () => void; onUploaded: () => Pro
 
   async function submit() {
     setError(null);
+    setServerWarnings([]);
     if (!name.trim() || !slug.trim()) { setError('Name and slug are required'); return; }
     if (!files || Object.keys(files).length === 0) { setError('Upload a ZIP first'); return; }
     if (missing.length > 0) {
@@ -2211,7 +2782,7 @@ function UploadTemplateModal(props: { onClose: () => void; onUploaded: () => Pro
     }
     setSubmitting(true);
     try {
-      await api.createPlatformTemplate({
+      const res = await api.createPlatformTemplate({
         slug: slug.trim(),
         name: name.trim(),
         description: description.trim() || null,
@@ -2220,7 +2791,16 @@ function UploadTemplateModal(props: { onClose: () => void; onUploaded: () => Pro
         files,
         variables: [],
       });
-      await props.onUploaded();
+      // Surface server-side warnings (e.g. "N undocumented variable(s)")
+      // before the upload modal closes. The brief specifies upload always
+      // succeeds — warnings are informational only.
+      if (res.warnings && res.warnings.length > 0) {
+        setServerWarnings(res.warnings);
+        // Give the operator a moment to read the warnings, then close.
+        setTimeout(() => { void props.onUploaded(); }, 3000);
+      } else {
+        await props.onUploaded();
+      }
     } catch (err) {
       setError(err instanceof ApiError ? extractError(err) : String(err));
     } finally {
@@ -2267,12 +2847,171 @@ function UploadTemplateModal(props: { onClose: () => void; onUploaded: () => Pro
             )}
           </div>
         )}
+        {detectedVars.length > 0 && (
+          <div style={{ fontSize: '11px', color: 'var(--text-dim)', marginTop: '8px' }}>
+            <strong>Detected variables ({detectedVars.length}):</strong>
+            <ul style={{ maxHeight: '160px', overflow: 'auto', margin: '4px 0', padding: '0 0 0 16px', listStyle: 'none' }}>
+              {detectedVars.map((v) => (
+                <li key={v.name} style={{ display: 'flex', gap: '8px', alignItems: 'baseline' }}>
+                  <span style={{ color: v.auto ? 'var(--green)' : 'var(--amber)' }}>
+                    {v.auto ? '✓' : '⚠'}
+                  </span>
+                  <code>{v.name}</code>
+                  <span style={{ color: v.auto ? 'var(--text-dim)' : 'var(--amber)' }}>
+                    {v.auto ? '(auto-provided)' : 'Not documented — will appear as literal {{' + v.name + '}}'}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {serverWarnings.length > 0 && (
+          <div style={{ fontSize: '12px', color: 'var(--amber)', marginTop: '8px', padding: '8px', border: '1px solid var(--amber)', borderRadius: '4px' }}>
+            <strong>✓ Upload succeeded — with warnings:</strong>
+            <ul style={{ margin: '4px 0 0', padding: '0 0 0 16px' }}>
+              {serverWarnings.map((w, i) => <li key={i}>{w}</li>)}
+            </ul>
+          </div>
+        )}
         <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
           <button style={styles.linkBtn} onClick={props.onClose}>Cancel</button>
           <button style={styles.primaryBtn} onClick={() => void submit()} disabled={submitting || !files || missing.length > 0}>
             {submitting ? 'Uploading...' : 'Upload'}
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Template detail panel + file preview (Brief 3) ──────────────────────────
+
+/**
+ * Mirrors the server's AUTO_VARIABLES set. Used by both the upload
+ * modal's preview AND the detail panel's per-variable status icon.
+ * Keep in sync with `packages/server/src/routes/templates.ts`.
+ */
+const AUTO_VARIABLES_CLIENT = new Set([
+  'projectName', 'projectDescription', 'defaultBranch',
+  'today', 'projectSlug',
+  'language', 'nodeVersion', 'packageManager', 'installCmd',
+  'testCmd', 'buildCmd', 'testFramework', 'framework',
+  'frontend', 'database', 'moduleStructure', 'architectureNotes',
+  'stackSection', 'agentPromptExtensionsYaml', 'ciSetupSteps',
+]);
+
+function TemplateDetailPanel(props: { detail: PlatformTemplate | 'loading' | undefined }) {
+  const [previewFile, setPreviewFile] = useState<string | null>(null);
+
+  if (props.detail === undefined || props.detail === 'loading') {
+    return <div style={{ padding: '12px', color: 'var(--text-dim)' }}>Loading template detail...</div>;
+  }
+  const t = props.detail;
+  const fileList = Object.keys(t.files).sort();
+  const vars = t.variableUsage ?? [];
+
+  return (
+    <div style={{ padding: '16px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '12px' }}>
+        <div style={{ fontSize: '12px', color: 'var(--text-dim)' }}>
+          Slug: <code>{t.slug}</code> · Tier: {t.tier} · v{t.version}
+          {t.isDefault && ' · ★ Default'}
+          {t.isBuiltin && ' · (built-in)'}
+        </div>
+        <select
+          style={{ ...styles.input, width: 'auto', fontSize: '12px' }}
+          value=""
+          onChange={(e) => { if (e.target.value) setPreviewFile(e.target.value); }}
+        >
+          <option value="">Preview file ▾</option>
+          {fileList.map((p) => <option key={p} value={p}>{p}</option>)}
+        </select>
+      </div>
+
+      <div style={{ marginBottom: '12px' }}>
+        <strong style={{ fontSize: '12px' }}>Files ({fileList.length})</strong>
+        <div style={{ fontSize: '11px', color: 'var(--text-dim)', marginTop: '4px' }}>
+          {fileList.map((p) => <code key={p} style={{ marginRight: '8px' }}>{p}</code>)}
+        </div>
+      </div>
+
+      <div>
+        <strong style={{ fontSize: '12px' }}>Variables ({vars.length})</strong>
+        <table style={{ ...styles.table, fontSize: '11px', marginTop: '4px' }}>
+          <thead>
+            <tr>
+              <th style={styles.th}></th>
+              <th style={styles.th}>Name</th>
+              <th style={styles.th}>Status</th>
+              <th style={styles.th}>Used in files</th>
+            </tr>
+          </thead>
+          <tbody>
+            {vars.length === 0 && (
+              <tr><td colSpan={4} style={styles.empty}>No variables detected</td></tr>
+            )}
+            {vars.map((v) => (
+              <tr key={v.name}>
+                <td style={styles.td}>
+                  {v.autoProvided
+                    ? <span style={{ color: 'var(--green)' }}>✓</span>
+                    : v.defined
+                      ? <span style={{ color: 'var(--green)' }}>✓</span>
+                      : <span style={{ color: 'var(--amber)' }}>⚠</span>}
+                </td>
+                <td style={styles.td}><code>{v.name}</code></td>
+                <td style={styles.td}>
+                  {v.autoProvided
+                    ? <span style={{ color: 'var(--text-dim)' }}>Auto</span>
+                    : v.defined
+                      ? <span style={{ color: 'var(--text-dim)' }}>
+                          Documented{v.required ? ' · required' : ''}
+                          {v.description ? ' · ' + v.description : ''}
+                        </span>
+                      : <span style={{ color: 'var(--amber)' }}>Undocumented</span>}
+                </td>
+                <td style={styles.td} title={v.usedInFiles.join(', ')}>
+                  Used in {v.usedInFiles.length} file{v.usedInFiles.length === 1 ? '' : 's'}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {previewFile && (
+        <FilePreviewModal
+          path={previewFile}
+          content={t.files[previewFile] ?? ''}
+          onClose={() => setPreviewFile(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function FilePreviewModal(props: { path: string; content: string; onClose: () => void }) {
+  return (
+    <div style={styles.modalBackdrop} onClick={props.onClose}>
+      <div style={{ ...styles.modal, maxWidth: '900px', maxHeight: '80vh' }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+          <h3 style={styles.cardTitle}><code>{props.path}</code></h3>
+          <button style={styles.linkBtn} onClick={props.onClose}>Close</button>
+        </div>
+        <p style={{ fontSize: '11px', color: 'var(--text-dim)', margin: '0 0 8px' }}>
+          Read-only. `{`{{variableName}}`}` placeholders are shown verbatim.
+        </p>
+        <pre style={{
+          background: 'var(--bg-subtle)',
+          padding: '12px',
+          border: '1px solid var(--border)',
+          borderRadius: '4px',
+          overflow: 'auto',
+          maxHeight: '60vh',
+          fontFamily: 'var(--font-mono)',
+          fontSize: '11px',
+          margin: 0,
+        }}>{props.content}</pre>
       </div>
     </div>
   );

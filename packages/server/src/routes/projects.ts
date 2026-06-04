@@ -24,9 +24,11 @@ import { simpleGit, type SimpleGit } from 'simple-git';
 import type { FastifyInstance } from 'fastify';
 import {
   getRepositories, createContextLogger,
+  resolveProjectCredential, encryptSecret,
   type ProjectRecord,
 } from '@gestalt/core';
 import { requireRole, checkProjectMembership } from '../auth/middleware';
+import { getMasterKey } from '../secrets/index';
 import { loadTemplate, resolveTemplatesDir } from '../templates/engine';
 import { generateStackConfig } from '../templates/stack-config';
 import { applyPipelinePatch } from './project-config';
@@ -45,11 +47,36 @@ const TEMPLATES_DIR = resolveTemplatesDir();
 
 const log = createContextLogger({ module: 'routes:projects' });
 
+/**
+ * POST /projects body. Exactly ONE of the three credential modes must
+ * be supplied (validated at handler level):
+ *   - `gitToken` — legacy plain-text PAT, stored in
+ *     `project_git_credentials`. Backward compat path.
+ *   - `gitSecretId` — vault secret already registered via
+ *     `POST /platform/secrets`. The project row links to it.
+ *   - `newSecret` — auto-save the supplied token to the vault under
+ *     the given name, then link the project to it. The plain-token
+ *     table is NOT populated in this path.
+ */
 interface CreateProjectBody {
   name: string;
   gitUrl: string;
   defaultBranch?: string;
-  gitToken: string;
+  gitToken?: string;
+  gitSecretId?: string;
+  newSecret?: {
+    name: string;
+    value: string;
+  };
+}
+
+interface UpdateGitCredentialsBody {
+  gitToken?: string;
+  gitSecretId?: string;
+  newSecret?: {
+    name: string;
+    value: string;
+  };
 }
 
 interface InitHarnessBody {
@@ -85,6 +112,10 @@ function toPublic(project: ProjectRecord): ProjectRecord {
     defaultBranch: project.defaultBranch,
     createdBy: project.createdBy,
     createdAt: project.createdAt,
+    // `gitSecretId` is a UUID reference, not the secret value — safe
+    // to expose so the dashboard can render the credential mode
+    // ("vault: <name>" vs "plain token stored") in the Pipeline tab.
+    gitSecretId: project.gitSecretId ?? null,
   };
 }
 
@@ -105,6 +136,54 @@ function authenticatedGitUrl(gitUrl: string, token: string): string {
   return url.toString();
 }
 
+/**
+ * Persist a project Git PAT into the platform vault. Returns the new
+ * secret's id (for `saveGitSecretRef`). Throws on duplicate name —
+ * the caller catches and surfaces 409 NAME_TAKEN. Audit row is
+ * written here (GP-006-compliant: metadata carries length only).
+ */
+async function createVaultSecret(params: {
+  name: string;
+  value: string;
+  createdBy: string;
+  correlationId: string;
+  ip: string;
+}): Promise<string> {
+  const { platformSecrets, audit } = getRepositories();
+  const trimmed = params.name.trim();
+  if (!trimmed) throw new Error('Secret name is required');
+  if (!params.value) throw new Error('Secret value is required');
+  const existing = await platformSecrets.findByName(trimmed);
+  if (existing) {
+    const err = new Error(`Secret with name '${trimmed}' already exists`) as Error & { code?: string };
+    err.code = 'NAME_TAKEN';
+    throw err;
+  }
+  const enc = encryptSecret(params.value, getMasterKey());
+  const created = await platformSecrets.create({
+    name: trimmed,
+    description: `Git PAT auto-saved during project setup`,
+    encrypted: enc.encrypted,
+    iv: enc.iv,
+    authTag: enc.authTag,
+    createdBy: params.createdBy,
+  });
+  await audit.append({
+    actor: params.createdBy,
+    action: 'secret.created',
+    entityType: 'platform_secrets',
+    entityId: created.id,
+    correlationId: params.correlationId,
+    metadata: {
+      name: created.name,
+      descriptionLength: (created.description ?? '').length,
+      origin: 'project-init',
+      ip: params.ip,
+    },
+  });
+  return created.id;
+}
+
 export async function registerProjectRoutes(app: FastifyInstance): Promise<void> {
 
   // POST /projects — register a project
@@ -115,15 +194,44 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
       if (!request.user) {
         return reply.code(401).send({ error: 'Authentication required' });
       }
-      const { name, gitUrl, defaultBranch, gitToken } = request.body ?? ({} as CreateProjectBody);
+      const body = request.body ?? ({} as CreateProjectBody);
+      const { name, gitUrl, defaultBranch, gitToken, gitSecretId, newSecret } = body;
 
-      if (!name?.trim() || !gitUrl?.trim() || !gitToken?.trim()) {
+      if (!name?.trim() || !gitUrl?.trim()) {
         return reply.code(400).send({
-          error: 'name, gitUrl, and gitToken are required',
+          error: 'name and gitUrl are required',
         });
       }
 
-      const { projects, audit } = getRepositories();
+      // Exactly one credential mode must be supplied. The check is
+      // mutually-exclusive — providing more than one means the
+      // operator ambiguous about which credential should win.
+      const modesProvided = [
+        gitToken?.trim() ? 'gitToken' : null,
+        gitSecretId?.trim() ? 'gitSecretId' : null,
+        newSecret?.value?.trim() ? 'newSecret' : null,
+      ].filter(Boolean);
+      if (modesProvided.length === 0) {
+        return reply.code(400).send({
+          error: 'One of gitToken, gitSecretId, or newSecret is required',
+          code: 'CREDENTIAL_REQUIRED',
+        });
+      }
+      if (modesProvided.length > 1) {
+        return reply.code(400).send({
+          error: `Provide only one credential mode (received: ${modesProvided.join(', ')})`,
+          code: 'CREDENTIAL_AMBIGUOUS',
+        });
+      }
+      // newSecret-mode validation: name + value both required
+      if (newSecret && (!newSecret.name?.trim() || !newSecret.value?.trim())) {
+        return reply.code(400).send({
+          error: 'newSecret requires both name and value',
+          code: 'NEW_SECRET_INVALID',
+        });
+      }
+
+      const { projects, audit, platformSecrets } = getRepositories();
 
       const existing = await projects.findByName(name.trim());
       if (existing) {
@@ -133,6 +241,18 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
         });
       }
 
+      // For gitSecretId: validate the secret actually exists BEFORE
+      // creating the project (no half-state on a bad UUID).
+      if (gitSecretId) {
+        const secret = await platformSecrets.findById(gitSecretId);
+        if (!secret) {
+          return reply.code(400).send({
+            error: `Vault secret '${gitSecretId}' not found`,
+            code: 'SECRET_NOT_FOUND',
+          });
+        }
+      }
+
       const project = await projects.create({
         name: name.trim(),
         gitUrl: gitUrl.trim(),
@@ -140,7 +260,38 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
         createdBy: request.user.id,
       });
 
-      await projects.saveCredential(project.id, gitToken);
+      let credentialType: 'plain' | 'vault-existing' | 'vault-new' = 'plain';
+      let linkedSecretId: string | null = null;
+      try {
+        if (newSecret) {
+          linkedSecretId = await createVaultSecret({
+            name: newSecret.name,
+            value: newSecret.value,
+            createdBy: request.user.id,
+            correlationId: request.correlationId,
+            ip: request.ip,
+          });
+          await projects.saveGitSecretRef(project.id, linkedSecretId);
+          credentialType = 'vault-new';
+        } else if (gitSecretId) {
+          await projects.saveGitSecretRef(project.id, gitSecretId);
+          linkedSecretId = gitSecretId;
+          credentialType = 'vault-existing';
+        } else if (gitToken) {
+          await projects.saveCredential(project.id, gitToken);
+          credentialType = 'plain';
+        }
+      } catch (err) {
+        // Cleanup: roll back the project row so the operator can retry
+        // with a different secret name.
+        await projects.delete(project.id).catch(() => undefined);
+        const errCode = err instanceof Error && 'code' in err && (err as { code?: string }).code === 'NAME_TAKEN'
+          ? 'NAME_TAKEN' : undefined;
+        return reply.code(errCode ? 409 : 500).send({
+          error: err instanceof Error ? err.message : String(err),
+          code: errCode ?? 'CREDENTIAL_SAVE_FAILED',
+        });
+      }
 
       // Auto-assign the creator as project-admin (migration 010 model).
       // Without this, a non-platform-admin user who registers a project
@@ -163,12 +314,18 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
           name: project.name,
           gitUrl: project.gitUrl,
           defaultBranch: project.defaultBranch,
+          credentialType,
+          // gitSecretId is a reference UUID — safe to log per GP-006.
+          gitSecretId: linkedSecretId,
           ip: request.ip,
         },
       });
 
-      log.info({ projectId: project.id, name: project.name }, 'Project registered');
-      return reply.code(201).send({ data: toPublic(project) });
+      // Re-load to pick up gitSecretId set above.
+      const refreshed = await projects.findById(project.id);
+      const finalProject = refreshed ?? project;
+      log.info({ projectId: finalProject.id, name: finalProject.name, credentialType }, 'Project registered');
+      return reply.code(201).send({ data: toPublic(finalProject) });
     },
   );
 
@@ -246,6 +403,123 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
       const project = await projects.findById(request.params.id);
       if (!project) return reply.code(404).send({ error: 'Project not found' });
       return reply.send({ data: toPublic(project) });
+    },
+  );
+
+  // PATCH /projects/:id/git-credentials — replace the project's PAT.
+  //
+  // Three credential modes (same as POST /projects):
+  //   - `gitToken`    → write plain token to project_git_credentials
+  //                     and clear `git_secret_id` so the vault
+  //                     reference doesn't shadow the new plain token
+  //   - `gitSecretId` → link to an existing vault secret (and clear
+  //                     any plain token so it doesn't linger)
+  //   - `newSecret`   → auto-save the supplied token to the vault,
+  //                     link the project to it, clear plain token
+  //
+  // project-admin minimum (HARNESS.json shapes deploy/maintenance for
+  // every operator on the project — credentials are the same trust
+  // level). GP-006: audit metadata never carries the token value.
+  app.patch<{ Params: { id: string }; Body: UpdateGitCredentialsBody }>(
+    '/projects/:id/git-credentials',
+    async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, request.params.id, 'project-admin')) return;
+
+      const body = request.body ?? ({} as UpdateGitCredentialsBody);
+      const { gitToken, gitSecretId, newSecret } = body;
+      const modesProvided = [
+        gitToken?.trim() ? 'gitToken' : null,
+        gitSecretId?.trim() ? 'gitSecretId' : null,
+        newSecret?.value?.trim() ? 'newSecret' : null,
+      ].filter(Boolean);
+      if (modesProvided.length === 0) {
+        return reply.code(400).send({
+          error: 'One of gitToken, gitSecretId, or newSecret is required',
+          code: 'CREDENTIAL_REQUIRED',
+        });
+      }
+      if (modesProvided.length > 1) {
+        return reply.code(400).send({
+          error: `Provide only one credential mode (received: ${modesProvided.join(', ')})`,
+          code: 'CREDENTIAL_AMBIGUOUS',
+        });
+      }
+      if (newSecret && (!newSecret.name?.trim() || !newSecret.value?.trim())) {
+        return reply.code(400).send({
+          error: 'newSecret requires both name and value',
+          code: 'NEW_SECRET_INVALID',
+        });
+      }
+
+      const { projects, audit, platformSecrets } = getRepositories();
+      const project = await projects.findById(request.params.id);
+      if (!project) return reply.code(404).send({ error: 'Project not found' });
+
+      if (gitSecretId) {
+        const secret = await platformSecrets.findById(gitSecretId);
+        if (!secret) {
+          return reply.code(400).send({
+            error: `Vault secret '${gitSecretId}' not found`,
+            code: 'SECRET_NOT_FOUND',
+          });
+        }
+      }
+
+      let credentialType: 'plain' | 'vault-existing' | 'vault-new' = 'plain';
+      let linkedSecretId: string | null = null;
+      try {
+        if (newSecret) {
+          linkedSecretId = await createVaultSecret({
+            name: newSecret.name,
+            value: newSecret.value,
+            createdBy: request.user.id,
+            correlationId: request.correlationId,
+            ip: request.ip,
+          });
+          // Clear any prior plain token AND link the new secret.
+          await projects.deleteAllCredentials(project.id);
+          await projects.saveGitSecretRef(project.id, linkedSecretId);
+          credentialType = 'vault-new';
+        } else if (gitSecretId) {
+          await projects.deleteAllCredentials(project.id);
+          await projects.saveGitSecretRef(project.id, gitSecretId);
+          linkedSecretId = gitSecretId;
+          credentialType = 'vault-existing';
+        } else if (gitToken) {
+          // Clear vault ref so the plain token wins the precedence
+          // check in resolveProjectCredential.
+          await projects.saveGitSecretRef(project.id, null);
+          await projects.deleteAllCredentials(project.id);
+          await projects.saveCredential(project.id, gitToken);
+          credentialType = 'plain';
+        }
+      } catch (err) {
+        const errCode = err instanceof Error && 'code' in err && (err as { code?: string }).code === 'NAME_TAKEN'
+          ? 'NAME_TAKEN' : undefined;
+        return reply.code(errCode ? 409 : 500).send({
+          error: err instanceof Error ? err.message : String(err),
+          code: errCode ?? 'CREDENTIAL_SAVE_FAILED',
+        });
+      }
+
+      await audit.append({
+        actor: request.user.id,
+        action: 'project.git-credentials-updated',
+        entityType: 'projects',
+        entityId: project.id,
+        correlationId: request.correlationId,
+        metadata: {
+          projectId: project.id,
+          credentialType,
+          gitSecretId: linkedSecretId,
+          ip: request.ip,
+        },
+      });
+
+      const refreshed = await projects.findById(project.id);
+      log.info({ projectId: project.id, credentialType }, 'Project git credentials updated');
+      return reply.send({ data: refreshed ? toPublic(refreshed) : toPublic(project) });
     },
   );
 
@@ -345,7 +619,7 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
       const project = await projects.findById(request.params.id);
       if (!project) return reply.code(404).send({ error: 'Project not found' });
 
-      const token = await projects.getCredential(project.id);
+      const token = await resolveProjectCredential(project);
       if (!token) {
         return reply.code(400).send({
           error: 'Project has no Git credential on file; re-register the project',
@@ -545,7 +819,7 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
       const project = await projects.findById(request.params.id);
       if (!project) return reply.code(404).send({ error: 'Project not found' });
 
-      const token = await projects.getCredential(project.id);
+      const token = await resolveProjectCredential(project);
       if (!token) {
         return reply.code(400).send({
           error: 'Project has no Git credential on file; re-register the project',

@@ -98,12 +98,27 @@ export interface ProjectRecord {
   defaultBranch: string;
   createdBy: string;
   createdAt: string;
+  /** Migration 022 — vault secret reference for the project's Git PAT.
+   *  Null = legacy plain-token mode. UUID = reference (NOT the value). */
+  gitSecretId?: string | null;
   /** Platform-admin enrichment — only present on rows returned to a
    *  platform-admin user. `gestalt platform projects list` consumes
    *  these; the regular `gestalt projects list` ignores them. */
   memberCount?: number;
   intentCount?: number;
   lastActivityAt?: string;
+}
+
+// ─── Git provider repo browser (migration 022) ───────────────────────────────
+
+export interface GitRepoSummary {
+  name: string;
+  fullName: string;
+  htmlUrl: string;
+  cloneUrl: string;
+  defaultBranch: string;
+  private: boolean;
+  description: string | null;
 }
 
 // ─── Agents (Step 2 — ADR-037) ───────────────────────────────────────────────
@@ -231,6 +246,14 @@ export interface ProjectConfigAgentsYaml {
 
 // ─── Platform LLM registry (Session 3, migration 014) ────────────────────────
 
+/**
+ * Wire shape (migration 023). 'chat-completions' is the legacy
+ * default (max_tokens + temperature). 'responses' is for OpenAI
+ * reasoning models (gpt-5*, o1, o3) — uses max_completion_tokens
+ * and omits temperature.
+ */
+export type LLMApiShape = 'chat-completions' | 'responses';
+
 export interface PlatformLLM {
   id: string;
   name: string;
@@ -239,6 +262,8 @@ export interface PlatformLLM {
   baseUrl: string;
   apiKeyEnv: string | null;
   secretId: string | null;
+  /** Wire shape — defaults to 'chat-completions'. */
+  apiShape: LLMApiShape;
   isDefault: boolean;
   description: string | null;
   createdAt: string;
@@ -252,6 +277,24 @@ export interface PlatformSecretSummary {
   createdBy: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * Master-key rotation log entry (migration 021). Returned by
+ * `listPlatformSecrets` as `lastRotation`. Records WHO rotated WHEN
+ * and HOW MANY secrets were re-encrypted; the keys themselves never
+ * touch the database.
+ */
+export interface KeyRotationSummary {
+  id: string;
+  rotatedBy: string | null;
+  secretCount: number;
+  rotatedAt: string;
+}
+
+export interface KeyRotationResult {
+  rotated: number;
+  rotatedAt: string;
 }
 
 // ─── Self-healing config (migration 020) ──────────────────────────────────
@@ -282,6 +325,21 @@ export interface PlatformTemplateSummary {
   createdBy: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface TemplateVariableUsage {
+  name: string;
+  usedInFiles: string[];
+  defined: boolean;
+  required: boolean;
+  defaultValue: string | null;
+  description: string | null;
+  autoProvided: boolean;
+}
+
+export interface PlatformTemplateDetail extends PlatformTemplateSummary {
+  files: Record<string, string>;
+  variableUsage?: TemplateVariableUsage[];
 }
 
 export interface PlatformMcpServer {
@@ -504,13 +562,46 @@ export class GestaltApiClient {
 
   // ─── Projects ──────────────────────────────────────────────────────────────
 
+  /**
+   * Register a project. Migration 022 — exactly one of the three
+   * credential modes must be supplied:
+   *   - `gitToken`     — legacy plain-text PAT
+   *   - `gitSecretId`  — link to an existing vault secret
+   *   - `newSecret`    — auto-save the token to the vault first
+   */
   async createProject(params: {
     name: string;
     gitUrl: string;
     defaultBranch?: string;
-    gitToken: string;
+    gitToken?: string;
+    gitSecretId?: string;
+    newSecret?: { name: string; value: string };
   }): Promise<{ data: ProjectRecord }> {
     return this.post('/projects', params);
+  }
+
+  /** Project-admin only — replace the project's Git PAT. Same three
+   *  credential modes as `createProject`. */
+  async updateProjectGitCredentials(
+    projectId: string,
+    body: {
+      gitToken?: string;
+      gitSecretId?: string;
+      newSecret?: { name: string; value: string };
+    },
+  ): Promise<{ data: ProjectRecord }> {
+    return this.patch(`/projects/${projectId}/git-credentials`, body);
+  }
+
+  /** GitHub repo browser (server-side proxy). Today only GitHub is
+   *  wired; the `provider` arg is reserved for future GitLab / Azure
+   *  DevOps support. */
+  async listGitRepos(
+    secretId: string,
+    provider: 'github' = 'github',
+  ): Promise<{ data: GitRepoSummary[] }> {
+    const qs = `?secretId=${encodeURIComponent(secretId)}&provider=${encodeURIComponent(provider)}`;
+    return this.get(`/platform/git/repos${qs}`);
   }
 
   async listProjects(): Promise<{ data: ProjectRecord[] }> {
@@ -540,11 +631,19 @@ export class GestaltApiClient {
   async listPlatformTemplates(): Promise<{ data: PlatformTemplateSummary[] }> {
     return this.get('/platform/templates');
   }
+  /**
+   * Returns the full template record including `files` content and
+   * `variableUsage` (Brief 3 — per-`{{variable}}` status panel).
+   * Used by `gestalt platform templates inspect <slug>`.
+   */
+  async getPlatformTemplate(id: string): Promise<{ data: PlatformTemplateDetail }> {
+    return this.get(`/platform/templates/${id}`);
+  }
   async createPlatformTemplate(body: {
     slug: string; name: string; description?: string | null;
     tier?: string; version?: string;
     files: Record<string, string>;
-  }): Promise<{ data: PlatformTemplateSummary }> {
+  }): Promise<{ data: PlatformTemplateSummary; warnings?: string[] }> {
     return this.post('/platform/templates', body);
   }
   async setDefaultPlatformTemplate(id: string): Promise<{ data: PlatformTemplateSummary }> {
@@ -666,6 +765,8 @@ export class GestaltApiClient {
     apiKeyEnv?: string;
     /** Vault secret id (Session 4 — preferred). */
     secretId?: string;
+    /** Wire shape (migration 023). Defaults to 'chat-completions'. */
+    apiShape?: LLMApiShape;
     isDefault?: boolean;
     description?: string | null;
   }): Promise<{ data: PlatformLLM }> {
@@ -677,6 +778,7 @@ export class GestaltApiClient {
     body: Partial<{
       name: string; provider: string; modelString: string;
       baseUrl: string; apiKeyEnv: string | null; secretId: string | null;
+      apiShape: LLMApiShape;
       isDefault: boolean; description: string | null;
     }>,
   ): Promise<{ data: PlatformLLM }> {
@@ -693,8 +795,18 @@ export class GestaltApiClient {
 
   // ─── Platform secrets vault (Session 4 — migration 015) ───────────────────
 
-  async listPlatformSecrets(): Promise<{ data: PlatformSecretSummary[] }> {
+  async listPlatformSecrets(): Promise<{ data: PlatformSecretSummary[]; lastRotation: KeyRotationSummary | null }> {
     return this.get('/platform/secrets');
+  }
+
+  /**
+   * Rotates the master key — re-encrypts every row in
+   * `platform_secrets` atomically under a new 32-byte base64 key.
+   * Server validates length, runs the rotation in a single transaction,
+   * and on success persists the new key to file / warns about env var.
+   */
+  async rotatePlatformMasterKey(newKey: string): Promise<{ data: KeyRotationResult }> {
+    return this.post('/platform/secrets/rotate-key', { newKey });
   }
 
   async createPlatformSecret(body: {
@@ -806,10 +918,18 @@ export class GestaltApiClient {
   }
 
   async listIntents(params: {
-    projectId: string;
+    projectId?: string;
     status?: string;
     limit?: number;
     offset?: number;
+    // Brief 5 — extended filter set. Server accepts all of these as
+    // query params. Omitting projectId returns the union across every
+    // project the user can access (direct + group memberships).
+    source?: string;
+    priority?: string;
+    search?: string;
+    from?: string;
+    to?: string;
   }): Promise<{ data: IntentSummary[]; total: number }> {
     return this.get('/intents', params as Record<string, unknown>);
   }

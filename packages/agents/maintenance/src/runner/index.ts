@@ -21,6 +21,7 @@
 import { createHash, randomUUID } from 'crypto';
 import {
   createContextLogger, dispatch, emitLiveEvent, getRepositories,
+  resolveProjectCredential,
 } from '@gestalt/core';
 import type {
   TaskPriority, QueueConfig, MaintenanceRunRecord,
@@ -405,7 +406,7 @@ export async function loadProjectInputs(
     : await projects.listAll();
   const inputs: MaintenanceAgentInput[] = [];
   for (const project of allProjects) {
-    const token = await projects.getCredential(project.id);
+    const token = await resolveProjectCredential(project);
     if (!token) {
       log.warn({ projectId: project.id, name: project.name }, 'no Git credential — skipping');
       continue;

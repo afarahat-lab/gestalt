@@ -67,19 +67,122 @@ export async function initCommand(options: { server?: string } = {}): Promise<vo
     process.exit(1);
   }
 
-  const gitUrl = await prompt('Git repository URL (the server will clone and push to this)');
-  if (!gitUrl) {
-    console.log(c.error('Git URL is required.'));
-    process.exit(1);
+  // ─── Token credential selection ─────────────────────────────────────────────
+  //
+  // Three modes (migration 022):
+  //   1 — Select an existing vault secret (encrypted at rest)
+  //   2 — Enter a new token (optionally save to vault)
+  //
+  // If the vault has no secrets yet, mode 2 is forced.
+
+  let credentialBody: {
+    gitToken?: string;
+    gitSecretId?: string;
+    newSecret?: { name: string; value: string };
+  };
+  let selectedSecretId: string | null = null;
+
+  blank();
+  console.log(c.info('Git access token'));
+  const secretsList = await client.listPlatformSecrets().catch(() => null);
+  const availableSecrets = secretsList?.data ?? [];
+  let mode: '1' | '2' = '2';
+  if (availableSecrets.length > 0) {
+    console.log(`  ${c.bold('(1)')} Select from vault (${availableSecrets.length} available)`);
+    console.log(`  ${c.bold('(2)')} Enter a new token`);
+    const choice = (await prompt('Choice [2]')).trim() || '2';
+    if (choice === '1') mode = '1';
+  } else {
+    console.log(c.dim('No vault secrets available — entering a new token.'));
   }
 
-  const branchInput = await prompt('Default branch [main]');
-  const defaultBranch = branchInput || 'main';
+  if (mode === '1') {
+    availableSecrets.forEach((s, idx) => {
+      console.log(`  ${c.bold(String(idx + 1))}. ${s.name}${s.description ? c.dim(` — ${s.description}`) : ''}`);
+    });
+    const pickRaw = await prompt('Pick secret by number');
+    const pick = parseInt(pickRaw, 10);
+    if (!Number.isFinite(pick) || pick < 1 || pick > availableSecrets.length) {
+      console.log(c.error('Invalid selection.'));
+      process.exit(1);
+    }
+    selectedSecretId = availableSecrets[pick - 1].id;
+    credentialBody = { gitSecretId: selectedSecretId };
+  } else {
+    const newToken = await promptSecret('Git personal access token (needs repo read/write)');
+    if (!newToken) {
+      console.log(c.error('Git token is required.'));
+      process.exit(1);
+    }
+    const saveAnswer = (await prompt('Save this token to the vault? (y/N)')).trim().toLowerCase();
+    if (saveAnswer === 'y' || saveAnswer === 'yes') {
+      const defaultSecretName = `${name} Git PAT`;
+      const secretNameRaw = await prompt(`Secret name [${defaultSecretName}]`);
+      const secretName = secretNameRaw.trim() || defaultSecretName;
+      credentialBody = { newSecret: { name: secretName, value: newToken } };
+    } else {
+      credentialBody = { gitToken: newToken };
+    }
+  }
 
-  const gitToken = await promptSecret('Git personal access token (needs repo read/write)');
-  if (!gitToken) {
-    console.log(c.error('Git token is required.'));
-    process.exit(1);
+  // ─── Optional repo browser (vault-mode only — needs the secret id) ────────
+  //
+  // Skipped when the operator entered a brand-new token they haven't saved
+  // to the vault yet (we don't have a secret id to use). Could browse via
+  // the in-flight token, but that would force a second backend round-trip
+  // before the project even exists.
+
+  let gitUrl = '';
+  let defaultBranch = 'main';
+  if (selectedSecretId) {
+    blank();
+    const browseAnswer = (await prompt('Try to browse repos with this secret? (y/N)')).trim().toLowerCase();
+    if (browseAnswer === 'y' || browseAnswer === 'yes') {
+      const browseSpinner = createSpinner('Fetching repositories...');
+      browseSpinner.start();
+      try {
+        const { data: repos } = await client.listGitRepos(selectedSecretId, 'github');
+        browseSpinner.stop();
+        if (repos.length === 0) {
+          console.log(c.dim('No repos returned. Enter the URL manually.'));
+        } else {
+          blank();
+          repos.forEach((r, idx) => {
+            const lock = r.private ? '🔒' : '📖';
+            console.log(`  ${c.bold(String(idx + 1).padStart(2))}. ${lock} ${r.fullName}  ${c.dim(`(${r.defaultBranch})`)}`);
+          });
+          blank();
+          const pickRaw = await prompt('Select repo (or press Enter to type URL manually)');
+          if (pickRaw.trim()) {
+            const idx = parseInt(pickRaw, 10);
+            if (Number.isFinite(idx) && idx >= 1 && idx <= repos.length) {
+              const repo = repos[idx - 1];
+              gitUrl = repo.cloneUrl;
+              defaultBranch = repo.defaultBranch || 'main';
+              console.log(c.success(`✓ Using: ${gitUrl}`));
+            } else {
+              console.log(c.dim('Invalid selection — falling through to manual entry.'));
+            }
+          }
+        }
+      } catch (err) {
+        browseSpinner.stop();
+        const msg = err instanceof Error ? err.message : String(err);
+        console.log(c.dim(`Could not list repos: ${msg}`));
+        console.log(c.dim('Falling through to manual URL entry.'));
+      }
+    }
+  }
+
+  if (!gitUrl) {
+    const inputUrl = await prompt('Git repository URL (the server will clone and push to this)');
+    if (!inputUrl) {
+      console.log(c.error('Git URL is required.'));
+      process.exit(1);
+    }
+    gitUrl = inputUrl;
+    const branchInput = await prompt('Default branch [main]');
+    defaultBranch = branchInput || 'main';
   }
 
   blank();
@@ -88,7 +191,10 @@ export async function initCommand(options: { server?: string } = {}): Promise<vo
 
   let projectId: string;
   try {
-    const { data: project } = await client.createProject({ name, gitUrl, defaultBranch, gitToken });
+    const { data: project } = await client.createProject({
+      name, gitUrl, defaultBranch,
+      ...credentialBody,
+    });
     projectId = project.id;
     registerSpinner.succeed(c.success(`Project registered: ${project.name}`));
     await updateCliConfig({ currentProjectId: projectId });

@@ -227,8 +227,8 @@ export class LLMClient {
     const body = {
       model: this.config.model,
       messages: request.messages,
-      max_tokens: request.maxTokens ?? 4096,
-      temperature: request.temperature ?? 0.2,
+      ...tokenLimitField(this.config.apiShape, request.maxTokens ?? 4096),
+      ...temperatureField(this.config.apiShape, request.temperature ?? 0.2),
       ...(request.responseFormat === 'json'
         ? { response_format: { type: 'json_object' } }
         : {}),
@@ -294,8 +294,8 @@ export class LLMClient {
       messages,
       tools,
       tool_choice: 'auto',
-      max_tokens: request.maxTokens ?? 4096,
-      temperature: request.temperature ?? 0.2,
+      ...tokenLimitField(this.config.apiShape, request.maxTokens ?? 4096),
+      ...temperatureField(this.config.apiShape, request.temperature ?? 0.2),
     };
 
     const controller = new AbortController();
@@ -529,6 +529,7 @@ export async function getLLMClientForModel(modelString?: string): Promise<LLMCli
     model: registered.modelString,
     baseUrl: registered.baseUrl,
     apiKey: registered.apiKey,
+    apiShape: registered.apiShape ?? 'chat-completions',
   };
   const client = new LLMClient(overrideConfig);
   _registryClients.set(cacheKey, client);
@@ -551,6 +552,9 @@ interface RegistryEntry {
   modelString: string;
   baseUrl: string;
   apiKey: string;
+  /** Wire shape — see `tokenLimitField` / `temperatureField` below.
+   *  Optional for back-compat with resolvers that pre-date migration 023. */
+  apiShape?: 'chat-completions' | 'responses';
 }
 
 type RegistryResolver = (modelString: string) => Promise<RegistryEntry | null>;
@@ -581,6 +585,38 @@ export function _resetLLMRegistryCache(): void {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Per-API-shape parameter spelling.
+ *
+ *   - 'chat-completions' (default) — classic Chat Completions body:
+ *     `max_tokens` + `temperature`. Covers gpt-4o*, gpt-4-turbo,
+ *     gpt-3.5-turbo, Anthropic-proxy, Ollama, vLLM-in-OpenAI-mode.
+ *   - 'responses' — reasoning-model body still hitting
+ *     /chat/completions: `max_completion_tokens` only, temperature
+ *     omitted (reasoning models always run at temperature=1 and
+ *     return HTTP 400 on `max_tokens`).
+ *
+ * Returning a spreadable object lets the caller compose without
+ * a branching ladder around the body literal.
+ */
+function tokenLimitField(
+  apiShape: 'chat-completions' | 'responses' | undefined,
+  maxTokens: number,
+): Record<string, number> {
+  return apiShape === 'responses'
+    ? { max_completion_tokens: maxTokens }
+    : { max_tokens: maxTokens };
+}
+
+function temperatureField(
+  apiShape: 'chat-completions' | 'responses' | undefined,
+  temperature: number,
+): Record<string, number> {
+  // Reasoning models silently ignore temperature; omit it to avoid
+  // log noise + future stricter validation on the provider side.
+  return apiShape === 'responses' ? {} : { temperature };
+}
 
 interface OpenAIResponse {
   model: string;

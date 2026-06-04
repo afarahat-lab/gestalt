@@ -18,6 +18,7 @@ import { tmpdir } from 'os';
 import { simpleGit } from 'simple-git';
 import {
   getRepositories, createContextLogger, emitLiveEvent,
+  resolveProjectCredential,
 } from '@gestalt/core';
 import type { PlatformSignal, SignalType } from '@gestalt/core';
 import { resolvePipelineAdapter } from '../adapters/resolver';
@@ -99,7 +100,7 @@ export async function runPipelineAgent(input: PipelineAgentInput): Promise<Pipel
   const { projects, deploymentEvents } = getRepositories();
   const project = await projects.findById(input.projectId);
   if (!project) throw new Error(`Project ${input.projectId} not found`);
-  const token = await projects.getCredential(project.id);
+  const token = await resolveProjectCredential(project);
   if (!token) throw new Error(`Project ${project.name} has no Git credential`);
 
   // Shallow clone so the resolver can read the project's HARNESS.json.

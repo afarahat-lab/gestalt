@@ -14,12 +14,13 @@ import type {
   UserSummary, UserDetail, MembershipSummary, ProjectMember,
   CreateUserParams, UserRole, ProjectRole,
   ProjectConfigResponse, EditableAgentConfig, ProjectConfigCustomAgent,
-  PlatformLLM, LlmTestResult, PlatformSecret,
+  PlatformLLM, LLMApiShape, LlmTestResult, PlatformSecret, KeyRotation, KeyRotationResult,
   PlatformTemplateSummary, PlatformTemplate, TemplateVariable,
   PlatformMcpServer, PlatformMcpTestResult, PlatformToolInfo,
   IdentityProvider, IdentityState, RoleMapping,
   PlatformGroup, GroupMember, GroupProjectAssignment, ProjectGroupAssignment,
   SelfHealingConfig,
+  GitRepoSummary,
 } from '../types';
 
 export class DashboardApiClient {
@@ -51,6 +52,12 @@ export class DashboardApiClient {
     status?: string;
     limit?: number;
     offset?: number;
+    // Brief 5 — extended filter set
+    source?: string;
+    priority?: string;
+    search?: string;
+    from?: string;
+    to?: string;
   }): Promise<{ data: IntentSummary[]; total: number }> {
     return this.get('/intents', params);
   }
@@ -99,17 +106,55 @@ export class DashboardApiClient {
     return this.get('/projects');
   }
 
+  async getProject(projectId: string): Promise<{ data: ProjectSummary }> {
+    return this.get(`/projects/${projectId}`);
+  }
+
   /** Platform-admin only — register a new project with its Git
    *  credentials. The server auto-assigns the creator as
    *  `project-admin` so they immediately survive the membership-aware
-   *  GET /projects filter. */
+   *  GET /projects filter.
+   *
+   *  Three credential modes (migration 022): exactly one of `gitToken`,
+   *  `gitSecretId`, or `newSecret` must be supplied:
+   *    - `gitToken` — legacy plain-text PAT
+   *    - `gitSecretId` — link to an existing vault secret
+   *    - `newSecret` — auto-save the token to the vault first
+   */
   async createProject(body: {
     name: string;
     gitUrl: string;
     defaultBranch?: string;
-    gitToken: string;
+    gitToken?: string;
+    gitSecretId?: string;
+    newSecret?: { name: string; value: string };
   }): Promise<{ data: ProjectSummary }> {
     return this.post('/projects', body);
+  }
+
+  /** project-admin only — replace the project's Git PAT. Same three
+   *  credential modes as `createProject`. Clears the prior credential
+   *  (vault or plain) so only one source wins. */
+  async updateProjectGitCredentials(
+    projectId: string,
+    body: {
+      gitToken?: string;
+      gitSecretId?: string;
+      newSecret?: { name: string; value: string };
+    },
+  ): Promise<{ data: ProjectSummary }> {
+    return this.patch(`/projects/${projectId}/git-credentials`, body);
+  }
+
+  /** Lists the operator's accessible repos via the GitHub API,
+   *  proxied server-side so the decrypted token never crosses the
+   *  network. Today only `provider: 'github'` is wired. */
+  async listGitRepos(
+    secretId: string,
+    provider: 'github' = 'github',
+  ): Promise<{ data: GitRepoSummary[] }> {
+    const qs = `?secretId=${encodeURIComponent(secretId)}&provider=${encodeURIComponent(provider)}`;
+    return this.get(`/platform/git/repos${qs}`);
   }
 
   /** Server clones the repo, writes harness files, commits, and
@@ -326,6 +371,8 @@ export class DashboardApiClient {
     apiKeyEnv?: string;
     /** Vault secret id (Session 4 — migration 015). Preferred. */
     secretId?: string;
+    /** Wire shape (migration 023). Defaults to 'chat-completions'. */
+    apiShape?: LLMApiShape;
     isDefault?: boolean;
     description?: string | null;
   }): Promise<{ data: PlatformLLM }> {
@@ -337,6 +384,7 @@ export class DashboardApiClient {
     body: Partial<{
       name: string; provider: string; modelString: string;
       baseUrl: string; apiKeyEnv: string | null; secretId: string | null;
+      apiShape: LLMApiShape;
       isDefault: boolean; description: string | null;
     }>,
   ): Promise<{ data: PlatformLLM }> {
@@ -374,8 +422,18 @@ export class DashboardApiClient {
   // Note: secret VALUES are never returned by any API. The list/get/create/
   // update endpoints all return only the metadata fields in `PlatformSecret`.
 
-  async listPlatformSecrets(): Promise<{ data: PlatformSecret[] }> {
+  async listPlatformSecrets(): Promise<{ data: PlatformSecret[]; lastRotation: KeyRotation | null }> {
     return this.get('/platform/secrets');
+  }
+
+  /**
+   * Atomically re-encrypts every secret under a new master key.
+   * `newKey` must be a base64-encoded 32-byte value generated
+   * client-side via crypto.getRandomValues. The server never logs the
+   * key; the audit row records only the secret count.
+   */
+  async rotateMasterKey(newKey: string): Promise<{ data: KeyRotationResult }> {
+    return this.post('/platform/secrets/rotate-key', { newKey });
   }
 
   async createPlatformSecret(body: {
@@ -416,7 +474,7 @@ export class DashboardApiClient {
     files: Record<string, string>;
     variables?: TemplateVariable[];
     isDefault?: boolean;
-  }): Promise<{ data: PlatformTemplateSummary }> {
+  }): Promise<{ data: PlatformTemplateSummary; warnings?: string[] }> {
     return this.post('/platform/templates', body);
   }
 

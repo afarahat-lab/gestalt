@@ -5,6 +5,7 @@
 
 import type {
   IntentRepository, IntentRecord, IntentStatus, ResumeContext,
+  IntentListFilters,
 } from '@gestalt/core';
 import { getDb } from '../client';
 import { parseJsonb } from '../utils';
@@ -112,52 +113,116 @@ export class PostgresIntentRepository implements IntentRepository {
     return row;
   }
 
-  async list(params: {
-    projectId: string;
-    status?: IntentStatus;
-    limit: number;
-    offset: number;
-  }): Promise<{ records: IntentRecord[]; total: number }> {
+  async list(
+    params: IntentListFilters & { projectId: string },
+  ): Promise<{ records: IntentRecord[]; total: number }> {
     const db = getDb();
-
+    // Brief 5 — inline conditional filter fragments. Each
+    // `${cond ? db\`AND ...\` : db\`\`}` block uses postgres.js's
+    // nested-template handling to splice the fragment in (or skip it)
+    // at prepared-statement build time
+    const searchPattern = params.search ? `%${params.search}%` : null;
     const records = await db<IntentRecord[]>`
       SELECT * FROM intents
       WHERE project_id = ${params.projectId}
-      ${params.status ? db`AND status = ${params.status}` : db``}
+      ${params.status   ? db`AND status   = ${params.status}`                : db``}
+      ${params.source   ? db`AND source   = ${params.source}`                : db``}
+      ${params.priority ? db`AND priority = ${params.priority}`              : db``}
+      ${searchPattern   ? db`AND text ILIKE ${searchPattern}`                : db``}
+      ${params.from     ? db`AND created_at >= ${params.from}`               : db``}
+      ${params.to       ? db`AND created_at <= ${params.to}`                 : db``}
       ORDER BY created_at DESC
       LIMIT ${params.limit}
       OFFSET ${params.offset}
     `;
-
     const [{ count }] = await db<[{ count: string }]>`
       SELECT COUNT(*)::text AS count FROM intents
       WHERE project_id = ${params.projectId}
-      ${params.status ? db`AND status = ${params.status}` : db``}
+      ${params.status   ? db`AND status   = ${params.status}`                : db``}
+      ${params.source   ? db`AND source   = ${params.source}`                : db``}
+      ${params.priority ? db`AND priority = ${params.priority}`              : db``}
+      ${searchPattern   ? db`AND text ILIKE ${searchPattern}`                : db``}
+      ${params.from     ? db`AND created_at >= ${params.from}`               : db``}
+      ${params.to       ? db`AND created_at <= ${params.to}`                 : db``}
     `;
-
     return { records, total: parseInt(count, 10) };
   }
 
-  async listAll(params: {
-    status?: IntentStatus;
-    limit: number;
-    offset: number;
-  }): Promise<{ records: IntentRecord[]; total: number }> {
+  async listAll(
+    params: IntentListFilters,
+  ): Promise<{ records: IntentRecord[]; total: number }> {
     const db = getDb();
-
+    const searchPattern = params.search ? `%${params.search}%` : null;
+    // Anchor the WHERE on `1=1` (always-true) so the conditional
+    // `AND <col> = …` fragments compose cleanly without needing to
+    // swap the first AND for a WHERE.
     const records = await db<IntentRecord[]>`
       SELECT * FROM intents
-      ${params.status ? db`WHERE status = ${params.status}` : db``}
+      WHERE 1 = 1
+      ${params.status   ? db`AND status   = ${params.status}`                : db``}
+      ${params.source   ? db`AND source   = ${params.source}`                : db``}
+      ${params.priority ? db`AND priority = ${params.priority}`              : db``}
+      ${searchPattern   ? db`AND text ILIKE ${searchPattern}`                : db``}
+      ${params.from     ? db`AND created_at >= ${params.from}`               : db``}
+      ${params.to       ? db`AND created_at <= ${params.to}`                 : db``}
       ORDER BY created_at DESC
       LIMIT ${params.limit}
       OFFSET ${params.offset}
     `;
-
     const [{ count }] = await db<[{ count: string }]>`
       SELECT COUNT(*)::text AS count FROM intents
-      ${params.status ? db`WHERE status = ${params.status}` : db``}
+      WHERE 1 = 1
+      ${params.status   ? db`AND status   = ${params.status}`                : db``}
+      ${params.source   ? db`AND source   = ${params.source}`                : db``}
+      ${params.priority ? db`AND priority = ${params.priority}`              : db``}
+      ${searchPattern   ? db`AND text ILIKE ${searchPattern}`                : db``}
+      ${params.from     ? db`AND created_at >= ${params.from}`               : db``}
+      ${params.to       ? db`AND created_at <= ${params.to}`                 : db``}
     `;
+    return { records, total: parseInt(count, 10) };
+  }
 
+  /**
+   * UNION-style listing across multiple projects. Used by GET /intents
+   * when no projectId is supplied — the route resolves every project
+   * the user can access via direct membership OR group assignment, and
+   * passes the deduped union here. Single round-trip via `= ANY` —
+   * no N+1 over per-project queries. Brief 5.
+   */
+  async listForProjects(
+    projectIds: string[],
+    filters: IntentListFilters,
+  ): Promise<{ records: IntentRecord[]; total: number }> {
+    if (projectIds.length === 0) {
+      return { records: [], total: 0 };
+    }
+    const db = getDb();
+    const searchPattern = filters.search ? `%${filters.search}%` : null;
+    // `project_id` is TEXT on the 001_initial schema (not UUID), so the
+    // cast is to text[] not uuid[]. = ANY is a single-pass index check.
+    const records = await db<IntentRecord[]>`
+      SELECT * FROM intents
+      WHERE project_id = ANY(${projectIds}::text[])
+      ${filters.status   ? db`AND status   = ${filters.status}`              : db``}
+      ${filters.source   ? db`AND source   = ${filters.source}`              : db``}
+      ${filters.priority ? db`AND priority = ${filters.priority}`            : db``}
+      ${searchPattern    ? db`AND text ILIKE ${searchPattern}`               : db``}
+      ${filters.from     ? db`AND created_at >= ${filters.from}`             : db``}
+      ${filters.to       ? db`AND created_at <= ${filters.to}`               : db``}
+      ORDER BY created_at DESC
+      LIMIT ${filters.limit}
+      OFFSET ${filters.offset}
+    `;
+    const [{ count }] = await db<[{ count: string }]>`
+      SELECT COUNT(*)::text AS count FROM intents
+      WHERE project_id = ANY(${projectIds}::text[])
+      ${filters.status   ? db`AND status   = ${filters.status}`              : db``}
+      ${filters.source   ? db`AND source   = ${filters.source}`              : db``}
+      ${filters.priority ? db`AND priority = ${filters.priority}`            : db``}
+      ${searchPattern    ? db`AND text ILIKE ${searchPattern}`               : db``}
+      ${filters.from     ? db`AND created_at >= ${filters.from}`             : db``}
+      ${filters.to       ? db`AND created_at <= ${filters.to}`               : db``}
+    `;
     return { records, total: parseInt(count, 10) };
   }
 

@@ -25,7 +25,7 @@ import { tmpdir } from 'os';
 import { simpleGit } from 'simple-git';
 import {
   getRepositories, createContextLogger, emitLiveEvent,
-  createHarnessEngine,
+  createHarnessEngine, resolveProjectCredential,
 } from '@gestalt/core';
 import type {
   PlatformSignal, SignalType, DeploymentEventType,
@@ -149,7 +149,7 @@ export async function runPromotionAgent(input: PromotionAgentInput): Promise<Pro
 
   const project = await projects.findById(input.projectId);
   if (!project) throw new Error(`Project ${input.projectId} not found`);
-  const token = await projects.getCredential(project.id);
+  const token = await resolveProjectCredential(project);
   if (!token) throw new Error(`Project ${project.name} has no Git credential`);
 
   const workDir = await mkdtemp(join(tmpdir(), `gestalt-promo-${input.correlationId}-`));

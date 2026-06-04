@@ -24,6 +24,7 @@ import { parse as parseYaml } from 'yaml';
 import type { FastifyInstance } from 'fastify';
 import {
   getRepositories, createContextLogger, type ProjectRecord,
+  resolveProjectCredential,
 } from '@gestalt/core';
 import {
   loadCustomAgents, defaultAgentConfig, scheduleCustomAgents,
@@ -127,7 +128,7 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
       const project = await projects.findById(request.params.id);
       if (!project) return reply.code(404).send({ error: 'Project not found' });
 
-      const token = await projects.getCredential(project.id);
+      const token = await resolveProjectCredential(project);
       if (!token) return reply.code(400).send({ error: 'Project has no Git credential on file' });
 
       let yamlRaw: string | null = null;
@@ -206,7 +207,7 @@ export async function registerAgentRoutes(app: FastifyInstance): Promise<void> {
       const project = await projects.findById(request.params.id);
       if (!project) return reply.code(404).send({ error: 'Project not found' });
 
-      const token = await projects.getCredential(project.id);
+      const token = await resolveProjectCredential(project);
       if (!token) return reply.code(400).send({ error: 'Project has no Git credential on file' });
 
       const warnings: string[] = [];

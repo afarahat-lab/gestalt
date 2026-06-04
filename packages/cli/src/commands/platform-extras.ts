@@ -182,6 +182,85 @@ export async function platformTemplatesDeleteCommand(
   }
 }
 
+/**
+ * `gestalt platform templates inspect <slug>` (Brief 3) — print the
+ * template's files + per-`{{variable}}` usage. Operators see at a
+ * glance which placeholders the template uses, whether each is
+ * auto-provided / documented / undocumented, and in which files
+ * the variable appears.
+ */
+export async function platformTemplatesInspectCommand(
+  slug: string,
+  options: BaseOptions = {},
+): Promise<void> {
+  const ctx = await openClient(options);
+  if (!ctx) return;
+  const { client, serverUrl } = ctx;
+  try {
+    const list = await client.listPlatformTemplates();
+    const summary = list.data.find((t) => t.slug === slug);
+    if (!summary) {
+      console.log(c.error(`No template with slug '${slug}'.`));
+      console.log(c.dim('  Run: gestalt platform templates list'));
+      process.exit(1);
+    }
+    const res = await client.getPlatformTemplate(summary.id);
+    const t = res.data;
+    blank();
+    console.log(c.bold(`Template: ${t.name}`));
+    console.log(c.dim(`  Slug:     ${t.slug}`));
+    console.log(c.dim(`  Tier:     ${t.tier}  Version: ${t.version}`));
+    console.log(c.dim(`  Default:  ${t.isDefault ? '★ yes' : 'no'}  ${t.isBuiltin ? '(built-in)' : ''}`));
+    if (t.description) {
+      console.log(c.dim(`  Description: ${t.description}`));
+    }
+    blank();
+    const fileNames = Object.keys(t.files).sort();
+    console.log(c.bold(`Files (${fileNames.length}):`));
+    for (const f of fileNames) {
+      console.log(`  ${f}`);
+    }
+    blank();
+    const usage = t.variableUsage ?? [];
+    console.log(c.bold(`Variables (${usage.length}):`));
+    if (usage.length === 0) {
+      console.log(c.dim('  No {{variable}} placeholders detected.'));
+    } else {
+      printTable(
+        usage.map((v) => {
+          const status = v.autoProvided ? c.success('✓ Auto')
+            : v.defined ? c.success('✓ Documented')
+            : c.warn('⚠ Undocumented');
+          const filesLine = v.usedInFiles.length === 1
+            ? v.usedInFiles[0]!
+            : `Used in ${v.usedInFiles.length} files`;
+          return {
+            status,
+            name:  v.name,
+            files: filesLine,
+          };
+        }),
+        [
+          { key: 'status', header: '',         width: 18 },
+          { key: 'name',   header: 'Name',     width: 24 },
+          { key: 'files',  header: 'Used in',  width: 50 },
+        ],
+      );
+      const undocumented = usage.filter((v) => !v.autoProvided && !v.defined);
+      if (undocumented.length > 0) {
+        blank();
+        console.log(c.dim(
+          `Note: ${undocumented.length} undocumented variable(s) will appear as ` +
+          'literal {{varName}} in committed files unless documented in the template metadata.',
+        ));
+      }
+    }
+    blank();
+  } catch (err) {
+    handleErr(err, serverUrl, `Failed to inspect ${slug}`);
+  }
+}
+
 // ─── MCP servers ─────────────────────────────────────────────────────────────
 
 export async function platformMcpListCommand(options: BaseOptions = {}): Promise<void> {

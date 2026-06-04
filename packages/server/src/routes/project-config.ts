@@ -36,6 +36,7 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import type { FastifyInstance } from 'fastify';
 import {
   getRepositories, createContextLogger,
+  resolveProjectCredential,
   type ProjectRecord,
   type HarnessPipelineConfig, type BuiltInToolName,
   type AgentToolConfig, type McpServerConfig,
@@ -88,7 +89,7 @@ export async function registerProjectConfigRoutes(app: FastifyInstance): Promise
       const project = await projects.findById(request.params.id);
       if (!project) return reply.code(404).send({ error: 'Project not found' });
 
-      const token = await projects.getCredential(project.id);
+      const token = await resolveProjectCredential(project);
       if (!token) {
         return reply.code(400).send({
           error: 'Project has no Git credential on file; re-register the project',
@@ -137,7 +138,7 @@ export async function registerProjectConfigRoutes(app: FastifyInstance): Promise
       const { projects, audit } = getRepositories();
       const project = await projects.findById(request.params.id);
       if (!project) return reply.code(404).send({ error: 'Project not found' });
-      const token = await projects.getCredential(project.id);
+      const token = await resolveProjectCredential(project);
       if (!token) {
         return reply.code(400).send({ error: 'Project has no Git credential on file', code: 'NO_CREDENTIAL' });
       }
@@ -192,7 +193,7 @@ export async function registerProjectConfigRoutes(app: FastifyInstance): Promise
       const { projects, audit } = getRepositories();
       const project = await projects.findById(request.params.id);
       if (!project) return reply.code(404).send({ error: 'Project not found' });
-      const token = await projects.getCredential(project.id);
+      const token = await resolveProjectCredential(project);
       if (!token) {
         return reply.code(400).send({ error: 'Project has no Git credential on file', code: 'NO_CREDENTIAL' });
       }
@@ -249,7 +250,7 @@ export async function registerProjectConfigRoutes(app: FastifyInstance): Promise
       const { projects, audit } = getRepositories();
       const project = await projects.findById(request.params.id);
       if (!project) return reply.code(404).send({ error: 'Project not found' });
-      const token = await projects.getCredential(project.id);
+      const token = await resolveProjectCredential(project);
       if (!token) {
         return reply.code(400).send({ error: 'Project has no Git credential on file', code: 'NO_CREDENTIAL' });
       }

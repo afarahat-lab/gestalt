@@ -35,6 +35,7 @@ import {
   createContextLogger, emitLiveEvent, QUEUE_NAMES,
   BaseOrchestrator,
   runSelfHealingLoop,
+  resolveProjectCredential,
 } from '@gestalt/core';
 import type {
   TaskMessage, TaskResult, TaskPriority, QueueConfig,
@@ -154,7 +155,7 @@ async function resolveProjectFor(intentId: string): Promise<{
   if (!intent) return null;
   const project = await projects.findById(intent.projectId);
   if (!project) return null;
-  const token = await projects.getCredential(project.id);
+  const token = await resolveProjectCredential(project);
   if (!token) return null;
   return { gitUrl: project.gitUrl, defaultBranch: project.defaultBranch, token };
 }

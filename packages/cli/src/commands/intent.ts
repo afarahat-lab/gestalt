@@ -39,6 +39,13 @@ const VALID_STATUSES = new Set([
   'deployed', 'failed', 'escalated', 'waiting-for-clarification',
 ]);
 
+const VALID_SOURCES = new Set([
+  'human', 'maintenance-agent', 'self-healing',
+  'auto-resolved', 'operator-resume', 'pipeline-feedback',
+]);
+
+const VALID_PRIORITIES = new Set(['critical', 'high', 'normal', 'low']);
+
 const WATCH_INTERVAL_MS = 3_000;
 
 // ─── intent list ─────────────────────────────────────────────────────────────
@@ -48,6 +55,12 @@ export interface IntentListOptions {
   project?: string;
   status?: string;
   limit?: string;
+  // Brief 5 — extended filter flags
+  source?: string;
+  priority?: string;
+  search?: string;
+  from?: string;
+  to?: string;
 }
 
 export async function intentListCommand(options: IntentListOptions = {}): Promise<void> {
@@ -62,22 +75,34 @@ export async function intentListCommand(options: IntentListOptions = {}): Promis
     console.log(c.error(`Unknown status '${options.status}'. Valid values: ${[...VALID_STATUSES].join(', ')}`));
     process.exit(1);
   }
+  if (options.source && !VALID_SOURCES.has(options.source)) {
+    console.log(c.error(`Unknown source '${options.source}'. Valid values: ${[...VALID_SOURCES].join(', ')}`));
+    process.exit(1);
+  }
+  if (options.priority && !VALID_PRIORITIES.has(options.priority)) {
+    console.log(c.error(`Unknown priority '${options.priority}'. Valid values: ${[...VALID_PRIORITIES].join(', ')}`));
+    process.exit(1);
+  }
 
   const limit = Math.min(Math.max(parseInt(options.limit ?? '20', 10) || 20, 1), 100);
   const client = new GestaltApiClient({ serverUrl, token: config.token });
 
   try {
     const projectId = await resolveProjectId(client, config.currentProjectId, options.project);
-    if (!projectId) {
-      // Platform-admin path — no project scope, server-wide list.
-      const res = await client.listIntents({ projectId: '', limit });
-      renderIntentTable(res.data, 'all projects');
-      return;
-    }
-    const params: Parameters<GestaltApiClient['listIntents']>[0] = { projectId, limit };
-    if (options.status) params.status = options.status;
+    // Brief 5: when projectId is absent, the server returns intents
+    // across every project the user can access via direct membership
+    // OR group assignment. Platform-admin sees server-wide. Regular
+    // users get the union of their group-accessible projects.
+    const params: Parameters<GestaltApiClient['listIntents']>[0] = { limit };
+    if (projectId) params.projectId = projectId;
+    if (options.status)   params.status = options.status;
+    if (options.source)   params.source = options.source;
+    if (options.priority) params.priority = options.priority;
+    if (options.search)   params.search = options.search;
+    if (options.from)     params.from = options.from;
+    if (options.to)       params.to = options.to;
     const res = await client.listIntents(params);
-    renderIntentTable(res.data, options.project ?? '(current project)');
+    renderIntentTable(res.data, projectId ? (options.project ?? '(current project)') : 'accessible projects');
   } catch (err) {
     if (isConnectivityError(err)) {
       printConnectionError(serverUrl);

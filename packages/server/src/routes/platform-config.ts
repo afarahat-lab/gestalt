@@ -39,6 +39,9 @@ const log = createContextLogger({ module: 'routes:platform-config' });
 const VALID_PROVIDERS = ['openai', 'azure-openai', 'anthropic', 'ollama', 'custom'] as const;
 type ValidProvider = typeof VALID_PROVIDERS[number];
 
+const VALID_API_SHAPES = ['chat-completions', 'responses'] as const;
+type ValidApiShape = typeof VALID_API_SHAPES[number];
+
 interface CreateLLMBody {
   name?: unknown;
   provider?: unknown;
@@ -48,6 +51,8 @@ interface CreateLLMBody {
   apiKeyEnv?: unknown;
   /** Vault secret id (Session 4 — preferred). Takes precedence at call time. */
   secretId?: unknown;
+  /** Wire shape (migration 023). Defaults to 'chat-completions'. */
+  apiShape?: unknown;
   isDefault?: unknown;
   description?: unknown;
 }
@@ -59,6 +64,7 @@ interface UpdateLLMBody {
   baseUrl?: unknown;
   apiKeyEnv?: unknown;
   secretId?: unknown;
+  apiShape?: unknown;
   isDefault?: unknown;
   description?: unknown;
 }
@@ -113,6 +119,7 @@ export async function registerPlatformConfigRoutes(app: FastifyInstance): Promis
             isDefault: created.isDefault,
             apiKeyEnv: created.apiKeyEnv,
             secretId: created.secretId,
+            apiShape: created.apiShape,
             ip: request.ip,
           },
         });
@@ -262,6 +269,21 @@ export async function registerPlatformConfigRoutes(app: FastifyInstance): Promis
         });
       }
 
+      // Per-shape body (migration 023): reasoning-class models
+      // ('responses' shape) reject `max_tokens` + ignore `temperature`.
+      // Build the body to match what an agent call would actually send
+      // for this row so the test result reflects reality.
+      const shape = existing.apiShape ?? 'chat-completions';
+      const testBody: Record<string, unknown> = {
+        model: existing.modelString,
+        messages: [{ role: 'user', content: 'hello' }],
+      };
+      if (shape === 'responses') {
+        testBody.max_completion_tokens = 5;
+      } else {
+        testBody.max_tokens = 5;
+      }
+
       const startedAt = Date.now();
       try {
         const res = await fetch(`${existing.baseUrl}/chat/completions`, {
@@ -270,11 +292,7 @@ export async function registerPlatformConfigRoutes(app: FastifyInstance): Promis
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${apiKey}`,
           },
-          body: JSON.stringify({
-            model: existing.modelString,
-            messages: [{ role: 'user', content: 'hello' }],
-            max_tokens: 5,
-          }),
+          body: JSON.stringify(testBody),
           signal: AbortSignal.timeout(10_000),
         });
         const latencyMs = Date.now() - startedAt;
@@ -483,6 +501,7 @@ function validateCreateBody(body: CreateLLMBody): ValidationResult<{
   baseUrl: string;
   apiKeyEnv: string | null;
   secretId: string | null;
+  apiShape: ValidApiShape;
   isDefault: boolean;
   description: string | null;
 }> {
@@ -517,6 +536,13 @@ function validateCreateBody(body: CreateLLMBody): ValidationResult<{
   if (body.description !== undefined && body.description !== null && typeof body.description !== 'string') {
     return { ok: false, code: 'INVALID_DESCRIPTION', error: 'description must be a string or null' };
   }
+  let apiShape: ValidApiShape = 'chat-completions';
+  if (body.apiShape !== undefined && body.apiShape !== null) {
+    if (typeof body.apiShape !== 'string' || !VALID_API_SHAPES.includes(body.apiShape as ValidApiShape)) {
+      return { ok: false, code: 'INVALID_API_SHAPE', error: `apiShape must be one of: ${VALID_API_SHAPES.join(', ')}` };
+    }
+    apiShape = body.apiShape as ValidApiShape;
+  }
   return {
     ok: true,
     fields: {
@@ -526,6 +552,7 @@ function validateCreateBody(body: CreateLLMBody): ValidationResult<{
       baseUrl: body.baseUrl.trim().replace(/\/$/, ''),
       apiKeyEnv: hasApiKeyEnv ? (body.apiKeyEnv as string).trim() : null,
       secretId: hasSecretId ? (body.secretId as string).trim() : null,
+      apiShape,
       isDefault: body.isDefault === true,
       description: typeof body.description === 'string' ? body.description : null,
     },
@@ -539,12 +566,14 @@ function validateUpdateBody(body: UpdateLLMBody): ValidationResult<Partial<{
   baseUrl: string;
   apiKeyEnv: string | null;
   secretId: string | null;
+  apiShape: ValidApiShape;
   isDefault: boolean;
   description: string | null;
 }>> {
   const out: Partial<{
     name: string; provider: string; modelString: string;
     baseUrl: string; apiKeyEnv: string | null; secretId: string | null;
+    apiShape: ValidApiShape;
     isDefault: boolean; description: string | null;
   }> = {};
   if (body.name !== undefined) {
@@ -584,6 +613,12 @@ function validateUpdateBody(body: UpdateLLMBody): ValidationResult<Partial<{
       const trimmed = body.secretId.trim();
       out.secretId = trimmed === '' ? null : trimmed;
     }
+  }
+  if (body.apiShape !== undefined) {
+    if (typeof body.apiShape !== 'string' || !VALID_API_SHAPES.includes(body.apiShape as ValidApiShape)) {
+      return { ok: false, code: 'INVALID_API_SHAPE', error: `apiShape must be one of: ${VALID_API_SHAPES.join(', ')}` };
+    }
+    out.apiShape = body.apiShape as ValidApiShape;
   }
   if (body.isDefault !== undefined) {
     if (typeof body.isDefault !== 'boolean') return { ok: false, code: 'INVALID_IS_DEFAULT', error: 'isDefault must be a boolean' };

@@ -30,9 +30,19 @@ interface SubmitIntentBody {
 }
 
 interface ListIntentsQuery {
+  // Existing
+  projectId?: string;
   status?: string;
   limit?: string;
   offset?: string;
+  // Brief 5 — additional filter params. All are optional; ISO dates
+  // for `from` / `to` parse to JS `Date` server-side before reaching
+  // the repository.
+  source?: string;
+  priority?: string;
+  search?: string;
+  from?: string;
+  to?: string;
 }
 
 interface ClarifyBody {
@@ -111,48 +121,66 @@ export async function registerIntentRoutes(app: FastifyInstance): Promise<void> 
     },
   );
 
-  // GET /intents — list intents
+  // GET /intents — list intents (Brief 5 widened)
   //
   // Membership rules:
-  //   - With ?projectId=…  → require reader+ on that project (403 if
-  //     not a member); platform-admin bypasses the check
+  //   - With ?projectId=…  → require reader+ on that project (direct
+  //     OR group-derived); platform-admin bypasses
   //   - Without projectId  → platform-admin sees the server-wide list
-  //     (via intents.listAll); regular users get an empty array
-  //     instead of a 403 so the response shape never leaks "this
-  //     project exists" by erroring instead of returning empty
+  //     (via intents.listAll). Regular users see intents for EVERY
+  //     project they can access via direct membership OR group
+  //     assignment (Brief 5). An empty set returns `{data: [], total: 0}`
+  //     rather than 403 so the response shape never leaks "project X
+  //     exists" by erroring vs returning empty
+  //
+  // Query filters (all optional):
+  //   - status / source / priority — exact match against the typed
+  //     column. Source accepts the wider Brief 5 union but most
+  //     intents stay at their original `human` / `maintenance-agent`
+  //     source on retry cycles
+  //   - search — ILIKE '%search%' on the text column
+  //   - from / to — ISO date strings; both inclusive bounds on
+  //     created_at. Invalid dates fall through with no filter applied
   app.get<{ Querystring: ListIntentsQuery }>(
     '/intents',
     async (request, reply) => {
       if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
-      const { status, limit = '20', offset = '0' } = request.query;
-      const projectId = (request.query as Record<string, string>)['projectId'] ?? '';
-      const parsedLimit = Math.min(parseInt(limit, 10), 100);
-      const parsedOffset = parseInt(offset, 10);
+      const q = request.query;
+      const limit = Math.min(parseInt(q.limit ?? '20', 10) || 20, 100);
+      const offset = parseInt(q.offset ?? '0', 10) || 0;
+      const filters = buildIntentFilters(q, limit, offset);
+      const projectId = q.projectId?.trim() ?? '';
 
-      const { intents } = getRepositories();
+      const { intents, memberships, platformGroups } = getRepositories();
 
       if (!projectId) {
-        if (request.user.role !== 'platform-admin') {
-          return reply.send({ data: [], total: 0, limit: parsedLimit, offset: parsedOffset });
+        // Platform-admin: server-wide list across every project
+        if (request.user.role === 'platform-admin') {
+          const { records, total } = await intents.listAll(filters);
+          return reply.send({ data: records, total, limit, offset });
         }
-        const { records, total } = await intents.listAll({
-          status: status as never,
-          limit: parsedLimit,
-          offset: parsedOffset,
-        });
-        return reply.send({ data: records, total, limit: parsedLimit, offset: parsedOffset });
+
+        // Regular user: UNION of direct memberships + group-derived access
+        const [direct, viaGroups] = await Promise.all([
+          memberships.findByUser(request.user.id),
+          platformGroups.getEffectiveMemberships(request.user.id),
+        ]);
+        const allProjectIds = [
+          ...new Set([
+            ...direct.map((m) => m.projectId),
+            ...viaGroups.map((m) => m.projectId),
+          ]),
+        ];
+        if (allProjectIds.length === 0) {
+          return reply.send({ data: [], total: 0, limit, offset });
+        }
+        const { records, total } = await intents.listForProjects(allProjectIds, filters);
+        return reply.send({ data: records, total, limit, offset });
       }
 
       if (!await checkProjectMembership(reply, request.user.id, request.user.role, projectId)) return;
-
-      const { records, total } = await intents.list({
-        projectId,
-        status: status as never,
-        limit: parsedLimit,
-        offset: parsedOffset,
-      });
-
-      return reply.send({ data: records, total, limit: parsedLimit, offset: parsedOffset });
+      const { records, total } = await intents.list({ projectId, ...filters });
+      return reply.send({ data: records, total, limit, offset });
     },
   );
 
@@ -314,4 +342,49 @@ export async function registerIntentRoutes(app: FastifyInstance): Promise<void> 
       });
     },
   );
+}
+
+/**
+ * Translate `ListIntentsQuery` into the typed `IntentListFilters`
+ * the repositories expect (Brief 5).
+ *
+ *   - Trims string values + rejects empties so the SQL conditional
+ *     `($N IS NULL OR …)` fragments are bypassed
+ *   - Parses `from` / `to` via `new Date(...)`. If the result is
+ *     `NaN`, the filter is dropped silently — invalid date strings
+ *     don't error; the user just sees an unfiltered range. Matches
+ *     the brief's permissive approach
+ *   - `status` is widened from string at this boundary; the repo's
+ *     `IntentListFilters.status` typing constrains downstream callers
+ */
+function buildIntentFilters(
+  q: ListIntentsQuery,
+  limit: number,
+  offset: number,
+): import('@gestalt/core').IntentListFilters {
+  const filters: import('@gestalt/core').IntentListFilters = { limit, offset };
+  const trimmed = (s: string | undefined): string | undefined => {
+    const t = s?.trim();
+    return t ? t : undefined;
+  };
+  const status   = trimmed(q.status);
+  const source   = trimmed(q.source);
+  const priority = trimmed(q.priority);
+  const search   = trimmed(q.search);
+  // `status` is an open `IntentStatus` union; the cast widens through
+  // unknown so an arbitrary string from the query doesn't break the
+  // type. The DB silently ignores unknown statuses (no row matches).
+  if (status)   filters.status = status as unknown as import('@gestalt/core').IntentListFilters['status'];
+  if (source)   filters.source = source;
+  if (priority) filters.priority = priority;
+  if (search)   filters.search = search;
+  if (q.from) {
+    const d = new Date(q.from);
+    if (!Number.isNaN(d.getTime())) filters.from = d;
+  }
+  if (q.to) {
+    const d = new Date(q.to);
+    if (!Number.isNaN(d.getTime())) filters.to = d;
+  }
+  return filters;
 }

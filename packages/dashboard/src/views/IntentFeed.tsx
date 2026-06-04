@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useDashboardApi } from '../hooks/useApi';
 import { useLiveEvent } from '../hooks/useLiveEvents';
 import { useProject } from '../context/ProjectContext';
@@ -14,42 +14,104 @@ const PRIORITY_COLORS: Record<string, string> = {
   low:      'var(--text-dim)',
 };
 
+// Brief 5 — closed unions matching the server's IntentListFilters
+const STATUS_OPTIONS = [
+  'generating', 'in-review', 'approved',
+  'deploying', 'deployed', 'failed',
+  'escalated', 'waiting-for-clarification',
+];
+const SOURCE_OPTIONS = [
+  'human', 'maintenance-agent', 'self-healing',
+  'auto-resolved', 'operator-resume', 'pipeline-feedback',
+];
+
+interface FilterState {
+  status: string;
+  source: string;
+  search: string;
+  from: string;
+  to: string;
+}
+
+function readFiltersFromUrl(params: URLSearchParams): FilterState {
+  return {
+    status: params.get('status') ?? '',
+    source: params.get('source') ?? '',
+    search: params.get('search') ?? '',
+    from:   params.get('from')   ?? '',
+    to:     params.get('to')     ?? '',
+  };
+}
+
+function writeFiltersToUrl(filters: FilterState): URLSearchParams {
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(filters)) {
+    if (v) params.set(k, v);
+  }
+  return params;
+}
+
 export function IntentFeed() {
   const api = useDashboardApi();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   // Project selection lives in ProjectContext (sidebar selector). Per-view
   // localStorage reads and dropdowns from earlier sessions are gone.
   const { currentProjectId, currentProject } = useProject();
   const [intents, setIntents] = useState<IntentSummary[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
-  const [filter, setFilter] = useState('');
+  // Brief 5 — filters live in the URL so links are shareable.
+  const filters = useMemo(() => readFiltersFromUrl(searchParams), [searchParams]);
+  // Local search state for debouncing — bound to the input but only
+  // applied to the URL (and therefore the fetch) after 300ms.
+  const [searchInput, setSearchInput] = useState(filters.search);
+  useEffect(() => { setSearchInput(filters.search); }, [filters.search]);
+
+  // Debounce search → URL update
+  useEffect(() => {
+    if (searchInput === filters.search) return;
+    const handle = setTimeout(() => {
+      setSearchParams(writeFiltersToUrl({ ...filters, search: searchInput }), { replace: true });
+    }, 300);
+    return () => clearTimeout(handle);
+  }, [searchInput, filters, setSearchParams]);
 
   const load = useCallback(async () => {
     if (!currentProjectId) { setIntents([]); setTotal(0); setLoading(false); return; }
+    setLoading(true);
     try {
-      // No status filter — the feed shows ALL intents for the project,
-      // including failed, escalated, and waiting-for-clarification.
-      // Status badges in the row are how the operator triages.
-      const res = await api.listIntents({ projectId: currentProjectId, limit: 50 });
+      const res = await api.listIntents({
+        projectId: currentProjectId,
+        status: filters.status || undefined,
+        source: filters.source || undefined,
+        search: filters.search || undefined,
+        from:   filters.from   || undefined,
+        to:     filters.to     || undefined,
+        limit: 50,
+      });
       setIntents(res.data ?? []);
       setTotal(res.total ?? 0);
     } catch { /* handled */ } finally {
       setLoading(false);
     }
-  }, [api, currentProjectId]);
+  }, [api, currentProjectId, filters]);
 
   useEffect(() => { void load(); }, [load]);
 
   useLiveEvent('intent.created', () => { void load(); });
   useLiveEvent('intent.status-changed', () => { void load(); });
 
-  const filtered = filter
-    ? intents.filter(i =>
-        i.status === filter ||
-        i.text.toLowerCase().includes(filter.toLowerCase())
-      )
-    : intents;
+  function updateFilter(patch: Partial<FilterState>) {
+    setSearchParams(writeFiltersToUrl({ ...filters, ...patch }), { replace: true });
+  }
+
+  function clearFilters() {
+    setSearchParams(new URLSearchParams(), { replace: true });
+  }
+
+  const anyFilterActive =
+    filters.status || filters.source || filters.search || filters.from || filters.to;
 
   return (
     <div>
@@ -58,15 +120,58 @@ export function IntentFeed() {
         subtitle={currentProject
           ? `${total} total · ${currentProject.name}`
           : 'no project selected'}
-        actions={
-          <input
-            placeholder="filter..."
-            value={filter}
-            onChange={e => setFilter(e.target.value)}
-            style={filterInputStyle}
-          />
-        }
       />
+
+      {/* Brief 5 — filter bar above the list. Filters persist in the URL
+          so /app/intents?status=failed&search=pnpm loads the filtered
+          view in a new tab. */}
+      <div style={filterBarStyle}>
+        <select
+          style={selectStyle}
+          value={filters.status}
+          onChange={(e) => updateFilter({ status: e.target.value })}
+        >
+          <option value="">All statuses</option>
+          {STATUS_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <select
+          style={selectStyle}
+          value={filters.source}
+          onChange={(e) => updateFilter({ source: e.target.value })}
+        >
+          <option value="">All sources</option>
+          {SOURCE_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <input
+          placeholder="Search..."
+          style={inputStyle}
+          value={searchInput}
+          onChange={(e) => setSearchInput(e.target.value)}
+        />
+        <label style={dateLabelStyle}>
+          From:
+          <input
+            type="date"
+            style={dateInputStyle}
+            value={filters.from}
+            onChange={(e) => updateFilter({ from: e.target.value })}
+          />
+        </label>
+        <label style={dateLabelStyle}>
+          To:
+          <input
+            type="date"
+            style={dateInputStyle}
+            value={filters.to}
+            onChange={(e) => updateFilter({ to: e.target.value })}
+          />
+        </label>
+        {anyFilterActive && (
+          <button style={clearBtnStyle} onClick={clearFilters} title="Clear all filters">
+            × Clear
+          </button>
+        )}
+      </div>
 
       <div style={{ padding: '20px 28px' }}>
         {loading ? (
@@ -76,14 +181,14 @@ export function IntentFeed() {
             message="No projects yet"
             hint={'Run `gestalt init` on the CLI to set up your first project.'}
           />
-        ) : filtered.length === 0 ? (
+        ) : intents.length === 0 ? (
           <EmptyState
-            message="No intents yet"
-            hint={'gestalt run "describe what you want to build"'}
+            message={anyFilterActive ? 'No intents match the current filters' : 'No intents yet'}
+            hint={anyFilterActive ? 'Try clearing one or more filters.' : 'gestalt run "describe what you want to build"'}
           />
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-            {filtered.map(intent => (
+            {intents.map(intent => (
               <Card
                 key={intent.id}
                 style={{ cursor: 'pointer', transition: 'border-color 0.12s' }}
@@ -137,13 +242,51 @@ const intentRowStyle: React.CSSProperties = {
   padding: '14px 16px',
 };
 
-const filterInputStyle: React.CSSProperties = {
+const filterBarStyle: React.CSSProperties = {
+  display: 'flex',
+  flexWrap: 'wrap',
+  alignItems: 'center',
+  gap: '8px',
+  padding: '12px 28px',
+  borderBottom: '1px solid var(--border)',
   background: 'var(--bg-subtle)',
+};
+
+const selectStyle: React.CSSProperties = {
+  background: 'var(--bg)',
   border: '1px solid var(--border)',
-  borderRadius: '5px',
-  padding: '5px 10px',
+  borderRadius: '4px',
+  padding: '4px 8px',
   fontSize: '12px',
   color: 'var(--text-primary)',
   outline: 'none',
+};
+
+const inputStyle: React.CSSProperties = {
+  ...selectStyle,
   width: '180px',
+};
+
+const dateLabelStyle: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: '4px',
+  fontSize: '11px',
+  color: 'var(--text-dim)',
+};
+
+const dateInputStyle: React.CSSProperties = {
+  ...selectStyle,
+  fontSize: '11px',
+};
+
+const clearBtnStyle: React.CSSProperties = {
+  background: 'transparent',
+  border: '1px solid var(--border)',
+  borderRadius: '4px',
+  padding: '4px 8px',
+  fontSize: '11px',
+  color: 'var(--text-dim)',
+  cursor: 'pointer',
+  marginLeft: 'auto',
 };

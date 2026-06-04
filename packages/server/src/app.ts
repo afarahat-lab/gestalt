@@ -40,6 +40,7 @@ import { registerPlatformMcpRoutes } from './routes/platform-mcp';
 import { registerPlatformToolsRoutes } from './routes/platform-tools';
 import { registerIdentityRoutes } from './routes/identity';
 import { registerGroupRoutes } from './routes/groups';
+import { registerGitReposRoutes } from './routes/git-repos';
 import { correlationHook } from './middleware/correlation';
 import { auditHook } from './middleware/audit';
 import type { AuthManager } from './auth/auth-manager';
@@ -111,6 +112,7 @@ export async function createApp(
   await registerPlatformToolsRoutes(app);
   await registerIdentityRoutes(app, authManager);
   await registerGroupRoutes(app);
+  await registerGitReposRoutes(app);
 
   // ─── Dashboard static files ────────────────────────────────────────────────
   //

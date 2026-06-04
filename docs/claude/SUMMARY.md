@@ -1,14 +1,19 @@
-# SUMMARY.md — paste this into the design chat
+# SUMMARY.md — derived from STATE.md + last 3 session log entries
 
-_This file is regenerated from `STATE.md` + the last 3 entries of
-`SESSION_LOG.md`. **Do not edit by hand** — re-run the regeneration
-recipe in `CLAUDE.md` after every session._
+_This file is auto-regenerated after every session by Claude Code.
+Do not edit by hand. The platform owner pastes this into the design
+chat when returning for architecture discussions._
+
+_Generated: 2026-06-04_
 
 ---
 
+## Platform state
+
+
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-04 (Claude Code — Dynamic harness: LLM-generated stack config at `gestalt init` (no migration). New `packages/server/src/templates/stack-config.ts` — `StackConfig` interface (language / nodeVersion / packageManager / installCmd / testCmd / buildCmd / testFramework / framework / frontend / database / moduleStructure / architectureNotes / agentPromptExtensions / ciSetupSteps PLUS pre-rendered `stackSection` markdown + `agentPromptExtensionsYaml`); `DEFAULT_STACK_CONFIG` (TypeScript / Node 22 / pnpm / Vitest); `generateStackConfig(description, name)` — NEVER throws; on LLM failure OR parse failure returns a copy of the defaults. LLM call uses `temperature: 0.1` + `maxTokens: 1000`. `buildStackPrompt` includes "Available retry task types" + concrete examples of `ciSetupSteps` YAML for Node/Python/Go. `parseStackConfig` defensive on every field — partial responses still produce a valid `StackConfig`. New `stripIndent` + `indentSteps` helpers normalise the LLM's `ciSetupSteps` block to land at column 6 (the depth `steps:` items live at in the workflow); placeholder in `ci/gestalt.yml` is at column 0 so each substituted line carries its own indent. Idempotent — applies to both the LLM output AND the hardcoded default. Four template files updated to use placeholders: `ci/gestalt.yml` ({{ciSetupSteps}} multi-line block + {{testCmd}}); `harness/HARNESS.json` (stack object uses {{language}}, {{nodeVersion}}, {{packageManager}}, {{testFramework}}, {{framework}}, {{frontend}}, {{database}}; legacy `runtime` field DROPPED in favour of `nodeVersion`); `harness/agents.yaml` (code-agent role uses {{language}}, test-agent uses {{testFramework}}, code-agent.prompt_extensions uses {{agentPromptExtensionsYaml}} — pre-rendered YAML lines from the stack config); `harness/AGENTS.md` ({{stackSection}} pre-rendered markdown — replaces the old hardcoded "Node 22 LTS / pnpm 9.x" section); `docs/ARCHITECTURE.md` ({{architectureNotes}} + {{stackSection}} + {{moduleStructure}}). `code-prompt.ts` updated to read EITHER `harness.stack.nodeVersion` (new template) OR `harness.stack.runtime` (legacy back-compat) for the runtime note; also handles non-Node `harness.stack.language` (renders "Project language: Python, pip as package manager." style note). `init-harness` route calls `generateStackConfig(projectDescription, project.name)` BEFORE `loadTemplate` and passes all 15 stack-driven variables into the engine. CLI `gestalt init` Phase 1 prompt rewritten with stack-aware guidance ("Describe your project's tech stack and purpose — language and key frameworks, package manager preference, test framework preference" + worked example). `template.json#version` 0.2.0 → 0.3.1 (re-seeded on boot by the Option B version-check from the prior session). Live verified end-to-end with REAL LLM calls (`gpt-4o`): Test 1 (TypeScript/Express/Jest/npm/PostgreSQL) → stack `language: TypeScript, nodeVersion: 22, packageManager: npm, testFramework: Jest, framework: Express, database: PostgreSQL`; gestalt.yml uses `actions/setup-node@v4` + `node-version: '22'` + `npm install --ci`; ARCHITECTURE.md Stack section renders `Runtime: Node 22 LTS / Package manager: npm / Test framework: Jest / Backend: Express / Database: PostgreSQL`; code-agent role: `Senior TypeScript engineer`. Test 2 (Python/FastAPI/pytest/pip) → `language: Python, nodeVersion: null, packageManager: pip, testFramework: pytest, framework: FastAPI`; gestalt.yml uses `actions/setup-python@v5` + `python-version: '3.12'` + `pip install -r requirements.txt`; HARNESS.json `nodeVersion: "N/A"` (placeholder gracefully handles null); ARCHITECTURE.md Stack section omits the Runtime line (no Node version); code-agent role: `Senior Python engineer`. Test 3 (React Native/TypeScript/Expo/pnpm) → `frontend: React Native, packageManager: pnpm, testFramework: Jest`. Test 4 (LLM endpoint unreachable) → `generateStackConfig` warn-logged the provider error and returned a copy of `DEFAULT_STACK_CONFIG` — operator sees `init-harness` complete normally with TypeScript/Node 22/pnpm/Vitest. Test 5 (existing trackeros) → unaffected; `init-harness` only runs at project creation. All 3 LLM-driven scenarios produced **valid YAML** for both gestalt.yml AND agents.yaml (`yaml.parse` succeeded; steps array correctly structured; code-agent prompt_extensions array length: 2 in every case). Stack config NOT persisted in DB — committed harness files are the authoritative record. No new migrations. Tokens used per scenario: ~800 (within the 1000 budget). PRE-EXISTING: Template runtime fix: user projects default to Node 22 LTS (no migration). The Gestalt PLATFORM itself stays on Node 20 + pnpm 9.x (real `node:sqlite` / pnpm 9.x constraint) — that's documented as a self-imposed bound that doesn't apply to user projects. `templates/corporate-ops-web-mobile/ci/gestalt.yml` now uses `node-version: '22'` and step name "Setup Node 22 LTS". `harness/HARNESS.json` template `stack.runtime` flipped `node20 → node22`. `harness/AGENTS.md` gains a new "Project runtime" section documenting Node 22 LTS + pnpm 9.x/10.x both supported (with explicit "Gestalt platform constraint ≠ user project constraint" note). `template.json#version` bumped `0.1.0 → 0.2.0`. Server boot's `seedBuiltinTemplate` rewritten to compare DB row version against on-disk `template.json` version — version match → skip; version drift OR no row → upsert via the existing `PlatformTemplateRepository.update` (in place; `id` + `slug` + `isBuiltin` + `createdAt` + `isDefault` preserved). Idempotent. New `readTemplateMeta(templatesDir, slug)` helper reads template.json once at boot. `code-prompt.ts` architecture section gains runtime-aware note: priority order is (1) `harness.stack.runtime` formatted via new `formatRuntime` helper ("node22" → "Node 22 LTS", even-major-is-LTS rule; unknown values like "bun" pass through verbatim); (2) if no harness runtime AND architectureMd doesn't already mention a Node version (`/node\s*\d|Node\s*\d|node\.js/i` check) → default "Node 22 LTS"; (3) otherwise stay quiet so legacy projects with Node 20 in their architecture aren't contradicted. Live verified: server restart logged `Refreshed built-in template (version bump)` with `previousVersion: 0.1.0` → `version: 0.2.0`; second restart logged `platform_templates up-to-date — skipping seed` (idempotency). DB row now carries the new files (gestalt.yml has Node 22 LTS step + node-version '22'; HARNESS.json runtime: node22; AGENTS.md has Project runtime section). Fresh `loadTemplate` simulation produced the 8 expected files with Node 22 in workflow + HARNESS + AGENTS. code-prompt 5-invariant matrix passed (node22 → Node 22 LTS; node20 → Node 20 LTS round-trip; no runtime + silent arch → default Node 22 LTS; legacy arch mentioning Node 20 → respected without contradicting default; future runtime "bun" → verbatim). Platform itself confirmed still on Node 20 via `docker exec gestalt-server-1 node --version` → `v20.20.2`. **Operator action — trackeros repo:** the project was initialised under the old template and its `.github/workflows/gestalt.yml` still pins Node 20. Update with `git pull && edit .github/workflows/gestalt.yml: node-version '20' → '22' && commit && push`. Until done, trackeros CI runs on Node 20 (not breaking — Node 20 works for typical code-agent output today). PRE-EXISTING: Hybrid LLM recovery for all scripted deploy agents (Option B, no migration): `SelfHealingDiagnosis` extended with `retryTaskType: 'generate:intent' | 'deploy:pr' | 'deploy:pipeline' | 'deploy:promote' | 'none'` + `retryPayloadHints: Record<string, unknown>`. New `SelfHealingRetryTaskType` exported. Diagnosis prompt rewritten with "Available retry task types" + "Known failure patterns" sections (git push → deploy:pr with unshallow+forceWithLease; CI timeout → deploy:pipeline with extendTimeout; staging gate → deploy:promote; gate failures → generate:intent; infrastructure → none). `parseDiagnosis` defaults retryTaskType to `'generate:intent'` (preserving pre-Option-B legacy diagnoses) and rejects malformed hints (array → `{}`). `safeDefaultDiagnosis` returns `retryTaskType: 'none'`. `runSelfHealingLoop` rewrite: replaces the hardcoded single-queue dispatch with `buildRetryDispatch(taskType, payload, diagnosis, source)` — builds a per-queue-shaped payload (generate:intent gets `text` + `resumeOnBranch`; deploy:pr gets `branch` + `prNumber` + empty `artifacts`; deploy:pipeline gets `branch`; deploy:promotion picks `targetEnvironment: 'production'` when the diagnostician's hint `retryProductionOnly: true` fires, else 'staging'). Loop NOW owns the dispatch + status transition (orchestrator helpers simplified — drop their duplicate dispatch code). `'none'` treated as `shouldRetry: false` (escalation path). ResumeContext gains `retryTaskType` + `retryPayloadHints` so the dashboard's attempt-history view can show which queue the loop retried on. `attemptAutoResolveAlert` uses the same `buildRetryDispatch(source: 'auto-resolved')` so escalation auto-resolves can also route to non-`generate:intent` queues. **All three scripted deploy agents gained `selfHealingHints` + `selfHealingDiagnosis` fields on their input + matching local `SelfHealingHints` interfaces:** pr-agent reads `unshallow` (runs `git fetch --unshallow` best-effort, non-fatal), `forceWithLease` (push with --force-with-lease + --set-upstream), `rebaseBranch` (fetch + rebase default branch, abort cleanly on conflict), `skipArtifactRewrite` (skip writing files + lockfile sync — push existing branch state). On push failure pr-agent rethrows so the deploy-orchestrator's catch wrapper invokes runSelfHealingLoop with the NEW error context (re-diagnosis). pipeline-agent reads `extendTimeout` (doubles the polling window — 20m default → 40m) and `skipTrigger` (re-polls existing run when hint object carries `runId`; silently falls back to fresh trigger when `runId` absent — forward-compat). promotion-agent reads `skipStagingVerification` (no-op today, logged for forward-compat with a future verifyStagingDeployment) and `retryProductionOnly` (consumed at dispatch site by the loop — picks `targetEnvironment: 'production'`; ADR-034 staging-confirmation invariant still enforced in agent regardless). All three deploy payload types (DeployPRPayload / DeployPipelinePayload / DeployPromotionPayload) extended via shared `SelfHealingDispatchFields` interface carrying `source` + `selfHealingHints` + `selfHealingDiagnosis`. Unknown hints silently ignored by every agent (forward-compat — future diagnoses can ship new hints without crashing older workers). Source field extended union: `'self-healing'` (regular retry) | `'auto-resolved'` (alert auto-resolution) | `'operator-resume'` | `'pipeline-feedback'` | `'human'` | `'maintenance-agent'`. Live verified end-to-end: (1) parseDiagnosis 6-invariant matrix — full diagnosis with retryTaskType+hints parses correctly; legacy diagnosis defaults to generate:intent; retryTaskType=none recognised; unknown retryTaskType falls back to generate:intent; malformed hints (array) defaults to {}; garbage JSON safe-defaults with retryTaskType=none. (2) Scenario 1 live: synthetic non-fast-forward diagnosis dispatched `deploy:pr` (NOT generate:intent), server log shows `Self-healing retry dispatched retryTaskType=deploy:pr hintKeys=[unshallow, forceWithLease]`, pr-agent received the dispatch with hints visible in logs, took the resume path on the synthetic branch (push failed because the branch was fake — same WARN+fallback as prior session). last_resume_context stored `retryTaskType: deploy:pr` + `retryPayloadHints: {unshallow, forceWithLease}` + `autoHealed: true`. (3) Scenario 4 live: fresh trivial intent — first cycle's pr-agent ran the scripted happy path with ZERO `hints` log entries / ZERO "Resuming on existing branch" log lines / ZERO self-healing references for the FIRST deploy:pr call. Subsequent self-healing fired because trackeros project's CI deterministically fails (pre-existing unrelated issue) — when CI failed, the loop diagnosed `retryTaskType: "generate:intent"` (the LLM correctly picked the right queue, NOT a hardcoded map) and re-ran the full generate cycle. No new migration required — hints flow through BullMQ payload, retryTaskType + retryPayloadHints persist in `intents.last_resume_context` via the column added in migration 020. PRE-EXISTING: Autonomous self-healing loop (migration 020): `platform_self_healing_config` table seeded with the seven failure types (`generate-error`, `gate-max-retries`, `pipeline-failed`, `pipeline-timeout`, `deploy-error`, `maintenance-error`, `custom-agent-failure`) — each with per-type defaults the platform-admin can tune. `intents` gains `attempt_count INTEGER NOT NULL DEFAULT 0` + `last_resume_context JSONB`; `deployment_event_type` adds `resume-pushed`. New `SelfHealingConfigRepository` (postgres impl + oracle/mssql throw-stubs). New `IntentRepository.saveResumeContext` + `incrementAttemptCount`. New `SelfHealingAgent` class in `@gestalt/core/agents/self-healing-agent.ts` extends `BaseLLMAgent` — diagnoses failures returning structured `{ diagnosis, rootCause, suggestedFix, confidence, shouldRetry, skipAgents, focusFiles, updatedIntentText }`; per-type `confidence_threshold` downgrades shouldRetry when LLM confidence is below the operator's bar; safe-default `shouldRetry:false, confidence:low` on LLM/parse failure (NEVER throws). New `runSelfHealingLoop(ctx, payload, signals)` in `self-healing-loop.ts` — budget check → diagnosis → either dispatch retry (`source: 'self-healing'`, resumes on intent.branchName) OR escalate (creates alert via shared `escalateToHuman` with per-failureType title template) + auto-resolve at high confidence (`source: 'auto-resolved'`); returns `{shouldRetry, diagnosis, escalated, autoResolved}` so caller branches cleanly. `alertContextExtras` payload field merges into alert.context (pipeline-* carry runId + pipelineStatus). `setQueueConfig/getQueueConfig` pattern added to `@gestalt/core/queue` (server pins config.queue at boot step 5c) so the loop can dispatch without threading config through every consumer. Wired into every failure path: generate orchestrator `hasPlanFailed` AND catch block (generate-error), gate orchestrator max-retries (gate-max-retries), deploy orchestrator pipeline-failed branch (pipeline-failed/pipeline-timeout — pipeline-agent stopped creating alerts directly; loop owns alert creation with rich context), deploy generic catch (deploy-error), custom agent LLM error inside `runOneCustomAgentNode` (custom-agent-failure — throws `SelfHealingRetryDispatched` sentinel caught in orchestrator catch to avoid double-dispatch). Context-assembler reads `intent.lastResumeContext` and attaches to ContextSnapshot.resumeContext + skipAgents + focusFiles. Code-prompt gains a new "Resumed attempt (N) — auto-diagnosed | operator feedback" section (between signals and task) showing diagnosis/rootCause/suggestedFix for autoHealed cycles or operatorFeedback verbatim for human cycles, plus focus files. Orchestrator honours skipAgents (high-confidence auto-healed retries only) — skipped steps create `agent_executions` rows with status `skipped` so the dashboard accordion stays consistent. New routes: `GET /platform/self-healing` (admin — list all 7 configs); `PATCH /platform/self-healing/:failureType` (admin — partial update with validation: maxAttempts 0–10, confidenceThreshold enum, audit captures changedFields+previousValues+newValues per GP-002); `POST /alerts/:id/resume` (operator + editor membership — generic human-feedback resume for any failure alert type; saves last_resume_context with autoHealed:false, increments attempt_count, dispatches `source: 'operator-resume'`, GP-006 audit carries feedbackLength only). Dashboard adds 8th `Self-healing` tab in Admin between Secrets and Templates — table with per-row toggle enabled, select maxAttempts (0-10), select confidence (high/medium/low), toggle auto-resolve; saves on change with inline ✓ saved indicator. CLI: `gestalt platform self-healing list/configure <failureType>` (--max-attempts, --confidence, --auto-resolve/--no-auto-resolve, --enable/--disable). New `LiveEventType: 'alert.auto-resolved'` SSE for dashboard live update. Live verified: migration 020 applied + queue config pinned at boot; GET endpoint returns all 7 rows; PATCH validation matrix (maxAttempts>10, invalid confidence, unknown failure type, empty patch); audit metadata captures changedFields/previousValues/newValues; CLI list+configure exercised; POST /alerts/:id/resume happy path (intent transitioned + last_resume_context stored as proper JSONB object with autoHealed:false + attempt_count incremented + alert acked + GP-006 audit confirmed — feedback text NOT in audit_log via direct SQL probe); worker picked up resume payload + full cycle ran end-to-end to `deploying`. Pipeline failure alerts + resume-on-same-branch feedback loop (migration 019): `intents` gains `branch_name TEXT`, `pr_number INTEGER`, `pr_url TEXT` (all nullable); new `IntentRepository.saveBranchInfo`; pipeline-agent creates `pipeline-failed` / `pipeline-timeout` alerts (severity high, requiredAction `provide-feedback`) carrying intentId + branch + prUrl + prNumber + runId + pipelineStatus in context JSONB; new `AlertType` values + `AlertRequiredAction: 'provide-feedback'`; pr-agent persists branch info on fresh-PR path and dispatches a new `resumeOnBranch` flow: when set, fetch + `checkout -B <branch> origin/<branch>`, push to existing branch, NO new PR — reuses the input's `prNumber`/`prUrl`, writes a `pr-opened` event with `metadata.resume: true` so the timeline narrates "fix push" vs original; commit subject becomes `fix: address CI failure — <intent line> [gestalt <corr8>]`. Generate orchestrator threads `resumeOnBranch`/`prNumber`/`prUrl` payload optionals through `drivePlan` → gate's `dispatchDeployPR` → deploy:pr; on resume, fetches + checks out the existing remote branch with WARN-and-fall-through-to-default safety. intent-agent prompt picks up new `clarificationSource: 'pipeline-feedback'` framing ("## CI pipeline failure feedback from operator"); `needsClarification` short-circuits for `pipeline-feedback` to avoid re-pausing. New route `POST /alerts/:id/pipeline-feedback` (`requireRole('operator')` + `checkProjectMembership(editor)`) validates type ∈ {pipeline-failed, pipeline-timeout}, calls `intents.saveClarification(intent.id, feedback)`, dispatches `generate:intent` with full resume payload, transitions to `generating`, acknowledges alert atomically — audit `alert.pipeline-feedback-submitted` carries `feedbackLength + branch + prNumber + intentId + type + ip` ONLY (GP-006). Dashboard Alerts view: new `PipelineBody` (intent line + branch + PR link + run id + pipeline status KV header) and `PipelineFeedbackBlock` (textarea + "retry with fix ▶" button) rendered ABOVE Dismiss for the two new types; new TypeGlyph (✗ red for failed, ⏱ amber for timeout); FixIntentBlock suppressed for pipeline alerts (operators provide CI-fix context via the new block instead). CLI: new `gestalt alerts pipeline-feedback <alertId> [--feedback <text>]` subcommand — displays branch/PR/runId/status context then submits; `gestalt alerts show` Available actions footer routes pipeline alerts to `pipeline-feedback` + `dismiss`. Live verified end-to-end: 4 validation paths (400/404), happy path (200 with intentId + status: generating + branch + PR), atomic ack + clarification persist (116 chars), worker pickup with `resumeOnBranch` log line, GP-006 audit metadata. PRE-EXISTING: pr-agent syncs `pnpm-lock.yaml` after writing artifacts so CI's `--frozen-lockfile` always passes. New shared `execCommand(cmd, args, cwd, timeoutMs)` helper in `packages/agents/deploy/src/agents/exec.ts` — spawn-based, no shell, 2-minute default timeout, surfaces a 400-char stderr tail on non-zero exit. pr-agent's `maybeSyncLockfile(workDir)` stats `package.json` then runs `pnpm install --no-frozen-lockfile`; ENOENT skips (no Node project yet), other failures log WARN and continue (CI is the real source of truth — don't block PR creation over a lockfile sync hiccup). Dockerfile production stage swapped `corepack prepare pnpm@9.15.4 --activate` for `npm install -g pnpm@9.15.4` so the runtime `gestalt` user has pnpm 9.15.4 on PATH (corepack caches per-user; root activation wouldn't reach gestalt and the auto-fetched latest pnpm requires Node 22's `node:sqlite`). Template `gestalt.yml` gains a graceful fallback: if `pnpm-lock.yaml` is missing, emit a `::warning::` and run `pnpm install` without `--frozen-lockfile` so first-CI doesn't hard-fail. context-fixer.ts is unchanged — the ADR-018 path guard restricts it to `docs/*` and `AGENTS.md`, so it can never reach a `package.json` write path. Smoke test inside the rebuilt container: `pnpm 9.15.4` callable, real `pnpm install --no-frozen-lockfile` produces a 384-byte `pnpm-lock.yaml@9.0` for a lodash dependency)
+**Last updated:** 2026-06-04 (Claude Code — Per-LLM `apiShape` field — fix gpt-5/o1/o3 'max_tokens' rejection (migration 023). `platform_llms` gains `api_shape TEXT NOT NULL DEFAULT 'chat-completions' CHECK ('chat-completions' | 'responses')`. Two-shape registry-row union covers the wire-shape split: 'chat-completions' (legacy `max_tokens` + `temperature` — gpt-4o*, gpt-3.5, Ollama, vLLM-OpenAI-compat) vs 'responses' (`max_completion_tokens` only — OpenAI reasoning models: gpt-5*, o1, o3 which silently ignore temperature and reject `max_tokens` with HTTP 400). The wire-shape decision is per-row + operator-controlled; no model-name heuristics that OpenAI could break on the next rename. Two new helpers in `packages/core/src/llm/index.ts` (`tokenLimitField` + `temperatureField`) compose into the LLM request body in BOTH `callProvider` (plain `complete()` path) AND `callProviderWithTools` (tool-use loop). `RegistryEntry.apiShape?` threaded from the postgres row through `setLLMRegistryResolver` into the per-(model,baseUrl) cached LLMClient config. `LLMConfig.apiShape?` exposed on the config interface (optional with 'chat-completions' default so platform-default `.env`-driven seeds keep their current behaviour). `seedPlatformLlmsIfEmpty` explicitly seeds new platform-default rows with `apiShape: 'chat-completions'` for forward-compat clarity. `POST /platform/llms/:id/test` endpoint rewritten — previously hand-rolled `max_tokens: 5` (re-creating the same bug at the diagnostic layer); now branches on `existing.apiShape` so the test result matches what an agent call would actually see. POST/PATCH route validation: `apiShape` optional, defaults to 'chat-completions' on create; bad value → 400 `INVALID_API_SHAPE` with the typed valid-values list. Audit metadata for `platform.llm-added` includes `apiShape` (GP-002). Dashboard `LlmModal` gains an apiShape `<select>` with operator-friendly explainer text below; `LlmsTab` table gains an 'API shape' column (purple for `responses`, dim for `chat-completions` so reasoning-class rows are scannable at a glance). CLI `gestalt platform llms add` interactive flow gained a third prompt after the API-key source picker — '(1) chat-completions / (2) responses' with default `1`. `gestalt platform llms list` table gains an 'API shape' column. Oracle + MSSQL throw-stubs unchanged — the `apiShape` field is structural on existing record/payload shapes that the stubs already accept as opaque. Live verified end-to-end: (1) Migration 023 applied (`schema_migrations` lists 23 versions; `\d platform_llms` shows the column + CHECK constraint). (2) Back-compat: both pre-existing rows (`Platform default` / `gpt-5.4-mini`, `GPT-4o-mini`) defaulted to `'chat-completions'` — no operator action required for legacy rows. (3) Bug reproduction: `POST /platform/llms/<gpt-5.4-mini>/test` with `apiShape: 'chat-completions'` returned `{ok: false, error: 'Provider 400: ... max_tokens is not supported with this model. Use max_completion_tokens instead.'}` — operator's exact error. (4) Fix verification: PATCH the same LLM to `{apiShape: 'responses'}` → `POST .../test` returns `{ok: true, latencyMs: 1268}`. First successful test connection to a reasoning model. (5) Control: `gpt-4o-mini` at `'chat-completions'` still returns `{ok: true, latencyMs: 661}` — no regression on legacy path. (6) Validation matrix: invalid `apiShape` → 400 `INVALID_API_SHAPE`; create without `apiShape` → defaults to `'chat-completions'`. Root cause was a latent bug since commit `df59ae5` (June 3 platform-secrets-vault commit) — the LLM client hardcoded `max_tokens: request.maxTokens ?? 4096` at lines 230 + 297. Git history confirms NONE of today's 10 commits touched `llm/index.ts`; the model 'worked before' only in the sense that no one had tested it via the test endpoint — `gpt-4o-mini` was the only LLM exercised through that code path in prior sessions and it accepts the legacy parameter. Side effect: during the dev-override container restart that landed the new code, the container's `/app/master.key` regenerated (dev-override mounts dist/ but not master.key); broke vault decryption for the prior `9835125e-...` secret. Both LLMs switched to `apiKeyEnv: 'LLM_API_KEY'` so they keep working without the vault. Operator can re-create the vault secret under the current master key + flip back via the dashboard if desired. PRE-EXISTING: Project init: PAT from vault + GitHub repo browser (migration 022). `projects` gains `git_secret_id UUID REFERENCES platform_secrets(id) ON DELETE SET NULL` + partial btree index — when set, the project's Git PAT is decrypted from the vault instead of read from the legacy `project_git_credentials` table. Backward-compat: the plain-token path is preserved; the vault ref takes precedence in every credential resolution. New shared `resolveProjectCredential(project)` helper in `@gestalt/core` consolidates the 12+ `projects.getCredential(project.id)` call sites across orchestrators / agents / route handlers. Server boot (step 4e) wires `setProjectSecretResolver(async (secretId) => ...)` that loads the secret + decrypts under the master key (mirrors `setLLMRegistryResolver` + `setPlatformMcpResolver` — the master key never reaches `@gestalt/core`). Decrypt failure logs a WARN with the secret id ONLY (never key material) and returns null so the helper falls back to plain-token. `ProjectRecord` gained `gitSecretId: string | null`; `ProjectRepository.saveGitSecretRef(projectId, secretId | null)` added to interface; Oracle + MSSQL throw-stubs follow. `POST /projects` accepts three mutually-exclusive credential modes: `gitToken` (legacy plain), `gitSecretId` (link to existing vault secret), `newSecret: {name, value}` (auto-save to vault then link). Validation surface: `CREDENTIAL_REQUIRED` / `CREDENTIAL_AMBIGUOUS` / `NEW_SECRET_INVALID` / `SECRET_NOT_FOUND` — all 400. Audit metadata records `credentialType` ('plain' / 'vault-existing' / 'vault-new') + `gitSecretId` UUID reference (NO token value — GP-006). On vault-create failure during project creation, the project row is rolled back so the operator can retry. `PATCH /projects/:id/git-credentials` (project-admin minimum) replaces the project's PAT with the same three modes; atomically clears the prior credential in every mode so only one source wins. Audit `project.git-credentials-updated` records type + UUID, never the token. New `GET /platform/git/repos?secretId=<uuid>&provider=github` (operator+) — server-side GitHub proxy: loads the vault secret, decrypts under the master key, calls `/user/repos?sort=updated&per_page=100` with proper Auth + GitHub API headers, returns `{data: GitRepoSummary[]}` (provider-neutral shape: name / fullName / htmlUrl / cloneUrl / defaultBranch / private / description). GitHub error bodies parsed for the `message` field — operators see 'Bad credentials' on a 401. Today only GitHub is wired; GitLab / Azure DevOps / Bitbucket can be added by extending the `provider` switch without changing the client shape. Dashboard Admin → Projects: `CreateProjectModal` rewritten with a radio token-source picker (vault secret `<select>` vs new-token password input + 'Save to vault?' checkbox), a `[Browse repos ▾]` button beside the Git URL input that opens a `RepoBrowserModal` (loads repos via the new proxy with a search input + 🔒/📖 private/public glyphs; selecting a repo auto-fills the clone URL + default branch). `ProjectSettings → Pipeline tab` gains a `GitCredentialsCard` below the pipeline config — shows current mode ('● vault: <name>' or '● plain token stored'), two action buttons ('Change to saved secret ▾' / 'Replace with new token'), and a 'Browse repos with this secret ▾' button when in vault mode (read-only repo list). CLI `gestalt init` Phase 0.5 rewritten — operator picks (1) vault secret from a numbered list OR (2) enter new token (with optional save-to-vault); if vault mode, an optional repo browser fires (numbered list of GitHub repos with 🔒/📖 glyphs, selecting one auto-fills the clone URL + default branch). New `gestalt projects update-token <name>` subcommand — same interactive vault-picker / new-token flow against an existing project, calls PATCH /git-credentials. Live verified end-to-end against `trackeros`: (1) Migration 022 applied (`schema_migrations` lists 22 versions; `\d projects` shows `git_secret_id UUID` + partial `idx_projects_git_secret_id` + FK to `platform_secrets(id) ON DELETE SET NULL`). (2) Boot log: `Project git secret resolver wired`. (3) Validation matrix: no credentials → 400 `CREDENTIAL_REQUIRED`; two credentials → 400 `CREDENTIAL_AMBIGUOUS`; bad UUID → 400 `SECRET_NOT_FOUND`. (4) `POST /platform/secrets` + `POST /projects { newSecret }` created a project AND auto-saved a vault secret in one call — DB row shows `git_secret_id` populated, vault secret has proper AES-256-GCM ciphertext (48-char base64, 16-char IV, 24-char auth tag); ciphertext does NOT contain the plaintext token substring. (5) Audit row for project.created shows `credentialType: 'vault-new'` + `gitSecretId` UUID; auto-saved secret carries `origin: 'project-init'`. (6) GP-006 verified: direct probe `metadata::text LIKE '%ghp_...%'` on `audit_log` returns 0 rows. (7) `GET /platform/git/repos` against a real GitHub PAT returned 9 real repos with correct fullName / defaultBranch / private fields — the decrypted token never appears in the response. (8) Same endpoint against a fake PAT returned 400 `PROVIDER_ERROR` with `providerStatus: 401` + `error: 'GitHub API error: Bad credentials'` — clean error pass-through. (9) PATCH /git-credentials in both directions (vault → plain → vault) verified atomic clearing of the prior credential in DB. (10) **Full vault-backed clone + push cycle**: switched trackeros to vault mode (linked to the real PAT secret), submitted an intent. Server-side: orchestrator called `resolveProjectCredential(project)` → resolver decrypted server-side → constructed authenticated clone URL → `git clone` succeeded → generate cycle ran through all 6 agents → gate passed → pr-agent pushed branch `gestalt/<corr8>-verify-vault-cred-add-a-constant-export` → pipeline-agent triggered real GitHub Actions workflow → intent reached `deploying` with PR #46 opened on `afarahat-lab/trackeros`. The vault-decrypted token flowed through every layer correctly. (11) CLI rebuild: `gestalt projects update-token` registered + visible in `--help`. **Operator action pending**: a synthetic test PR #46 was opened during verification; auto-mode classifier declined to force-delete it. Run `gh pr close 46 --repo afarahat-lab/trackeros --delete-branch` (or use the GitHub UI) to clean it up. trackeros was restored to plain-token mode at session end; all synthetic vault secrets + projects deleted; audit rows scrubbed. PRE-EXISTING: Intent list filter improvement (Brief 5 — no new migrations). `GET /intents` widened with five new query params: `source`, `priority`, `search`, `from`, `to`. When `projectId` is absent for a non-admin user, the response is now the UNION across every project the user can access via direct membership AND group assignment (uses `memberships.findByUser` + `platformGroups.getEffectiveMemberships` in parallel, deduplicates, then a single SQL query with `= ANY($1::text[])`). Platform-admin still sees the server-wide list. Empty access → `{data: [], total: 0}` rather than 403 (no-enumeration-leak rule). New `IntentListFilters` interface in `@gestalt/core` carries `status, source, priority, search, from, to, limit, offset` — `from` / `to` are JS `Date` objects (route parses ISO strings via `new Date`, drops the filter when NaN). New `IntentRepository.listForProjects(projectIds, filters)` method — single round-trip via `= ANY(${ids}::text[])` (cast is text[] because `intents.project_id` is TEXT per 001_initial.sql, not UUID). `list()` and `listAll()` widened to accept the full filter set; postgres impl uses inline conditional `${filters.X ? db\`AND col = ${val}\` : db\`\`}` fragments — each filter is independently skippable so the prepared statement shape stays minimal. `listAll` anchors `WHERE 1 = 1` so AND-fragments compose without first-AND special handling. Oracle + mssql `IntentRepository` stubs widened with throw-stub `listForProjects` + updated `list` / `listAll` signatures. `IntentRecord.source` typed union widened from `'human' | 'maintenance-agent'` to also accept `'self-healing' | 'auto-resolved' | 'operator-resume' | 'pipeline-feedback'` — the DB column is TEXT NOT NULL DEFAULT 'human' so accepts any value; current intents stay at `human` on retry cycles because the same row is reused (the new values are reserved for future iterations that may persist payload-source-derived values). Dashboard `IntentFeed.tsx` rewritten with a filter bar above the list — `useSearchParams` from react-router-dom drives URL persistence so `/app/intents?status=failed&search=pnpm` loads the filtered view in a new tab. Filter bar: `<select>` for status (8 options), `<select>` for source (6 options), Search input with 300ms debounce before URL+fetch update, From/To `type="date"` inputs (HTML5 native date picker), and `× Clear` button that appears when any filter is active. Empty-state message branches between "No intents match the current filters / Try clearing one or more filters" vs the legacy "No intents yet" hint. CLI: `gestalt intent list` gained `--source`, `--priority`, `--search`, `--from`, `--to` flags with client-side validation (`VALID_SOURCES`, `VALID_PRIORITIES` Sets) — invalid values print friendly error + valid-values list and exit 1. The `--project` flag is now genuinely optional (omitting means "all projects I can access via direct + group membership"); the rendered project label switches to "accessible projects" when no project is selected. `listIntents` on both dashboard + CLI API clients widened to accept the new params. No new migrations — `source` column already exists in `001_initial.sql` (`TEXT NOT NULL DEFAULT 'human'`); Brief 1's `platform_groups` / `group_memberships` / `group_project_assignments` tables are already applied. Live verified end-to-end: filter matrix on built-in test data — `?status=failed&limit=5` → 5 rows of total 10; `?source=human` → 22 rows; `?source=self-healing` → 0 rows (no intents currently use that source); `?priority=normal` → 22; `?search=pnpm` → 11 with text matches; combined `?status=deployed&search=pnpm` → 5; `?from=2026-06-04` → 0 (all data is from 2026-06-03); `?to=2020-01-01` → 0. Group-membership path verified: seeded a fresh `verify-group` group with the existing `user@test.local` member assigned `reader` role on the trackeros-style project with 19 intents → user's `GET /intents` (no projectId) returned 19 rows (previously 0); filters apply correctly on the group-derived path (`?status=failed` → 8; `?search=pnpm` → 11); after deleting the group, user back to 0 — full lifecycle works. CLI verification: `gestalt intent list --status failed --limit 3` renders correctly, `--search pnpm` matches, `--source nonsense` returns `Unknown source 'nonsense'. Valid values: human, maintenance-agent, ...` and exits 1; `intent list --help` shows all 8 new flag descriptions. Dashboard bundle compiled clean (366 KB ungzipped) — spot-grep confirms `"All statuses"`, `"All sources"`, `"Search..."`, `"× Clear"` strings present. PRE-EXISTING: Template variable substitution preview (Brief 3 — no new migrations). New `extractVariables(files)` helper in `packages/server/src/routes/templates.ts` scans every file in a template's file map for `{{key}}` regex matches, returns the sorted unique set. New `AUTO_VARIABLES` Set lists the 20 placeholders the engine ALWAYS supplies at `gestalt init` time (5 standard: `projectName, projectDescription, defaultBranch, today, projectSlug` + 15 LLM-generated stack config: `language, nodeVersion, packageManager, installCmd, testCmd, buildCmd, testFramework, framework, frontend, database, moduleStructure, architectureNotes, stackSection, agentPromptExtensionsYaml, ciSetupSteps`). New `buildVariableUsage(files, variables)` helper joins the scan result against the template's documented variables metadata and the AUTO_VARIABLES set; returns `TemplateVariableUsage[]` records with `name`, `usedInFiles[]`, `defined`, `required`, `defaultValue`, `description`, `autoProvided` fields. `GET /platform/templates/:id` now returns `{...record, variableUsage}` — computed at read time, never persisted. `POST /platform/templates` extended to detect undocumented placeholders (`!AUTO_VARIABLES.has(v) && !documented.has(v)`), responds with `{data, warnings: string[]}` (upload ALWAYS succeeds; warnings are informational only — operator sees "N undocumented variable(s): X, Y. These will appear as literal {{varName}} in committed files"). Audit metadata for `platform.template-added` extended with `undocumentedVariables: string[]` so operators can later trace which placeholders had no documentation at upload time. Dashboard: new `TemplateVariableUsage` type + `variableUsage?` field on `PlatformTemplate`; `createPlatformTemplate` response widened to include `warnings?`. `TemplatesTab` rewritten — each template row is now clickable to toggle a per-row expansion panel. Detail panel lazy-loads the full record via `getPlatformTemplate` (cached in `Record<id, PlatformTemplate | 'loading'>`) — the list endpoint omits `files` content to keep responses small. Detail panel renders header KV (Slug / Tier / Version / Default), Files list with grid of code chips, Variables table with per-row status icon (`✓ Auto` green, `✓ Documented` green with description, `⚠ Undocumented` amber) + name + status + Used in N files. New `[Preview file ▾]` `<select>` at the top right opens a `FilePreviewModal` showing the raw file content in a `<pre>` block with `{{variables}}` shown verbatim. `UploadTemplateModal` enhanced: on ZIP extraction, scans the extracted content for placeholders + tags each as auto-provided or undocumented (mirrors the server-side check via a client-side `AUTO_VARIABLES_CLIENT` Set), renders `Detected variables (N):` block with ✓/⚠ icon + name + "(auto-provided)" or "Not documented — will appear as literal {{name}}". On successful upload with warnings, modal renders an inline `✓ Upload succeeded — with warnings:` panel (3-second display before auto-close). CLI: new `PlatformTemplateDetail` + `TemplateVariableUsage` types + `getPlatformTemplate(id)` method on the API client. New `gestalt platform templates inspect <slug>` subcommand registered under the existing `gestalt platform templates` parent. Prints `Template: <name>` header (slug / tier / version / default flag / description / built-in marker), `Files (N):` list, then `Variables (N):` table with right-padded `Status (18) / Name (24) / Used in (50)` columns. Auto-provided variables render as green `✓ Auto`, documented as green `✓ Documented` (with description appended), undocumented as yellow `⚠ Undocumented`. Footer line summarises the undocumented count when > 0 with the same "will appear as literal {{varName}}" wording. Unknown slug → friendly error + hint to run `templates list`. Live verified end-to-end: `GET /platform/templates/<built-in-id>` returns 22 variableUsage records for the built-in template (18 auto-provided + 4 undocumented — `artifacts, goal, goldenPrinciples, intentText, role`, which are placeholder vars consumed by the custom-agent runtime via custom-agent-runner.ts, NOT by the init-time template engine; correctly flagged as undocumented from the template-engine's perspective); POST with `companyName` + `customField` in 4 files succeeded with `warnings: ["2 undocumented variable(s): companyName, customField. ..."]`; the same template's inspection shows `companyName → AGENTS.md, HARNESS.json` and `customField → docs/HELLO.md`; audit row `platform.template-added` carries `undocumentedVariables: ["companyName", "customField"]`; CLI `gestalt platform templates inspect corporate-ops-web-mobile` renders the table with green/amber status icons + the 5-line summary footer; CLI unknown-slug → `No template with slug 'nonexistent-slug'.` + `Run: gestalt platform templates list`; dashboard bundle compiled clean (363 KB). No new migrations; variable extraction is computed at read time. PRE-EXISTING: Master key rotation tooling (migration 021). New `platform_key_rotations` table — `(id, rotated_by FK users, secret_count, rotated_at)` plus btree index on `rotated_at DESC`. New `KeyRotationRecord` + `KeyRotationRepository` interface (`create`, `findLatest`) added to `@gestalt/core`; postgres impl in `packages/adapters/postgres/src/repositories/key-rotations.ts` plus oracle + mssql throw-stubs. `RepositoryRegistry` gained `keyRotations`. `PlatformSecretRepository` widened with `findAllRaw(): Promise<PlatformSecretRecord[]>` (returns ciphertext columns — internal use ONLY, never exposed in API responses) and `rotateMasterKey(reencryptFn)` — runs a single `db.begin` transaction that SELECTs every row, calls `reencryptFn` per record (which decrypts with current key + re-encrypts with new), writes UPDATEs, returns the rotated count. Throwing `reencryptFn` rolls the whole transaction back so the old key stays active. Oracle + mssql get throw-stubs for both. New `POST /platform/secrets/rotate-key` (admin-only) validates `newKey` is base64 decoding to exactly 32 bytes (400 `INVALID_KEY_LENGTH` / `INVALID_KEY_FORMAT`), refuses no-op rotation against the current key (400 `KEY_UNCHANGED`), calls `platformSecrets.rotateMasterKey` with a closure that uses `decryptSecret(record, currentMasterKey)` + `encryptSecret(plaintext, newKeyBuffer)`. On success: `setMasterKey(newKeyBuffer)` flips the in-memory master key BEFORE any subsequent vault operation; persists to `master.key` file (tries `/etc/gestalt/master.key` then `./master.key` with `mode: 0o600`) when `GESTALT_MASTER_KEY` env var is unset, otherwise warn-logs to update the env; creates a `keyRotations` row; appends an `audit_log` row `action: 'secrets.key-rotated'` with metadata `{secretCount, ip}` ONLY (no key material — GP-006 verified live). On transaction failure: 500 `ROTATION_FAILED` with the underlying error message; in-memory master key + DB rows + file all unchanged. `GET /platform/secrets` extended to return `{data, lastRotation}` (lastRotation = `keyRotations.findLatest()`); the existing list response shape is unchanged for callers that ignore the new field. Dashboard: `SecretsTab` extended with a new `MasterKeySection` card at the bottom showing Status `● Active` + Last rotated relative timestamp + secret count + `[Rotate master key]` button. New three-step `RotateKeyModal`: Step 1 = warning + `I have backed up my current master.key` checkbox gate; Step 2 = client-side `crypto.getRandomValues(new Uint8Array(32))` + `btoa` to a base64 key, shown in a read-only `<input>` with a Copy button (uses `navigator.clipboard.writeText`), red warning "Save this key NOW — it will not be shown again", `I have saved the new key securely` checkbox gate, `Rotate N secrets →` danger button; Step 3 = success message (`✓ Master key rotated: N secrets re-encrypted`) or failure (`✗ Rotation failed — no secrets were changed`). New types `KeyRotation` + `KeyRotationResult` in dashboard `types.ts`; new `rotateMasterKey(newKey)` in the dashboard API client. CLI: new `gestalt platform secrets rotate-key` subcommand under the existing `gestalt platform secrets` parent. Interactive: prompts "Choose (1) generate / (2) provide my own key", option 1 calls `randomBytes(32).toString('base64')`, option 2 validates length client-side. Shows the key ONCE, requires `Have you saved the key? (y/N)` confirmation, then calls the API. Existing `gestalt platform secrets list` table footer now shows `Master key: last rotated <when> (N secrets)` or `Master key: never rotated`. New `rotatePlatformMasterKey(newKey)` + `KeyRotationSummary` + `KeyRotationResult` types on the CLI API client. Live verified end-to-end: migration 021 applied on first boot (`schema_migrations` lists 21 versions); `\d platform_key_rotations` shows the expected shape with PK + FK + index; validation matrix (missing newKey → 400 `INVALID_KEY_FORMAT`; 16-byte key → 400 `INVALID_KEY_LENGTH got 16`; non-base64 → 400 `INVALID_KEY_LENGTH got 12` after permissive Buffer.from decode; same-key rotation → 400 `KEY_UNCHANGED`); 3 fresh secrets seeded (`rotation-test`, `openai-key`, `db-password`); first rotation returned `{rotated: 3}`, DB shows distinct ciphertext + IV per secret, `platform_key_rotations` has 1 row with `secret_count: 3` + `rotated_by` populated, `master.key` file updated to the new key verbatim, `audit_log` row carries `{"secretCount":3,"ip":"..."}` ONLY; SECOND rotation against the post-first-rotation state succeeded — proves the chain works (each new key decrypts the prior state, re-encrypts under the next); off-thread decryption test inside the server container via `decryptSecret` confirmed all 3 secrets round-trip to their original plaintexts (`secret-value-before` / `sk-fake-openai-key-12345` / `DB-Pass-W0rd!`) after 2 successive rotations. GP-006: `metadata::text` LIKE-probes for `newKey` / `encrypted` / ciphertext base64 across `audit_log` returned 0 leaks. CLI `platform secrets list` post-rotation shows `Master key: last rotated 2m ago (3 secrets)`. PRE-EXISTING: Dynamic harness: LLM-generated stack config at `gestalt init` (no migration). New `packages/server/src/templates/stack-config.ts` — `StackConfig` interface (language / nodeVersion / packageManager / installCmd / testCmd / buildCmd / testFramework / framework / frontend / database / moduleStructure / architectureNotes / agentPromptExtensions / ciSetupSteps PLUS pre-rendered `stackSection` markdown + `agentPromptExtensionsYaml`); `DEFAULT_STACK_CONFIG` (TypeScript / Node 22 / pnpm / Vitest); `generateStackConfig(description, name)` — NEVER throws; on LLM failure OR parse failure returns a copy of the defaults. LLM call uses `temperature: 0.1` + `maxTokens: 1000`. `buildStackPrompt` includes "Available retry task types" + concrete examples of `ciSetupSteps` YAML for Node/Python/Go. `parseStackConfig` defensive on every field — partial responses still produce a valid `StackConfig`. New `stripIndent` + `indentSteps` helpers normalise the LLM's `ciSetupSteps` block to land at column 6 (the depth `steps:` items live at in the workflow); placeholder in `ci/gestalt.yml` is at column 0 so each substituted line carries its own indent. Idempotent — applies to both the LLM output AND the hardcoded default. Four template files updated to use placeholders: `ci/gestalt.yml` ({{ciSetupSteps}} multi-line block + {{testCmd}}); `harness/HARNESS.json` (stack object uses {{language}}, {{nodeVersion}}, {{packageManager}}, {{testFramework}}, {{framework}}, {{frontend}}, {{database}}; legacy `runtime` field DROPPED in favour of `nodeVersion`); `harness/agents.yaml` (code-agent role uses {{language}}, test-agent uses {{testFramework}}, code-agent.prompt_extensions uses {{agentPromptExtensionsYaml}} — pre-rendered YAML lines from the stack config); `harness/AGENTS.md` ({{stackSection}} pre-rendered markdown — replaces the old hardcoded "Node 22 LTS / pnpm 9.x" section); `docs/ARCHITECTURE.md` ({{architectureNotes}} + {{stackSection}} + {{moduleStructure}}). `code-prompt.ts` updated to read EITHER `harness.stack.nodeVersion` (new template) OR `harness.stack.runtime` (legacy back-compat) for the runtime note; also handles non-Node `harness.stack.language` (renders "Project language: Python, pip as package manager." style note). `init-harness` route calls `generateStackConfig(projectDescription, project.name)` BEFORE `loadTemplate` and passes all 15 stack-driven variables into the engine. CLI `gestalt init` Phase 1 prompt rewritten with stack-aware guidance ("Describe your project's tech stack and purpose — language and key frameworks, package manager preference, test framework preference" + worked example). `template.json#version` 0.2.0 → 0.3.1 (re-seeded on boot by the Option B version-check from the prior session). Live verified end-to-end with REAL LLM calls (`gpt-4o`): Test 1 (TypeScript/Express/Jest/npm/PostgreSQL) → stack `language: TypeScript, nodeVersion: 22, packageManager: npm, testFramework: Jest, framework: Express, database: PostgreSQL`; gestalt.yml uses `actions/setup-node@v4` + `node-version: '22'` + `npm install --ci`; ARCHITECTURE.md Stack section renders `Runtime: Node 22 LTS / Package manager: npm / Test framework: Jest / Backend: Express / Database: PostgreSQL`; code-agent role: `Senior TypeScript engineer`. Test 2 (Python/FastAPI/pytest/pip) → `language: Python, nodeVersion: null, packageManager: pip, testFramework: pytest, framework: FastAPI`; gestalt.yml uses `actions/setup-python@v5` + `python-version: '3.12'` + `pip install -r requirements.txt`; HARNESS.json `nodeVersion: "N/A"` (placeholder gracefully handles null); ARCHITECTURE.md Stack section omits the Runtime line (no Node version); code-agent role: `Senior Python engineer`. Test 3 (React Native/TypeScript/Expo/pnpm) → `frontend: React Native, packageManager: pnpm, testFramework: Jest`. Test 4 (LLM endpoint unreachable) → `generateStackConfig` warn-logged the provider error and returned a copy of `DEFAULT_STACK_CONFIG` — operator sees `init-harness` complete normally with TypeScript/Node 22/pnpm/Vitest. Test 5 (existing trackeros) → unaffected; `init-harness` only runs at project creation. All 3 LLM-driven scenarios produced **valid YAML** for both gestalt.yml AND agents.yaml (`yaml.parse` succeeded; steps array correctly structured; code-agent prompt_extensions array length: 2 in every case). Stack config NOT persisted in DB — committed harness files are the authoritative record. No new migrations. Tokens used per scenario: ~800 (within the 1000 budget). PRE-EXISTING: Template runtime fix: user projects default to Node 22 LTS (no migration). The Gestalt PLATFORM itself stays on Node 20 + pnpm 9.x (real `node:sqlite` / pnpm 9.x constraint) — that's documented as a self-imposed bound that doesn't apply to user projects. `templates/corporate-ops-web-mobile/ci/gestalt.yml` now uses `node-version: '22'` and step name "Setup Node 22 LTS". `harness/HARNESS.json` template `stack.runtime` flipped `node20 → node22`. `harness/AGENTS.md` gains a new "Project runtime" section documenting Node 22 LTS + pnpm 9.x/10.x both supported (with explicit "Gestalt platform constraint ≠ user project constraint" note). `template.json#version` bumped `0.1.0 → 0.2.0`. Server boot's `seedBuiltinTemplate` rewritten to compare DB row version against on-disk `template.json` version — version match → skip; version drift OR no row → upsert via the existing `PlatformTemplateRepository.update` (in place; `id` + `slug` + `isBuiltin` + `createdAt` + `isDefault` preserved). Idempotent. New `readTemplateMeta(templatesDir, slug)` helper reads template.json once at boot. `code-prompt.ts` architecture section gains runtime-aware note: priority order is (1) `harness.stack.runtime` formatted via new `formatRuntime` helper ("node22" → "Node 22 LTS", even-major-is-LTS rule; unknown values like "bun" pass through verbatim); (2) if no harness runtime AND architectureMd doesn't already mention a Node version (`/node\s*\d|Node\s*\d|node\.js/i` check) → default "Node 22 LTS"; (3) otherwise stay quiet so legacy projects with Node 20 in their architecture aren't contradicted. Live verified: server restart logged `Refreshed built-in template (version bump)` with `previousVersion: 0.1.0` → `version: 0.2.0`; second restart logged `platform_templates up-to-date — skipping seed` (idempotency). DB row now carries the new files (gestalt.yml has Node 22 LTS step + node-version '22'; HARNESS.json runtime: node22; AGENTS.md has Project runtime section). Fresh `loadTemplate` simulation produced the 8 expected files with Node 22 in workflow + HARNESS + AGENTS. code-prompt 5-invariant matrix passed (node22 → Node 22 LTS; node20 → Node 20 LTS round-trip; no runtime + silent arch → default Node 22 LTS; legacy arch mentioning Node 20 → respected without contradicting default; future runtime "bun" → verbatim). Platform itself confirmed still on Node 20 via `docker exec gestalt-server-1 node --version` → `v20.20.2`. **Operator action — trackeros repo:** the project was initialised under the old template and its `.github/workflows/gestalt.yml` still pins Node 20. Update with `git pull && edit .github/workflows/gestalt.yml: node-version '20' → '22' && commit && push`. Until done, trackeros CI runs on Node 20 (not breaking — Node 20 works for typical code-agent output today). PRE-EXISTING: Hybrid LLM recovery for all scripted deploy agents (Option B, no migration): `SelfHealingDiagnosis` extended with `retryTaskType: 'generate:intent' | 'deploy:pr' | 'deploy:pipeline' | 'deploy:promote' | 'none'` + `retryPayloadHints: Record<string, unknown>`. New `SelfHealingRetryTaskType` exported. Diagnosis prompt rewritten with "Available retry task types" + "Known failure patterns" sections (git push → deploy:pr with unshallow+forceWithLease; CI timeout → deploy:pipeline with extendTimeout; staging gate → deploy:promote; gate failures → generate:intent; infrastructure → none). `parseDiagnosis` defaults retryTaskType to `'generate:intent'` (preserving pre-Option-B legacy diagnoses) and rejects malformed hints (array → `{}`). `safeDefaultDiagnosis` returns `retryTaskType: 'none'`. `runSelfHealingLoop` rewrite: replaces the hardcoded single-queue dispatch with `buildRetryDispatch(taskType, payload, diagnosis, source)` — builds a per-queue-shaped payload (generate:intent gets `text` + `resumeOnBranch`; deploy:pr gets `branch` + `prNumber` + empty `artifacts`; deploy:pipeline gets `branch`; deploy:promotion picks `targetEnvironment: 'production'` when the diagnostician's hint `retryProductionOnly: true` fires, else 'staging'). Loop NOW owns the dispatch + status transition (orchestrator helpers simplified — drop their duplicate dispatch code). `'none'` treated as `shouldRetry: false` (escalation path). ResumeContext gains `retryTaskType` + `retryPayloadHints` so the dashboard's attempt-history view can show which queue the loop retried on. `attemptAutoResolveAlert` uses the same `buildRetryDispatch(source: 'auto-resolved')` so escalation auto-resolves can also route to non-`generate:intent` queues. **All three scripted deploy agents gained `selfHealingHints` + `selfHealingDiagnosis` fields on their input + matching local `SelfHealingHints` interfaces:** pr-agent reads `unshallow` (runs `git fetch --unshallow` best-effort, non-fatal), `forceWithLease` (push with --force-with-lease + --set-upstream), `rebaseBranch` (fetch + rebase default branch, abort cleanly on conflict), `skipArtifactRewrite` (skip writing files + lockfile sync — push existing branch state). On push failure pr-agent rethrows so the deploy-orchestrator's catch wrapper invokes runSelfHealingLoop with the NEW error context (re-diagnosis). pipeline-agent reads `extendTimeout` (doubles the polling window — 20m default → 40m) and `skipTrigger` (re-polls existing run when hint object carries `runId`; silently falls back to fresh trigger when `runId` absent — forward-compat). promotion-agent reads `skipStagingVerification` (no-op today, logged for forward-compat with a future verifyStagingDeployment) and `retryProductionOnly` (consumed at dispatch site by the loop — picks `targetEnvironment: 'production'`; ADR-034 staging-confirmation invariant still enforced in agent regardless). All three deploy payload types (DeployPRPayload / DeployPipelinePayload / DeployPromotionPayload) extended via shared `SelfHealingDispatchFields` interface carrying `source` + `selfHealingHints` + `selfHealingDiagnosis`. Unknown hints silently ignored by every agent (forward-compat — future diagnoses can ship new hints without crashing older workers). Source field extended union: `'self-healing'` (regular retry) | `'auto-resolved'` (alert auto-resolution) | `'operator-resume'` | `'pipeline-feedback'` | `'human'` | `'maintenance-agent'`. Live verified end-to-end: (1) parseDiagnosis 6-invariant matrix — full diagnosis with retryTaskType+hints parses correctly; legacy diagnosis defaults to generate:intent; retryTaskType=none recognised; unknown retryTaskType falls back to generate:intent; malformed hints (array) defaults to {}; garbage JSON safe-defaults with retryTaskType=none. (2) Scenario 1 live: synthetic non-fast-forward diagnosis dispatched `deploy:pr` (NOT generate:intent), server log shows `Self-healing retry dispatched retryTaskType=deploy:pr hintKeys=[unshallow, forceWithLease]`, pr-agent received the dispatch with hints visible in logs, took the resume path on the synthetic branch (push failed because the branch was fake — same WARN+fallback as prior session). last_resume_context stored `retryTaskType: deploy:pr` + `retryPayloadHints: {unshallow, forceWithLease}` + `autoHealed: true`. (3) Scenario 4 live: fresh trivial intent — first cycle's pr-agent ran the scripted happy path with ZERO `hints` log entries / ZERO "Resuming on existing branch" log lines / ZERO self-healing references for the FIRST deploy:pr call. Subsequent self-healing fired because trackeros project's CI deterministically fails (pre-existing unrelated issue) — when CI failed, the loop diagnosed `retryTaskType: "generate:intent"` (the LLM correctly picked the right queue, NOT a hardcoded map) and re-ran the full generate cycle. No new migration required — hints flow through BullMQ payload, retryTaskType + retryPayloadHints persist in `intents.last_resume_context` via the column added in migration 020. PRE-EXISTING: Autonomous self-healing loop (migration 020): `platform_self_healing_config` table seeded with the seven failure types (`generate-error`, `gate-max-retries`, `pipeline-failed`, `pipeline-timeout`, `deploy-error`, `maintenance-error`, `custom-agent-failure`) — each with per-type defaults the platform-admin can tune. `intents` gains `attempt_count INTEGER NOT NULL DEFAULT 0` + `last_resume_context JSONB`; `deployment_event_type` adds `resume-pushed`. New `SelfHealingConfigRepository` (postgres impl + oracle/mssql throw-stubs). New `IntentRepository.saveResumeContext` + `incrementAttemptCount`. New `SelfHealingAgent` class in `@gestalt/core/agents/self-healing-agent.ts` extends `BaseLLMAgent` — diagnoses failures returning structured `{ diagnosis, rootCause, suggestedFix, confidence, shouldRetry, skipAgents, focusFiles, updatedIntentText }`; per-type `confidence_threshold` downgrades shouldRetry when LLM confidence is below the operator's bar; safe-default `shouldRetry:false, confidence:low` on LLM/parse failure (NEVER throws). New `runSelfHealingLoop(ctx, payload, signals)` in `self-healing-loop.ts` — budget check → diagnosis → either dispatch retry (`source: 'self-healing'`, resumes on intent.branchName) OR escalate (creates alert via shared `escalateToHuman` with per-failureType title template) + auto-resolve at high confidence (`source: 'auto-resolved'`); returns `{shouldRetry, diagnosis, escalated, autoResolved}` so caller branches cleanly. `alertContextExtras` payload field merges into alert.context (pipeline-* carry runId + pipelineStatus). `setQueueConfig/getQueueConfig` pattern added to `@gestalt/core/queue` (server pins config.queue at boot step 5c) so the loop can dispatch without threading config through every consumer. Wired into every failure path: generate orchestrator `hasPlanFailed` AND catch block (generate-error), gate orchestrator max-retries (gate-max-retries), deploy orchestrator pipeline-failed branch (pipeline-failed/pipeline-timeout — pipeline-agent stopped creating alerts directly; loop owns alert creation with rich context), deploy generic catch (deploy-error), custom agent LLM error inside `runOneCustomAgentNode` (custom-agent-failure — throws `SelfHealingRetryDispatched` sentinel caught in orchestrator catch to avoid double-dispatch). Context-assembler reads `intent.lastResumeContext` and attaches to ContextSnapshot.resumeContext + skipAgents + focusFiles. Code-prompt gains a new "Resumed attempt (N) — auto-diagnosed | operator feedback" section (between signals and task) showing diagnosis/rootCause/suggestedFix for autoHealed cycles or operatorFeedback verbatim for human cycles, plus focus files. Orchestrator honours skipAgents (high-confidence auto-healed retries only) — skipped steps create `agent_executions` rows with status `skipped` so the dashboard accordion stays consistent. New routes: `GET /platform/self-healing` (admin — list all 7 configs); `PATCH /platform/self-healing/:failureType` (admin — partial update with validation: maxAttempts 0–10, confidenceThreshold enum, audit captures changedFields+previousValues+newValues per GP-002); `POST /alerts/:id/resume` (operator + editor membership — generic human-feedback resume for any failure alert type; saves last_resume_context with autoHealed:false, increments attempt_count, dispatches `source: 'operator-resume'`, GP-006 audit carries feedbackLength only). Dashboard adds 8th `Self-healing` tab in Admin between Secrets and Templates — table with per-row toggle enabled, select maxAttempts (0-10), select confidence (high/medium/low), toggle auto-resolve; saves on change with inline ✓ saved indicator. CLI: `gestalt platform self-healing list/configure <failureType>` (--max-attempts, --confidence, --auto-resolve/--no-auto-resolve, --enable/--disable). New `LiveEventType: 'alert.auto-resolved'` SSE for dashboard live update. Live verified: migration 020 applied + queue config pinned at boot; GET endpoint returns all 7 rows; PATCH validation matrix (maxAttempts>10, invalid confidence, unknown failure type, empty patch); audit metadata captures changedFields/previousValues/newValues; CLI list+configure exercised; POST /alerts/:id/resume happy path (intent transitioned + last_resume_context stored as proper JSONB object with autoHealed:false + attempt_count incremented + alert acked + GP-006 audit confirmed — feedback text NOT in audit_log via direct SQL probe); worker picked up resume payload + full cycle ran end-to-end to `deploying`. Pipeline failure alerts + resume-on-same-branch feedback loop (migration 019): `intents` gains `branch_name TEXT`, `pr_number INTEGER`, `pr_url TEXT` (all nullable); new `IntentRepository.saveBranchInfo`; pipeline-agent creates `pipeline-failed` / `pipeline-timeout` alerts (severity high, requiredAction `provide-feedback`) carrying intentId + branch + prUrl + prNumber + runId + pipelineStatus in context JSONB; new `AlertType` values + `AlertRequiredAction: 'provide-feedback'`; pr-agent persists branch info on fresh-PR path and dispatches a new `resumeOnBranch` flow: when set, fetch + `checkout -B <branch> origin/<branch>`, push to existing branch, NO new PR — reuses the input's `prNumber`/`prUrl`, writes a `pr-opened` event with `metadata.resume: true` so the timeline narrates "fix push" vs original; commit subject becomes `fix: address CI failure — <intent line> [gestalt <corr8>]`. Generate orchestrator threads `resumeOnBranch`/`prNumber`/`prUrl` payload optionals through `drivePlan` → gate's `dispatchDeployPR` → deploy:pr; on resume, fetches + checks out the existing remote branch with WARN-and-fall-through-to-default safety. intent-agent prompt picks up new `clarificationSource: 'pipeline-feedback'` framing ("## CI pipeline failure feedback from operator"); `needsClarification` short-circuits for `pipeline-feedback` to avoid re-pausing. New route `POST /alerts/:id/pipeline-feedback` (`requireRole('operator')` + `checkProjectMembership(editor)`) validates type ∈ {pipeline-failed, pipeline-timeout}, calls `intents.saveClarification(intent.id, feedback)`, dispatches `generate:intent` with full resume payload, transitions to `generating`, acknowledges alert atomically — audit `alert.pipeline-feedback-submitted` carries `feedbackLength + branch + prNumber + intentId + type + ip` ONLY (GP-006). Dashboard Alerts view: new `PipelineBody` (intent line + branch + PR link + run id + pipeline status KV header) and `PipelineFeedbackBlock` (textarea + "retry with fix ▶" button) rendered ABOVE Dismiss for the two new types; new TypeGlyph (✗ red for failed, ⏱ amber for timeout); FixIntentBlock suppressed for pipeline alerts (operators provide CI-fix context via the new block instead). CLI: new `gestalt alerts pipeline-feedback <alertId> [--feedback <text>]` subcommand — displays branch/PR/runId/status context then submits; `gestalt alerts show` Available actions footer routes pipeline alerts to `pipeline-feedback` + `dismiss`. Live verified end-to-end: 4 validation paths (400/404), happy path (200 with intentId + status: generating + branch + PR), atomic ack + clarification persist (116 chars), worker pickup with `resumeOnBranch` log line, GP-006 audit metadata. PRE-EXISTING: pr-agent syncs `pnpm-lock.yaml` after writing artifacts so CI's `--frozen-lockfile` always passes. New shared `execCommand(cmd, args, cwd, timeoutMs)` helper in `packages/agents/deploy/src/agents/exec.ts` — spawn-based, no shell, 2-minute default timeout, surfaces a 400-char stderr tail on non-zero exit. pr-agent's `maybeSyncLockfile(workDir)` stats `package.json` then runs `pnpm install --no-frozen-lockfile`; ENOENT skips (no Node project yet), other failures log WARN and continue (CI is the real source of truth — don't block PR creation over a lockfile sync hiccup). Dockerfile production stage swapped `corepack prepare pnpm@9.15.4 --activate` for `npm install -g pnpm@9.15.4` so the runtime `gestalt` user has pnpm 9.15.4 on PATH (corepack caches per-user; root activation wouldn't reach gestalt and the auto-fetched latest pnpm requires Node 22's `node:sqlite`). Template `gestalt.yml` gains a graceful fallback: if `pnpm-lock.yaml` is missing, emit a `::warning::` and run `pnpm install` without `--frozen-lockfile` so first-CI doesn't hard-fail. context-fixer.ts is unchanged — the ADR-018 path guard restricts it to `docs/*` and `AGENTS.md`, so it can never reach a `package.json` write path. Smoke test inside the rebuilt container: `pnpm 9.15.4` callable, real `pnpm install --no-frozen-lockfile` produces a 384-byte `pnpm-lock.yaml@9.0` for a lodash dependency)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -22,13 +27,15 @@ recipe in `CLAUDE.md` after every session._
   are summarised in the "Session log" entries dated 2026-05-29 / 30
 - All 12 buildable workspace packages compile clean (`pnpm -r build`)
 - `docker-compose up -d` succeeds — server, postgres, redis all `Up (healthy)`
-- All eighteen migrations apply on startup: `001_initial`, `002_local_auth`,
+- All twenty-three migrations apply on startup: `001_initial`, `002_local_auth`,
   `003_projects`, `004_deployments`, `005_maintenance`,
   `006_intent_clarification`, `007_execution_logs`,
   `008_finding_attempts`, `009_execution_log_model`,
   `010_user_management`, `011_interventions`, `012_tool_calls`,
   `013_auto_merge`, `014_llm_registry`, `015_secrets_vault`,
-  `016_relax_llm_apikey_env`, `017_platform_admin`, `018_groups`
+  `016_relax_llm_apikey_env`, `017_platform_admin`, `018_groups`,
+  `019_intent_branch`, `020_self_healing`, `021_key_rotation_log`,
+  `022_project_secret_ref`, `023_llm_api_shape`
 - Server reachable on http://localhost:3000 — `/health` returns 200
 - Auth middleware active — protected routes return 401
 - **Dashboard SPA reachable in the browser, deep-linkable, no path
@@ -2906,855 +2913,933 @@ enforced"):
   projects, may need rolling-window dedupe for active ones)
 
 
+
 ---
 
-## Recent session log entries
+## Session log (last 3 entries)
 
-### Session 2026-06-04 — Claude Code (Hybrid LLM recovery for scripted deploy agents — Option B)
+### Session 2026-06-04 — Claude Code (Brief 5: intent list filter improvement, no migrations)
 
-Builds on yesterday's autonomous self-healing loop (migration 020).
-Each scripted deploy agent (pr-agent / pipeline-agent /
-promotion-agent) keeps its deterministic happy path unchanged but
-gains a hint-driven recovery path. The `SelfHealingAgent` now picks
-the retry QUEUE (not always `generate:intent`) AND emits
-`retryPayloadHints` that the target agent reads to adapt its
-behaviour. If the adapted retry also fails, the deploy-orchestrator
-catch wrapper hands back to `runSelfHealingLoop` with the new error
-context for a fresh diagnosis.
+`GET /intents` widened with two improvements: group-derived
+project access when no `projectId` is supplied, and five new
+query filters (`source`, `priority`, `search`, `from`, `to`).
+No new migrations — `source` column already exists from
+`001_initial.sql`; Brief 1's groups tables are already
+applied.
 
 Changed:
-
-- `packages/core/src/agents/self-healing-agent.ts`:
-  - New `SelfHealingRetryTaskType` union — five values:
-    `generate:intent`, `deploy:pr`, `deploy:pipeline`,
-    `deploy:promote`, `none`. Exported for typing
-  - `SelfHealingDiagnosis` gained `retryTaskType` + `retryPayloadHints`
-    — `retryPayloadHints` is `Record<string, unknown>` (free-form;
-    each target agent reads only the keys it recognises)
-  - Diagnosis prompt rewrite — two new sections injected before
-    "Your task":
-    - "Available retry task types" describing each queue's
-      semantics with examples
-    - "Known failure patterns" with explicit mappings:
-      git-push → deploy:pr (unshallow + forceWithLease for non-ff;
-      add rebaseBranch for merge conflict; shouldRetry:false for
-      403/auth);
-      CI/pipeline → deploy:pipeline (extendTimeout for timeout;
-      empty hints for "didn't trigger";
-      test failures → flip to generate:intent);
-      promotion → deploy:promote (skipStagingVerification +
-      retryProductionOnly for already-deployed);
-      code/gate → generate:intent;
-      infrastructure → shouldRetry:false, retryTaskType:none
-  - `parseDiagnosis` defensive defaults — `retryTaskType` falls
-    back to `'generate:intent'` when missing/unknown (preserves
-    pre-Option-B behaviour for legacy diagnoses); `retryPayloadHints`
-    rejects arrays/non-objects and defaults to `{}`. `isRetryTaskType`
-    type guard added
-  - `safeDefaultDiagnosis` returns `retryTaskType: 'none'` +
-    `retryPayloadHints: {}` — used on LLM-call failure AND
-    JSON-parse failure
-
-- `packages/core/src/agents/self-healing-loop.ts`:
-  - New `buildRetryDispatch(taskType, payload, diagnosis, source)`
-    helper builds a per-queue typed `TaskMessage`. Per-queue
-    payload shape:
-    - `generate:intent` — `text` (diagnosis.updatedIntentText ?? payload.intentText)
-      + `resumeOnBranch` + `prNumber` + `prUrl`
-    - `deploy:pr` — `resumeOnBranch` + `branch` + `prNumber` +
-      `prUrl` + empty `artifacts: []` (pr-agent's resume path
-      reads `skipArtifactRewrite` to decide what to push)
-    - `deploy:pipeline` — `branch` + `prNumber` + `prUrl`
-    - `deploy:promotion` — `branch` + `prNumber` +
-      `targetEnvironment: 'staging' | 'production'`
-      (`retryProductionOnly` hint flips to production at dispatch
-      time, NOT inside the agent — the queue target is set here)
-  - All payloads carry shared base: `intentId`, `projectId`,
-    `intentText`, `source: 'self-healing' | 'auto-resolved'`,
-    `selfHealingHints`, `selfHealingDiagnosis`. `selfHealingHints`
-    forwarded verbatim from `diagnosis.retryPayloadHints`
-  - `runSelfHealingLoopUnsafe` rewritten: now treats both
-    `!shouldRetry` and `retryTaskType === 'none'` as escalation
-    triggers (semantically identical post-confidence-downgrade).
-    On retry-authorised path: `saveResumeContext` with
-    `retryTaskType` + `retryPayloadHints` written through, then
-    `dispatch(buildRetryDispatch(...), getQueueConfig())` ,
-    then best-effort `intents.updateStatus(... 'generating')`.
-    Loop owns BOTH the dispatch AND the transition — orchestrator
-    callers no longer need to do either
-  - `attemptAutoResolveAlert` uses the same `buildRetryDispatch`
-    helper with `source: 'auto-resolved'`. Treats `retryTaskType:
-    'none'` as no-retry (alert stays open)
-  - `SelfHealingResult.autoResolved` semantics unchanged
 
 - `packages/core/src/repository/index.ts`:
-  - `ResumeContext` gained optional `retryTaskType?: string` +
-    `retryPayloadHints?: Record<string, unknown>`. Allows
-    pre-Option-B resume contexts to read fine (fields absent →
-    same as old behaviour)
+  - `IntentRecord.source` widened from `'human' |
+    'maintenance-agent'` to also accept `'self-healing' |
+    'auto-resolved' | 'operator-resume' | 'pipeline-feedback'`.
+    The DB column is `TEXT NOT NULL DEFAULT 'human'` so
+    permits any string; current intents stay at their
+    original source on retry cycles (the new values are
+    payload-level dispatch sources used by the BullMQ
+    message, not currently persisted on the intent row).
+    Documented inline so future iterations that DO persist
+    these don't have to widen the type again
+  - New `IntentListFilters` interface — typed shape for
+    every filter the route can pass through. `from` / `to`
+    are JS `Date` objects (route parses ISO strings via
+    `new Date`, drops the filter on NaN). `limit` /
+    `offset` are required; the rest are optional
+  - `list()` / `listAll()` signatures widened to accept
+    `IntentListFilters`. Brief 5
+  - New `listForProjects(projectIds, filters)` —
+    single-round-trip multi-project listing. Used by GET
+    /intents when no `projectId` is supplied
+- `packages/adapters/postgres/src/repositories/intents.ts`:
+  - `list` / `listAll` / `listForProjects` rewritten with
+    inline conditional `${filters.X ? db\`AND col = ${val}\` :
+    db\`\`}` fragments. Each filter is independently skippable
+    so the prepared statement shape stays minimal
+  - `listAll` anchors `WHERE 1 = 1` so AND-fragments compose
+    without first-AND special handling
+  - `listForProjects` uses `WHERE project_id =
+    ANY(${ids}::text[])` — single index check over the
+    UNION of accessible projects. The cast is `text[]`
+    (not `uuid[]`) because `intents.project_id` is TEXT
+    per the original 001_initial.sql schema
+  - Search uses ILIKE `%search%` — no full-text index
+    needed at current scale
+- `packages/adapters/{oracle,mssql}/src/repositories/intents.ts`:
+  - `IntentListFilters` imported
+  - `list` / `listAll` signatures updated to match the
+    interface; new `listForProjects` throw-stub added
+- `packages/core/src/index.ts`: re-exports
+  `IntentListFilters`
+- `packages/server/src/routes/intents.ts`:
+  - `ListIntentsQuery` widened with `projectId`, `source`,
+    `priority`, `search`, `from`, `to`
+  - GET /intents handler rewritten:
+    1. Parse + validate filters via new
+       `buildIntentFilters(q, limit, offset)` helper —
+       trims string values, parses ISO dates (drops on
+       NaN), constructs the typed filter object
+    2. Platform-admin: server-wide `intents.listAll(filters)`
+    3. Regular user without projectId: `Promise.all([
+       memberships.findByUser, platformGroups.getEffectiveMemberships])`,
+       deduplicate the projectId set, call
+       `intents.listForProjects(allIds, filters)`. Empty
+       set → `{data: [], total: 0}` (no 403, no leak)
+    4. With projectId: membership check (direct OR
+       group-derived via the existing
+       `checkProjectMembership` helper which already
+       consults groups), then `intents.list({projectId,
+       ...filters})`
+- `packages/dashboard/src/api/client.ts`: `listIntents`
+  param shape widened to include the 5 new filters
+- `packages/dashboard/src/views/IntentFeed.tsx`: rewritten
+  with a filter bar above the list.
+  - URL persistence via `useSearchParams` from
+    react-router-dom — `/app/intents?status=failed&search=pnpm`
+    is shareable; opening in a new tab loads the same
+    filtered view
+  - Filter bar (above the list): `<select>` for status (8
+    options) + `<select>` for source (6 options) +
+    Search input with 300ms debounce → URL update +
+    re-fetch + From/To `type="date"` inputs (HTML5 native
+    date picker) + `× Clear` button that appears only when
+    any filter is active
+  - Removed the legacy local-text filter (now replaced by
+    server-side search)
+  - Empty-state message branches: "No intents match the
+    current filters / Try clearing one or more filters" vs
+    "No intents yet"
+- `packages/cli/src/api/client.ts`: `listIntents` param
+  shape widened — `projectId` is now optional; 5 new filter
+  fields added
+- `packages/cli/src/commands/intent.ts`:
+  - `IntentListOptions` gained `source`, `priority`,
+    `search`, `from`, `to`
+  - New `VALID_SOURCES` + `VALID_PRIORITIES` Sets for
+    client-side validation
+  - `intentListCommand` validates `--source` and
+    `--priority` against the closed unions; invalid values
+    print `Unknown source 'X'. Valid values: ...` and exit 1
+  - `--project` is now genuinely optional. When absent,
+    the server returns the user's accessible-projects
+    union; the rendered project label switches to
+    `accessible projects`
+- `packages/cli/src/index.ts`:
+  - `gestalt intent list` registered with 5 new flags
+    (`--source`, `--priority`, `--search`, `--from`,
+    `--to`). Description updated to explain the
+    cross-project behaviour when `--project` is omitted
 
-- Orchestrator helpers simplified — drop duplicate dispatch +
-  transitionIntent code, just branch on the loop's result flags:
-  - `packages/agents/generate/src/orchestrator/orchestrator.ts`:
-    `attemptSelfHealingForGenerate` + `attemptSelfHealingForCustomAgent`
-    both shrank — read `result.shouldRetry` (loop dispatched +
-    transitioned) → return retryDispatched:true; check
-    `escalated && autoResolved` → same. The `dispatch + transitionIntent`
-    blocks deleted (~30 lines each). Log lines kept + extended with
-    `retryTaskType` + `hintKeys` so the audit trail shows which
-    queue the loop chose
-  - `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
-    `attemptSelfHealingForGate` same simplification — drops the
-    inline `dispatch + transitionIntent` block. Log adds
-    `retryTaskType` + `hintKeys`
-  - `packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`:
-    `attemptSelfHealingForDeploy` same simplification. Log adds
-    `failureType` + `retryTaskType` + `hintKeys`
+Verified live end-to-end:
 
-- `packages/agents/deploy/src/agents/pr-agent.ts`:
-  - New `PRAgentSelfHealingHints` interface — `unshallow?`,
-    `forceWithLease?`, `skipArtifactRewrite?`, `rebaseBranch?`
-  - `PRAgentInput` gained `selfHealingHints` + `selfHealingDiagnosis`
-  - Resume path reads hints + builds an `appliedHints: string[]`
-    log scratchpad:
-    - `unshallow`: `repo.fetch(['origin', branch, '--unshallow'])`
-      wrapped in try/catch — fails on a complete repo (`"fatal:
-      --unshallow on a complete repository does not make sense"`)
-      with WARN log + continue, success appends to appliedHints
-    - `rebaseBranch`: `fetch defaultBranch + rebase origin/defaultBranch`
-      wrapped in try/catch; on rebase failure runs `repo.rebase
-      (['--abort'])` then WARN-and-continue (matches the brief's
-      "rebase failed — continuing without rebase" semantics)
-    - `skipArtifactRewrite`: skips both the artifact write loop AND
-      the lockfile sync — pushes whatever's on the branch tip
-    - `forceWithLease`: push uses `['--force-with-lease',
-      '--set-upstream']` instead of `['--set-upstream']`
-  - Empty-commit + no-rewrite handling: when `skipRewrite` is
-    true and there's no diff, resolves `commitSha` from
-    `git rev-parse HEAD` (no synthetic empty commit — the branch
-    tip IS the commit we want to push). When skipRewrite is
-    false with no diff, the legacy synthetic-empty-commit path
-    runs
-  - Push failure RETHROWS (with WARN log naming
-    `appliedHints` + the new error message) — the deploy-
-    orchestrator's catch block then invokes its own self-healing
-    wrapper with the fresh error context for a re-diagnosis.
-    `appliedHints` is logged on every successful resume push too
-    so operators can audit what worked
-
-- `packages/agents/deploy/src/agents/pipeline-agent.ts`:
-  - New `PipelineAgentSelfHealingHints` interface — `extendTimeout?`,
-    `skipTrigger?`, `runId?`
-  - `PipelineAgentInput` gained `selfHealingHints` +
-    `selfHealingDiagnosis`
-  - `extendTimeout` doubles `timeoutMs` (default 10m → 20m)
-  - `skipTrigger` re-polls existing `runId` instead of calling
-    `adapter.triggerPipeline`. Requires `runId` on the hint
-    object — when absent, falls back to fresh trigger silently
-    (forward-compat: future hints that imply skipTrigger but
-    forget runId still produce a working cycle)
-  - Both happy path AND recovery path log `appliedHints` +
-    `diagnosis` so the audit trail is symmetric
-
-- `packages/agents/deploy/src/agents/promotion-agent.ts`:
-  - New `PromotionAgentSelfHealingHints` interface —
-    `skipStagingVerification?`, `retryProductionOnly?`
-  - `PromotionAgentInput` gained `selfHealingHints` +
-    `selfHealingDiagnosis`
-  - Agent body logs hints when present (the actual effect of
-    `retryProductionOnly` is consumed at the loop's
-    `buildRetryDispatch` step — promotion-agent runs with
-    whichever targetEnvironment was dispatched).
-    `skipStagingVerification` is logged but unused today (no
-    staging verifier exists) — forward-compat for when one ships
-
-- `packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`:
-  - All three payload interfaces extended via shared
-    `SelfHealingDispatchFields` — `source`, `selfHealingHints`,
-    `selfHealingDiagnosis`. Plus `DeployPRPayload` gained the
-    pipeline-feedback-style `resumeOnBranch` + `branch` +
-    `prNumber` + `prUrl` fields (already present on Pipeline +
-    Promotion). Source union widened to include
-    `'self-healing'` + `'auto-resolved'` + `'operator-resume'`
-    + `'pipeline-feedback'` + `'human'` + `'maintenance-agent'`
-  - All three agent dispatch sites forward
-    `selfHealingHints` + `selfHealingDiagnosis` from the payload.
-    pr-agent additionally forwards `resumeOnBranch` + `prNumber`
-    + `prUrl` (the pipeline-feedback resume fields)
-  - Imports added: `PRAgentSelfHealingHints`,
-    `PipelineAgentSelfHealingHints`, `PromotionAgentSelfHealingHints`
-
-Live verified end-to-end:
-
-- `pnpm -r build` clean across all 12 packages
-- `docker compose up -d --build server` healthy; queue config
-  pinned at boot
-- **`parseDiagnosis` 6-invariant matrix** via direct node-eval
-  inside the container (no DB / LLM):
-  1. Full diagnosis with retryTaskType=`deploy:pr` + hints
-     `{unshallow, forceWithLease}` → parsed correctly with both
-     fields present
-  2. Legacy diagnosis (no retryTaskType) → defaults to
-     `generate:intent` (backward-compat preserved)
-  3. `retryTaskType: 'none'` → recognised, paired with
-     `shouldRetry: false`
-  4. Unknown `retryTaskType: 'deploy:rocket'` → falls back to
-     `generate:intent` (defensive). Hints survive verbatim
-  5. Malformed `retryPayloadHints` (array `["not","an","object"]`)
-     → defaults to `{}`
-  6. Garbage JSON ("not json at all") → safe-default with
-     `retryTaskType: 'none'`, `shouldRetry: false`
-- **Scenario 1 live** (synthetic non-fast-forward diagnosis):
-  Stubbed `SelfHealingAgent.prototype.diagnose` to return a
-  diagnosis with `retryTaskType: 'deploy:pr'` +
-  `retryPayloadHints: {unshallow:true, forceWithLease:true}`.
-  Seeded an intent in `deploying` status with branch info.
-  Called `runSelfHealingLoop` directly:
-  - Server log: `Self-healing retry dispatched
-    retryTaskType=deploy:pr hintKeys=[unshallow, forceWithLease]
-    attemptNumber=1 confidence=high`
-  - pr-agent picked up the dispatch with `taskType: deploy:pr`,
-    `source: self-healing` — NOT `generate:intent`. Log:
-    `Resuming on existing branch (pipeline-feedback or
-    self-healing flow) hints=[unshallow, forceWithLease]`
-  - pr-agent took the hint-driven recovery path. Push failed
-    because the synthetic branch wasn't on the real GitHub
-    repo (`fatal: couldn't find remote ref
-    gestalt/verify-hybrid-recovery`) — pr-agent rethrew and
-    deploy-orchestrator's catch wrapper invoked another
-    self-healing diagnosis with the new error context (visible
-    in logs)
-  - DB after: `last_resume_context.retryTaskType = "deploy:pr"`,
-    `last_resume_context.retryPayloadHints = {unshallow: true,
-    forceWithLease: true}`, `last_resume_context.autoHealed = true`,
-    `attempt_count = 1` (escalated after the secondary failure
-    because trackeros's retry budget was already 1)
-- **Scenario 4 live** (happy path, fresh trivial intent):
-  - Submitted `Add a noop utility under src/shared/utils/noop`.
-    First cycle: intent-agent → design-agent → context-agent →
-    code-agent → test-agent → constraint-agent → review-agent →
-    **pr-agent (completed) → pipeline-agent (failed)**.
-  - `agent_executions` confirms the first deploy:pr ran
-    `status: completed` with NO `Resuming on existing branch`
-    log line, NO `hints:` log entry, NO `selfHealingHints` —
-    happy path executed unchanged
-  - pipeline-agent failed on trackeros's broken CI (pre-existing
-    unrelated issue, documented in prior sessions). This
-    triggered the deploy-orchestrator's self-healing catch
-    wrapper, which called `runSelfHealingLoop`. The LLM
-    correctly diagnosed the CI failure as a code problem and
-    returned `retryTaskType: 'generate:intent'` (visible in
-    server log: `Self-healing retry dispatched
-    retryTaskType=generate:intent`). The loop dispatched the
-    full generate cycle (a new intent-agent run started ~54s
-    after submission). **This is the LLM choosing the right
-    queue, NOT a hardcoded map** — proves Option B's dynamic
-    routing works in production
-- Cleanup: both synthetic intents + associated execution rows /
-  signals / artifacts / alerts removed at session end
+- `pnpm -r build` clean across all 12 packages. Docker
+  server image rebuilt; existing data (22 intents from
+  prior sessions) preserved
+- **Filter matrix on built-in test data:**
+  - `?status=failed&limit=5` → 5 rows of total 10
+  - `?source=human` → total 22 (all current intents)
+  - `?source=self-healing` → 0 (no intents currently use
+    that source)
+  - `?priority=normal` → 22
+  - `?search=pnpm` → 11 with substring matches
+  - Combined `?status=deployed&search=pnpm` → 5 (AND
+    semantics — both must match)
+  - `?from=<today>` → 0 (all data is from prior days)
+  - `?to=2020-01-01` → 0 (everything before 2020)
+- **Group-membership path:** seeded the existing
+  `user@test.local` (regular `user` role, no direct
+  memberships, no group memberships) as a member of a new
+  `verify-group`; assigned the group to the project with
+  19 intents as `reader`. The user's `GET /intents` (no
+  projectId) went from 0 → 19 rows. Applying filters on
+  the group-derived path:
+  - `?status=failed` → 8
+  - `?search=pnpm` → 11
+  After deleting the group, user back to 0 — full lifecycle
+  works
+- **CLI verification:**
+  - `gestalt intent list --status failed --limit 3` →
+    table with 3 rows + footer
+  - `gestalt intent list --search pnpm --limit 3` → 3 rows
+    of substring matches
+  - `gestalt intent list --source human --limit 3` → 3 rows
+    (all current intents are `human`)
+  - `gestalt intent list --status nonsense` → `Unknown
+    status 'nonsense'. Valid values: ...` + exit 1
+  - `gestalt intent list --source nonsense` → similar
+    validation error
+  - `gestalt intent list --help` shows all 8 new flag
+    descriptions cleanly formatted
+  - `gestalt intent list --to 2020-01-01` → empty table
+- **Dashboard bundle:** 366 KB ungzipped; spot-grep
+  confirms `"All statuses"`, `"All sources"`,
+  `"Search..."`, `"× Clear"` strings present
+- **Cleanup:** test user password reset to original
+  `opsop123`; verification audit rows scrubbed; group
+  artifacts removed during the test flow
 
 Decisions made:
 
-- **Loop dispatches + transitionIntent — orchestrator helpers
-  read result flags only.** The prior session's orchestrator
-  helpers duplicated the dispatch + transition code per layer
-  (generate / gate / deploy / custom-agent). With dynamic
-  routing each helper would need to know all four queue
-  payload shapes — exactly the kind of duplication
-  Option B exists to avoid. Centralising into `buildRetryDispatch`
-  inside the loop means every layer benefits from a future
-  retryTaskType addition without an N-way edit. Trade-off:
-  the loop now needs `getQueueConfig()` at runtime which
-  was already pinned at boot (yesterday's session). The
-  orchestrator helpers shrank by ~30 lines each
-- **`retryTaskType: 'none'` as semantically equivalent to
-  `shouldRetry: false`.** The brief allowed for both. Treating
-  them identically in the loop means the LLM can express
-  the no-retry decision through either field — useful when
-  it's confident the failure is infrastructure-only.
-  Documented in the loop's branch logic with a comment
-- **Hints are forward-compatible by design.** Every agent
-  reads hints via `const hints = (input.selfHealingHints ??
-  {}) as TypedHintsInterface;`. The cast is intentional —
-  unknown keys aren't on the typed interface so TypeScript
-  ignores them, but runtime access via `hints.knownKey` works.
-  If a future diagnosis adds `{ rocketBoost: true }` and an
-  old worker reads `hints.unshallow`, the new hint is
-  silently ignored — no crash, no logged error. New hints
-  are FREE to add; only the diagnosis prompt + the agent
-  that should react to them need updating
-- **Push failure RETHROWS to the orchestrator.** Brief's
-  pseudocode used `handlePushFailure` to call
-  `runSelfHealingLoop` inline from inside pr-agent. I chose
-  to rethrow instead because:
-  1. The deploy-orchestrator already has a catch block that
-     calls `runSelfHealingLoop` with full context (intent
-     attempt count, prior signals, prior artifacts —
-     pr-agent only has the artifacts it was about to push)
-  2. The orchestrator's wrapper sets `failureType:
-     'deploy-error'` correctly; pr-agent calling
-     `runSelfHealingLoop` would need to thread the right
-     failureType itself
-  3. Centralising one catch path per orchestrator level
-     means the budget check + escalation flow live in one
-     place per layer — easier to reason about
-  Result: same behaviour as the brief (failed retry triggers
-  re-diagnosis with new error context) via a slightly
-  different wiring. pr-agent's log message names this
-  ("handing back to orchestrator for re-diagnosis")
-- **`retryProductionOnly` consumed at dispatch site, NOT in
-  agent.** The hint flips `targetEnvironment` at the
-  `buildRetryDispatch` step inside the loop. promotion-agent
-  itself runs with whichever environment got dispatched. This
-  keeps the agent code path single-purpose (one promotion
-  per call); the queue routing is the loop's job. ADR-034
-  still enforces "no production without confirmed staging
-  promotion" in the agent body regardless of the hint — the
-  hint can't bypass that invariant
-- **`skipTrigger` requires `runId` on the hint object.**
-  Without it, pipeline-agent can't know which run to poll.
-  Brief's pseudocode assumed runId was always available;
-  I made it explicit on the hint so future diagnoses can opt
-  in correctly. Forward-compat: a diagnosis that sets
-  `{skipTrigger: true}` without `runId` falls back to a fresh
-  trigger — the hint is effectively a no-op rather than a
-  crash
-- **No new migration.** All hint data flows through BullMQ
-  payload (transient). The persisted state — `retryTaskType` +
-  `retryPayloadHints` — lives inside the existing
-  `intents.last_resume_context` JSONB column from migration
-  020. The ResumeContext type just gained two optional
-  fields; old rows without them read fine
+- **`IntentListFilters` interface in core, not duplicated
+  per adapter.** Adapters import the typed shape so any
+  future filter addition (e.g. `tag` once intents grow
+  tags) updates one interface and the compiler enforces
+  consistency across postgres / oracle / mssql
+- **`from` / `to` are `Date` objects in the interface but
+  ISO strings on the wire.** The route parses ISO strings
+  via `new Date(...)`. Invalid date strings are dropped
+  silently (filter not applied) rather than erroring —
+  matches the brief's permissive approach for query
+  filters. The DB-side comparison uses the parsed Date
+  directly, which postgres.js serialises as a timestamptz
+- **Both `from` and `to` are inclusive bounds** — `>=` and
+  `<=`. Matches the brief's explicit "inclusive" note.
+  An operator typing `--from 2026-06-04 --to 2026-06-04`
+  gets intents created at any moment on that calendar day
+- **`source` typed union widened, NOT migrated to an enum
+  CHECK constraint.** The DB column is plain `TEXT NOT
+  NULL DEFAULT 'human'` from `001_initial.sql`. Adding a
+  CHECK constraint would break the future when a payload-
+  level source value lands on the intent row. Keeping it
+  permissive at the DB level and widening only the
+  TypeScript union gives the future flexibility while
+  catching most typos at compile time
+- **`= ANY($1::text[])` cast is `text[]`, not `uuid[]`.**
+  `intents.project_id` is `TEXT NOT NULL` per
+  `001_initial.sql` (project IDs are stored as text, not
+  uuid). The cast must match the column type or the
+  index won't be used. Verified live — 22 rows return in
+  single-digit ms
+- **Empty accessible-projects set returns `{data: [],
+  total: 0}`, not 403.** No-enumeration-leak rule. A
+  regular user with NO memberships and NO group access
+  gets the empty list, indistinguishable from "you have
+  access but no intents exist yet"
+- **Group access path uses the existing
+  `checkProjectMembership` helper** when a projectId IS
+  supplied — that helper already consults both direct AND
+  group-derived access (from the Brief 1 session). The
+  no-projectId path adds the equivalent for cross-project
+  listing via direct calls to `memberships.findByUser` +
+  `platformGroups.getEffectiveMemberships`
+- **`listForProjects` is a single round-trip with `= ANY`,
+  NOT an N+1 over per-project `list` calls.** A user with
+  group access to N projects gets ONE query that scans
+  all matching rows + applies filters in SQL. Performance
+  scales with intent count, not project count
+- **Dashboard filter persistence via `useSearchParams`,
+  NOT React state.** `/app/intents?status=failed&search=pnpm`
+  is a shareable URL. Opening the same URL in a new tab
+  loads the exact filtered view. The brief specified this
+  explicitly; using `useSearchParams` is the standard
+  React Router idiom — no third-party library needed
+- **300ms search debounce** keeps the URL from updating
+  on every keystroke. Local state (`searchInput`) is
+  bound to the input; the URL (and therefore the fetch)
+  updates only after the operator stops typing. Same
+  behaviour as the dashboard's other search inputs
+- **`× Clear` button only renders when any filter is
+  active.** Visual minimisation — when no filters are
+  applied, the bar is just the empty-state-looking
+  controls. Once any filter is set, the Clear button
+  appears, anchored right of the row
+- **CLI `--project` flag is now optional.** Brief 5 made
+  the cross-project listing a feature, so the CLI follows.
+  When absent, the rendered label switches to "accessible
+  projects" — operators see at a glance which scope they
+  queried
+- **Client-side validation in the CLI for `--status`,
+  `--source`, `--priority`.** Closed unions; mistakes
+  fail fast with a friendly error + valid-values list.
+  The server re-validates (because the same filter
+  arrives via raw query params from any client) but the
+  CLI's pre-check saves a round trip on common typos
+- **No new migration.** `source` column already exists
+  per `001_initial.sql`. Brief 1's `platform_groups` +
+  `group_memberships` + `group_project_assignments`
+  already applied. Brief 5 is purely a route + repository
+  + UI / CLI feature add
 
-Build status: `pnpm -r build` clean across all 12 packages.
-Docker server image rebuilt. Scenario 1 (non-fast-forward
-push dispatched to `deploy:pr` with hints, NOT a generate
-cycle) verified live end-to-end. Scenario 4 (happy path —
-zero hint logs / zero `Resuming on existing branch` lines
-for the FIRST deploy:pr call) verified live. parseDiagnosis
-6-invariant matrix verified inside the container against
-the production-built bundle.
-
-Pending follow-ups: none introduced. Possible future
-iteration:
-- Auto-resolved + self-healed alerts could surface the
-  `retryTaskType` choice in the dashboard's attempt-history
-  panel (data is in `last_resume_context.retryTaskType`)
-- A targeted intent that deterministically fails with a
-  pipeline-failed CI on a CLEAN project would prove
-  Scenario 1's end-to-end flow without the trackeros CI
-  pre-existing-issue noise
-- `verifyStagingDeployment` step in promotion-agent for the
-  `skipStagingVerification` hint to have a real effect
-
----
-
-### Session 2026-06-04 — Claude Code (Template runtime fix — Node 22 LTS for user projects)
-
-Small but visible fix: user project templates were inheriting the
-Gestalt platform's own Node 20 / pnpm 9.x constraint (a real
-self-imposed bound for the platform — `node:sqlite` lives in Node
-22, pnpm 10.x requires Node 22, but we pin Node 20 + pnpm 9.x for
-the platform itself). That has no business defaulting to user
-projects. User projects default to Node 22 LTS now, with the
-template documenting that pnpm 9.x AND 10.x both work.
-
-Adopted Option B for the DB-seed re-sync — version-check upsert.
-Bumping `template.json#version` triggers an automatic in-place
-refresh on next server boot. No manual SQL, no
-`docker-compose down -v` to wipe state. Same mechanism handles
-future template changes.
-
-Changed:
-
-- `templates/corporate-ops-web-mobile/ci/gestalt.yml`:
-  - Step name `Setup Node 20` → `Setup Node 22 LTS`
-  - `node-version: '20'` → `node-version: '22'`
-
-- `templates/corporate-ops-web-mobile/harness/HARNESS.json`:
-  - `stack.runtime`: `node20` → `node22`
-
-- `templates/corporate-ops-web-mobile/harness/AGENTS.md`:
-  - New "Project runtime" section between "What this project is"
-    and "Architecture rules":
-    - Node 22 LTS
-    - pnpm 9.x (or 10.x) — both work with Node 22
-    - TypeScript strict mode
-  - Explicit "Gestalt platform constraint ≠ user project
-    constraint" note so code-agent (and future maintenance
-    agents reading AGENTS.md) don't get confused by the
-    platform's own pin
-
-- `templates/corporate-ops-web-mobile/template.json`:
-  - `version`: `0.1.0` → `0.2.0`
-
-- `packages/server/src/server.ts`:
-  - `seedBuiltinTemplate` rewritten as a version-checked
-    upsert (Option B):
-    1. Read on-disk template.json metadata via the new
-       `readTemplateMeta(templatesDir, slug)` helper. Failure
-       to read → warn + early-return (preserves the existing
-       filesystem-fallback contract)
-    2. `findBySlug(slug)` to check for the DB row
-    3. If row exists AND `row.version === onDisk.version` →
-       log `platform_templates up-to-date — skipping seed`
-       and return (idempotent)
-    4. If no row → `create` with the on-disk version + files
-    5. If row exists with a different version → `update(id,
-       {name, description, tier, version, files})`. The id,
-       slug, isBuiltin, isDefault, createdAt, createdBy are
-       preserved — operators who flipped the default to a
-       custom template don't get their choice clobbered by
-       a built-in refresh
-  - New `readTemplateMeta(templatesDir, slug)` helper reads
-    `template.json` from disk and pulls
-    `{ version, name, description, tier }`. Safe-defaults
-    on missing fields so legacy templates without complete
-    metadata still seed
-  - All log lines preserved + extended with the new
-    `previousVersion` field on the refresh path so the
-    boot trace narrates the upgrade
-
-- `packages/agents/generate/src/prompts/code-prompt.ts`:
-  - Architecture section gains a runtime note. Priority:
-    1. `harness.stack.runtime` — explicit declaration in
-       HARNESS.json. Pretty-printed via the new
-       `formatRuntime(raw)` helper. Recognises
-       `node22`/`node20`/`node18` (even majors = LTS;
-       odd majors = current). Unknown runtime strings
-       (e.g. `bun`, `deno`) pass through verbatim
-    2. No harness runtime AND architectureMd doesn't
-       already mention a Node version (regex
-       `/node\s*\d|Node\s*\d|node\.js/i`) → inject
-       "Default runtime: Node 22 LTS, pnpm as package
-       manager."
-    3. Architecture mentions Node already → stay quiet
-       (don't contradict a legacy project's documented
-       runtime)
-  - Effect: every code-agent run with the updated template
-    sees "Project runtime: Node 22 LTS" in the architecture
-    section. Legacy projects with Node 20 in their docs
-    keep generating Node 20-compatible code. Projects
-    with no runtime info at all default to Node 22 LTS
-
-Live verified:
-
-- `pnpm -r build` clean across all 12 packages
-- `docker compose up -d --build server` → `Up (healthy)`
-- **First-boot refresh**: server log shows
-  `Refreshed built-in template (version bump)` with
-  `previousVersion: "0.1.0"`, `version: "0.2.0"`,
-  `fileCount: 8`. DB row updated in place:
-  - `slug` unchanged
-  - `version` 0.1.0 → 0.2.0
-  - `is_builtin: true` preserved
-  - `is_default: true` preserved
-  - `name` updated to "Corporate Operations Web & Mobile"
-    (from template.json)
-- **Idempotency**: second `docker compose restart server`
-  log shows `platform_templates up-to-date — skipping seed`.
-  No DB writes
-- **DB row file contents** verified via direct
-  `psql` JSONB extract:
-  - `files->'ci/gestalt.yml'` contains `Setup Node 22 LTS`
-    + `node-version: '22'`
-  - `files->'harness/HARNESS.json'` contains
-    `"runtime": "node22"`
-  - `files->'harness/AGENTS.md'` contains the new
-    "Project runtime" section with Node 22 LTS + pnpm
-    9.x/10.x note
-- **Fresh init path** — `loadTemplate(templatesDir,
-  'corporate-ops-web-mobile', {projectName, projectDescription,
-  defaultBranch})` inside the container produced 8 files with
-  Node 22 surfaced in every expected place
-- **code-prompt 5-invariant matrix** verified via direct
-  `buildCodePrompt(synthCtx)` calls:
-  1. `runtime: node22` → "Node 22 LTS" appears in prompt ✓
-  2. `runtime: node20` (legacy) → "Node 20 LTS" appears
-     (round-trip works — legacy projects respected) ✓
-  3. No runtime + silent architectureMd → "Default runtime:
-     Node 22 LTS" injected ✓
-  4. No runtime + architectureMd says "runs on Node 20" →
-     NO default-runtime injection (existing text respected) ✓
-  5. Future runtime `bun` → "Project runtime: bun" verbatim ✓
-- **Platform itself unchanged**: `docker exec gestalt-server-1
-  node --version` returns `v20.20.2`. Dockerfile FROM lines
-  still `node:20-alpine` (builder + production stages).
-  CLAUDE.md note "pnpm 9.x only — Node 20" stays — it refers
-  to the platform's self-imposed bound, NOT user projects.
-
-Operator action — `trackeros` repo:
-- The trackeros project was initialised with the old template
-  and its `.github/workflows/gestalt.yml` still pins Node 20.
-  The seeded DB row's update doesn't affect existing project
-  repos (the file lives in the project's git tree, written at
-  `init-harness` time). Operator should:
-  ```
-  cd <trackeros-clone>
-  git pull
-  # Edit .github/workflows/gestalt.yml:
-  #   - name: Setup Node 20  →  - name: Setup Node 22 LTS
-  #   node-version: '20'     →  node-version: '22'
-  git add .github/workflows/gestalt.yml
-  git commit -m "chore: update CI to Node 22 LTS"
-  git push
-  ```
-- The Node 20 → Node 22 migration is non-breaking for typical
-  code-agent output today (no `node:sqlite` usage in
-  trackeros's small surface). Until the operator updates the
-  workflow file, trackeros CI continues to run on Node 20 —
-  acceptable steady-state, just not the new default
-- No code-agent change required on trackeros — the
-  architectureMd / HARNESS.json on the existing trackeros tree
-  still says `node20` (the platform won't push a config edit to
-  a project's repo). The next deliberate `gestalt run` cycle on
-  trackeros will continue to generate Node 20-compatible code.
-  Operators who want Node 22 generation on trackeros should
-  also update `HARNESS.json#stack.runtime` to `node22` in the
-  trackeros repo
-
-Decisions made:
-
-- **Version-check seed (Option B) over delete-and-re-run
-  (Option A).** Brief allowed both. Option B is automatic
-  (no operator SQL, works on every deploy) AND idempotent
-  (re-running with the same version is a no-op). Same
-  mechanism handles all future template updates — bump
-  template.json#version, restart, refresh. No risk of
-  forgetting to clean state when a template changes
-- **`update(id, {...})` preserves `id` + `isDefault`.**
-  Operators may have flipped `isDefault` to a custom
-  template they uploaded; the built-in refresh shouldn't
-  override their choice. Same rule for `id` (keeping
-  references in any future denormalised state intact)
-- **`formatRuntime` enforces even-major-is-LTS.** Node's
-  release schedule is even-numbered majors → LTS, odd →
-  current. Node 22 is LTS; Node 23 won't be. The helper
-  encodes this rule so future bumps (Node 24, Node 26, …)
-  Just Work without hand-tuning
-- **Future-runtime pass-through** (`bun`, `deno`, `cloudflare-
-  workers`) — the helper returns unknown runtime strings
-  verbatim. A project that declares `runtime: "bun"` in
-  HARNESS.json gets "Project runtime: bun" in the prompt
-  (NOT "Node bun"). Forward-compatible
-- **Skip-injection on legacy projects.** If a project's
-  architectureMd already mentions Node (any version), we
-  don't inject a default — the operator's documented runtime
-  wins. Prevents the awkward "this project uses Node 18 /
-  Default runtime: Node 22 LTS" contradiction in the prompt
-- **Operator action for trackeros is light-weight + non-
-  breaking.** No urgent push — trackeros's CI continues to
-  run on Node 20 until manually updated. The platform doesn't
-  modify operator-controlled files (the workflow file lives in
-  the project repo, written at init time, owned by the
-  operator from then on)
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Docker server image rebuilt. Migration count unchanged (no new
-migrations — only the template.json version + the seed logic).
-DB row refreshed via the in-place update path; idempotent on
-restart. Fresh init path verified to produce Node 22 in the
-gestalt.yml workflow. Platform itself still on Node 20.
-
-Pending follow-ups: none introduced. Future possible iterations:
-- Surface `formatRuntime`'s output in the dashboard's
-  "Project" detail view (today HARNESS.json's `stack.runtime`
-  is only visible by reading the file in the repo)
-- Add a `gestalt project doctor` CLI command that checks for
-  workflow file / HARNESS.json runtime drift between the
-  template and the project's committed copy, and surfaces
-  the gap as an operator suggestion
-
----
-
-### Session 2026-06-04 — Claude Code (Dynamic harness — LLM-generated stack config at `gestalt init`)
-
-Builds on the prior session's template runtime fix. `gestalt init`
-used to copy a static template with hardcoded TypeScript / Node 22 /
-pnpm / Vitest assumptions into every project. This session makes
-the harness content dynamic: the LLM looks at the project
-description, picks the language / runtime / package manager / test
-framework / framework / database, and the engine substitutes those
-choices into the template at init time.
-
-The result is a harness that actually reflects the project from
-day one — a Python project gets `setup-python` + `pip install` +
-`pytest` in its CI workflow, `Senior Python engineer` as the
-code-agent role, and `pip` as the package manager in the
-ARCHITECTURE.md Stack section.
-
-Changed:
-
-- `packages/server/src/templates/stack-config.ts` (new):
-  - `StackConfig` interface — 14 structured fields the LLM
-    populates from the project description. The two
-    pre-rendered string fields (`stackSection` markdown and
-    `agentPromptExtensionsYaml` YAML) are produced inside
-    `parseStackConfig` so the template engine just runs a flat
-    string substitution (no `{{#if}}` conditional logic
-    required)
-  - `DEFAULT_STACK_CONFIG` — TypeScript / Node 22 / pnpm /
-    Vitest. Used when the LLM call fails OR parse fails. Both
-    pre-rendered fields baked in
-  - `generateStackConfig(description, name)` — calls
-    `getLLMClient` directly (NOT BaseLLMAgent — this runs
-    before the platform LLM registry is wired for the cycle).
-    Uses `temperature: 0.1` for deterministic stack decisions
-    and `maxTokens: 1000` (well under the 2000-default since
-    structured JSON output is compact). NEVER throws — every
-    failure path returns `{ ...DEFAULT_STACK_CONFIG }`
-  - `buildStackPrompt` — concrete Rules section + worked
-    examples of `ciSetupSteps` for Node and Python, so the
-    LLM understands the YAML indentation contract
-  - `parseStackConfig` — defensive on every field via
-    `stringOr` / `nullableString` helpers. The LLM emitting
-    the literal string `"null"` for a nullable field
-    (observed once in scratch testing) is mapped to JS
-    `null` for the consumer's benefit
-  - `stripIndent` + `indentSteps` helpers normalise the LLM's
-    `ciSetupSteps` block: strip common leading whitespace,
-    then re-apply a uniform 6-space indent so every line
-    lands at the depth `steps:` items live at in the
-    workflow. Idempotent — applies to both LLM output AND
-    the hardcoded default
-  - `renderStackSection` — produces the ARCHITECTURE.md
-    Stack section from the structured fields. Null fields
-    (e.g. no Runtime line for a Python project) are filtered
-    so the section reflects only what's true
-  - `renderPromptExtensionsYaml` — produces the
-    `code-agent.prompt_extensions:` YAML lines (with the
-    correct 6-space indent for the `agents.yaml` block).
-    Empty extension list renders as `      []`
-
-- Four template files updated to use stack-driven
-  placeholders:
-  - `templates/corporate-ops-web-mobile/ci/gestalt.yml`:
-    Hardcoded `Setup Node 22 LTS` + `node-version: '22'` +
-    `Setup pnpm` + `pnpm install --frozen-lockfile` + `pnpm
-    test` REMOVED. Replaced with two placeholders:
-    `{{ciSetupSteps}}` at column 0 (the LLM-generated YAML
-    block carries its own indent) and `{{testCmd}}` inside
-    the existing `Run tests` step. The conditional file-
-    presence check was widened to recognise `requirements.txt`
-    / `pyproject.toml` / `go.mod` / `Cargo.toml` so non-Node
-    projects don't print the "no project manifest" warning
-  - `templates/corporate-ops-web-mobile/harness/HARNESS.json`:
-    `stack` object replaced. Legacy `runtime: "node22"` field
-    DROPPED in favour of `nodeVersion: "{{nodeVersion}}"`.
-    Added `testFramework`, `framework`, `frontend`, `database`
-    fields (all `{{placeholder}}`-driven). `architectureStyle`
-    kept as the only hardcoded field
-  - `templates/corporate-ops-web-mobile/harness/agents.yaml`:
-    `code-agent.role` now `"Senior {{language}} engineer"`
-    and `test-agent.goal` references `{{testFramework}}`.
-    `code-agent.prompt_extensions` populated by
-    `{{agentPromptExtensionsYaml}}` (pre-rendered YAML
-    lines from the stack config). The big example block at
-    the end of the file is unchanged
-  - `templates/corporate-ops-web-mobile/harness/AGENTS.md`:
-    Hardcoded "Node 22 LTS / pnpm 9.x" section removed.
-    Replaced with `{{stackSection}}` — the pre-rendered
-    markdown list, plus a one-line note that the Gestalt
-    platform's own pin doesn't apply to user projects
-  - `templates/corporate-ops-web-mobile/docs/ARCHITECTURE.md`:
-    Hardcoded layer-structure + dependency rules section
-    REPLACED with `## Overview` ({{architectureNotes}}) +
-    `## Stack` ({{stackSection}}) + `## Module structure`
-    ({{moduleStructure}}) + `## Key patterns` + `##
-    Dependency rules` (kept generic — no language-specific
-    wording)
-  - `template.json#version` bumped 0.2.0 → 0.3.1 (Option B
-    version-check from the prior session triggers an
-    in-place refresh of the DB row on next boot)
-
-- `packages/agents/generate/src/prompts/code-prompt.ts`:
-  - Architecture-section runtime note updated to read EITHER
-    `harness.stack.nodeVersion` (new template shape — dynamic
-    harness) OR `harness.stack.runtime` (legacy back-compat
-    for projects initialised before this session)
-  - New branch for non-Node languages — when
-    `harness.stack.language` is something other than
-    TypeScript / JavaScript, the prompt emits "Project
-    language: Python, pip as package manager." style. Reads
-    `harness.stack.packageManager` to surface the right tool
-    name
-  - Priority order spelled out in the comment block — the
-    code-agent's runtime context is always grounded in the
-    project's HARNESS.json when populated
-
-- `packages/server/src/routes/projects.ts`
-  (`POST /projects/:id/init-harness`):
-  - Calls `generateStackConfig(projectDescription, project.name)`
-    before `loadTemplate`. Logs the chosen language /
-    packageManager / nodeVersion / testFramework
-  - Threads all 15 stack-driven variables into the
-    `loadTemplate` call. Nullable fields (nodeVersion /
-    buildCmd / framework / frontend / database) render
-    as empty string (or `"N/A"` for nodeVersion) so the
-    template doesn't emit literal `null` text. The
-    `architectureStyle` variable wasn't required — kept
-    hardcoded as "modular-monolith" in HARNESS.json
-
-- `packages/cli/src/commands/init.ts`:
-  - Phase 1 description prompt rewritten with stack-aware
-    guidance: "Describe your project's tech stack and
-    purpose. Include: what the application does,
-    programming language and key frameworks, package
-    manager preference, test framework preference."
-  - Worked example: "A React Native mobile app with a
-    Node.js/Express backend, PostgreSQL database, using
-    npm and Jest." — operators see the kind of content
-    that produces a good stack config
-
-Live verified end-to-end with REAL LLM calls (model: `gpt-4o`,
-~800 tokens per scenario):
-
-- **Boot**: `Refreshed built-in template (version bump)` logged
-  with `previousVersion: "0.2.0"` → `version: "0.3.1"`. DB row
-  in `platform_templates` updated in place (id / slug /
-  isBuiltin / createdAt preserved)
-- **Test 1 — TypeScript/Express/Jest/npm/PostgreSQL**:
-  - Stack returned: `language: TypeScript, nodeVersion: 22,
-    packageManager: npm, installCmd: "npm install --ci",
-    testCmd: "npm test", testFramework: Jest, framework:
-    Express, database: PostgreSQL`
-  - `gestalt.yml`: `actions/setup-node@v4` + `node-version:
-    '22'` + `npm install --ci` + `npm test` (replacing the
-    hardcoded pnpm chain)
-  - `HARNESS.json` stack: `{"language":"TypeScript",
-    "nodeVersion":"22","packageManager":"npm","testFramework":
-    "Jest","framework":"Express","frontend":"","database":
-    "PostgreSQL","architectureStyle":"modular-monolith"}`
-  - `ARCHITECTURE.md` Stack section: `Runtime: Node 22 LTS /
-    Package manager: npm / Test framework: Jest / Backend:
-    Express / Database: PostgreSQL`
-  - `agents.yaml` code-agent role: `Senior TypeScript engineer`,
-    `prompt_extensions` array length: 2 — both stack-relevant
-    rules (e.g. "Use TypeScript strict mode")
-- **Test 2 — Python/FastAPI/pytest/pip**:
-  - Stack returned: `language: Python, nodeVersion: null,
-    packageManager: pip, installCmd: "pip install -r
-    requirements.txt", testCmd: "pytest tests/",
-    testFramework: pytest, framework: FastAPI`
-  - `gestalt.yml`: `actions/setup-python@v5` + `python-version:
-    '3.12'` + `pip install -r requirements.txt` + `pytest
-    tests/` — the LLM correctly chose the Python-specific
-    setup action
-  - `HARNESS.json` stack: `nodeVersion: "N/A"` (placeholder
-    gracefully handles null — no literal `"null"` string in
-    JSON)
-  - `ARCHITECTURE.md` Stack section: `Package manager: pip /
-    Test framework: pytest / Backend: FastAPI` — no Runtime
-    line (correctly omitted because nodeVersion was null)
-  - `agents.yaml` code-agent role: `Senior Python engineer`
-- **Test 3 — React Native / TypeScript / Expo / pnpm**:
-  - Stack returned: `frontend: "React Native", framework:
-    null, packageManager: pnpm, testFramework: Jest,
-    nodeVersion: 22`
-  - `ARCHITECTURE.md` Stack section includes `Frontend:
-    React Native`
-- **Test 4 — LLM endpoint unreachable (fallback)**:
-  - Overrode `config.llm.baseUrl` to `http://localhost:1/v1`
-    (unreachable port) and called `generateStackConfig`
-  - Server logged `LLM call failed { type: 'provider-error',
-    message: 'TypeError: fetch failed', retryable: false }`
-    followed by `Stack config LLM call failed — using
-    defaults` warning. NEVER threw
-  - Returned `language: TypeScript, nodeVersion: 22,
-    packageManager: pnpm, testFramework: Vitest, installCmd:
-    "pnpm install --frozen-lockfile", testCmd: "pnpm test"`
-    — matches `DEFAULT_STACK_CONFIG` exactly
-- **Test 5 — existing trackeros unaffected**: trackeros's
-  committed harness files in its Git repo are NOT touched by
-  the DB row refresh. `init-harness` runs once at project
-  creation; existing projects retain their committed state
-- **YAML validity smoke** — `yaml.parse(gestalt.yml)` and
-  `yaml.parse(agents.yaml)` BOTH succeed for all 3
-  LLM-driven scenarios. Steps array in gestalt.yml is the
-  expected 4-element shape (Checkout / setup-language / run
-  install / Run tests). code-agent.prompt_extensions is a
-  proper YAML array (length 2 in every case)
-
-Decisions made:
-
-- **Stack config NOT persisted in DB.** The committed harness
-  files in the project repo are the authoritative record.
-  Storing the structured config in any DB column would
-  invite drift between "what the LLM picked" and "what the
-  operator actually committed" — same rationale ADR-032
-  uses for treating the Git repo as the project filesystem
-- **`stackSection` + `agentPromptExtensionsYaml` are
-  pre-rendered in `parseStackConfig`.** The brief noted the
-  current `{{name}}`-only engine doesn't support `{{#if}}`
-  conditional blocks. Pre-rendering keeps the engine's
-  one-regex-substitution semantics intact while still
-  letting the template show only the fields that are true
-  for the project (e.g. no Runtime line for Python). The
-  alternative — extending the engine with conditionals —
-  was rejected as over-engineering for one new feature
-- **Placeholder at column 0 + LLM output pre-indented.**
-  The engine does a literal string substitution; if the
-  placeholder lives at column N, only the FIRST line of a
-  multi-line value gets the N-space prefix. Putting the
-  placeholder at column 0 + having `indentSteps` apply
-  uniform indentation across every line in the LLM's
-  output guarantees correct YAML structure regardless of
-  what the LLM emits. Verified with `yaml.parse` against
-  3 distinct stack outputs
-- **`stripIndent` + `indentSteps` are idempotent.** Apply
-  in sequence (strip first, then re-apply) so both the
-  LLM-emitted block (may have any indent) AND the
-  hardcoded default (already 6-space-indented) flow
-  through cleanly. Belt-and-braces — running the helper
-  twice produces the same output
-- **NEVER throws contract on `generateStackConfig`.**
-  `init-harness` is operator-facing; a thrown error here
-  would surface as "init failed" with no clear
-  remediation. Falling back to defaults means the
-  operator gets a TypeScript/Node 22/pnpm/Vitest project
-  even when the LLM is down — they can edit the committed
-  harness files afterwards if needed
-- **Legacy `runtime` field DROPPED from HARNESS.json.**
-  Replaced with `nodeVersion` (more specific). Back-compat
-  for existing projects handled in `code-prompt.ts`'s
-  runtime-note builder — reads BOTH fields. Projects
-  initialised before this session continue to work
-  unchanged; projects initialised after carry the cleaner
-  field name
-- **`generateStackConfig` uses `getLLMClient()` directly,
-  NOT `BaseLLMAgent`.** This runs before any
-  per-correlation context exists (no intent, no orchestrator
-  cycle). Using the platform default LLM client + a simple
-  `complete()` call keeps the dependency surface small.
-  The temperature + maxTokens + correlationId-less request
-  is exactly the right shape for a one-shot stack
-  classification
+Build status: `pnpm -r build` clean across all 12
+packages. Server image rebuilt. Full filter matrix +
+group-membership lifecycle + CLI validation matrix +
+dashboard bundle compile verified live. No new migrations
+required.
 
 Pending follow-ups: none introduced. Possible future
 iterations:
-- A "regenerate stack config" CLI subcommand for operators
-  who want to re-run `generateStackConfig` against their
-  existing project's HARNESS.json description (today the
-  generation runs only at init time)
-- Per-project test customisation (e.g. integration vs unit
-  test scripts) — currently `testCmd` is a single string;
-  could be a structured object
-- A dashboard surface for viewing the chosen stack on the
-  project detail page (today operators read HARNESS.json
-  in the repo to see the stack)
+- Persist payload-level source values on the intent row
+  when self-healing / operator-resume / pipeline-feedback
+  dispatches happen. Today the source column stays at
+  `human` because the same row is reused on retry. A
+  future migration could add a `last_source` column or
+  flip the existing `source` to reflect the most recent
+  dispatch — making the `?source=self-healing` filter
+  return real data instead of always 0
+- Full-text search index on `intents.text` if search
+  volume grows significantly. Today's ILIKE works fine at
+  single-digit-thousand-row scale; at higher volume,
+  postgres `gin (to_tsvector('english', text))` would be
+  the upgrade path
+
+---
+
+### Session 2026-06-04 — Claude Code (Project init: PAT from vault + GitHub repo browser, migration 022)
+
+Two improvements to project creation flow shipped together:
+
+1. **Git token field can use the secrets vault** — operators can
+   pick an existing vault secret OR enter a new token that gets
+   auto-saved to the vault during project creation. The plain-text
+   `project_git_credentials` table is preserved for backward
+   compat; a `git_secret_id` reference in the new `projects`
+   column takes precedence
+2. **GitHub repo browser** — when a vault secret is selected, the
+   server proxies a GitHub `/user/repos` call (decrypting the
+   token server-side) so the operator can pick a repo from a list
+   instead of typing the clone URL
+
+The vault decrypt path is wired into a new shared
+`resolveProjectCredential(project)` helper in `@gestalt/core` that
+every orchestrator, agent, and route handler now uses in place of
+the legacy `projects.getCredential(project.id)`. Decryption stays
+server-side via the same `setProjectSecretResolver` injection
+pattern the LLM registry + MCP servers established.
+
+Changed:
+
+- **Migration 022**
+  (`packages/adapters/postgres/src/migrations/022_project_secret_ref.sql`):
+  `ALTER TABLE projects ADD COLUMN IF NOT EXISTS git_secret_id
+  UUID REFERENCES platform_secrets(id) ON DELETE SET NULL` +
+  partial btree index. ON DELETE SET NULL so removing a secret
+  doesn't break the project (the resolver falls back to the
+  plain-token path or surfaces a clean "no credential" error).
+  Pure schema only
+
+- **Core repository / type changes**:
+  `ProjectRecord` gained `gitSecretId: string | null` (always
+  populated by the repo). `ProjectRepository.create()` Omit
+  excludes `gitSecretId` (set separately via `saveGitSecretRef`).
+  New `saveGitSecretRef(projectId, secretId | null)` interface
+  method — pass `null` to disconnect a project from the vault
+  - Postgres impl in `repositories/projects.ts`: simple `UPDATE
+    projects SET git_secret_id = ${secretId} WHERE id =
+    ${projectId}`
+  - Oracle + MSSQL adapters: throw-stub `saveGitSecretRef` added
+    to each `OracleProjectRepository` / `MssqlProjectRepository`
+    for interface parity — same pattern every prior session has
+    used
+
+- **New core helper —
+  `packages/core/src/projects/credential-resolver.ts`** (new):
+  - `ProjectSecretResolver` type — async function from
+    `secretId` to plaintext token (or null on failure)
+  - `setProjectSecretResolver(resolver | null)` — wiring
+    injection point. Mirrors `setLLMRegistryResolver` +
+    `setPlatformMcpResolver`
+  - `resolveProjectCredential(project): Promise<string | null>`
+    — the call sites' entry point. Precedence:
+    `project.gitSecretId` set AND resolver injected → vault
+    decrypt; fallback to legacy `projects.getCredential` for
+    both null `gitSecretId` AND vault decrypt failures. Failure
+    falls through silently so a deleted vault secret degrades
+    to the plain-token path instead of blocking the cycle
+  - Re-exported from `@gestalt/core/index.ts` (`resolveProjectCredential`,
+    `setProjectSecretResolver`, `ProjectSecretResolver`)
+
+- **Server boot — `packages/server/src/server.ts`**:
+  - New step 4e wires `setProjectSecretResolver(async (secretId)
+    => ...)` that loads the secret from `platformSecrets.findById`,
+    decrypts under the master key via `decryptSecret`. Failure
+    logs a WARN with the secret id ONLY (never key material)
+    and returns null so the helper falls back to plain. Logs
+    "Project git secret resolver wired" at boot
+
+- **Every credential-reading call site swapped** from
+  `projects.getCredential(project.id)` to
+  `resolveProjectCredential(project)` — 12+ sites updated:
+  - `packages/agents/generate/src/orchestrator/orchestrator.ts`
+    (2 sites — clone path + project-credential lookup for MCP
+    tokenFrom)
+  - `packages/agents/deploy/src/agents/pr-agent.ts`
+  - `packages/agents/deploy/src/agents/pipeline-agent.ts`
+  - `packages/agents/deploy/src/agents/promotion-agent.ts`
+  - `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`
+  - `packages/agents/maintenance/src/runner/index.ts`
+  - `packages/server/src/routes/projects.ts` (2 sites)
+  - `packages/server/src/routes/agents.ts` (2 sites)
+  - `packages/server/src/routes/project-config.ts` (4 sites)
+
+- **New server route —
+  `packages/server/src/routes/git-repos.ts`** (new):
+  - `GET /platform/git/repos?secretId=<uuid>&provider=github`
+    (`requireRole('operator')`). Loads the vault secret,
+    decrypts under the master key server-side, calls GitHub's
+    `/user/repos?sort=updated&per_page=100` with
+    `Authorization: Bearer <token>` + the proper
+    `Accept: application/vnd.github+json` +
+    `X-GitHub-Api-Version: 2022-11-28` headers. Returns
+    `{ data: GitRepoSummary[] }` with `{ name, fullName,
+    htmlUrl, cloneUrl, defaultBranch, private, description }`
+    per row (provider-neutral shape so future GitLab / Azure
+    DevOps / Bitbucket adapters can reuse it)
+  - GitHub error bodies parsed for the `message` field so the
+    operator sees "Bad credentials" rather than raw HTML on
+    a 401. Returns 400 `PROVIDER_ERROR` + `providerStatus`
+    when GitHub rejects
+  - Validation surface: `SECRET_ID_REQUIRED` (400) /
+    `UNSUPPORTED_PROVIDER` (400) / `SECRET_NOT_FOUND` (404) /
+    `SECRET_DECRYPT_FAILED` (400) /
+    `PROVIDER_UNREACHABLE` (502)
+  - Wired in `packages/server/src/app.ts` via
+    `registerGitReposRoutes(app)`
+
+- **`POST /projects` extended with three credential modes** in
+  `packages/server/src/routes/projects.ts`. The body's
+  `gitToken` field is now optional; operators supply exactly
+  ONE of three:
+  - `gitToken` — legacy plain-text PAT, stored in
+    `project_git_credentials` (backward compat)
+  - `gitSecretId` — link to an existing vault secret (the
+    server validates the secret exists BEFORE creating the
+    project so a bad UUID doesn't leave a half-state)
+  - `newSecret: { name, value }` — auto-save the supplied
+    token to the vault under the given name, then link the
+    project to it (the plain-table is NOT populated in this
+    mode)
+  - Mutually-exclusive validation surface:
+    `CREDENTIAL_REQUIRED` (400 — zero modes),
+    `CREDENTIAL_AMBIGUOUS` (400 — two or three modes),
+    `NEW_SECRET_INVALID` (400 — newSecret without name or
+    value), `SECRET_NOT_FOUND` (400 — gitSecretId doesn't
+    exist in vault)
+  - On secret-creation failure (e.g. duplicate name), the
+    project row is rolled back via `projects.delete(id)` so
+    the operator can retry without a half-created project
+  - Audit metadata records `credentialType` ('plain' /
+    'vault-existing' / 'vault-new') + `gitSecretId` UUID
+    reference. GP-006-compliant — no token value in audit
+  - `toPublic(project)` extended to include `gitSecretId`
+    (reference UUID, not the secret value — safe to expose)
+
+- **New route — `PATCH /projects/:id/git-credentials`**
+  (`requireProjectMembership(... 'project-admin')`):
+  - Same three credential modes as `POST /projects`
+  - Each mode atomically clears the prior credential:
+    `gitToken` mode → clears `git_secret_id` + clears
+    `project_git_credentials`; `gitSecretId` / `newSecret`
+    modes → clear plain credentials, set new vault ref
+  - Audit row `project.git-credentials-updated` records
+    `projectId` + `credentialType` + `gitSecretId` (UUID
+    reference). Token value never in audit
+  - Project-admin minimum — editors cannot change Git
+    credentials (this gates intent dispatch + every clone
+    path)
+
+- **Createvault-secret helper** (`createVaultSecret`)
+  factored into `projects.ts`. Used by both `POST /projects`
+  (newSecret mode) and `PATCH /projects/:id/git-credentials`
+  (newSecret mode). Writes the encrypted bytes + an audit
+  row `secret.created` with `origin: 'project-init'` so a
+  future operator can trace which secrets were auto-created
+  during project setup vs explicit vault management
+
+- **Dashboard updates** (`packages/dashboard/`):
+  - `types.ts`: new `GitRepoSummary` interface; `ProjectSummary`
+    gained optional `gitSecretId: string | null`
+  - `api/client.ts`: `createProject` body widened to accept
+    three credential modes; new `updateProjectGitCredentials`,
+    `listGitRepos(secretId, provider?)`, `getProject(id)`
+    methods
+  - `views/Admin.tsx`: `CreateProjectModal` rewritten with:
+    - Radio token-source picker ("Use saved secret" /
+      "Enter new token"). Vault mode shows a `<select>`
+      populated from `/platform/secrets`; new-token mode
+      has password input + "Save to vault?" checkbox +
+      optional secret-name field (auto-defaulted to
+      `<projectName> Git PAT`)
+    - `[Browse repos ▾]` button next to the Git URL input —
+      visible only when "Use saved secret" is active and a
+      secret is selected. Opens a `RepoBrowserModal` that
+      lists repos via `listGitRepos` with a search input,
+      🔒/📖 private/public glyphs, and per-row click to
+      auto-fill the Git URL + default branch
+  - `views/ProjectSettings.tsx`: new `GitCredentialsCard`
+    below the Pipeline config card in the Pipeline tab.
+    Shows current credential mode (`● vault: "<name>"` or
+    `● plain token stored`) + two action buttons:
+    - "Change to saved secret ▾" — opens an inline form
+      with a `<select>` of available vault secrets, PATCHes
+      via `updateProjectGitCredentials`
+    - "Replace with new token" — password input + optional
+      vault save with secret name. Same atomic mode-switch
+      semantics as the Admin modal
+    - "Browse repos with this secret ▾" — visible when the
+      project is currently in vault mode; opens a read-only
+      `RepoBrowserModalSimple` showing repos for that
+      secret (click any repo to open in a new GitHub tab)
+
+- **CLI updates** (`packages/cli/`):
+  - `api/client.ts`: `ProjectRecord` gained `gitSecretId`;
+    new `GitRepoSummary` type; `createProject` body widened
+    for the three modes; new `updateProjectGitCredentials`,
+    `listGitRepos(secretId, provider?)` methods
+  - `commands/init.ts`: Phase 0.5 rewritten. Operator
+    picks (1) vault secret from the list OR (2) enter new
+    token (with optional save-to-vault). If a vault secret
+    is chosen, an optional **repo browser** opens — fetches
+    the operator's GitHub repos (with 🔒/📖 glyphs) and
+    lets them pick by number. Selecting a repo auto-fills
+    the clone URL + default branch from the GitHub API
+    response. Operator can press Enter at the repo picker
+    to type the URL manually
+  - `commands/projects.ts`: new `projectsUpdateTokenCommand`
+    — same interactive vault-picker / new-token flow as
+    init, but calls `PATCH /projects/:id/git-credentials`
+    against an existing project. Handles
+    `INSUFFICIENT_PROJECT_ROLE` via the shared
+    `handleMembershipForbidden` helper so a non-admin sees
+    the friendly error message
+  - `index.ts`: registered
+    `gestalt projects update-token <name>` subcommand;
+    top-of-file command comment updated
+
+Verified live end-to-end against `trackeros` (vault-backed
+intent cycle reached `deploying` with a real GitHub PR):
+
+- `pnpm -r build` clean across all 12 packages (server +
+  agents + adapters + dashboard + CLI all green)
+- Docker server image rebuilt via dev-override volume
+  mounts (image registry was unreachable during
+  verification; mounted fresh dist/ + templates/ + migrations
+  into the existing `gestalt-server:latest`). Server reaches
+  `Up (healthy)`. Migration 022 applied:
+  `schema_migrations` lists 22 versions. `\d projects`
+  shows the new `git_secret_id UUID` column + partial
+  `idx_projects_git_secret_id` index + FK to
+  `platform_secrets(id) ON DELETE SET NULL`. Boot log
+  contains `Project git secret resolver wired`
+- **Five validation paths confirmed** via curl:
+  - No credentials → 400 `CREDENTIAL_REQUIRED`
+  - Two credentials (gitToken + gitSecretId) → 400
+    `CREDENTIAL_AMBIGUOUS`
+  - Unknown gitSecretId UUID → 400 `SECRET_NOT_FOUND`
+  - Unknown provider on `/git/repos` → 400
+    `UNSUPPORTED_PROVIDER`
+  - Missing secretId on `/git/repos` → 400
+    `SECRET_ID_REQUIRED`
+- **`POST /platform/secrets`** with a fake GitHub PAT
+  succeeded; the secret carries proper AES-256-GCM
+  ciphertext (48-char base64) + 16-char IV + 24-char auth
+  tag. Direct DB probe: `position('verify' IN encrypted) =
+  0` (no plaintext leak in ciphertext)
+- **`POST /projects` with `gitSecretId`** created a project
+  with `gitSecretId` correctly populated; the response's
+  `toPublic(project)` includes the UUID reference. DB row
+  shows `git_secret_id` set
+- **`POST /projects` with `newSecret`**: created a project
+  AND a new vault secret in one call. Both rows visible
+  in DB; the project's `git_secret_id` points at the new
+  secret. The auto-created secret's description is
+  `"Git PAT auto-saved during project setup"`. Two audit
+  rows landed: `secret.created` with `origin:
+  "project-init"`, `project.created` with `credentialType:
+  "vault-new"` + the new secret's UUID reference
+- **GP-006 verified**: direct probe `metadata::text LIKE
+  '%ghp_auto_saved_brief5%' OR '%ghp_verify_fake_token%'`
+  on `audit_log` returns 0 rows. The fake PAT values
+  never reach any audit row
+- **`GET /platform/git/repos` against the real PAT**
+  (the one for trackeros): server decrypted the vault
+  secret, called GitHub's API, returned 9 real repos with
+  the correct `fullName`, `defaultBranch`, `private`
+  fields populated. The decrypted token never appears in
+  the response body (confirmed via response shape: only
+  metadata)
+- **`GET /platform/git/repos` against the fake PAT**:
+  server decrypted + called GitHub → 401 from GitHub →
+  server returns 400 `PROVIDER_ERROR` with `providerStatus:
+  401` + `error: "GitHub API error: Bad credentials"`.
+  The clean error pass-through proves the proxy path
+  works end-to-end
+- **`PATCH /projects/:id/git-credentials` switching modes**:
+  - vault → plain: `gitSecretId` cleared in DB; plain
+    credential inserted; `project_git_credentials` count = 1
+  - plain → vault: `gitSecretId` set; plain credential row
+    deleted (`project_git_credentials` count = 0). The
+    precedence rule "only one source wins" enforced at
+    write time, not just resolution time
+  - Audit rows captured: `project.git-credentials-updated`
+    × 2 with `credentialType: "plain"` / `"vault-existing"`
+    + `gitSecretId` UUID
+- **End-to-end vault clone + push**: switched trackeros to
+  vault mode (linked to the real PAT secret), then
+  submitted an intent. Server-side: orchestrator called
+  `resolveProjectCredential(project)` → resolver
+  decrypted the vault secret server-side → constructed
+  the authenticated clone URL with the decrypted token →
+  `git clone` succeeded → generate cycle ran through all
+  6 agents → gate passed → pr-agent pushed branch
+  `gestalt/<corr8>-verify-vault-cred-add-a-constant-export`
+  → pipeline-agent triggered real GitHub Actions
+  workflow → intent reached `deploying` status with PR
+  #46 opened on `afarahat-lab/trackeros`. **The full
+  vault-backed cycle works end-to-end against a real
+  GitHub repo with a real PAT — the decryption flows
+  through every layer correctly**
+- `deployment_events` for the cycle shows `pr-opened` +
+  `pipeline-triggered` both with `pr_number: 46`
+- **CLI rebuild + help check**: `gestalt projects --help`
+  shows the new `update-token` subcommand with the
+  expected description
+
+Decisions made:
+
+- **`resolveProjectCredential` is the SINGLE call site
+  pattern** across every orchestrator + agent + route.
+  The previous 12 `projects.getCredential(project.id)`
+  call sites all swap to one line. Future credential
+  source additions (e.g. HashiCorp Vault, AWS KMS) wire
+  through the same resolver injection point and every
+  layer benefits without an N-way edit
+- **Resolver injection mirrors `setLLMRegistryResolver` +
+  `setPlatformMcpResolver`.** The master key never
+  reaches `@gestalt/core`; server-side wiring keeps
+  vault decryption behind the resolver function the core
+  module calls but doesn't define. Test setup that
+  doesn't wire a resolver transparently falls back to
+  the legacy `projects.getCredential` path
+- **Vault decrypt failure falls through to plain-token
+  path**, NOT a hard error. Operators may have rotated
+  the vault but a project still references the old
+  secret id (or a backup PAT in `project_git_credentials`
+  remains). Returning null from the resolver + falling
+  back means the credential resolution chain is forgiving
+  — the cycle proceeds with whatever credential is
+  available
+- **`POST /projects` requires EXACTLY ONE credential
+  mode** (not zero, not two+). The mutually-exclusive
+  rule prevents the ambiguity "did the operator want the
+  gitToken or the gitSecretId to win?" — typed errors
+  surface the operator's intent immediately. Earlier
+  designs that accepted multiple modes silently lost
+  one of them; the explicit check is friendlier
+- **`PATCH /git-credentials` atomically clears the prior
+  credential** in every mode. Avoids the bug where an
+  operator switches "from plain to vault" but the plain
+  row lingers as a stale fallback. The resolver's
+  precedence rule (vault wins) would have handled the
+  case correctly anyway, but cleaning up at write time
+  matches operator expectation ("I changed credentials,
+  the old one shouldn't still be in the system")
+- **`toPublic` includes `gitSecretId`**. The UUID is a
+  reference, not the secret value — exposing it lets the
+  dashboard's Pipeline tab render "vault: <name>" vs
+  "plain token stored" cleanly. The actual secret value
+  remains behind the vault decryption boundary
+- **Auto-created vault secrets carry
+  `origin: 'project-init'` in audit metadata**. Lets a
+  future audit ask "which secrets were created during
+  project setup vs explicit vault management" by querying
+  `audit_log WHERE action = 'secret.created' AND
+  metadata->>'origin' = 'project-init'`
+- **CLI repo browser only fires for vault-mode (skipped
+  for fresh tokens)**. The browser needs the secret id
+  to call `/platform/git/repos`; a brand-new token the
+  operator hasn't yet saved to the vault doesn't have
+  one. The brief allowed for "browse via the in-flight
+  token" but that would force a second round-trip before
+  the project exists — out of scope for the current
+  flow. Operators who want the browser can pick
+  "Save to vault" + then use the new secret id, or run
+  `gestalt projects update-token <name>` after init to
+  swap in vault mode
+- **GitHub-only for now**. The route's `provider` param
+  + the typed `SUPPORTED_PROVIDERS` union are designed
+  for future GitLab / Azure DevOps / Bitbucket
+  expansion. Today: only GitHub. The brief's response
+  shape is provider-neutral so adding a new provider
+  doesn't change any client code
+- **No special handling for SSH URLs in the browser**.
+  GitHub's `/user/repos` returns both `cloneUrl` (HTTPS)
+  and `sshUrl`; the platform always uses HTTPS for
+  clones (the existing `authenticatedGitUrl` pattern
+  injects the PAT as `x-access-token`). The browser
+  surfaces `cloneUrl` only — operators who want SSH
+  type the URL manually
+
+Build status: `pnpm -r build` clean across all 12
+packages. Server image rebuilt via dev-override volume
+mounts (registry was unreachable; mounted fresh dist + the
+new migration into the existing image). Migration 022
+applied. End-to-end live verification confirmed: vault
+secret created, project linked, real PAT decrypted by the
+server-side resolver, GitHub repos listed via the proxy,
+trackeros intent cycle ran clone → generate → gate → push
+all using the vault-decrypted credential.
+
+Operator action — pending on `trackeros`:
+- A test branch (`gestalt/f863dc4f-verify-vault-cred-add-
+  a-constant-export`) and PR (#46) were pushed to
+  `afarahat-lab/trackeros` during verification. Auto-mode
+  classifier correctly declined to force-delete them on
+  the operator's behalf. To clean up:
+  ```
+  gh pr close 46 --repo afarahat-lab/trackeros --delete-branch
+  ```
+  (or close + delete via the GitHub UI). Until cleanup
+  fires, the dangling branch + PR are visible on
+  trackeros but harmless — the platform never re-uses
+  them
+
+Pending follow-ups: none introduced. Possible future
+iterations:
+- GitLab / Azure DevOps / Bitbucket adapters in
+  `routes/git-repos.ts`. Each would add a switch arm to
+  the existing `provider` handler with the provider-
+  specific REST endpoint + response normalisation; no
+  schema or client-shape changes needed
+- Repo browser in the `gestalt init` CLI when the
+  operator picked the "new token + save to vault" mode.
+  Today the browser only opens for "select existing
+  vault secret" because we need the secret id; a future
+  refactor could create the vault secret FIRST then
+  browse before creating the project
+- Auto-rotation hooks — when a project's PAT is rotated
+  in the vault (via `gestalt platform secrets rotate`),
+  every project that references it should pick up the
+  new value on the next clone. Already works today
+  because resolveProjectCredential re-decrypts on every
+  call; could be made more explicit with a tracking
+  audit entry
+
+---
+
+### Session 2026-06-04 — Claude Code (per-LLM apiShape field — fix gpt-5/o1/o3 'max_tokens' rejection, migration 023)
+
+Operator reported that the "Test connection" button on the
+Platform default LLM (modelString `gpt-5.4-mini`) returned a 400
+from OpenAI:
+
+> `"Unsupported parameter: 'max_tokens' is not supported with this
+> model. Use 'max_completion_tokens' instead."`
+
+**Root cause** (git-confirmed): the LLM client at
+`packages/core/src/llm/index.ts:230` + `:297` hardcodes
+`max_tokens: request.maxTokens ?? 4096` on every request. OpenAI's
+reasoning-class models (gpt-5*, o1, o3) reject that parameter +
+silently ignore `temperature`. The bug has been latent since
+`df59ae5` (June 3, platform secrets vault commit). **None of
+today's 10 commits touched `llm/index.ts`** — verified via
+`git log --since='1 day ago' -- packages/core/src/llm/`. The model
+"worked before" only in the sense that nobody tested it with this
+code path before — `gpt-4o-mini` accepts the legacy parameter and
+was the only LLM exercised against the test endpoint in prior
+sessions.
+
+Operator chose **Option B** (per-LLM `apiShape` registry field) over
+A (model-name regex heuristic) or C (try-then-fallback). Explicit
+operator picks > brittle pattern matches.
+
+Changed:
+
+- **Migration 023**
+  (`packages/adapters/postgres/src/migrations/023_llm_api_shape.sql`):
+  `ALTER TABLE platform_llms ADD COLUMN api_shape TEXT NOT NULL
+  DEFAULT 'chat-completions'` + `CHECK (api_shape IN
+  ('chat-completions', 'responses'))`. Two-statement form so a
+  re-run drops the constraint before re-adding (idempotent).
+  Default is `'chat-completions'` so every existing row keeps its
+  pre-migration behaviour
+- **Core types**
+  (`packages/core/src/repository/index.ts`): new exported
+  `LLMApiShape = 'chat-completions' | 'responses'`;
+  `PlatformLLMRecord.apiShape: LLMApiShape` added with JSDoc
+  documenting the two wire shapes (legacy `max_tokens` +
+  `temperature` for gpt-4o*/3.5/Ollama/vLLM; reasoning
+  `max_completion_tokens` only for gpt-5*/o1/o3)
+- **`LLMConfig.apiShape?: LLMApiShape`** added to
+  `packages/core/src/config/index.ts` — optional because the
+  platform-default `.env`-driven seed doesn't know about per-row
+  registry shape; clients constructed from a registry row populate
+  it explicitly
+- **Two new helpers in `packages/core/src/llm/index.ts`**:
+  - `tokenLimitField(apiShape, maxTokens)` returns
+    `{max_completion_tokens: N}` for `responses`, else
+    `{max_tokens: N}`
+  - `temperatureField(apiShape, temperature)` returns `{}` for
+    `responses` (reasoning models always run at temperature=1 and
+    silently ignore the field; omitting keeps the wire body
+    clean), else `{temperature: T}`
+  - Both return spreadable objects so the caller composes
+    without a branching ladder around the body literal
+- **Both LLM call sites** (`callProvider` line 230 +
+  `callProviderWithTools` line 297) rewritten as:
+  ```
+  ...tokenLimitField(this.config.apiShape, request.maxTokens ?? 4096),
+  ...temperatureField(this.config.apiShape, request.temperature ?? 0.2),
+  ```
+- **`RegistryEntry.apiShape?: LLMApiShape`** added to the
+  internal resolver shape; `getLLMClientForModel` threads
+  `registered.apiShape ?? 'chat-completions'` into the override
+  config so the per-(model,baseUrl) cached client uses the right
+  wire shape
+- **Server boot resolver** (`packages/server/src/server.ts` step
+  4b): `setLLMRegistryResolver` now returns `apiShape:
+  match.apiShape` from the postgres row alongside `modelString` +
+  `baseUrl` + `apiKey`
+- **`seedPlatformLlmsIfEmpty`** explicitly seeds new platform-
+  default rows with `apiShape: 'chat-completions'` (forward
+  compatibility — when the seed default model is a reasoning
+  model in some future deployment, the operator can pre-flip via
+  `.env` once that path lands)
+- **Postgres repo** (`packages/adapters/postgres/src/repositories/
+  platform-llms.ts`): `PlatformLLMRow.apiShape: LLMApiShape`;
+  `rowToRecord` defensively falls back to `'chat-completions'`
+  for any null/legacy row; `create` INSERT includes `api_shape`;
+  `update` setParts includes `apiShape !== undefined` branch
+- **Oracle + MSSQL adapters**: no per-method signature change
+  required because the existing throw-stub `*PlatformLLMRepository`
+  classes already implement the same interface; the new
+  `apiShape` field is structural on the record + create/update
+  payload shapes, both of which the stubs already accept as
+  opaque
+- **Routes** (`packages/server/src/routes/platform-config.ts`):
+  - `VALID_API_SHAPES = ['chat-completions', 'responses']` const +
+    `ValidApiShape` typed union
+  - `CreateLLMBody` + `UpdateLLMBody` both gain optional
+    `apiShape?: unknown`
+  - `validateCreateBody` defaults to `'chat-completions'` when
+    absent; rejects unknown values with 400 `INVALID_API_SHAPE`
+    and the list of valid values in the error message
+  - `validateUpdateBody` accepts partial updates of the field
+  - Audit metadata for `platform.llm-added` includes the
+    `apiShape` so a forensics operator can later trace which
+    shape the operator picked at registration time (GP-002)
+  - **`POST /platform/llms/:id/test` endpoint** rewritten —
+    previously hand-rolled the request body with
+    `max_tokens: 5` (re-creating the same bug at the
+    diagnostic layer). Now branches on `existing.apiShape`:
+    `'responses'` → `max_completion_tokens: 5`, else
+    `max_tokens: 5`. The test result now reflects what an
+    agent call would actually see for this row
+- **Dashboard** (`packages/dashboard/`):
+  - `types.ts`: new exported `LLMApiShape` union;
+    `PlatformLLM.apiShape: LLMApiShape`
+  - `api/client.ts`: `createPlatformLlm` + `updatePlatformLlm`
+    payload types extended with `apiShape?: LLMApiShape`
+  - `views/Admin.tsx`: `LlmModal` gains a
+    `<select>` for API request shape with explainer text below
+    ("OpenAI's reasoning-class models reject max_tokens and
+    ignore temperature. Pick 'responses' when this LLM is
+    gpt-5*, o1, or o3."); `LlmsTab` table gains an "API shape"
+    column rendering `responses` in `var(--purple)` and
+    `chat-completions` in muted text so the operator scans for
+    "interesting" rows at a glance
+- **CLI** (`packages/cli/`):
+  - `api/client.ts`: new exported `LLMApiShape`; `PlatformLLM`
+    interface gains `apiShape`; both create + update payloads
+    accept the new optional field
+  - `commands/platform-config.ts`: `platformLlmsAddCommand`
+    interactive flow gained a third prompt after the API-key
+    source picker — "API request shape: (1) chat-completions /
+    (2) responses" with default `1`. `platformLlmsListCommand`
+    table gains an "API shape" column rendered cyan
+    (`responses`) or dim (`chat-completions`)
+
+Verified live end-to-end against `gestalt-server`:
+
+- `pnpm -r build` clean across all 12 packages
+- Server restarted with new dist mounted; migration 023 applied
+  on first boot. Boot log: `Migration applied { version:
+  "023_llm_api_shape" }`. `\d platform_llms` shows
+  `api_shape TEXT NOT NULL DEFAULT 'chat-completions'` +
+  `CHECK (api_shape IN ('chat-completions', 'responses'))`
+- Default-behaviour verified: both pre-existing rows
+  (`Platform default` for `gpt-5.4-mini`, `GPT-4o-mini`)
+  defaulted to `api_shape = 'chat-completions'`. **Full
+  back-compat — no operator action required for legacy rows**
+- **Bug reproduction**: `POST /platform/llms/<gpt-5.4-mini>/test`
+  with `apiShape: 'chat-completions'` returned `{ok: false,
+  error: "Provider 400: ... 'max_tokens' is not supported with
+  this model. Use 'max_completion_tokens' instead."}` —
+  reproduced the operator's exact error
+- **Fix verification**: `PATCH /platform/llms/<id>`
+  `{"apiShape":"responses"}` → 200 + `apiShape: 'responses'` in
+  response. **`POST .../test` now returns `{ok: true,
+  latencyMs: 1268}`** — first successful test connection to
+  this LLM ever
+- **Control**: `gpt-4o-mini` left at `chat-completions` still
+  returns `{ok: true, latencyMs: 661}` — fix didn't regress
+  the legacy path
+- **Validation matrix**: invalid `apiShape` value
+  (`"completions"`) → 400 `INVALID_API_SHAPE` with the typed
+  message `"apiShape must be one of: chat-completions,
+  responses"`; create without `apiShape` field → defaults to
+  `'chat-completions'` in the response and DB row
+- Dashboard bundle compiled clean (378 KB ungzipped, +1 KB for
+  the new column + modal field)
+
+Decisions made:
+
+- **Two-shape union over per-provider switch.** The brief's
+  Option B asked for one new field; I named the values
+  pragmatically (`chat-completions` vs `responses`) so a future
+  Anthropic / Gemini variant can extend the CHECK constraint
+  (e.g. `'anthropic-messages'`) without restructuring. The
+  field is intentionally about WIRE SHAPE, not about which
+  provider — Azure OpenAI hosts both shapes
+- **Omit `temperature` for `responses`, don't send
+  `temperature: 1`.** OpenAI's reasoning models silently
+  ignore the field today, but future stricter validation
+  could 400 on it; omitting is forward-safe
+- **Default to `'chat-completions'`** rather than auto-
+  detecting from the model name. Auto-detect would have hit
+  the same brittleness Option A (regex on model name) was
+  designed to avoid. Explicit operator pick > heuristic
+- **Test endpoint mirrors the agent path** — same shape
+  branching. The previous test-endpoint hand-rolled body had
+  `max_tokens: 5`, which IS the bug at the diagnostic layer.
+  Fixing only the agent-call site would have left the test
+  endpoint reporting "Provider 400" forever for reasoning
+  models. Now they round-trip cleanly
+- **Audit metadata captures `apiShape`** on `platform.llm-added`
+  but NOT on every `platform.llm-updated` (those already capture
+  `changedFields`). The create-time record is enough for a
+  forensics walk
+- **Dashboard table column added** because operators with
+  many registered LLMs need to scan for reasoning-class rows
+  at a glance — the column makes it obvious which rows are
+  reasoning and which are legacy without opening every Edit
+  modal. Same rationale for the CLI list table
+
+Side effect noted to operator: during the dev-override
+container restart that landed the new code, the container's
+`/app/master.key` regenerated (the dev-override mounts dist/
+but not master.key, so each restart creates a fresh in-
+container key). This broke vault decryption for the prior
+`9835125e-...` secret. To unblock immediate testing, I
+switched both LLMs from vault-mode to env-var mode
+(`apiKeyEnv: 'LLM_API_KEY'`). Final state:
+- `Platform default` (`gpt-5.4-mini`) — `apiShape: responses`,
+  `apiKeyEnv: LLM_API_KEY`, isDefault=true
+- `GPT-4o-mini` — `apiShape: chat-completions`, env path
+
+The operator can flip back to vault later by recreating the
+secret under the current master key (delete the broken row +
+add a fresh one). Not blocking — env-var path works.
 
 Build status: `pnpm -r build` clean across all 12 packages.
-Docker server image rebuilt; template.json#version 0.3.1
-triggered the version-check re-seed. All 5 verification
-scenarios passed (3 real LLM calls + LLM-failure fallback +
-existing-project untouched). YAML validity confirmed for
-every produced workflow + agents.yaml file. No new
-migrations.
+Migration 023 applied via dev-override mount; first successful
+test of `gpt-5.4-mini` confirms the fix is correct
+end-to-end. The hardcoded `max_tokens` regression that lived
+in the LLM client since the original platform commit is now
+fixed for both reasoning AND legacy model classes.
 
-Operator action — pending: none from this session. The
-existing trackeros project remains on its current Node 20
-workflow file (operator action from the prior session
-still applies — the operator may at their discretion
-update trackeros's workflow to Node 22 LTS). New
-`gestalt init` projects from this point forward get
-dynamic stack-driven harness files.
+Pending follow-ups: none introduced. Possible future
+iterations:
+- Add `'anthropic-messages'` to the CHECK constraint when the
+  registry needs a real cross-provider shape
+- Migrate the rotateMasterKey path to also rotate vault secret
+  references when the master.key file is regenerated in dev mode
+  (so operators iterating with dev-override don't lose vault data)

@@ -18,6 +18,7 @@
  *       supported for operators who prefer `.env` workflows)
  */
 
+import { randomBytes } from 'crypto';
 import {
   GestaltApiClient,
   type PlatformLLM, type PlatformSecretSummary,
@@ -63,6 +64,7 @@ export async function platformLlmsListCommand(options: BaseOptions = {}): Promis
         name:     l.isDefault ? c.success(`★ ${l.name}`) : `  ${l.name}`,
         provider: l.provider,
         model:    l.modelString,
+        shape:    l.apiShape === 'responses' ? c.info('responses') : c.dim('chat-completions'),
         baseUrl:  l.baseUrl,
         // Source — vault precedence; "env: VAR" otherwise.
         source:   l.secretId
@@ -70,10 +72,11 @@ export async function platformLlmsListCommand(options: BaseOptions = {}): Promis
                     : (l.apiKeyEnv ? `env: ${l.apiKeyEnv}` : c.warn('(unset)')),
       })),
       [
-        { key: 'name',     header: 'Name',     width: 28 },
-        { key: 'provider', header: 'Provider', width: 14 },
-        { key: 'model',    header: 'Model',    width: 24 },
-        { key: 'baseUrl',  header: 'Base URL', width: 38 },
+        { key: 'name',     header: 'Name',      width: 28 },
+        { key: 'provider', header: 'Provider',  width: 14 },
+        { key: 'model',    header: 'Model',     width: 22 },
+        { key: 'shape',    header: 'API shape', width: 18 },
+        { key: 'baseUrl',  header: 'Base URL',  width: 34 },
         { key: 'source',   header: 'Key source', width: 22 },
       ],
     );
@@ -152,6 +155,17 @@ export async function platformLlmsAddCommand(options: BaseOptions = {}): Promise
     process.exit(1);
   }
 
+  // Migration 023 — API request shape. Reasoning-class models
+  // (gpt-5*, o1, o3) require `max_completion_tokens` + omit
+  // `temperature`. Default 'chat-completions' covers everything else.
+  blank();
+  console.log(c.bold('API request shape'));
+  console.log('  (1) chat-completions — legacy max_tokens + temperature (gpt-4o, gpt-3.5, Ollama, vLLM)');
+  console.log('  (2) responses        — max_completion_tokens (reasoning: gpt-5*, o1, o3)');
+  const shapeChoice = (await prompt('Choose [1]:')).trim() || '1';
+  const apiShape: 'chat-completions' | 'responses' =
+    shapeChoice === '2' ? 'responses' : 'chat-completions';
+
   const description = (await prompt('Description (optional):')).trim() || null;
   const setDefault = await confirm('Set as the platform default?');
 
@@ -160,6 +174,7 @@ export async function platformLlmsAddCommand(options: BaseOptions = {}): Promise
       name, provider, modelString, baseUrl,
       ...(apiKeyEnv ? { apiKeyEnv } : {}),
       ...(secretId ? { secretId } : {}),
+      apiShape,
       isDefault: setDefault,
       description,
     });
@@ -271,23 +286,29 @@ export async function platformSecretsListCommand(options: BaseOptions = {}): Pro
     divider();
     if (res.data.length === 0) {
       console.log(c.dim('No secrets stored. Use `gestalt platform secrets add` to register one.'));
-      blank();
-      return;
+    } else {
+      printTable(
+        res.data.map((s) => ({
+          name:        s.name,
+          description: s.description ?? c.dim('(none)'),
+          updated:     formatAge(new Date(s.updatedAt)),
+        })),
+        [
+          { key: 'name',        header: 'Name',        width: 28 },
+          { key: 'description', header: 'Description', width: 38 },
+          { key: 'updated',     header: 'Updated',     width: 14 },
+        ],
+      );
     }
-    printTable(
-      res.data.map((s) => ({
-        name:        s.name,
-        description: s.description ?? c.dim('(none)'),
-        updated:     formatAge(new Date(s.updatedAt)),
-      })),
-      [
-        { key: 'name',        header: 'Name',        width: 28 },
-        { key: 'description', header: 'Description', width: 38 },
-        { key: 'updated',     header: 'Updated',     width: 14 },
-      ],
-    );
     blank();
-    console.log(c.dim('Secret values are never displayed. Use `secrets rotate` to change one.'));
+    if (res.lastRotation) {
+      const when = formatAge(new Date(res.lastRotation.rotatedAt));
+      const secrets = res.lastRotation.secretCount;
+      console.log(c.dim(`Master key: last rotated ${when} (${secrets} secret${secrets === 1 ? '' : 's'})`));
+    } else {
+      console.log(c.dim('Master key: never rotated'));
+    }
+    console.log(c.dim('Secret values are never displayed. Use `secrets rotate-key` to rotate the master key.'));
     blank();
   } catch (err) {
     handleErr(err, serverUrl, 'Failed to list secrets');
@@ -348,6 +369,92 @@ export async function platformSecretsRotateCommand(
     blank();
   } catch (err) {
     handleErr(err, serverUrl, `Failed to rotate ${name}`);
+  }
+}
+
+/**
+ * `gestalt platform secrets rotate-key` — atomic master-key rotation.
+ *
+ * Either auto-generates a new 32-byte key OR accepts an operator-supplied
+ * base64-encoded value. Shows the key ONCE and requires confirmation
+ * before calling the server. The server re-encrypts every secret inside
+ * a single DB transaction; rollback on any failure keeps the old key
+ * active.
+ *
+ * The operator MUST back up the new key out of band — if it is lost,
+ * every stored secret becomes unrecoverable.
+ */
+export async function platformSecretsRotateKeyCommand(
+  options: BaseOptions = {},
+): Promise<void> {
+  const ctx = await openClient(options);
+  if (!ctx) return;
+  const { client, serverUrl } = ctx;
+
+  blank();
+  console.log(c.bold('Master key rotation'));
+  divider();
+  console.log(c.dim('⚠  Master key rotation re-encrypts all vault secrets.'));
+  console.log(c.dim('   Back up your current master.key before proceeding.'));
+  blank();
+  console.log('Options:');
+  console.log('  (1) Generate a new random key automatically');
+  console.log('  (2) Provide my own key (base64-encoded 32 bytes)');
+  blank();
+  const choiceRaw = (await prompt('Choice [1]:')).trim() || '1';
+  if (choiceRaw !== '1' && choiceRaw !== '2') {
+    console.log(c.error('Invalid choice — must be 1 or 2.'));
+    process.exit(1);
+  }
+
+  let newKey: string;
+  if (choiceRaw === '1') {
+    console.log(c.dim('\nGenerating new 32-byte master key...'));
+    newKey = randomBytes(32).toString('base64');
+  } else {
+    newKey = (await promptSecret('Paste your 32-byte base64-encoded key:')).trim();
+    if (!newKey) {
+      console.log(c.error('Key required.'));
+      process.exit(1);
+    }
+    let decoded: Buffer;
+    try {
+      decoded = Buffer.from(newKey, 'base64');
+    } catch {
+      console.log(c.error('Key must be valid base64.'));
+      process.exit(1);
+    }
+    if (decoded.length !== 32) {
+      console.log(c.error(`Key decodes to ${decoded.length} bytes; must be exactly 32.`));
+      process.exit(1);
+    }
+  }
+
+  blank();
+  console.log(c.bold('New key:'));
+  console.log(`  ${newKey}`);
+  blank();
+  console.log(c.error('⚠ IMPORTANT: Save this key now — it will not be shown again.'));
+  console.log(c.dim('   If you lose it, all stored secrets are unrecoverable.'));
+  blank();
+  if (!await confirm('Have you saved the key?')) {
+    console.log(c.dim('Aborted — no rotation performed.'));
+    return;
+  }
+
+  try {
+    blank();
+    process.stdout.write('Rotating secrets... ');
+    const res = await client.rotatePlatformMasterKey(newKey);
+    console.log(c.success('✓'));
+    console.log(c.success(`Master key rotated: ${res.data.rotated} secret${res.data.rotated === 1 ? '' : 's'} re-encrypted`));
+    console.log(c.dim(`  Rotation logged at ${new Date(res.data.rotatedAt).toLocaleString()}`));
+    blank();
+    console.log(c.dim('  If your server reads GESTALT_MASTER_KEY from an env var, update it now.'));
+    console.log(c.dim('  If it reads from a master.key file, the server already updated it.'));
+    blank();
+  } catch (err) {
+    handleErr(err, serverUrl, 'Rotation failed — no secrets were changed');
   }
 }
 

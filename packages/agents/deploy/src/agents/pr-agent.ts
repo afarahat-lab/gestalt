@@ -20,6 +20,7 @@ import { tmpdir } from 'os';
 import { simpleGit, type SimpleGit } from 'simple-git';
 import {
   getRepositories, createContextLogger, emitLiveEvent,
+  resolveProjectCredential,
 } from '@gestalt/core';
 import { resolvePipelineAdapter } from '../adapters/resolver';
 import { authenticatedGitUrl, branchNameFor } from './util';
@@ -89,7 +90,7 @@ export async function runPRAgent(input: PRAgentInput): Promise<PRAgentResult> {
   if (!project) {
     throw new Error(`Project ${input.projectId} not found`);
   }
-  const token = await projects.getCredential(project.id);
+  const token = await resolveProjectCredential(project);
   if (!token) {
     throw new Error(`Project ${project.name} has no Git credential on file`);
   }

@@ -8,6 +8,7 @@
 
 import type {
   IntentRepository, IntentRecord, IntentStatus, ResumeContext,
+  IntentListFilters,
 } from '@gestalt/core';
 
 const notImplemented = (): never => {
@@ -23,17 +24,9 @@ export class OracleIntentRepository implements IntentRepository {
   async findByCorrelationId(_correlationId: string): Promise<IntentRecord | null> { return notImplemented(); }
   async updateStatus(_id: string, _status: IntentStatus): Promise<IntentRecord> { return notImplemented(); }
   async saveClarification(_id: string, _clarification: string): Promise<IntentRecord> { return notImplemented(); }
-  async list(_params: {
-    projectId: string;
-    status?: IntentStatus;
-    limit: number;
-    offset: number;
-  }): Promise<{ records: IntentRecord[]; total: number }> { return notImplemented(); }
-  async listAll(_params: {
-    status?: IntentStatus;
-    limit: number;
-    offset: number;
-  }): Promise<{ records: IntentRecord[]; total: number }> { return notImplemented(); }
+  async list(_params: IntentListFilters & { projectId: string }): Promise<{ records: IntentRecord[]; total: number }> { return notImplemented(); }
+  async listAll(_params: IntentListFilters): Promise<{ records: IntentRecord[]; total: number }> { return notImplemented(); }
+  async listForProjects(_projectIds: string[], _filters: IntentListFilters): Promise<{ records: IntentRecord[]; total: number }> { return notImplemented(); }
   async countByProject(_projectId: string): Promise<number> { return notImplemented(); }
   async countActiveByProject(_projectId: string): Promise<number> { return notImplemented(); }
   async findLatestByProject(_projectId: string): Promise<IntentRecord | null> { return notImplemented(); }

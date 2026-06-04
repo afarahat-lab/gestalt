@@ -4,9 +4,12 @@
  * One row per project in `projects`; one row per project in
  * `project_git_credentials`, related by FK with ON DELETE CASCADE.
  *
- * The token is stored as plain text for the bootstrap phase.
- * TODO: encrypt at rest before production use — wrap with libsodium or
- * pgcrypto's `pgp_sym_encrypt` once a key-management story is decided.
+ * Projects may also reference a vault secret via `git_secret_id`
+ * (migration 022). When present, the vault secret takes precedence
+ * over the plain `project_git_credentials.token` — see
+ * `resolveProjectCredential` in `BaseOrchestrator`. The plain-token
+ * path is preserved for backward compatibility with projects
+ * registered before vault support shipped.
  */
 
 import type { ProjectRepository, ProjectRecord } from '@gestalt/core';
@@ -21,7 +24,7 @@ export class PostgresProjectRepository implements ProjectRepository {
   }
 
   async create(
-    project: Omit<ProjectRecord, 'id' | 'createdAt'>,
+    project: Omit<ProjectRecord, 'id' | 'createdAt' | 'gitSecretId'>,
   ): Promise<ProjectRecord> {
     const db = getDb();
     const [row] = await db<ProjectRecord[]>`
@@ -109,5 +112,17 @@ export class PostgresProjectRepository implements ProjectRepository {
       SELECT COUNT(*)::text AS count FROM deleted
     `;
     return parseInt(count, 10);
+  }
+
+  async saveGitSecretRef(
+    projectId: string,
+    secretId: string | null,
+  ): Promise<void> {
+    const db = getDb();
+    await db`
+      UPDATE projects
+      SET git_secret_id = ${secretId}
+      WHERE id = ${projectId}
+    `;
   }
 }

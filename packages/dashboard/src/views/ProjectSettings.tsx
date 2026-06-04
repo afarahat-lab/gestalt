@@ -34,6 +34,7 @@ import type {
   ProjectConfigResponse, EditableAgentConfig, ProjectConfigCustomAgent,
   ProjectMember, UserSummary, ProjectRole, PlatformLLM,
   PlatformGroup, ProjectGroupAssignment,
+  ProjectSummary, PlatformSecret, GitRepoSummary,
 } from '../types';
 import { ApiError } from '../api/client';
 
@@ -955,48 +956,359 @@ function PipelineTab(props: AgentsTabProps) {
   }
 
   return (
+    <>
+      <Card>
+        <div style={styles.cardBody}>
+          <div style={styles.cardHeader}>
+            <h3 style={styles.cardTitle}>Pipeline configuration</h3>
+            <button style={styles.primaryBtn} onClick={() => void handleSave()} disabled={saving}>
+              {saving ? 'Saving...' : 'Save changes'}
+            </button>
+          </div>
+          {success && <div style={styles.successBanner}>{success}</div>}
+          {error && <div style={styles.errorBanner}>{error}</div>}
+          <FieldRow label="CI/CD adapter">
+            <label style={styles.radioLabel}>
+              <input type="radio" name="adapter" value="noop" checked={adapter === 'noop'} onChange={() => setAdapter('noop')} />
+              noop (fallback — no real CI)
+            </label>
+            <label style={styles.radioLabel}>
+              <input type="radio" name="adapter" value="github-actions" checked={adapter === 'github-actions'} onChange={() => setAdapter('github-actions')} />
+              github-actions
+            </label>
+          </FieldRow>
+          <FieldRow label="Auto-merge">
+            <label style={styles.checkboxLabel}>
+              <input type="checkbox" checked={autoMerge} onChange={(e) => setAutoMerge(e.target.checked)} />
+              Automatically merge PR after CI passes (after staging promotion)
+            </label>
+          </FieldRow>
+          <FieldRow label="Merge method">
+            <label style={styles.radioLabel}>
+              <input type="radio" name="merge-method" value="merge" checked={mergeMethod === 'merge'} onChange={() => setMergeMethod('merge')} />
+              merge
+            </label>
+            <label style={styles.radioLabel}>
+              <input type="radio" name="merge-method" value="squash" checked={mergeMethod === 'squash'} onChange={() => setMergeMethod('squash')} />
+              squash
+            </label>
+            <label style={styles.radioLabel}>
+              <input type="radio" name="merge-method" value="rebase" checked={mergeMethod === 'rebase'} onChange={() => setMergeMethod('rebase')} />
+              rebase
+            </label>
+          </FieldRow>
+        </div>
+      </Card>
+      <div style={{ marginTop: '12px' }}>
+        <GitCredentialsCard projectId={props.projectId} />
+      </div>
+    </>
+  );
+}
+
+/**
+ * Per-project Git credential management. Shows the current source
+ * (vault secret name vs plain token), with controls to switch to a
+ * different vault secret OR replace with a new token (optionally
+ * saved to the vault).
+ *
+ * Project-admin only — the server enforces this on
+ * PATCH /projects/:id/git-credentials. The Settings link itself is
+ * already gated by RequireProjectAdmin so reaching this card means
+ * the operator can mutate.
+ */
+function GitCredentialsCard({ projectId }: { projectId: string }) {
+  const api = useDashboardApi();
+  const [project, setProject] = useState<ProjectSummary | null>(null);
+  const [secrets, setSecrets] = useState<PlatformSecret[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+  const [mode, setMode] = useState<'view' | 'switch-vault' | 'new-token'>('view');
+  const [selectedSecretId, setSelectedSecretId] = useState<string>('');
+  const [newToken, setNewToken] = useState<string>('');
+  const [saveToVault, setSaveToVault] = useState<boolean>(true);
+  const [newSecretName, setNewSecretName] = useState<string>('');
+  const [saving, setSaving] = useState(false);
+  const [browseOpen, setBrowseOpen] = useState(false);
+
+  async function reload() {
+    try {
+      const [proj, sec] = await Promise.all([
+        api.getProject(projectId),
+        api.listPlatformSecrets().catch(() => ({ data: [] as PlatformSecret[] })),
+      ]);
+      setProject(proj.data);
+      setSecrets(sec.data);
+      if (proj.data.gitSecretId) setSelectedSecretId(proj.data.gitSecretId);
+      else if (sec.data.length > 0) setSelectedSecretId(sec.data[0].id);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof ApiError ? extractErrorMessage(err) : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId]);
+
+  useEffect(() => {
+    if (saveToVault && !newSecretName && project?.name) {
+      setNewSecretName(`${project.name} Git PAT`);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project, saveToVault]);
+
+  async function submit() {
+    setSaving(true); setError(null); setSuccess(null);
+    try {
+      if (mode === 'switch-vault') {
+        if (!selectedSecretId) {
+          setError('Pick a vault secret first');
+          return;
+        }
+        await api.updateProjectGitCredentials(projectId, { gitSecretId: selectedSecretId });
+      } else if (mode === 'new-token') {
+        if (!newToken.trim()) {
+          setError('Enter a new token');
+          return;
+        }
+        if (saveToVault) {
+          if (!newSecretName.trim()) {
+            setError('Provide a name for the new vault secret');
+            return;
+          }
+          await api.updateProjectGitCredentials(projectId, {
+            newSecret: { name: newSecretName.trim(), value: newToken },
+          });
+        } else {
+          await api.updateProjectGitCredentials(projectId, { gitToken: newToken });
+        }
+      }
+      setSuccess('Git credentials updated');
+      setMode('view');
+      setNewToken('');
+      await reload();
+    } catch (err) {
+      setError(err instanceof ApiError ? extractErrorMessage(err) : String(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const currentSecret = project?.gitSecretId
+    ? secrets.find((s) => s.id === project.gitSecretId) ?? null
+    : null;
+
+  return (
     <Card>
       <div style={styles.cardBody}>
-        <div style={styles.cardHeader}>
-          <h3 style={styles.cardTitle}>Pipeline configuration</h3>
-          <button style={styles.primaryBtn} onClick={() => void handleSave()} disabled={saving}>
-            {saving ? 'Saving...' : 'Save changes'}
-          </button>
-        </div>
-        {success && <div style={styles.successBanner}>{success}</div>}
-        {error && <div style={styles.errorBanner}>{error}</div>}
-        <FieldRow label="CI/CD adapter">
-          <label style={styles.radioLabel}>
-            <input type="radio" name="adapter" value="noop" checked={adapter === 'noop'} onChange={() => setAdapter('noop')} />
-            noop (fallback — no real CI)
-          </label>
-          <label style={styles.radioLabel}>
-            <input type="radio" name="adapter" value="github-actions" checked={adapter === 'github-actions'} onChange={() => setAdapter('github-actions')} />
-            github-actions
-          </label>
-        </FieldRow>
-        <FieldRow label="Auto-merge">
-          <label style={styles.checkboxLabel}>
-            <input type="checkbox" checked={autoMerge} onChange={(e) => setAutoMerge(e.target.checked)} />
-            Automatically merge PR after CI passes (after staging promotion)
-          </label>
-        </FieldRow>
-        <FieldRow label="Merge method">
-          <label style={styles.radioLabel}>
-            <input type="radio" name="merge-method" value="merge" checked={mergeMethod === 'merge'} onChange={() => setMergeMethod('merge')} />
-            merge
-          </label>
-          <label style={styles.radioLabel}>
-            <input type="radio" name="merge-method" value="squash" checked={mergeMethod === 'squash'} onChange={() => setMergeMethod('squash')} />
-            squash
-          </label>
-          <label style={styles.radioLabel}>
-            <input type="radio" name="merge-method" value="rebase" checked={mergeMethod === 'rebase'} onChange={() => setMergeMethod('rebase')} />
-            rebase
-          </label>
-        </FieldRow>
+        <h3 style={styles.cardTitle}>Git credentials</h3>
+        {loading && <LoadingSpinner />}
+        {!loading && project && (
+          <>
+            <div style={{ marginBottom: '8px', fontSize: '13px' }}>
+              {currentSecret ? (
+                <span style={{ color: 'var(--green)' }}>
+                  ● vault: <strong>{currentSecret.name}</strong> (encrypted at rest)
+                </span>
+              ) : project.gitSecretId ? (
+                <span style={{ color: 'var(--amber, #d97706)' }}>
+                  ● vault reference: <code>{project.gitSecretId}</code> (secret not found — falls back to plain token)
+                </span>
+              ) : (
+                <span style={{ color: 'var(--text-dim)' }}>
+                  ● plain token stored (consider migrating to the vault)
+                </span>
+              )}
+            </div>
+            {success && <div style={styles.successBanner}>{success}</div>}
+            {error && <div style={styles.errorBanner}>{error}</div>}
+            {mode === 'view' && (
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                <button
+                  style={styles.linkBtn}
+                  onClick={() => setMode('switch-vault')}
+                  disabled={secrets.length === 0}
+                  title={secrets.length === 0 ? 'No vault secrets exist yet' : ''}
+                >
+                  Change to saved secret ▾
+                </button>
+                <button style={styles.linkBtn} onClick={() => setMode('new-token')}>
+                  Replace with new token
+                </button>
+              </div>
+            )}
+            {mode === 'switch-vault' && (
+              <div style={{ background: 'var(--bg-subtle)', padding: '10px', borderRadius: '4px', marginTop: '8px' }}>
+                <label style={styles.label}>Select vault secret
+                  <select
+                    style={styles.input}
+                    value={selectedSecretId}
+                    onChange={(e) => setSelectedSecretId(e.target.value)}
+                  >
+                    {secrets.map((s) => (
+                      <option key={s.id} value={s.id}>{s.name}</option>
+                    ))}
+                  </select>
+                </label>
+                <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+                  <button
+                    style={styles.linkBtn}
+                    onClick={() => { setMode('view'); setError(null); }}
+                    disabled={saving}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    style={styles.primaryBtn}
+                    onClick={() => void submit()}
+                    disabled={saving || project.gitSecretId === selectedSecretId}
+                  >
+                    {saving ? 'Saving...' : 'Apply'}
+                  </button>
+                </div>
+              </div>
+            )}
+            {mode === 'new-token' && (
+              <div style={{ background: 'var(--bg-subtle)', padding: '10px', borderRadius: '4px', marginTop: '8px' }}>
+                <label style={styles.label}>New Git token (PAT)
+                  <input
+                    type="password"
+                    style={styles.input}
+                    value={newToken}
+                    onChange={(e) => setNewToken(e.target.value)}
+                    placeholder="ghp_..."
+                    autoComplete="new-password"
+                  />
+                </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '12px' }}>
+                  <input
+                    type="checkbox"
+                    checked={saveToVault}
+                    onChange={(e) => setSaveToVault(e.target.checked)}
+                  />
+                  Save to vault (encrypt at rest, reusable across projects)
+                </label>
+                {saveToVault && (
+                  <label style={styles.label}>Vault secret name
+                    <input
+                      style={styles.input}
+                      value={newSecretName}
+                      onChange={(e) => setNewSecretName(e.target.value)}
+                      placeholder={`${project.name} Git PAT`}
+                    />
+                  </label>
+                )}
+                <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+                  <button
+                    style={styles.linkBtn}
+                    onClick={() => { setMode('view'); setError(null); setNewToken(''); }}
+                    disabled={saving}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    style={styles.primaryBtn}
+                    onClick={() => void submit()}
+                    disabled={saving}
+                  >
+                    {saving ? 'Saving...' : 'Apply'}
+                  </button>
+                </div>
+              </div>
+            )}
+            {project.gitSecretId && mode === 'view' && (
+              <div style={{ marginTop: '8px' }}>
+                <button
+                  style={styles.linkBtn}
+                  onClick={() => setBrowseOpen(true)}
+                  title="List GitHub repos with this vault secret"
+                >
+                  Browse repos with this secret ▾
+                </button>
+              </div>
+            )}
+          </>
+        )}
       </div>
+      {browseOpen && project?.gitSecretId && (
+        <RepoBrowserModalSimple
+          secretId={project.gitSecretId}
+          onClose={() => setBrowseOpen(false)}
+        />
+      )}
     </Card>
+  );
+}
+
+/**
+ * Lightweight read-only repo browser for the Pipeline tab. Same
+ * `/platform/git/repos` proxy as the Admin Create-Project modal.
+ * Clicking a repo opens it in a new tab rather than mutating the
+ * project (the project's git URL is already set).
+ */
+function RepoBrowserModalSimple(props: { secretId: string; onClose: () => void }) {
+  const api = useDashboardApi();
+  const [repos, setRepos] = useState<GitRepoSummary[] | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await api.listGitRepos(props.secretId, 'github');
+        if (!cancelled) setRepos(res.data);
+      } catch (err) {
+        if (!cancelled) setError(err instanceof ApiError ? extractErrorMessage(err) : String(err));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.secretId]);
+
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 60,
+      }}
+      onClick={props.onClose}
+    >
+      <div
+        style={{ background: 'var(--bg-base)', padding: '16px', borderRadius: '6px', maxWidth: '600px', width: '90%', maxHeight: '80vh', overflowY: 'auto' }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 style={styles.cardTitle}>Repos available with this secret</h3>
+        {loading && <div style={{ color: 'var(--text-dim)' }}>Fetching…</div>}
+        {error && <div style={styles.errorBanner}>{error}</div>}
+        {repos && repos.length === 0 && <div style={{ color: 'var(--text-dim)' }}>No repos returned.</div>}
+        {repos && repos.length > 0 && (
+          <table style={{ width: '100%', fontSize: '13px', borderCollapse: 'collapse' }}>
+            <tbody>
+              {repos.map((r) => (
+                <tr key={r.fullName} style={{ borderBottom: '1px solid var(--border)' }}>
+                  <td style={{ padding: '6px 8px' }}>{r.private ? '🔒' : '📖'}</td>
+                  <td style={{ padding: '6px 8px', fontFamily: 'var(--font-mono)' }}>
+                    <a href={r.htmlUrl} target="_blank" rel="noopener noreferrer">{r.fullName}</a>
+                  </td>
+                  <td style={{ padding: '6px 8px', color: 'var(--text-dim)' }}>{r.defaultBranch}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '12px' }}>
+          <button style={styles.linkBtn} onClick={props.onClose}>Close</button>
+        </div>
+      </div>
+    </div>
   );
 }
 

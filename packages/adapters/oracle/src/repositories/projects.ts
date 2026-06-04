@@ -14,7 +14,7 @@ const notImplemented = (): never => {
 
 export class OracleProjectRepository implements ProjectRepository {
   async healthCheck(): Promise<boolean> { return notImplemented(); }
-  async create(_project: Omit<ProjectRecord, 'id' | 'createdAt'>): Promise<ProjectRecord> { return notImplemented(); }
+  async create(_project: Omit<ProjectRecord, 'id' | 'createdAt' | 'gitSecretId'>): Promise<ProjectRecord> { return notImplemented(); }
   async findById(_id: string): Promise<ProjectRecord | null> { return notImplemented(); }
   async findByName(_name: string): Promise<ProjectRecord | null> { return notImplemented(); }
   async list(_userId: string): Promise<ProjectRecord[]> { return notImplemented(); }
@@ -23,4 +23,5 @@ export class OracleProjectRepository implements ProjectRepository {
   async getCredential(_projectId: string): Promise<string | null> { return notImplemented(); }
   async delete(_projectId: string): Promise<number> { return notImplemented(); }
   async deleteAllCredentials(_projectId: string): Promise<number> { return notImplemented(); }
+  async saveGitSecretRef(_projectId: string, _secretId: string | null): Promise<void> { return notImplemented(); }
 }

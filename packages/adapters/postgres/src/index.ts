@@ -25,6 +25,7 @@ import { PostgresProjectMembershipRepository } from './repositories/memberships'
 import { PostgresInterventionRepository } from './repositories/interventions';
 import { PostgresPlatformLLMRepository } from './repositories/platform-llms';
 import { PostgresPlatformSecretRepository } from './repositories/platform-secrets';
+import { PostgresKeyRotationRepository } from './repositories/key-rotations';
 import { PostgresPlatformTemplateRepository } from './repositories/platform-templates';
 import { PostgresPlatformMcpServerRepository } from './repositories/platform-mcp-servers';
 import {
@@ -69,6 +70,7 @@ export async function createPostgresAdapter(databaseUrl: string): Promise<Reposi
     interventions:    new PostgresInterventionRepository(),
     platformLlms:       new PostgresPlatformLLMRepository(),
     platformSecrets:    new PostgresPlatformSecretRepository(),
+    keyRotations:       new PostgresKeyRotationRepository(),
     platformTemplates:  new PostgresPlatformTemplateRepository(),
     platformMcpServers: new PostgresPlatformMcpServerRepository(),
     identityConfig:     new PostgresIdentityConfigRepository(),

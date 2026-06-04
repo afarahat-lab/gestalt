@@ -12,6 +12,11 @@ export interface ProjectSummary {
   defaultBranch: string;
   createdBy: string;
   createdAt: string;
+  /** Migration 022 — when set, the project's Git PAT lives in the
+   *  vault under this secret id (precedence over plain token in
+   *  `project_git_credentials`). Null = legacy plain-token mode.
+   *  This is a reference UUID, not the secret value. */
+  gitSecretId?: string | null;
   /** Platform-admin enrichment (Session — project management). Present
    *  on rows returned to a platform-admin user; omitted for regular
    *  users (whose `/projects` listing skips the cross-project stats). */
@@ -20,6 +25,18 @@ export interface ProjectSummary {
   /** ISO string of the most recent intent's `created_at`, or the
    *  project's `created_at` when no intents exist yet. */
   lastActivityAt?: string;
+}
+
+// ─── Git provider repo browser (migration 022) ───────────────────────────────
+
+export interface GitRepoSummary {
+  name: string;
+  fullName: string;
+  htmlUrl: string;
+  cloneUrl: string;
+  defaultBranch: string;
+  private: boolean;
+  description: string | null;
 }
 
 // ─── Intent feed ──────────────────────────────────────────────────────────────
@@ -423,6 +440,14 @@ export interface ProjectConfigResponse {
 
 // ─── Platform LLM registry (Session 3, migration 014) ────────────────────────
 
+/**
+ * Wire shape (migration 023). 'chat-completions' is the default
+ * legacy shape (max_tokens + temperature). 'responses' is for
+ * OpenAI reasoning models (gpt-5*, o1, o3) — uses
+ * max_completion_tokens + omits temperature.
+ */
+export type LLMApiShape = 'chat-completions' | 'responses';
+
 export interface PlatformLLM {
   id: string;
   name: string;
@@ -433,6 +458,8 @@ export interface PlatformLLM {
   apiKeyEnv: string | null;
   /** Vault secret reference (Session 4 — migration 015). */
   secretId: string | null;
+  /** Wire shape — see `LLMApiShape`. Defaults to 'chat-completions'. */
+  apiShape: LLMApiShape;
   isDefault: boolean;
   description: string | null;
   createdAt: string;
@@ -457,6 +484,24 @@ export interface PlatformSecret {
   description: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * Master-key rotation log entry (migration 021). Returned by
+ * `listPlatformSecrets` as `lastRotation` so the Secrets tab can
+ * render "Last rotated: 2h ago by amr@co.com" without a separate
+ * round-trip.
+ */
+export interface KeyRotation {
+  id: string;
+  rotatedBy: string | null;
+  secretCount: number;
+  rotatedAt: string;
+}
+
+export interface KeyRotationResult {
+  rotated: number;
+  rotatedAt: string;
 }
 
 // ─── Templates / MCP / Tools / Identity (Session 3 — migration 017) ─────────
@@ -486,6 +531,23 @@ export interface PlatformTemplateSummary {
 
 export interface PlatformTemplate extends PlatformTemplateSummary {
   files: Record<string, string>;
+  /**
+   * Per-`{{variable}}` usage scanned by the server at read time
+   * (Brief 3). Computed every GET — never persisted — so the
+   * dashboard's detail panel + CLI inspector can render the
+   * documented / auto-provided / undocumented status at a glance.
+   */
+  variableUsage?: TemplateVariableUsage[];
+}
+
+export interface TemplateVariableUsage {
+  name: string;
+  usedInFiles: string[];
+  defined: boolean;
+  required: boolean;
+  defaultValue: string | null;
+  description: string | null;
+  autoProvided: boolean;
 }
 
 export interface PlatformMcpServer {

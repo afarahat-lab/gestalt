@@ -46,7 +46,19 @@ export interface IntentRecord {
    */
   clarification: string | null;
   status: IntentStatus;
-  source: 'human' | 'maintenance-agent';
+  /**
+   * How this intent came to exist. `human` = operator submission via
+   * `POST /intents`; `maintenance-agent` = queued by the maintenance
+   * scheduler. The remaining values (`self-healing`, `auto-resolved`,
+   * `operator-resume`, `pipeline-feedback`) are payload-level
+   * dispatch sources used by the BullMQ message — most existing
+   * intents stay at their original `human` source on retry cycles
+   * because the same row is reused. Brief 5 widens the type so
+   * `GET /intents?source=` filtering can express the union; future
+   * iterations may persist these on the intent row directly.
+   */
+  source: 'human' | 'maintenance-agent' | 'self-healing'
+       | 'auto-resolved' | 'operator-resume' | 'pipeline-feedback';
   priority: 'critical' | 'high' | 'normal' | 'low';
   createdAt: Date;
   updatedAt: Date;
@@ -141,6 +153,33 @@ export interface ResumeContext {
   retryPayloadHints?: Record<string, unknown>;
 }
 
+/**
+ * Filter set accepted by every intent list endpoint (Brief 5).
+ *
+ *   - `status` — exact match on `intents.status`
+ *   - `source` — exact match on `intents.source` (the typed union
+ *     above)
+ *   - `priority` — exact match on `intents.priority`
+ *   - `search` — case-insensitive `ILIKE '%search%'` on `intents.text`
+ *   - `from` / `to` — `created_at` bounds (BOTH inclusive); pass `Date`
+ *     objects so adapters can format per dialect
+ *   - `limit` / `offset` — standard pagination
+ *
+ * All fields are optional except `limit` and `offset`. Adapters must
+ * apply the filters in SQL — postgres uses `($N::text IS NULL OR …)`
+ * conditional fragments so the prepared statement shape is constant.
+ */
+export interface IntentListFilters {
+  status?: IntentStatus;
+  source?: string;
+  priority?: string;
+  search?: string;
+  from?: Date;
+  to?: Date;
+  limit: number;
+  offset: number;
+}
+
 export interface IntentRepository extends BaseRepository {
   create(intent: Omit<IntentRecord, 'createdAt' | 'updatedAt' | 'resolvedAt' | 'clarification' | 'branchName' | 'prNumber' | 'prUrl' | 'attemptCount' | 'lastResumeContext'>): Promise<IntentRecord>;
   findById(id: string): Promise<IntentRecord | null>;
@@ -178,13 +217,28 @@ export interface IntentRepository extends BaseRepository {
    * enforce the per-failure-type retry budget. Migration 020.
    */
   incrementAttemptCount(id: string): Promise<number>;
-  list(params: { projectId: string; status?: IntentStatus; limit: number; offset: number }): Promise<{ records: IntentRecord[]; total: number }>;
+  /**
+   * Per-project intent list. Now supports the full filter set:
+   * `status`, `source`, `priority`, `search` (ILIKE on text), `from` /
+   * `to` (created_at bounds, both inclusive). All filters are optional.
+   * Brief 5.
+   */
+  list(params: IntentListFilters & { projectId: string }): Promise<{ records: IntentRecord[]; total: number }>;
   /**
    * Server-wide intent list (no project filter). Used by the
    * platform-admin view of `GET /intents`. Regular users never reach
-   * this path — they get a per-project list scoped by membership.
+   * this path — they get a per-project or per-group-membership list
+   * via `listForProjects`. Brief 5: now accepts the same filter set.
    */
-  listAll(params: { status?: IntentStatus; limit: number; offset: number }): Promise<{ records: IntentRecord[]; total: number }>;
+  listAll(params: IntentListFilters): Promise<{ records: IntentRecord[]; total: number }>;
+  /**
+   * Multi-project intent list — UNION across direct memberships AND
+   * group-derived project access. Used by `GET /intents` when no
+   * `projectId` query param is supplied; the route resolves every
+   * project the user can access (direct + group), passes the union as
+   * `projectIds`, and the SQL applies `= ANY($1::uuid[])`. Brief 5.
+   */
+  listForProjects(projectIds: string[], filters: IntentListFilters): Promise<{ records: IntentRecord[]; total: number }>;
   /**
    * Returns the total intent count for a project. Used by the
    * platform-admin GET /projects enrichment and by the project
@@ -437,10 +491,17 @@ export interface ProjectRecord {
   defaultBranch: string;   // typically 'main'
   createdBy: string;       // users.id
   createdAt: Date;
+  /**
+   * When set, the Git PAT for this project is resolved from
+   * `platform_secrets` instead of the plain `project_git_credentials`
+   * table. Takes precedence over the plain token in every credential
+   * resolution path. Null = legacy plain-token mode.
+   */
+  gitSecretId: string | null;
 }
 
 export interface ProjectRepository extends BaseRepository {
-  create(project: Omit<ProjectRecord, 'id' | 'createdAt'>): Promise<ProjectRecord>;
+  create(project: Omit<ProjectRecord, 'id' | 'createdAt' | 'gitSecretId'>): Promise<ProjectRecord>;
   findById(id: string): Promise<ProjectRecord | null>;
   findByName(name: string): Promise<ProjectRecord | null>;
   list(userId: string): Promise<ProjectRecord[]>;
@@ -455,6 +516,13 @@ export interface ProjectRepository extends BaseRepository {
   // the token never appears in API responses (see routes/projects.ts).
   saveCredential(projectId: string, token: string): Promise<void>;
   getCredential(projectId: string): Promise<string | null>;
+
+  /**
+   * Wire the project's Git PAT to a vault-managed secret. Replaces
+   * any prior reference. Pass `null` to disconnect (the orchestrator
+   * will fall back to the plain-token path).
+   */
+  saveGitSecretRef(projectId: string, secretId: string | null): Promise<void>;
 
   /**
    * Hard-delete a project row. The route layer is responsible for
@@ -496,6 +564,11 @@ export interface RepositoryRegistry {
   interventions: InterventionRepository;
   platformLlms: PlatformLLMRepository;
   platformSecrets: PlatformSecretRepository;
+  /**
+   * Master key rotation log (migration 021). Records each successful
+   * rotation event; the keys themselves never touch the database.
+   */
+  keyRotations: KeyRotationRepository;
   platformTemplates: PlatformTemplateRepository;
   platformMcpServers: PlatformMcpServerRepository;
   identityConfig: IdentityConfigRepository;
@@ -526,6 +599,26 @@ export interface RepositoryRegistry {
  * set; otherwise fall back to `process.env[apiKeyEnv]`. See
  * `resolveApiKey` in the LLM layer.
  */
+/**
+ * Wire shape the LLM client uses for this row's requests. Added in
+ * migration 023 because OpenAI's reasoning-class models (o1/o3,
+ * gpt-5*, …) reject the legacy `max_tokens` parameter and silently
+ * ignore `temperature`.
+ *
+ *   - 'chat-completions' — legacy shape: `max_tokens` + `temperature`.
+ *     Covers `gpt-4o*`, `gpt-4-turbo`, `gpt-3.5-turbo`, Azure
+ *     OpenAI Chat Completions, Anthropic-proxy, Ollama, vLLM in
+ *     OpenAI-compat mode.
+ *   - 'responses' — reasoning shape: `max_completion_tokens`,
+ *     temperature omitted. Covers OpenAI reasoning models hit via
+ *     the Chat Completions endpoint (gpt-5*, o1*, o3*).
+ *
+ * Future migrations can extend the CHECK constraint to add
+ * provider-specific shapes (e.g. `anthropic-messages`) when the
+ * registry needs cross-provider variants.
+ */
+export type LLMApiShape = 'chat-completions' | 'responses';
+
 export interface PlatformLLMRecord {
   id: string;
   name: string;
@@ -541,6 +634,9 @@ export interface PlatformLLMRecord {
    * `secretId` without immediately clearing `apiKeyEnv`.
    */
   secretId: string | null;
+  /** Wire shape — see `LLMApiShape` JSDoc. Defaults to
+   *  'chat-completions' on rows created before migration 023. */
+  apiShape: LLMApiShape;
   isDefault: boolean;
   description: string | null;
   createdAt: Date;
@@ -645,6 +741,50 @@ export interface PlatformSecretRepository extends BaseRepository {
    * guard and by the dashboard's delete-confirm panel.
    */
   findReferencingLlms(secretId: string): Promise<Array<{ id: string; name: string }>>;
+  /**
+   * Returns every secret with the full ciphertext columns
+   * (`encrypted`, `iv`, `authTag`). Used EXCLUSIVELY by the master
+   * key rotation endpoint (`POST /platform/secrets/rotate-key`) for
+   * diagnostic / inspection paths. NEVER expose this in any API
+   * response.
+   */
+  findAllRaw(): Promise<PlatformSecretRecord[]>;
+  /**
+   * Atomically re-encrypts every row in `platform_secrets` under a
+   * new master key. The `reencryptFn` is called inside a single DB
+   * transaction for each record — it MUST decrypt with the current
+   * master key + re-encrypt with the new key + return the new
+   * ciphertext. Throwing from `reencryptFn` rolls back the
+   * transaction, leaving every row encrypted under the OLD key.
+   * Returns the count of rotated secrets.
+   */
+  rotateMasterKey(
+    reencryptFn: (record: PlatformSecretRecord) => {
+      encrypted: string; iv: string; authTag: string;
+    },
+  ): Promise<number>;
+}
+
+// ─── Master key rotation log (migration 021) ─────────────────────────────────
+
+/**
+ * One row per successful master-key rotation. The rotation itself
+ * happens via `POST /platform/secrets/rotate-key` — an atomic
+ * transaction that re-encrypts every row in `platform_secrets`
+ * under the new key. This table stores ONLY metadata of each
+ * successful rotation; the keys themselves NEVER touch the database.
+ */
+export interface KeyRotationRecord {
+  id: string;
+  rotatedBy: string | null;
+  secretCount: number;
+  rotatedAt: Date;
+}
+
+export interface KeyRotationRepository extends BaseRepository {
+  create(params: { rotatedBy: string; secretCount: number }): Promise<KeyRotationRecord>;
+  /** Most recent rotation, or null if no key has ever been rotated. */
+  findLatest(): Promise<KeyRotationRecord | null>;
 }
 
 // ─── Platform templates (Session 3 — migration 017) ──────────────────────────

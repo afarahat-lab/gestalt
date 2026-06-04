@@ -18,6 +18,7 @@ import {
   McpClient, resolveMcpClients, createHarnessEngine,
   BaseOrchestrator,
   runSelfHealingLoop,
+  resolveProjectCredential,
 } from '@gestalt/core';
 import type {
   TaskMessage, TaskResult, QueueConfig,
@@ -220,7 +221,7 @@ async function handleIntentTask(
     }
 
     if (!projectRoot) {
-      const token = await projects.getCredential(project.id);
+      const token = await resolveProjectCredential(project);
       if (!token) {
         throw new Error(`Project ${project.name} has no Git credential on file`);
       }
@@ -285,8 +286,10 @@ async function handleIntentTask(
     }
     // Project Git PAT — feeds the `tokenFrom: 'project_credential'`
     // source. Already loaded if we cloned ourselves; for the resume
-    // path (payload.projectRoot supplied) we look it up.
-    const projectCredential = await projects.getCredential(project.id);
+    // path (payload.projectRoot supplied) we look it up. Routed
+    // through `resolveProjectCredential` so vault-backed projects
+    // (migration 022) decrypt automatically.
+    const projectCredential = await resolveProjectCredential(project);
 
     const retryCount = payload.retryCount ?? 0;
     const priorSignals = payload.priorSignals ?? [];

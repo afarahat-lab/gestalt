@@ -21,6 +21,7 @@ import {
   loadMasterKey, decryptSecret,
   setPlatformMcpResolver, McpClient,
   setQueueConfig,
+  setProjectSecretResolver,
 } from '@gestalt/core';
 import { setMasterKey, getMasterKey } from './secrets/index';
 import { createPostgresAdapter, closeDb } from '@gestalt/adapter-postgres';
@@ -85,6 +86,7 @@ export async function startServer(): Promise<void> {
       modelString: match.modelString,
       baseUrl: match.baseUrl,
       apiKey,
+      apiShape: match.apiShape,
     };
   });
   log.info('Platform LLM registry resolver wired');
@@ -110,6 +112,34 @@ export async function startServer(): Promise<void> {
     return new McpClient(server.name, server.url, token);
   });
   log.info('Platform MCP server resolver wired');
+
+  // 4e. Project Git PAT vault resolver (migration 022).
+  //
+  // When `projects.git_secret_id` is set, the orchestrators /
+  // agents / route handlers call `resolveProjectCredential(project)`
+  // and this resolver decrypts the vault secret server-side using
+  // the master key. The pattern matches `setLLMRegistryResolver` +
+  // `setPlatformMcpResolver` — `@gestalt/core` never sees the
+  // master key. Decrypt failure logs a WARN with the secret id
+  // (NEVER the key material) and returns `null` so the helper
+  // falls back to the plain-token path.
+  setProjectSecretResolver(async (secretId) => {
+    try {
+      const secret = await getRepositories().platformSecrets.findById(secretId);
+      if (!secret) {
+        log.warn({ secretId }, 'Project git secret not found in vault — falling back to plain token');
+        return null;
+      }
+      return decryptSecret(
+        { encrypted: secret.encrypted, iv: secret.iv, authTag: secret.authTag },
+        getMasterKey(),
+      );
+    } catch (err) {
+      log.warn({ err, secretId }, 'Project git secret decrypt failed — falling back to plain token');
+      return null;
+    }
+  });
+  log.info('Project git secret resolver wired');
 
   // 5. Auth manager
   const identityConfig = await loadIdentityConfig();
@@ -196,6 +226,10 @@ async function seedPlatformLlmsIfEmpty(
     // to a vault secret later via the Admin → LLMs → Edit modal or
     // `gestalt platform llms` CLI.
     secretId: null,
+    // Default to 'chat-completions' — safe for gpt-4o*, gpt-3.5,
+    // Ollama, vLLM. Operators flip to 'responses' for reasoning
+    // models (gpt-5*, o1, o3) via the LLM modal.
+    apiShape: 'chat-completions',
     isDefault: true,
     description: 'Seeded from server .env config on first boot',
   });

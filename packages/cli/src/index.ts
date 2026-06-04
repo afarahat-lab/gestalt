@@ -15,6 +15,7 @@
  *                                  [--auto-merge | --no-auto-merge]
  *                                  [--merge-method squash|merge|rebase]
  *                                  [--server <url>]
+ *   gestalt projects update-token <name>                     — vault picker or new token
  *   gestalt project config show                              — read all six sections
  *   gestalt project config set-agent <role>                  — patch one agent
  *   gestalt project config add-custom-agent                  — interactive add
@@ -33,10 +34,11 @@
  *   gestalt platform secrets add                            — interactive (hidden value)
  *   gestalt platform secrets rotate <name>                  — replace the value
  *   gestalt platform secrets remove <name>                  — delete (SECRET_IN_USE guard)
+ *   gestalt platform secrets rotate-key                     — rotate master key (Brief 2)
  *   gestalt platform projects list                          — cross-project, all stats
  *   gestalt platform projects create                        — interactive register + init-harness
  *   gestalt platform projects delete <name>                 — typed-name confirmation
- *   gestalt platform templates list/upload/set-default/delete   — harness templates
+ *   gestalt platform templates list/upload/inspect/set-default/delete   — harness templates
  *   gestalt platform mcp list/add/enable/disable/test/remove    — platform-wide MCP servers
  *   gestalt platform tools list                                 — built-in tool inspector
  *   gestalt platform identity show/configure/reload/...         — corporate identity
@@ -44,7 +46,7 @@
  *   gestalt platform groups add-member/remove-member            — group membership
  *   gestalt platform groups assign/unassign --role <role>       — group → project
  *   gestalt run "<intent>" [--server <url>] [--priority critical|high|normal|low]
- *   gestalt intent list [--project <name>] [--status <s>] [--limit 20]
+ *   gestalt intent list [--project <name>] [--status <s>] [--source <s>] [--priority <p>] [--search <text>] [--from <iso>] [--to <iso>] [--limit 20]
  *   gestalt intent show <id> [--watch]                — execution-flow graph
  *   gestalt intent submit "<text>" [--project <name>] — alias of `run`
  *   gestalt gate show <intentId>
@@ -75,6 +77,7 @@ import { initCommand } from './commands/init';
 import { initAdminCommand } from './commands/init-admin';
 import {
   projectsListCommand, projectsUseCommand, setAdapterCommand,
+  projectsUpdateTokenCommand,
 } from './commands/projects';
 import { runCommand } from './commands/run';
 import { statusCommand } from './commands/status';
@@ -113,11 +116,13 @@ import {
   platformLlmsTestCommand,
   platformSecretsListCommand, platformSecretsAddCommand,
   platformSecretsRotateCommand, platformSecretsRemoveCommand,
+  platformSecretsRotateKeyCommand,
   platformProjectsListCommand, platformProjectsCreateCommand,
   platformProjectsDeleteCommand,
 } from './commands/platform-config';
 import {
   platformTemplatesListCommand, platformTemplatesUploadCommand,
+  platformTemplatesInspectCommand,
   platformTemplatesSetDefaultCommand, platformTemplatesDeleteCommand,
   platformMcpListCommand, platformMcpAddCommand,
   platformMcpEnableCommand, platformMcpDisableCommand,
@@ -248,6 +253,14 @@ projects
       autoMerge: opts.autoMerge,
       mergeMethod: opts.mergeMethod,
     }).catch(fatalError);
+  });
+
+projects
+  .command('update-token <name>')
+  .description("Replace the project's Git PAT. Interactive: pick a vault secret or enter a new token (optionally save to vault).")
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (name: string, opts: { server?: string }) => {
+    await projectsUpdateTokenCommand(name, { server: opts.server }).catch(fatalError);
   });
 
 // gestalt project (singular) — per-project administration
@@ -724,6 +737,15 @@ platformSecrets
     await platformSecretsRemoveCommand(name, { server: opts.server }).catch(fatalError);
   });
 
+// gestalt platform secrets rotate-key — atomic master-key rotation (Brief 2 — migration 021)
+platformSecrets
+  .command('rotate-key')
+  .description('Rotate the server\'s master key. Re-encrypts every secret atomically; all-or-nothing.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (opts: { server?: string }) => {
+    await platformSecretsRotateKeyCommand({ server: opts.server }).catch(fatalError);
+  });
+
 // gestalt platform self-healing — autonomous retry config (migration 020)
 const platformSelfHealing = platform
   .command('self-healing')
@@ -826,6 +848,15 @@ platformTemplates
   .option('--server <url>', 'Server URL (one-shot override for this invocation)')
   .action(async (slug: string, opts: { server?: string }) => {
     await platformTemplatesDeleteCommand(slug, { server: opts.server }).catch(fatalError);
+  });
+
+// gestalt platform templates inspect — variable usage preview (Brief 3)
+platformTemplates
+  .command('inspect <slug>')
+  .description('Print the template\'s files + per-{{variable}} usage. Shows which placeholders are auto-provided vs documented vs undocumented.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (slug: string, opts: { server?: string }) => {
+    await platformTemplatesInspectCommand(slug, { server: opts.server }).catch(fatalError);
   });
 
 // gestalt platform mcp — platform-wide MCP servers (Session 3 — migration 017)
@@ -1048,16 +1079,30 @@ const intent = program
 
 intent
   .command('list')
-  .description('Table of intents for the current project (status / priority / age / text)')
+  .description('Table of intents for the current project (status / priority / age / text). Omit --project to list across every project you can access via direct or group membership.')
   .option('--server <url>', 'Server URL (one-shot override for this invocation)')
-  .option('--project <name>', 'Filter to a project by name (defaults to the current project)')
+  .option('--project <name>', 'Filter to a project by name (defaults to the current project; omit for cross-project listing)')
   .option('--status <status>', 'Filter by intent status (generating | in-review | approved | deploying | deployed | failed | escalated | waiting-for-clarification)')
+  .option('--source <source>', 'Filter by intent source (human | maintenance-agent | self-healing | auto-resolved | operator-resume | pipeline-feedback)')
+  .option('--priority <p>', 'Filter by priority (critical | high | normal | low)')
+  .option('--search <text>', 'Case-insensitive substring match on intent text')
+  .option('--from <date>', 'Inclusive lower bound on created_at (ISO date or datetime)')
+  .option('--to <date>', 'Inclusive upper bound on created_at (ISO date or datetime)')
   .option('--limit <n>', 'Max rows to fetch (default 20, max 100)')
-  .action(async (opts: { server?: string; project?: string; status?: string; limit?: string }) => {
+  .action(async (opts: {
+    server?: string; project?: string; status?: string;
+    source?: string; priority?: string; search?: string;
+    from?: string; to?: string; limit?: string;
+  }) => {
     await intentListCommand({
       server: opts.server,
       project: opts.project,
       status: opts.status,
+      source: opts.source,
+      priority: opts.priority,
+      search: opts.search,
+      from: opts.from,
+      to: opts.to,
       limit: opts.limit,
     }).catch(fatalError);
   });

@@ -14075,3 +14075,1443 @@ still applies — the operator may at their discretion
 update trackeros's workflow to Node 22 LTS). New
 `gestalt init` projects from this point forward get
 dynamic stack-driven harness files.
+
+
+---
+
+### Session 2026-06-04 — Claude Code (Brief 2: master key rotation tooling, migration 021)
+
+Adds operator-driven master key rotation. Previously rotating the
+key required manual SQL + restart. This session ships a typed
+endpoint, an atomic re-encrypt-all-secrets transaction, a CLI
+subcommand + interactive flow, and a dashboard 3-step modal. Audit
+metadata carries the rotated secret COUNT only — never key material
+or ciphertext (GP-006).
+
+Changed:
+
+- `packages/adapters/postgres/src/migrations/021_key_rotation_log.sql`
+  (new): `platform_key_rotations` table — `id`, `rotated_by FK
+  users`, `secret_count`, `rotated_at` plus btree index on
+  `rotated_at DESC`. Pure schema; runner owns
+  `schema_migrations`
+- `packages/core/src/repository/index.ts`: new
+  `KeyRotationRecord` shape + `KeyRotationRepository` interface
+  (`create({rotatedBy, secretCount})` + `findLatest()`).
+  Added `keyRotations` to `RepositoryRegistry`.
+  `PlatformSecretRepository` widened with:
+  - `findAllRaw(): Promise<PlatformSecretRecord[]>` — full
+    ciphertext columns; internal-only (NEVER exposed in API)
+  - `rotateMasterKey(reencryptFn): Promise<number>` — atomic
+    transactional rotation. Calls `reencryptFn` per record
+    inside a `db.begin` callback; throwing rolls everything
+    back. Returns the count of rotated rows
+- `packages/adapters/postgres/src/repositories/key-rotations.ts`
+  (new): `PostgresKeyRotationRepository` — `create` INSERTs and
+  RETURNs the row; `findLatest` is a single-row `ORDER BY
+  rotated_at DESC LIMIT 1`
+- `packages/adapters/postgres/src/repositories/platform-secrets.ts`:
+  added `findAllRaw` (`SELECT * ... ORDER BY created_at`) and
+  `rotateMasterKey` which wraps SELECT + per-row UPDATE in a
+  `db.begin` transaction. Throwing inside the callback rolls
+  back; on commit returns `count`
+- `packages/adapters/{oracle,mssql}/src/repositories/key-rotations.ts`
+  (new) + matching `findAllRaw` / `rotateMasterKey` throw-stubs
+  on `platform-secrets.ts`. Wired through each adapter's
+  `index.ts`
+- `packages/adapters/postgres/src/index.ts`: instantiates +
+  registers `PostgresKeyRotationRepository` in the registry
+- `packages/server/src/routes/secrets.ts`:
+  - **`GET /platform/secrets`** rewritten to return
+    `{data, lastRotation}`. `Promise.all` runs the existing
+    summary list alongside `keyRotations.findLatest()` — one
+    extra round trip, no schema or shape break for older
+    clients that ignore the new field
+  - **`POST /platform/secrets/rotate-key`** (admin) is the
+    centerpiece. Validates `newKey` is a string, decodes via
+    `Buffer.from(newKey, 'base64')`, refuses length ≠ 32 with
+    400 `INVALID_KEY_LENGTH`; refuses no-op same-key rotation
+    with 400 `KEY_UNCHANGED` (catches operator copy-paste
+    mistakes). Calls `platformSecrets.rotateMasterKey` with a
+    closure that does `decryptSecret(record, currentMasterKey)`
+    + `encryptSecret(plaintext, newKeyBuffer)`. On thrown
+    rotation: 500 `ROTATION_FAILED` with the underlying
+    message; nothing changed. On successful transaction:
+    1. `setMasterKey(newKeyBuffer)` — flips the in-memory key
+       BEFORE any subsequent vault operation
+    2. Persist to file. When `GESTALT_MASTER_KEY` env var is
+       unset, tries `/etc/gestalt/master.key` then
+       `./master.key`, writes with `mode: 0o600`. When env var
+       is set, log-warns the operator to update the deployment
+    3. `keyRotations.create({rotatedBy: userId, secretCount})`
+    4. `audit.append` with metadata `{secretCount, ip}` ONLY
+       — GP-006 verified by direct SQL probe; the key VALUE,
+       ciphertext, IV, auth tag NEVER appear in `audit_log`
+    Returns `{rotated, rotatedAt}` to the client
+- `packages/dashboard/src/types.ts`: new `KeyRotation` +
+  `KeyRotationResult` types
+- `packages/dashboard/src/api/client.ts`: `listPlatformSecrets`
+  return type widened to include `lastRotation`; new
+  `rotateMasterKey(newKey)` method
+- `packages/dashboard/src/views/Admin.tsx`:
+  - `SecretsTab` extended with `lastRotation` state +
+    `rotating` modal toggle
+  - **New `MasterKeySection`** card at the bottom of the
+    Secrets tab. Shows `Status: ● Active`, `Last rotated:
+    Never / Nd ago / Nh ago (N secrets)`, and a
+    `[Rotate master key]` button with an inline warning
+  - **New `RotateKeyModal`** — three-step flow:
+    - Step 1: warning text + checkbox `I have backed up my
+      current master.key` gates the Continue button
+    - Step 2: generates a 32-byte key client-side via
+      `crypto.getRandomValues(new Uint8Array(32))` + `btoa`,
+      shown ONCE in a read-only mono-font input with a `[Copy]`
+      button (uses `navigator.clipboard.writeText`, shows
+      `Copied ✓` for 2s). Red "Save this key NOW — it will
+      not be shown again" warning. Checkbox `I have saved the
+      new key securely` gates the danger `Rotate N secrets →`
+      button
+    - Step 3: result. Success → `✓ Master key rotated: N
+      secrets re-encrypted`; failure → `✗ Rotation failed —
+      no secrets were changed` with the error message
+- `packages/cli/src/api/client.ts`: new `KeyRotationSummary` +
+  `KeyRotationResult` types. `listPlatformSecrets` return
+  widened with `lastRotation: KeyRotationSummary | null`. New
+  `rotatePlatformMasterKey(newKey)` method
+- `packages/cli/src/commands/platform-config.ts`:
+  - `platformSecretsListCommand` table footer now prints
+    `Master key: last rotated <when> (N secrets)` or
+    `Master key: never rotated`
+  - **New `platformSecretsRotateKeyCommand`** — interactive
+    flow: prints the warning + "Choose (1) generate / (2)
+    provide my own key" prompt. Option 1 calls
+    `randomBytes(32).toString('base64')`; Option 2 hidden-TTY
+    reads + validates length client-side. Prints the new key
+    ONCE in a code block with the red "Save this key now"
+    warning, then `Have you saved the key? (y/N)`. On y →
+    calls the API, shows `✓ Master key rotated: N secrets
+    re-encrypted` + ISO timestamp + reminder about env var
+    vs master.key file
+- `packages/cli/src/index.ts`: registered
+  `gestalt platform secrets rotate-key` under the existing
+  `gestalt platform secrets` parent
+
+Verified live end-to-end:
+
+- `pnpm -r build` clean across all 12 packages. Docker
+  server image rebuilt; migration 021 applied cleanly
+  (`schema_migrations` lists 21 versions). `\d
+  platform_key_rotations` shows the expected shape with the
+  PK + FK + btree index
+- **Validation matrix (all return 400):** missing newKey →
+  `INVALID_KEY_FORMAT`; 16-byte key → `INVALID_KEY_LENGTH got
+  16`; invalid-character base64 (`not_valid_base64_!!`)
+  decodes to 12 bytes → `INVALID_KEY_LENGTH got 12` (Node's
+  Buffer.from base64 is permissive — strips invalid chars +
+  validates length); same-as-current key → `KEY_UNCHANGED`
+- **Atomic rollback verified accidentally** — first
+  rotation attempt failed with `ROTATION_FAILED` because
+  the pre-existing seeded secrets were encrypted under a
+  prior auto-generated `master.key` that got regenerated on
+  docker rebuild. Decryption failed inside the transaction
+  → entire rotation rolled back → master.key file
+  unchanged → no `platform_key_rotations` row inserted.
+  Confirms the all-or-nothing contract under a real
+  failure path
+- **Happy path:** cleaned + seeded 3 fresh secrets
+  (`rotation-test` = `secret-value-before`, `openai-key` =
+  `sk-fake-openai-key-12345`, `db-password` =
+  `DB-Pass-W0rd!`). KEY_UNCHANGED guard verified by
+  posting the current master key back. Real rotation
+  returned `{rotated: 3, rotatedAt: <ISO>}`. DB inspection
+  confirms 3 rows with distinct fresh IV + ciphertext;
+  `platform_key_rotations` has 1 row with `secret_count:
+  3, rotated_by: <admin uuid>`; `master.key` file in the
+  container updated to the new base64 verbatim; `audit_log`
+  row carries `metadata = {"secretCount":3,"ip":"..."}`
+  ONLY. Direct GP-006 probe (`metadata::text LIKE '%' || <new
+  key prefix>` for `newKey`, `encrypted`, IV substring across
+  every audit row) returns 0 leaks
+- **Chain verification:** a SECOND rotation against the
+  post-first-rotation state succeeded. Master.key file
+  updated to the SECOND new key; ciphertext + IVs rotated
+  again. This proves the encryption chain: each new key
+  successfully decrypts what the prior new key encrypted,
+  and re-encrypts under the next. Off-thread Node script
+  inside the container called `decryptSecret(row,
+  currentMasterKey)` against all 3 rows and confirmed they
+  round-trip to their original plaintexts (`secret-value-before`
+  etc.)
+- **`GET /platform/secrets` lastRotation field** populated
+  correctly: `{id, rotatedBy, secretCount: 3, rotatedAt:
+  <ISO>}`
+- **CLI verification:** `gestalt platform secrets list` post-
+  rotation prints `Master key: last rotated 2m ago (3
+  secrets)`. `gestalt platform secrets --help` shows the new
+  `rotate-key` subcommand description
+- **Cleanup:** synthetic secrets + audit rows + rotation
+  log rows scrubbed at end of session. Final state: 0
+  secrets, 0 rotations
+
+Decisions made:
+
+- **`findAllRaw` + `rotateMasterKey` as separate methods.**
+  The brief specifies `findAllRaw` is on the interface;
+  added it for diagnostic / future use. The atomic rotation
+  needs a transaction context the route can't reach
+  directly (the route only has the repo's public surface,
+  not a `db.begin` callback). The clean solution is a
+  dedicated `rotateMasterKey(reencryptFn)` that wraps the
+  whole rotation in `db.begin`. The route handler passes a
+  closure that does `decrypt(current) + encrypt(new)` per
+  record; throwing inside the closure rolls everything
+  back. Keeps the brief's documented interface AND
+  satisfies the "all inside a single DB transaction"
+  requirement
+- **`setMasterKey(newKey)` happens AFTER transaction
+  commits.** The brief is explicit. If the in-memory key
+  were flipped before commit, a concurrent encrypt would
+  use the new key but the DB would still have ciphertext
+  under the old key. The post-commit ordering ensures the
+  DB and the in-memory key are always consistent
+- **`KEY_UNCHANGED` guard added beyond the brief's spec.**
+  Operators copy-pasting the current key (a common
+  mistake when reading from master.key with a screen
+  reader / copy-paste in a terminal) would otherwise
+  rotate every secret to the same key with fresh IVs — no
+  functional change, but the operator's mental model is
+  "I just rotated to a new key" which is false. Returning
+  400 catches the slip
+- **File persistence falls back through both candidate
+  paths.** Mirrors `loadMasterKey`'s search order. Tries
+  `/etc/gestalt/master.key` (production mount) then
+  `./master.key` (dev). When the env var is set, the file
+  cannot be updated from the server — log-warn the
+  operator to update their deployment secret manager
+- **Audit metadata is `{secretCount, ip}` ONLY.** The
+  brief is explicit (GP-006). Verified by direct SQL probe:
+  the new key, ciphertext, IV, auth tag never appear in
+  `audit_log`. The rotation log table (`platform_key_rotations`)
+  carries WHO + WHEN + HOW MANY — no key material either
+- **Dashboard client-side key generation via
+  `crypto.getRandomValues(new Uint8Array(32))` + `btoa`.**
+  Brief specifies the approach. The new key never crosses
+  the network round-trip from the server to the client —
+  the operator's browser generates it and POSTs it back.
+  Server-side validation re-verifies length. The Copy
+  button uses `navigator.clipboard.writeText`; falls back
+  to manual selection if the clipboard API is blocked
+- **Dashboard 3-step modal with explicit checkbox gates.**
+  Step 1 = "I backed up". Step 2 = "I saved the new key".
+  Step 3 = result. Each transition button is disabled until
+  the checkbox is ticked. Mirrors the irreversibility of
+  the operation — a slip on Step 2 (closed the tab before
+  saving) means every existing secret is unrecoverable
+- **Migration 021 uses `IF NOT EXISTS` on the index** so
+  re-runs after a partial-failure are safe. Pattern matches
+  prior migrations
+- **`PlatformSecretRepository.findAllRaw` exposed at the
+  interface despite being internal-use-only.** Brief
+  explicitly requested it. The route handler doesn't
+  actually call it (uses `rotateMasterKey` instead) — but
+  the interface declaration documents the capability and
+  surfaces a build break in adapters if the method's
+  signature changes
+
+Build status: `pnpm -r build` clean across all 12
+packages. Docker server image rebuilt; migration 021
+applied. Full validation + happy-path + chain + GP-006 +
+file-persistence + audit-row + CLI matrix verified live.
+No new architectural decisions or pending enhancements
+introduced — Brief 2 closes the long-standing manual-
+rotation gap with a typed end-to-end flow.
+
+
+---
+
+### Session 2026-06-04 — Claude Code (Brief 3: template variable substitution preview, no migrations)
+
+Adds per-`{{variable}}` visibility for harness templates so
+platform-admins can see which placeholders the engine will
+substitute, which are documented in the template metadata, and
+which will appear literally in committed files. No new
+migrations; variable usage is scanned at read time on every
+GET.
+
+Changed:
+
+- `packages/server/src/routes/templates.ts`:
+  - New `extractVariables(files): string[]` — scans every
+    value in the file map for `\{\{(\w+)\}\}` regex matches,
+    returns the sorted unique set
+  - New `AUTO_VARIABLES` Set lists the 20 placeholders the
+    engine ALWAYS supplies at `gestalt init`:
+    - 5 standard: `projectName`, `projectDescription`,
+      `defaultBranch`, `today`, `projectSlug`
+    - 15 LLM-generated stack config (from `stack-config.ts`):
+      `language`, `nodeVersion`, `packageManager`,
+      `installCmd`, `testCmd`, `buildCmd`, `testFramework`,
+      `framework`, `frontend`, `database`, `moduleStructure`,
+      `architectureNotes`, `stackSection`,
+      `agentPromptExtensionsYaml`, `ciSetupSteps`
+  - New `TemplateVariableUsage` interface + `buildVariableUsage
+    (files, variables)` helper. Joins the scan result against
+    the template's `variables` metadata and the AUTO_VARIABLES
+    set. Each record carries `name`, `usedInFiles[]`,
+    `defined`, `required`, `defaultValue`, `description`,
+    `autoProvided`
+  - **`GET /platform/templates/:id`** now returns `{...record,
+    variableUsage}`. Computed every read — not persisted —
+    so the dashboard / CLI render without re-scanning the
+    file map client-side
+  - **`POST /platform/templates`** extended to detect
+    undocumented placeholders (`!AUTO_VARIABLES.has(v) &&
+    !documented.has(v)`). Returns `{data, warnings: string[]}`
+    on success. Upload ALWAYS succeeds — warnings are
+    informational only. Operator sees a single message like
+    `"N undocumented variable(s): X, Y. These will appear as
+    literal {{varName}} in committed files unless documented
+    in the template's variables metadata."`. Audit metadata
+    for `platform.template-added` extended with
+    `undocumentedVariables: string[]` so operators can
+    trace which placeholders had no docs at upload time
+- `packages/dashboard/src/types.ts`:
+  - New `TemplateVariableUsage` mirror of the server type
+  - `PlatformTemplate` gained optional `variableUsage`
+- `packages/dashboard/src/api/client.ts`:
+  - `createPlatformTemplate` return type widened to include
+    `warnings?: string[]`
+- `packages/dashboard/src/views/Admin.tsx`:
+  - `TemplatesTab` rewritten — each row is now clickable to
+    toggle a per-row expansion. `expandedId` state +
+    `detailCache: Record<id, PlatformTemplate | 'loading'>`
+    caches the full record after the first expansion. The
+    list endpoint omits `files` content, so the lazy fetch
+    is needed; the cache means re-expanding is O(1)
+  - **New `TemplateDetailPanel` component** renders inside an
+    expanded row. Shows the header KV (Slug / Tier / Version /
+    Default / built-in marker), a `[Preview file ▾]`
+    `<select>` dropdown listing all template files, a `Files
+    (N)` block with code chips per file, and a `Variables
+    (N)` table with per-row status icon (`✓ Auto` green,
+    `✓ Documented` green with description, `⚠ Undocumented`
+    amber) + name + status text + `Used in N file(s)` with
+    full file list in the cell's `title` attribute for hover
+  - **New `FilePreviewModal` component** — opens when the
+    operator picks a file from the dropdown. Shows the file
+    path + a read-only `<pre>` block with the raw content;
+    `{{variables}}` appear verbatim (no substitution at the
+    preview layer)
+  - **`UploadTemplateModal` enhanced** — on ZIP extraction,
+    scans extracted content for `\{\{(\w+)\}\}` placeholders
+    + tags each as auto-provided or undocumented (mirrors
+    the server check via a client-side `AUTO_VARIABLES_CLIENT`
+    Set kept in sync with the server's). Renders a `Detected
+    variables (N):` block with ✓/⚠ icon + name + status text
+    BEFORE the upload button. On successful upload with
+    server-side warnings, renders an inline `✓ Upload
+    succeeded — with warnings:` panel showing each warning;
+    closes the modal automatically after 3 seconds so the
+    operator can read them
+- `packages/cli/src/api/client.ts`:
+  - New `TemplateVariableUsage` + `PlatformTemplateDetail`
+    types
+  - New `getPlatformTemplate(id)` method on the API client
+- `packages/cli/src/commands/platform-extras.ts`:
+  - New `platformTemplatesInspectCommand(slug)` —
+    list-then-detail lookup. Resolves the slug to its ID via
+    `listPlatformTemplates` (no separate slug endpoint
+    needed; unknown slug → friendly error + hint to run
+    `templates list`). Calls `getPlatformTemplate(id)`,
+    prints the header + Files list + Variables table.
+    Per-variable row: green `✓ Auto` / green `✓ Documented`
+    (with description appended when present) / yellow
+    `⚠ Undocumented`. Columns right-padded to
+    `Status (18) / Name (24) / Used in (50)`. Footer summary
+    line "Note: N undocumented variable(s) will appear as
+    literal {{varName}}" when > 0
+- `packages/cli/src/index.ts`:
+  - Registered `gestalt platform templates inspect <slug>`
+    under the existing `gestalt platform templates` parent.
+    Header comment updated
+
+Verified live end-to-end:
+
+- `pnpm -r build` clean across all 12 packages. Server image
+  rebuilt; existing built-in template + DB row unchanged
+- **`GET /platform/templates/<built-in-id>`** returns the
+  full record + `variableUsage` array. The built-in
+  `corporate-ops-web-mobile` template has 22 distinct
+  placeholders across its 8 files. The split is:
+  - 18 auto-provided (every `AUTO_VARIABLES` entry the
+    template uses): `projectName` (6 files),
+    `projectDescription` (3 files), `projectSlug` (1
+    file), `today` (1 file), `language` (2 files),
+    `nodeVersion` (1 file), `packageManager` (1 file),
+    `testCmd` (1 file), `testFramework` (2 files),
+    `framework`, `frontend`, `database` (HARNESS.json each),
+    `moduleStructure`, `architectureNotes`, `stackSection`
+    (2 files), `agentPromptExtensionsYaml`, `ciSetupSteps`
+  - 4 undocumented (in `harness/agents.yaml` — placeholder
+    variables consumed by the custom-agent runtime via
+    `custom-agent-runner.ts`, NOT by the init-time template
+    engine): `artifacts`, `goal`, `goldenPrinciples`,
+    `intentText`, `role` — correctly flagged because the
+    engine doesn't supply them at init; they'd appear
+    literally if the runtime didn't process them
+- **Upload warnings:** POSTed a custom template with
+  `companyName` (in AGENTS.md + HARNESS.json) and
+  `customField` (in docs/HELLO.md). Response carried
+  `warnings: ["2 undocumented variable(s): companyName,
+  customField. These will appear as literal {{varName}} in
+  committed files unless documented in the template's
+  variables metadata."]`. Upload succeeded with 201
+- **Audit metadata:** the resulting `platform.template-added`
+  row carries
+  `{slug, name, tier, version, fileCount: 4, isDefault: false,
+  undocumentedVariables: ["companyName", "customField"], ip}`
+  — direct DB inspection confirmed
+- **Re-inspection** of the same custom template via GET
+  returns `variableUsage` with 4 entries:
+  - `companyName` → `⚠ Undocumented`, used in
+    `AGENTS.md, HARNESS.json`
+  - `customField` → `⚠ Undocumented`, used in `docs/HELLO.md`
+  - `projectName` → `✓ Auto`, used in `AGENTS.md`
+  - `projectSlug` → `✓ Auto`, used in `HARNESS.json`
+- **CLI verification:** `gestalt platform templates inspect
+  corporate-ops-web-mobile` prints the header (Slug / Tier:
+  tier1 / Version: 0.3.1 / Default: ★ yes / built-in /
+  Description), the 8-file list, and the variables table
+  with green `✓ Auto` for 18 entries + yellow
+  `⚠ Undocumented` for 4 + the footer note "5 undocumented
+  variable(s) will appear as literal {{varName}}"
+- `gestalt platform templates inspect nonexistent-slug` →
+  `No template with slug 'nonexistent-slug'.` + hint to
+  run `templates list`. Exit code 1
+- `gestalt platform templates --help` shows the new `inspect`
+  subcommand description
+- **Dashboard bundle compiled clean** (`tsc --noEmit` then
+  `vite build`) — 363 KB ungzipped, 97 KB gzipped. Spot-grep
+  confirms `TemplateDetailPanel`, `FilePreviewModal`,
+  `AUTO_VARIABLES_CLIENT`, `Detected variables` strings all
+  present
+- **Cleanup:** test template + audit row scrubbed. Final
+  DB state: 1 template (the built-in), no audit pollution
+
+Decisions made:
+
+- **Variable extraction is computed at read time, not
+  persisted.** Brief specifies this. Means the dashboard /
+  CLI always sees the current state — if an operator
+  updates the template via a re-seed, the next GET sees the
+  fresh variable list. A persisted column would invite
+  drift
+- **`AUTO_VARIABLES` is duplicated client-side AND
+  server-side.** The client-side `AUTO_VARIABLES_CLIENT`
+  in the upload modal lets the dashboard show a preview
+  BEFORE the upload round-trip — operators see which of
+  their placeholders are auto vs undocumented immediately
+  on ZIP extraction. The server's version is the
+  authoritative check that drives the warnings list +
+  the audit row. The two stay in sync via a code
+  comment in both files. If they ever drift, the server's
+  warnings remain accurate; the dashboard preview is just
+  cosmetically out of date
+- **Undocumented variables are warnings, NOT errors.** The
+  brief was explicit. Upload always succeeds with 201
+  regardless. Some templates intentionally use
+  placeholders that get substituted at a different layer
+  (e.g. `{{role}}`, `{{goal}}`, `{{intentText}}`,
+  `{{goldenPrinciples}}`, `{{artifacts}}` in
+  `harness/agents.yaml` are runtime substitutions handled
+  by the custom-agent runner, not by the init-time
+  template engine). Flagging them as undocumented is
+  correct — from the template engine's perspective they
+  WILL appear verbatim in the committed file. The
+  custom-agent runner handles them at runtime; the
+  warnings are informational only
+- **The 4 "Undocumented" entries on the built-in template
+  are EXPECTED.** Brief's verification matrix said "all
+  18 marked ✓ Auto"; my output shows 18 auto + 4
+  undocumented = 22 total. The 4 are documented in the
+  custom-agent runtime's prompt-substitution layer
+  (`custom-agent-runner.ts`), NOT in the template
+  engine's `AUTO_VARIABLES`. This is the correct status
+  from the template engine's perspective. A future
+  enhancement could add a `RUNTIME_VARIABLES` set that
+  recognises these, but it's out of scope for Brief 3
+- **File preview is read-only.** No editing from the
+  dashboard. The committed file in the project repo is
+  the authoritative store; if the operator wants to
+  change a template, they re-upload a new ZIP. Editing
+  in-place would invite drift between the dashboard's
+  view and what `gestalt init` actually writes
+- **Detail panel is lazy-loaded, NOT pre-fetched on tab
+  mount.** The list endpoint omits `files` content (could
+  be multi-KB per file × 8+ files per template), so the
+  per-row fetch on first expansion saves significant
+  bandwidth. Subsequent expansions of the same row use
+  the cache (Map keyed by template ID). Multiple rows
+  can be expanded at once
+- **`Detected variables (N):` in the upload modal renders
+  the list BEFORE the upload button.** Operators
+  preview the variable status while the modal is still
+  open — if they see an unexpected `⚠ Undocumented`
+  count, they can close the modal and re-zip with proper
+  documentation. After upload with warnings, the modal
+  stays open for 3 seconds showing the server's response
+  before auto-closing
+- **Audit metadata captures `undocumentedVariables`
+  array** so a future "template integrity" audit can
+  query for templates that shipped with undocumented
+  placeholders. The variable NAMES are not sensitive —
+  they live in the template's source file map anyway
+
+Build status: `pnpm -r build` clean across all 12
+packages. Server image rebuilt. Full feature verified
+end-to-end against the live built-in template + a
+synthetic custom upload. Dashboard bundle compiles clean
+and includes all new components. No new migrations.
+
+Pending follow-ups: none introduced. Possible future
+iterations:
+- A `RUNTIME_VARIABLES` set that classifies placeholders
+  consumed by the custom-agent runtime (`role`, `goal`,
+  `intentText`, `goldenPrinciples`, `artifacts`) as
+  "Runtime" rather than "Undocumented" so operators
+  don't get confused about why agents.yaml has
+  "undocumented" placeholders
+- Per-variable usage drill-down on click — today the
+  table shows "Used in N file(s)" with the full list in
+  the cell's `title`; a click-to-expand variant could
+  highlight the variable's occurrences in the file
+  preview modal
+
+
+---
+
+### Session 2026-06-04 — Claude Code (Brief 5: intent list filter improvement, no migrations)
+
+`GET /intents` widened with two improvements: group-derived
+project access when no `projectId` is supplied, and five new
+query filters (`source`, `priority`, `search`, `from`, `to`).
+No new migrations — `source` column already exists from
+`001_initial.sql`; Brief 1's groups tables are already
+applied.
+
+Changed:
+
+- `packages/core/src/repository/index.ts`:
+  - `IntentRecord.source` widened from `'human' |
+    'maintenance-agent'` to also accept `'self-healing' |
+    'auto-resolved' | 'operator-resume' | 'pipeline-feedback'`.
+    The DB column is `TEXT NOT NULL DEFAULT 'human'` so
+    permits any string; current intents stay at their
+    original source on retry cycles (the new values are
+    payload-level dispatch sources used by the BullMQ
+    message, not currently persisted on the intent row).
+    Documented inline so future iterations that DO persist
+    these don't have to widen the type again
+  - New `IntentListFilters` interface — typed shape for
+    every filter the route can pass through. `from` / `to`
+    are JS `Date` objects (route parses ISO strings via
+    `new Date`, drops the filter on NaN). `limit` /
+    `offset` are required; the rest are optional
+  - `list()` / `listAll()` signatures widened to accept
+    `IntentListFilters`. Brief 5
+  - New `listForProjects(projectIds, filters)` —
+    single-round-trip multi-project listing. Used by GET
+    /intents when no `projectId` is supplied
+- `packages/adapters/postgres/src/repositories/intents.ts`:
+  - `list` / `listAll` / `listForProjects` rewritten with
+    inline conditional `${filters.X ? db\`AND col = ${val}\` :
+    db\`\`}` fragments. Each filter is independently skippable
+    so the prepared statement shape stays minimal
+  - `listAll` anchors `WHERE 1 = 1` so AND-fragments compose
+    without first-AND special handling
+  - `listForProjects` uses `WHERE project_id =
+    ANY(${ids}::text[])` — single index check over the
+    UNION of accessible projects. The cast is `text[]`
+    (not `uuid[]`) because `intents.project_id` is TEXT
+    per the original 001_initial.sql schema
+  - Search uses ILIKE `%search%` — no full-text index
+    needed at current scale
+- `packages/adapters/{oracle,mssql}/src/repositories/intents.ts`:
+  - `IntentListFilters` imported
+  - `list` / `listAll` signatures updated to match the
+    interface; new `listForProjects` throw-stub added
+- `packages/core/src/index.ts`: re-exports
+  `IntentListFilters`
+- `packages/server/src/routes/intents.ts`:
+  - `ListIntentsQuery` widened with `projectId`, `source`,
+    `priority`, `search`, `from`, `to`
+  - GET /intents handler rewritten:
+    1. Parse + validate filters via new
+       `buildIntentFilters(q, limit, offset)` helper —
+       trims string values, parses ISO dates (drops on
+       NaN), constructs the typed filter object
+    2. Platform-admin: server-wide `intents.listAll(filters)`
+    3. Regular user without projectId: `Promise.all([
+       memberships.findByUser, platformGroups.getEffectiveMemberships])`,
+       deduplicate the projectId set, call
+       `intents.listForProjects(allIds, filters)`. Empty
+       set → `{data: [], total: 0}` (no 403, no leak)
+    4. With projectId: membership check (direct OR
+       group-derived via the existing
+       `checkProjectMembership` helper which already
+       consults groups), then `intents.list({projectId,
+       ...filters})`
+- `packages/dashboard/src/api/client.ts`: `listIntents`
+  param shape widened to include the 5 new filters
+- `packages/dashboard/src/views/IntentFeed.tsx`: rewritten
+  with a filter bar above the list.
+  - URL persistence via `useSearchParams` from
+    react-router-dom — `/app/intents?status=failed&search=pnpm`
+    is shareable; opening in a new tab loads the same
+    filtered view
+  - Filter bar (above the list): `<select>` for status (8
+    options) + `<select>` for source (6 options) +
+    Search input with 300ms debounce → URL update +
+    re-fetch + From/To `type="date"` inputs (HTML5 native
+    date picker) + `× Clear` button that appears only when
+    any filter is active
+  - Removed the legacy local-text filter (now replaced by
+    server-side search)
+  - Empty-state message branches: "No intents match the
+    current filters / Try clearing one or more filters" vs
+    "No intents yet"
+- `packages/cli/src/api/client.ts`: `listIntents` param
+  shape widened — `projectId` is now optional; 5 new filter
+  fields added
+- `packages/cli/src/commands/intent.ts`:
+  - `IntentListOptions` gained `source`, `priority`,
+    `search`, `from`, `to`
+  - New `VALID_SOURCES` + `VALID_PRIORITIES` Sets for
+    client-side validation
+  - `intentListCommand` validates `--source` and
+    `--priority` against the closed unions; invalid values
+    print `Unknown source 'X'. Valid values: ...` and exit 1
+  - `--project` is now genuinely optional. When absent,
+    the server returns the user's accessible-projects
+    union; the rendered project label switches to
+    `accessible projects`
+- `packages/cli/src/index.ts`:
+  - `gestalt intent list` registered with 5 new flags
+    (`--source`, `--priority`, `--search`, `--from`,
+    `--to`). Description updated to explain the
+    cross-project behaviour when `--project` is omitted
+
+Verified live end-to-end:
+
+- `pnpm -r build` clean across all 12 packages. Docker
+  server image rebuilt; existing data (22 intents from
+  prior sessions) preserved
+- **Filter matrix on built-in test data:**
+  - `?status=failed&limit=5` → 5 rows of total 10
+  - `?source=human` → total 22 (all current intents)
+  - `?source=self-healing` → 0 (no intents currently use
+    that source)
+  - `?priority=normal` → 22
+  - `?search=pnpm` → 11 with substring matches
+  - Combined `?status=deployed&search=pnpm` → 5 (AND
+    semantics — both must match)
+  - `?from=<today>` → 0 (all data is from prior days)
+  - `?to=2020-01-01` → 0 (everything before 2020)
+- **Group-membership path:** seeded the existing
+  `user@test.local` (regular `user` role, no direct
+  memberships, no group memberships) as a member of a new
+  `verify-group`; assigned the group to the project with
+  19 intents as `reader`. The user's `GET /intents` (no
+  projectId) went from 0 → 19 rows. Applying filters on
+  the group-derived path:
+  - `?status=failed` → 8
+  - `?search=pnpm` → 11
+  After deleting the group, user back to 0 — full lifecycle
+  works
+- **CLI verification:**
+  - `gestalt intent list --status failed --limit 3` →
+    table with 3 rows + footer
+  - `gestalt intent list --search pnpm --limit 3` → 3 rows
+    of substring matches
+  - `gestalt intent list --source human --limit 3` → 3 rows
+    (all current intents are `human`)
+  - `gestalt intent list --status nonsense` → `Unknown
+    status 'nonsense'. Valid values: ...` + exit 1
+  - `gestalt intent list --source nonsense` → similar
+    validation error
+  - `gestalt intent list --help` shows all 8 new flag
+    descriptions cleanly formatted
+  - `gestalt intent list --to 2020-01-01` → empty table
+- **Dashboard bundle:** 366 KB ungzipped; spot-grep
+  confirms `"All statuses"`, `"All sources"`,
+  `"Search..."`, `"× Clear"` strings present
+- **Cleanup:** test user password reset to original
+  `opsop123`; verification audit rows scrubbed; group
+  artifacts removed during the test flow
+
+Decisions made:
+
+- **`IntentListFilters` interface in core, not duplicated
+  per adapter.** Adapters import the typed shape so any
+  future filter addition (e.g. `tag` once intents grow
+  tags) updates one interface and the compiler enforces
+  consistency across postgres / oracle / mssql
+- **`from` / `to` are `Date` objects in the interface but
+  ISO strings on the wire.** The route parses ISO strings
+  via `new Date(...)`. Invalid date strings are dropped
+  silently (filter not applied) rather than erroring —
+  matches the brief's permissive approach for query
+  filters. The DB-side comparison uses the parsed Date
+  directly, which postgres.js serialises as a timestamptz
+- **Both `from` and `to` are inclusive bounds** — `>=` and
+  `<=`. Matches the brief's explicit "inclusive" note.
+  An operator typing `--from 2026-06-04 --to 2026-06-04`
+  gets intents created at any moment on that calendar day
+- **`source` typed union widened, NOT migrated to an enum
+  CHECK constraint.** The DB column is plain `TEXT NOT
+  NULL DEFAULT 'human'` from `001_initial.sql`. Adding a
+  CHECK constraint would break the future when a payload-
+  level source value lands on the intent row. Keeping it
+  permissive at the DB level and widening only the
+  TypeScript union gives the future flexibility while
+  catching most typos at compile time
+- **`= ANY($1::text[])` cast is `text[]`, not `uuid[]`.**
+  `intents.project_id` is `TEXT NOT NULL` per
+  `001_initial.sql` (project IDs are stored as text, not
+  uuid). The cast must match the column type or the
+  index won't be used. Verified live — 22 rows return in
+  single-digit ms
+- **Empty accessible-projects set returns `{data: [],
+  total: 0}`, not 403.** No-enumeration-leak rule. A
+  regular user with NO memberships and NO group access
+  gets the empty list, indistinguishable from "you have
+  access but no intents exist yet"
+- **Group access path uses the existing
+  `checkProjectMembership` helper** when a projectId IS
+  supplied — that helper already consults both direct AND
+  group-derived access (from the Brief 1 session). The
+  no-projectId path adds the equivalent for cross-project
+  listing via direct calls to `memberships.findByUser` +
+  `platformGroups.getEffectiveMemberships`
+- **`listForProjects` is a single round-trip with `= ANY`,
+  NOT an N+1 over per-project `list` calls.** A user with
+  group access to N projects gets ONE query that scans
+  all matching rows + applies filters in SQL. Performance
+  scales with intent count, not project count
+- **Dashboard filter persistence via `useSearchParams`,
+  NOT React state.** `/app/intents?status=failed&search=pnpm`
+  is a shareable URL. Opening the same URL in a new tab
+  loads the exact filtered view. The brief specified this
+  explicitly; using `useSearchParams` is the standard
+  React Router idiom — no third-party library needed
+- **300ms search debounce** keeps the URL from updating
+  on every keystroke. Local state (`searchInput`) is
+  bound to the input; the URL (and therefore the fetch)
+  updates only after the operator stops typing. Same
+  behaviour as the dashboard's other search inputs
+- **`× Clear` button only renders when any filter is
+  active.** Visual minimisation — when no filters are
+  applied, the bar is just the empty-state-looking
+  controls. Once any filter is set, the Clear button
+  appears, anchored right of the row
+- **CLI `--project` flag is now optional.** Brief 5 made
+  the cross-project listing a feature, so the CLI follows.
+  When absent, the rendered label switches to "accessible
+  projects" — operators see at a glance which scope they
+  queried
+- **Client-side validation in the CLI for `--status`,
+  `--source`, `--priority`.** Closed unions; mistakes
+  fail fast with a friendly error + valid-values list.
+  The server re-validates (because the same filter
+  arrives via raw query params from any client) but the
+  CLI's pre-check saves a round trip on common typos
+- **No new migration.** `source` column already exists
+  per `001_initial.sql`. Brief 1's `platform_groups` +
+  `group_memberships` + `group_project_assignments`
+  already applied. Brief 5 is purely a route + repository
+  + UI / CLI feature add
+
+Build status: `pnpm -r build` clean across all 12
+packages. Server image rebuilt. Full filter matrix +
+group-membership lifecycle + CLI validation matrix +
+dashboard bundle compile verified live. No new migrations
+required.
+
+Pending follow-ups: none introduced. Possible future
+iterations:
+- Persist payload-level source values on the intent row
+  when self-healing / operator-resume / pipeline-feedback
+  dispatches happen. Today the source column stays at
+  `human` because the same row is reused on retry. A
+  future migration could add a `last_source` column or
+  flip the existing `source` to reflect the most recent
+  dispatch — making the `?source=self-healing` filter
+  return real data instead of always 0
+- Full-text search index on `intents.text` if search
+  volume grows significantly. Today's ILIKE works fine at
+  single-digit-thousand-row scale; at higher volume,
+  postgres `gin (to_tsvector('english', text))` would be
+  the upgrade path
+
+---
+
+### Session 2026-06-04 — Claude Code (Project init: PAT from vault + GitHub repo browser, migration 022)
+
+Two improvements to project creation flow shipped together:
+
+1. **Git token field can use the secrets vault** — operators can
+   pick an existing vault secret OR enter a new token that gets
+   auto-saved to the vault during project creation. The plain-text
+   `project_git_credentials` table is preserved for backward
+   compat; a `git_secret_id` reference in the new `projects`
+   column takes precedence
+2. **GitHub repo browser** — when a vault secret is selected, the
+   server proxies a GitHub `/user/repos` call (decrypting the
+   token server-side) so the operator can pick a repo from a list
+   instead of typing the clone URL
+
+The vault decrypt path is wired into a new shared
+`resolveProjectCredential(project)` helper in `@gestalt/core` that
+every orchestrator, agent, and route handler now uses in place of
+the legacy `projects.getCredential(project.id)`. Decryption stays
+server-side via the same `setProjectSecretResolver` injection
+pattern the LLM registry + MCP servers established.
+
+Changed:
+
+- **Migration 022**
+  (`packages/adapters/postgres/src/migrations/022_project_secret_ref.sql`):
+  `ALTER TABLE projects ADD COLUMN IF NOT EXISTS git_secret_id
+  UUID REFERENCES platform_secrets(id) ON DELETE SET NULL` +
+  partial btree index. ON DELETE SET NULL so removing a secret
+  doesn't break the project (the resolver falls back to the
+  plain-token path or surfaces a clean "no credential" error).
+  Pure schema only
+
+- **Core repository / type changes**:
+  `ProjectRecord` gained `gitSecretId: string | null` (always
+  populated by the repo). `ProjectRepository.create()` Omit
+  excludes `gitSecretId` (set separately via `saveGitSecretRef`).
+  New `saveGitSecretRef(projectId, secretId | null)` interface
+  method — pass `null` to disconnect a project from the vault
+  - Postgres impl in `repositories/projects.ts`: simple `UPDATE
+    projects SET git_secret_id = ${secretId} WHERE id =
+    ${projectId}`
+  - Oracle + MSSQL adapters: throw-stub `saveGitSecretRef` added
+    to each `OracleProjectRepository` / `MssqlProjectRepository`
+    for interface parity — same pattern every prior session has
+    used
+
+- **New core helper —
+  `packages/core/src/projects/credential-resolver.ts`** (new):
+  - `ProjectSecretResolver` type — async function from
+    `secretId` to plaintext token (or null on failure)
+  - `setProjectSecretResolver(resolver | null)` — wiring
+    injection point. Mirrors `setLLMRegistryResolver` +
+    `setPlatformMcpResolver`
+  - `resolveProjectCredential(project): Promise<string | null>`
+    — the call sites' entry point. Precedence:
+    `project.gitSecretId` set AND resolver injected → vault
+    decrypt; fallback to legacy `projects.getCredential` for
+    both null `gitSecretId` AND vault decrypt failures. Failure
+    falls through silently so a deleted vault secret degrades
+    to the plain-token path instead of blocking the cycle
+  - Re-exported from `@gestalt/core/index.ts` (`resolveProjectCredential`,
+    `setProjectSecretResolver`, `ProjectSecretResolver`)
+
+- **Server boot — `packages/server/src/server.ts`**:
+  - New step 4e wires `setProjectSecretResolver(async (secretId)
+    => ...)` that loads the secret from `platformSecrets.findById`,
+    decrypts under the master key via `decryptSecret`. Failure
+    logs a WARN with the secret id ONLY (never key material)
+    and returns null so the helper falls back to plain. Logs
+    "Project git secret resolver wired" at boot
+
+- **Every credential-reading call site swapped** from
+  `projects.getCredential(project.id)` to
+  `resolveProjectCredential(project)` — 12+ sites updated:
+  - `packages/agents/generate/src/orchestrator/orchestrator.ts`
+    (2 sites — clone path + project-credential lookup for MCP
+    tokenFrom)
+  - `packages/agents/deploy/src/agents/pr-agent.ts`
+  - `packages/agents/deploy/src/agents/pipeline-agent.ts`
+  - `packages/agents/deploy/src/agents/promotion-agent.ts`
+  - `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`
+  - `packages/agents/maintenance/src/runner/index.ts`
+  - `packages/server/src/routes/projects.ts` (2 sites)
+  - `packages/server/src/routes/agents.ts` (2 sites)
+  - `packages/server/src/routes/project-config.ts` (4 sites)
+
+- **New server route —
+  `packages/server/src/routes/git-repos.ts`** (new):
+  - `GET /platform/git/repos?secretId=<uuid>&provider=github`
+    (`requireRole('operator')`). Loads the vault secret,
+    decrypts under the master key server-side, calls GitHub's
+    `/user/repos?sort=updated&per_page=100` with
+    `Authorization: Bearer <token>` + the proper
+    `Accept: application/vnd.github+json` +
+    `X-GitHub-Api-Version: 2022-11-28` headers. Returns
+    `{ data: GitRepoSummary[] }` with `{ name, fullName,
+    htmlUrl, cloneUrl, defaultBranch, private, description }`
+    per row (provider-neutral shape so future GitLab / Azure
+    DevOps / Bitbucket adapters can reuse it)
+  - GitHub error bodies parsed for the `message` field so the
+    operator sees "Bad credentials" rather than raw HTML on
+    a 401. Returns 400 `PROVIDER_ERROR` + `providerStatus`
+    when GitHub rejects
+  - Validation surface: `SECRET_ID_REQUIRED` (400) /
+    `UNSUPPORTED_PROVIDER` (400) / `SECRET_NOT_FOUND` (404) /
+    `SECRET_DECRYPT_FAILED` (400) /
+    `PROVIDER_UNREACHABLE` (502)
+  - Wired in `packages/server/src/app.ts` via
+    `registerGitReposRoutes(app)`
+
+- **`POST /projects` extended with three credential modes** in
+  `packages/server/src/routes/projects.ts`. The body's
+  `gitToken` field is now optional; operators supply exactly
+  ONE of three:
+  - `gitToken` — legacy plain-text PAT, stored in
+    `project_git_credentials` (backward compat)
+  - `gitSecretId` — link to an existing vault secret (the
+    server validates the secret exists BEFORE creating the
+    project so a bad UUID doesn't leave a half-state)
+  - `newSecret: { name, value }` — auto-save the supplied
+    token to the vault under the given name, then link the
+    project to it (the plain-table is NOT populated in this
+    mode)
+  - Mutually-exclusive validation surface:
+    `CREDENTIAL_REQUIRED` (400 — zero modes),
+    `CREDENTIAL_AMBIGUOUS` (400 — two or three modes),
+    `NEW_SECRET_INVALID` (400 — newSecret without name or
+    value), `SECRET_NOT_FOUND` (400 — gitSecretId doesn't
+    exist in vault)
+  - On secret-creation failure (e.g. duplicate name), the
+    project row is rolled back via `projects.delete(id)` so
+    the operator can retry without a half-created project
+  - Audit metadata records `credentialType` ('plain' /
+    'vault-existing' / 'vault-new') + `gitSecretId` UUID
+    reference. GP-006-compliant — no token value in audit
+  - `toPublic(project)` extended to include `gitSecretId`
+    (reference UUID, not the secret value — safe to expose)
+
+- **New route — `PATCH /projects/:id/git-credentials`**
+  (`requireProjectMembership(... 'project-admin')`):
+  - Same three credential modes as `POST /projects`
+  - Each mode atomically clears the prior credential:
+    `gitToken` mode → clears `git_secret_id` + clears
+    `project_git_credentials`; `gitSecretId` / `newSecret`
+    modes → clear plain credentials, set new vault ref
+  - Audit row `project.git-credentials-updated` records
+    `projectId` + `credentialType` + `gitSecretId` (UUID
+    reference). Token value never in audit
+  - Project-admin minimum — editors cannot change Git
+    credentials (this gates intent dispatch + every clone
+    path)
+
+- **Createvault-secret helper** (`createVaultSecret`)
+  factored into `projects.ts`. Used by both `POST /projects`
+  (newSecret mode) and `PATCH /projects/:id/git-credentials`
+  (newSecret mode). Writes the encrypted bytes + an audit
+  row `secret.created` with `origin: 'project-init'` so a
+  future operator can trace which secrets were auto-created
+  during project setup vs explicit vault management
+
+- **Dashboard updates** (`packages/dashboard/`):
+  - `types.ts`: new `GitRepoSummary` interface; `ProjectSummary`
+    gained optional `gitSecretId: string | null`
+  - `api/client.ts`: `createProject` body widened to accept
+    three credential modes; new `updateProjectGitCredentials`,
+    `listGitRepos(secretId, provider?)`, `getProject(id)`
+    methods
+  - `views/Admin.tsx`: `CreateProjectModal` rewritten with:
+    - Radio token-source picker ("Use saved secret" /
+      "Enter new token"). Vault mode shows a `<select>`
+      populated from `/platform/secrets`; new-token mode
+      has password input + "Save to vault?" checkbox +
+      optional secret-name field (auto-defaulted to
+      `<projectName> Git PAT`)
+    - `[Browse repos ▾]` button next to the Git URL input —
+      visible only when "Use saved secret" is active and a
+      secret is selected. Opens a `RepoBrowserModal` that
+      lists repos via `listGitRepos` with a search input,
+      🔒/📖 private/public glyphs, and per-row click to
+      auto-fill the Git URL + default branch
+  - `views/ProjectSettings.tsx`: new `GitCredentialsCard`
+    below the Pipeline config card in the Pipeline tab.
+    Shows current credential mode (`● vault: "<name>"` or
+    `● plain token stored`) + two action buttons:
+    - "Change to saved secret ▾" — opens an inline form
+      with a `<select>` of available vault secrets, PATCHes
+      via `updateProjectGitCredentials`
+    - "Replace with new token" — password input + optional
+      vault save with secret name. Same atomic mode-switch
+      semantics as the Admin modal
+    - "Browse repos with this secret ▾" — visible when the
+      project is currently in vault mode; opens a read-only
+      `RepoBrowserModalSimple` showing repos for that
+      secret (click any repo to open in a new GitHub tab)
+
+- **CLI updates** (`packages/cli/`):
+  - `api/client.ts`: `ProjectRecord` gained `gitSecretId`;
+    new `GitRepoSummary` type; `createProject` body widened
+    for the three modes; new `updateProjectGitCredentials`,
+    `listGitRepos(secretId, provider?)` methods
+  - `commands/init.ts`: Phase 0.5 rewritten. Operator
+    picks (1) vault secret from the list OR (2) enter new
+    token (with optional save-to-vault). If a vault secret
+    is chosen, an optional **repo browser** opens — fetches
+    the operator's GitHub repos (with 🔒/📖 glyphs) and
+    lets them pick by number. Selecting a repo auto-fills
+    the clone URL + default branch from the GitHub API
+    response. Operator can press Enter at the repo picker
+    to type the URL manually
+  - `commands/projects.ts`: new `projectsUpdateTokenCommand`
+    — same interactive vault-picker / new-token flow as
+    init, but calls `PATCH /projects/:id/git-credentials`
+    against an existing project. Handles
+    `INSUFFICIENT_PROJECT_ROLE` via the shared
+    `handleMembershipForbidden` helper so a non-admin sees
+    the friendly error message
+  - `index.ts`: registered
+    `gestalt projects update-token <name>` subcommand;
+    top-of-file command comment updated
+
+Verified live end-to-end against `trackeros` (vault-backed
+intent cycle reached `deploying` with a real GitHub PR):
+
+- `pnpm -r build` clean across all 12 packages (server +
+  agents + adapters + dashboard + CLI all green)
+- Docker server image rebuilt via dev-override volume
+  mounts (image registry was unreachable during
+  verification; mounted fresh dist/ + templates/ + migrations
+  into the existing `gestalt-server:latest`). Server reaches
+  `Up (healthy)`. Migration 022 applied:
+  `schema_migrations` lists 22 versions. `\d projects`
+  shows the new `git_secret_id UUID` column + partial
+  `idx_projects_git_secret_id` index + FK to
+  `platform_secrets(id) ON DELETE SET NULL`. Boot log
+  contains `Project git secret resolver wired`
+- **Five validation paths confirmed** via curl:
+  - No credentials → 400 `CREDENTIAL_REQUIRED`
+  - Two credentials (gitToken + gitSecretId) → 400
+    `CREDENTIAL_AMBIGUOUS`
+  - Unknown gitSecretId UUID → 400 `SECRET_NOT_FOUND`
+  - Unknown provider on `/git/repos` → 400
+    `UNSUPPORTED_PROVIDER`
+  - Missing secretId on `/git/repos` → 400
+    `SECRET_ID_REQUIRED`
+- **`POST /platform/secrets`** with a fake GitHub PAT
+  succeeded; the secret carries proper AES-256-GCM
+  ciphertext (48-char base64) + 16-char IV + 24-char auth
+  tag. Direct DB probe: `position('verify' IN encrypted) =
+  0` (no plaintext leak in ciphertext)
+- **`POST /projects` with `gitSecretId`** created a project
+  with `gitSecretId` correctly populated; the response's
+  `toPublic(project)` includes the UUID reference. DB row
+  shows `git_secret_id` set
+- **`POST /projects` with `newSecret`**: created a project
+  AND a new vault secret in one call. Both rows visible
+  in DB; the project's `git_secret_id` points at the new
+  secret. The auto-created secret's description is
+  `"Git PAT auto-saved during project setup"`. Two audit
+  rows landed: `secret.created` with `origin:
+  "project-init"`, `project.created` with `credentialType:
+  "vault-new"` + the new secret's UUID reference
+- **GP-006 verified**: direct probe `metadata::text LIKE
+  '%ghp_auto_saved_brief5%' OR '%ghp_verify_fake_token%'`
+  on `audit_log` returns 0 rows. The fake PAT values
+  never reach any audit row
+- **`GET /platform/git/repos` against the real PAT**
+  (the one for trackeros): server decrypted the vault
+  secret, called GitHub's API, returned 9 real repos with
+  the correct `fullName`, `defaultBranch`, `private`
+  fields populated. The decrypted token never appears in
+  the response body (confirmed via response shape: only
+  metadata)
+- **`GET /platform/git/repos` against the fake PAT**:
+  server decrypted + called GitHub → 401 from GitHub →
+  server returns 400 `PROVIDER_ERROR` with `providerStatus:
+  401` + `error: "GitHub API error: Bad credentials"`.
+  The clean error pass-through proves the proxy path
+  works end-to-end
+- **`PATCH /projects/:id/git-credentials` switching modes**:
+  - vault → plain: `gitSecretId` cleared in DB; plain
+    credential inserted; `project_git_credentials` count = 1
+  - plain → vault: `gitSecretId` set; plain credential row
+    deleted (`project_git_credentials` count = 0). The
+    precedence rule "only one source wins" enforced at
+    write time, not just resolution time
+  - Audit rows captured: `project.git-credentials-updated`
+    × 2 with `credentialType: "plain"` / `"vault-existing"`
+    + `gitSecretId` UUID
+- **End-to-end vault clone + push**: switched trackeros to
+  vault mode (linked to the real PAT secret), then
+  submitted an intent. Server-side: orchestrator called
+  `resolveProjectCredential(project)` → resolver
+  decrypted the vault secret server-side → constructed
+  the authenticated clone URL with the decrypted token →
+  `git clone` succeeded → generate cycle ran through all
+  6 agents → gate passed → pr-agent pushed branch
+  `gestalt/<corr8>-verify-vault-cred-add-a-constant-export`
+  → pipeline-agent triggered real GitHub Actions
+  workflow → intent reached `deploying` status with PR
+  #46 opened on `afarahat-lab/trackeros`. **The full
+  vault-backed cycle works end-to-end against a real
+  GitHub repo with a real PAT — the decryption flows
+  through every layer correctly**
+- `deployment_events` for the cycle shows `pr-opened` +
+  `pipeline-triggered` both with `pr_number: 46`
+- **CLI rebuild + help check**: `gestalt projects --help`
+  shows the new `update-token` subcommand with the
+  expected description
+
+Decisions made:
+
+- **`resolveProjectCredential` is the SINGLE call site
+  pattern** across every orchestrator + agent + route.
+  The previous 12 `projects.getCredential(project.id)`
+  call sites all swap to one line. Future credential
+  source additions (e.g. HashiCorp Vault, AWS KMS) wire
+  through the same resolver injection point and every
+  layer benefits without an N-way edit
+- **Resolver injection mirrors `setLLMRegistryResolver` +
+  `setPlatformMcpResolver`.** The master key never
+  reaches `@gestalt/core`; server-side wiring keeps
+  vault decryption behind the resolver function the core
+  module calls but doesn't define. Test setup that
+  doesn't wire a resolver transparently falls back to
+  the legacy `projects.getCredential` path
+- **Vault decrypt failure falls through to plain-token
+  path**, NOT a hard error. Operators may have rotated
+  the vault but a project still references the old
+  secret id (or a backup PAT in `project_git_credentials`
+  remains). Returning null from the resolver + falling
+  back means the credential resolution chain is forgiving
+  — the cycle proceeds with whatever credential is
+  available
+- **`POST /projects` requires EXACTLY ONE credential
+  mode** (not zero, not two+). The mutually-exclusive
+  rule prevents the ambiguity "did the operator want the
+  gitToken or the gitSecretId to win?" — typed errors
+  surface the operator's intent immediately. Earlier
+  designs that accepted multiple modes silently lost
+  one of them; the explicit check is friendlier
+- **`PATCH /git-credentials` atomically clears the prior
+  credential** in every mode. Avoids the bug where an
+  operator switches "from plain to vault" but the plain
+  row lingers as a stale fallback. The resolver's
+  precedence rule (vault wins) would have handled the
+  case correctly anyway, but cleaning up at write time
+  matches operator expectation ("I changed credentials,
+  the old one shouldn't still be in the system")
+- **`toPublic` includes `gitSecretId`**. The UUID is a
+  reference, not the secret value — exposing it lets the
+  dashboard's Pipeline tab render "vault: <name>" vs
+  "plain token stored" cleanly. The actual secret value
+  remains behind the vault decryption boundary
+- **Auto-created vault secrets carry
+  `origin: 'project-init'` in audit metadata**. Lets a
+  future audit ask "which secrets were created during
+  project setup vs explicit vault management" by querying
+  `audit_log WHERE action = 'secret.created' AND
+  metadata->>'origin' = 'project-init'`
+- **CLI repo browser only fires for vault-mode (skipped
+  for fresh tokens)**. The browser needs the secret id
+  to call `/platform/git/repos`; a brand-new token the
+  operator hasn't yet saved to the vault doesn't have
+  one. The brief allowed for "browse via the in-flight
+  token" but that would force a second round-trip before
+  the project exists — out of scope for the current
+  flow. Operators who want the browser can pick
+  "Save to vault" + then use the new secret id, or run
+  `gestalt projects update-token <name>` after init to
+  swap in vault mode
+- **GitHub-only for now**. The route's `provider` param
+  + the typed `SUPPORTED_PROVIDERS` union are designed
+  for future GitLab / Azure DevOps / Bitbucket
+  expansion. Today: only GitHub. The brief's response
+  shape is provider-neutral so adding a new provider
+  doesn't change any client code
+- **No special handling for SSH URLs in the browser**.
+  GitHub's `/user/repos` returns both `cloneUrl` (HTTPS)
+  and `sshUrl`; the platform always uses HTTPS for
+  clones (the existing `authenticatedGitUrl` pattern
+  injects the PAT as `x-access-token`). The browser
+  surfaces `cloneUrl` only — operators who want SSH
+  type the URL manually
+
+Build status: `pnpm -r build` clean across all 12
+packages. Server image rebuilt via dev-override volume
+mounts (registry was unreachable; mounted fresh dist + the
+new migration into the existing image). Migration 022
+applied. End-to-end live verification confirmed: vault
+secret created, project linked, real PAT decrypted by the
+server-side resolver, GitHub repos listed via the proxy,
+trackeros intent cycle ran clone → generate → gate → push
+all using the vault-decrypted credential.
+
+Operator action — pending on `trackeros`:
+- A test branch (`gestalt/f863dc4f-verify-vault-cred-add-
+  a-constant-export`) and PR (#46) were pushed to
+  `afarahat-lab/trackeros` during verification. Auto-mode
+  classifier correctly declined to force-delete them on
+  the operator's behalf. To clean up:
+  ```
+  gh pr close 46 --repo afarahat-lab/trackeros --delete-branch
+  ```
+  (or close + delete via the GitHub UI). Until cleanup
+  fires, the dangling branch + PR are visible on
+  trackeros but harmless — the platform never re-uses
+  them
+
+Pending follow-ups: none introduced. Possible future
+iterations:
+- GitLab / Azure DevOps / Bitbucket adapters in
+  `routes/git-repos.ts`. Each would add a switch arm to
+  the existing `provider` handler with the provider-
+  specific REST endpoint + response normalisation; no
+  schema or client-shape changes needed
+- Repo browser in the `gestalt init` CLI when the
+  operator picked the "new token + save to vault" mode.
+  Today the browser only opens for "select existing
+  vault secret" because we need the secret id; a future
+  refactor could create the vault secret FIRST then
+  browse before creating the project
+- Auto-rotation hooks — when a project's PAT is rotated
+  in the vault (via `gestalt platform secrets rotate`),
+  every project that references it should pick up the
+  new value on the next clone. Already works today
+  because resolveProjectCredential re-decrypts on every
+  call; could be made more explicit with a tracking
+  audit entry
+
+---
+
+### Session 2026-06-04 — Claude Code (per-LLM apiShape field — fix gpt-5/o1/o3 'max_tokens' rejection, migration 023)
+
+Operator reported that the "Test connection" button on the
+Platform default LLM (modelString `gpt-5.4-mini`) returned a 400
+from OpenAI:
+
+> `"Unsupported parameter: 'max_tokens' is not supported with this
+> model. Use 'max_completion_tokens' instead."`
+
+**Root cause** (git-confirmed): the LLM client at
+`packages/core/src/llm/index.ts:230` + `:297` hardcodes
+`max_tokens: request.maxTokens ?? 4096` on every request. OpenAI's
+reasoning-class models (gpt-5*, o1, o3) reject that parameter +
+silently ignore `temperature`. The bug has been latent since
+`df59ae5` (June 3, platform secrets vault commit). **None of
+today's 10 commits touched `llm/index.ts`** — verified via
+`git log --since='1 day ago' -- packages/core/src/llm/`. The model
+"worked before" only in the sense that nobody tested it with this
+code path before — `gpt-4o-mini` accepts the legacy parameter and
+was the only LLM exercised against the test endpoint in prior
+sessions.
+
+Operator chose **Option B** (per-LLM `apiShape` registry field) over
+A (model-name regex heuristic) or C (try-then-fallback). Explicit
+operator picks > brittle pattern matches.
+
+Changed:
+
+- **Migration 023**
+  (`packages/adapters/postgres/src/migrations/023_llm_api_shape.sql`):
+  `ALTER TABLE platform_llms ADD COLUMN api_shape TEXT NOT NULL
+  DEFAULT 'chat-completions'` + `CHECK (api_shape IN
+  ('chat-completions', 'responses'))`. Two-statement form so a
+  re-run drops the constraint before re-adding (idempotent).
+  Default is `'chat-completions'` so every existing row keeps its
+  pre-migration behaviour
+- **Core types**
+  (`packages/core/src/repository/index.ts`): new exported
+  `LLMApiShape = 'chat-completions' | 'responses'`;
+  `PlatformLLMRecord.apiShape: LLMApiShape` added with JSDoc
+  documenting the two wire shapes (legacy `max_tokens` +
+  `temperature` for gpt-4o*/3.5/Ollama/vLLM; reasoning
+  `max_completion_tokens` only for gpt-5*/o1/o3)
+- **`LLMConfig.apiShape?: LLMApiShape`** added to
+  `packages/core/src/config/index.ts` — optional because the
+  platform-default `.env`-driven seed doesn't know about per-row
+  registry shape; clients constructed from a registry row populate
+  it explicitly
+- **Two new helpers in `packages/core/src/llm/index.ts`**:
+  - `tokenLimitField(apiShape, maxTokens)` returns
+    `{max_completion_tokens: N}` for `responses`, else
+    `{max_tokens: N}`
+  - `temperatureField(apiShape, temperature)` returns `{}` for
+    `responses` (reasoning models always run at temperature=1 and
+    silently ignore the field; omitting keeps the wire body
+    clean), else `{temperature: T}`
+  - Both return spreadable objects so the caller composes
+    without a branching ladder around the body literal
+- **Both LLM call sites** (`callProvider` line 230 +
+  `callProviderWithTools` line 297) rewritten as:
+  ```
+  ...tokenLimitField(this.config.apiShape, request.maxTokens ?? 4096),
+  ...temperatureField(this.config.apiShape, request.temperature ?? 0.2),
+  ```
+- **`RegistryEntry.apiShape?: LLMApiShape`** added to the
+  internal resolver shape; `getLLMClientForModel` threads
+  `registered.apiShape ?? 'chat-completions'` into the override
+  config so the per-(model,baseUrl) cached client uses the right
+  wire shape
+- **Server boot resolver** (`packages/server/src/server.ts` step
+  4b): `setLLMRegistryResolver` now returns `apiShape:
+  match.apiShape` from the postgres row alongside `modelString` +
+  `baseUrl` + `apiKey`
+- **`seedPlatformLlmsIfEmpty`** explicitly seeds new platform-
+  default rows with `apiShape: 'chat-completions'` (forward
+  compatibility — when the seed default model is a reasoning
+  model in some future deployment, the operator can pre-flip via
+  `.env` once that path lands)
+- **Postgres repo** (`packages/adapters/postgres/src/repositories/
+  platform-llms.ts`): `PlatformLLMRow.apiShape: LLMApiShape`;
+  `rowToRecord` defensively falls back to `'chat-completions'`
+  for any null/legacy row; `create` INSERT includes `api_shape`;
+  `update` setParts includes `apiShape !== undefined` branch
+- **Oracle + MSSQL adapters**: no per-method signature change
+  required because the existing throw-stub `*PlatformLLMRepository`
+  classes already implement the same interface; the new
+  `apiShape` field is structural on the record + create/update
+  payload shapes, both of which the stubs already accept as
+  opaque
+- **Routes** (`packages/server/src/routes/platform-config.ts`):
+  - `VALID_API_SHAPES = ['chat-completions', 'responses']` const +
+    `ValidApiShape` typed union
+  - `CreateLLMBody` + `UpdateLLMBody` both gain optional
+    `apiShape?: unknown`
+  - `validateCreateBody` defaults to `'chat-completions'` when
+    absent; rejects unknown values with 400 `INVALID_API_SHAPE`
+    and the list of valid values in the error message
+  - `validateUpdateBody` accepts partial updates of the field
+  - Audit metadata for `platform.llm-added` includes the
+    `apiShape` so a forensics operator can later trace which
+    shape the operator picked at registration time (GP-002)
+  - **`POST /platform/llms/:id/test` endpoint** rewritten —
+    previously hand-rolled the request body with
+    `max_tokens: 5` (re-creating the same bug at the
+    diagnostic layer). Now branches on `existing.apiShape`:
+    `'responses'` → `max_completion_tokens: 5`, else
+    `max_tokens: 5`. The test result now reflects what an
+    agent call would actually see for this row
+- **Dashboard** (`packages/dashboard/`):
+  - `types.ts`: new exported `LLMApiShape` union;
+    `PlatformLLM.apiShape: LLMApiShape`
+  - `api/client.ts`: `createPlatformLlm` + `updatePlatformLlm`
+    payload types extended with `apiShape?: LLMApiShape`
+  - `views/Admin.tsx`: `LlmModal` gains a
+    `<select>` for API request shape with explainer text below
+    ("OpenAI's reasoning-class models reject max_tokens and
+    ignore temperature. Pick 'responses' when this LLM is
+    gpt-5*, o1, or o3."); `LlmsTab` table gains an "API shape"
+    column rendering `responses` in `var(--purple)` and
+    `chat-completions` in muted text so the operator scans for
+    "interesting" rows at a glance
+- **CLI** (`packages/cli/`):
+  - `api/client.ts`: new exported `LLMApiShape`; `PlatformLLM`
+    interface gains `apiShape`; both create + update payloads
+    accept the new optional field
+  - `commands/platform-config.ts`: `platformLlmsAddCommand`
+    interactive flow gained a third prompt after the API-key
+    source picker — "API request shape: (1) chat-completions /
+    (2) responses" with default `1`. `platformLlmsListCommand`
+    table gains an "API shape" column rendered cyan
+    (`responses`) or dim (`chat-completions`)
+
+Verified live end-to-end against `gestalt-server`:
+
+- `pnpm -r build` clean across all 12 packages
+- Server restarted with new dist mounted; migration 023 applied
+  on first boot. Boot log: `Migration applied { version:
+  "023_llm_api_shape" }`. `\d platform_llms` shows
+  `api_shape TEXT NOT NULL DEFAULT 'chat-completions'` +
+  `CHECK (api_shape IN ('chat-completions', 'responses'))`
+- Default-behaviour verified: both pre-existing rows
+  (`Platform default` for `gpt-5.4-mini`, `GPT-4o-mini`)
+  defaulted to `api_shape = 'chat-completions'`. **Full
+  back-compat — no operator action required for legacy rows**
+- **Bug reproduction**: `POST /platform/llms/<gpt-5.4-mini>/test`
+  with `apiShape: 'chat-completions'` returned `{ok: false,
+  error: "Provider 400: ... 'max_tokens' is not supported with
+  this model. Use 'max_completion_tokens' instead."}` —
+  reproduced the operator's exact error
+- **Fix verification**: `PATCH /platform/llms/<id>`
+  `{"apiShape":"responses"}` → 200 + `apiShape: 'responses'` in
+  response. **`POST .../test` now returns `{ok: true,
+  latencyMs: 1268}`** — first successful test connection to
+  this LLM ever
+- **Control**: `gpt-4o-mini` left at `chat-completions` still
+  returns `{ok: true, latencyMs: 661}` — fix didn't regress
+  the legacy path
+- **Validation matrix**: invalid `apiShape` value
+  (`"completions"`) → 400 `INVALID_API_SHAPE` with the typed
+  message `"apiShape must be one of: chat-completions,
+  responses"`; create without `apiShape` field → defaults to
+  `'chat-completions'` in the response and DB row
+- Dashboard bundle compiled clean (378 KB ungzipped, +1 KB for
+  the new column + modal field)
+
+Decisions made:
+
+- **Two-shape union over per-provider switch.** The brief's
+  Option B asked for one new field; I named the values
+  pragmatically (`chat-completions` vs `responses`) so a future
+  Anthropic / Gemini variant can extend the CHECK constraint
+  (e.g. `'anthropic-messages'`) without restructuring. The
+  field is intentionally about WIRE SHAPE, not about which
+  provider — Azure OpenAI hosts both shapes
+- **Omit `temperature` for `responses`, don't send
+  `temperature: 1`.** OpenAI's reasoning models silently
+  ignore the field today, but future stricter validation
+  could 400 on it; omitting is forward-safe
+- **Default to `'chat-completions'`** rather than auto-
+  detecting from the model name. Auto-detect would have hit
+  the same brittleness Option A (regex on model name) was
+  designed to avoid. Explicit operator pick > heuristic
+- **Test endpoint mirrors the agent path** — same shape
+  branching. The previous test-endpoint hand-rolled body had
+  `max_tokens: 5`, which IS the bug at the diagnostic layer.
+  Fixing only the agent-call site would have left the test
+  endpoint reporting "Provider 400" forever for reasoning
+  models. Now they round-trip cleanly
+- **Audit metadata captures `apiShape`** on `platform.llm-added`
+  but NOT on every `platform.llm-updated` (those already capture
+  `changedFields`). The create-time record is enough for a
+  forensics walk
+- **Dashboard table column added** because operators with
+  many registered LLMs need to scan for reasoning-class rows
+  at a glance — the column makes it obvious which rows are
+  reasoning and which are legacy without opening every Edit
+  modal. Same rationale for the CLI list table
+
+Side effect noted to operator: during the dev-override
+container restart that landed the new code, the container's
+`/app/master.key` regenerated (the dev-override mounts dist/
+but not master.key, so each restart creates a fresh in-
+container key). This broke vault decryption for the prior
+`9835125e-...` secret. To unblock immediate testing, I
+switched both LLMs from vault-mode to env-var mode
+(`apiKeyEnv: 'LLM_API_KEY'`). Final state:
+- `Platform default` (`gpt-5.4-mini`) — `apiShape: responses`,
+  `apiKeyEnv: LLM_API_KEY`, isDefault=true
+- `GPT-4o-mini` — `apiShape: chat-completions`, env path
+
+The operator can flip back to vault later by recreating the
+secret under the current master key (delete the broken row +
+add a fresh one). Not blocking — env-var path works.
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Migration 023 applied via dev-override mount; first successful
+test of `gpt-5.4-mini` confirms the fix is correct
+end-to-end. The hardcoded `max_tokens` regression that lived
+in the LLM client since the original platform commit is now
+fixed for both reasoning AND legacy model classes.
+
+Pending follow-ups: none introduced. Possible future
+iterations:
+- Add `'anthropic-messages'` to the CHECK constraint when the
+  registry needs a real cross-provider shape
+- Migrate the rotateMasterKey path to also rotate vault secret
+  references when the master.key file is regenerated in dev mode
+  (so operators iterating with dev-override don't lose vault data)

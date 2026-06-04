@@ -49,6 +49,10 @@ export type {
 export { BaseOrchestrator, setPlatformMcpResolver } from './orchestrator/base-orchestrator';
 export type { OrchestratorContext, PlatformMcpResolver } from './orchestrator/base-orchestrator';
 export {
+  resolveProjectCredential, setProjectSecretResolver,
+} from './projects/credential-resolver';
+export type { ProjectSecretResolver } from './projects/credential-resolver';
+export {
   loadAgentConfig, loadCustomAgents, defaultAgentConfig,
   PER_ROLE_DEFAULTS,
 } from './agents/agent-config-loader';
@@ -92,7 +96,7 @@ export {
 
 // Repository
 export type {
-  IntentRecord, IntentStatus,
+  IntentRecord, IntentStatus, IntentListFilters,
   AgentExecutionRecord, ExecutionStatus,
   AuditRecord,
   UserRecord,
@@ -105,8 +109,9 @@ export type {
   AgentExecutionLogRecord,
   ProjectMembershipRecord,
   InterventionRecord, InterventionAction,
-  PlatformLLMRecord, PlatformLLMRepository,
+  PlatformLLMRecord, PlatformLLMRepository, LLMApiShape,
   PlatformSecretRecord, PlatformSecretSummary, PlatformSecretRepository,
+  KeyRotationRecord, KeyRotationRepository,
   PlatformTemplateRecord, PlatformTemplateSummary, PlatformTemplateRepository,
   TemplateVariable,
   PlatformMcpServerRecord, PlatformMcpServerRepository,

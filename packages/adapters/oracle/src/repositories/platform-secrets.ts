@@ -28,4 +28,8 @@ export class OraclePlatformSecretRepository implements PlatformSecretRepository 
   async list(): Promise<PlatformSecretSummary[]> { return notImplemented(); }
   async delete(_id: string): Promise<void> { return notImplemented(); }
   async findReferencingLlms(_secretId: string): Promise<Array<{ id: string; name: string }>> { return notImplemented(); }
+  async findAllRaw(): Promise<PlatformSecretRecord[]> { return notImplemented(); }
+  async rotateMasterKey(
+    _reencryptFn: (record: PlatformSecretRecord) => { encrypted: string; iv: string; authTag: string },
+  ): Promise<number> { return notImplemented(); }
 }
