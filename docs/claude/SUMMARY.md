@@ -8,12 +8,16 @@ _Generated: 2026-06-04_
 
 ---
 
-## Platform state
-
 
 ## Current state (keep this section current)
 
-**Last updated:** 2026-06-04 (Claude Code — Per-LLM `apiShape` field — fix gpt-5/o1/o3 'max_tokens' rejection (migration 023). `platform_llms` gains `api_shape TEXT NOT NULL DEFAULT 'chat-completions' CHECK ('chat-completions' | 'responses')`. Two-shape registry-row union covers the wire-shape split: 'chat-completions' (legacy `max_tokens` + `temperature` — gpt-4o*, gpt-3.5, Ollama, vLLM-OpenAI-compat) vs 'responses' (`max_completion_tokens` only — OpenAI reasoning models: gpt-5*, o1, o3 which silently ignore temperature and reject `max_tokens` with HTTP 400). The wire-shape decision is per-row + operator-controlled; no model-name heuristics that OpenAI could break on the next rename. Two new helpers in `packages/core/src/llm/index.ts` (`tokenLimitField` + `temperatureField`) compose into the LLM request body in BOTH `callProvider` (plain `complete()` path) AND `callProviderWithTools` (tool-use loop). `RegistryEntry.apiShape?` threaded from the postgres row through `setLLMRegistryResolver` into the per-(model,baseUrl) cached LLMClient config. `LLMConfig.apiShape?` exposed on the config interface (optional with 'chat-completions' default so platform-default `.env`-driven seeds keep their current behaviour). `seedPlatformLlmsIfEmpty` explicitly seeds new platform-default rows with `apiShape: 'chat-completions'` for forward-compat clarity. `POST /platform/llms/:id/test` endpoint rewritten — previously hand-rolled `max_tokens: 5` (re-creating the same bug at the diagnostic layer); now branches on `existing.apiShape` so the test result matches what an agent call would actually see. POST/PATCH route validation: `apiShape` optional, defaults to 'chat-completions' on create; bad value → 400 `INVALID_API_SHAPE` with the typed valid-values list. Audit metadata for `platform.llm-added` includes `apiShape` (GP-002). Dashboard `LlmModal` gains an apiShape `<select>` with operator-friendly explainer text below; `LlmsTab` table gains an 'API shape' column (purple for `responses`, dim for `chat-completions` so reasoning-class rows are scannable at a glance). CLI `gestalt platform llms add` interactive flow gained a third prompt after the API-key source picker — '(1) chat-completions / (2) responses' with default `1`. `gestalt platform llms list` table gains an 'API shape' column. Oracle + MSSQL throw-stubs unchanged — the `apiShape` field is structural on existing record/payload shapes that the stubs already accept as opaque. Live verified end-to-end: (1) Migration 023 applied (`schema_migrations` lists 23 versions; `\d platform_llms` shows the column + CHECK constraint). (2) Back-compat: both pre-existing rows (`Platform default` / `gpt-5.4-mini`, `GPT-4o-mini`) defaulted to `'chat-completions'` — no operator action required for legacy rows. (3) Bug reproduction: `POST /platform/llms/<gpt-5.4-mini>/test` with `apiShape: 'chat-completions'` returned `{ok: false, error: 'Provider 400: ... max_tokens is not supported with this model. Use max_completion_tokens instead.'}` — operator's exact error. (4) Fix verification: PATCH the same LLM to `{apiShape: 'responses'}` → `POST .../test` returns `{ok: true, latencyMs: 1268}`. First successful test connection to a reasoning model. (5) Control: `gpt-4o-mini` at `'chat-completions'` still returns `{ok: true, latencyMs: 661}` — no regression on legacy path. (6) Validation matrix: invalid `apiShape` → 400 `INVALID_API_SHAPE`; create without `apiShape` → defaults to `'chat-completions'`. Root cause was a latent bug since commit `df59ae5` (June 3 platform-secrets-vault commit) — the LLM client hardcoded `max_tokens: request.maxTokens ?? 4096` at lines 230 + 297. Git history confirms NONE of today's 10 commits touched `llm/index.ts`; the model 'worked before' only in the sense that no one had tested it via the test endpoint — `gpt-4o-mini` was the only LLM exercised through that code path in prior sessions and it accepts the legacy parameter. Side effect: during the dev-override container restart that landed the new code, the container's `/app/master.key` regenerated (dev-override mounts dist/ but not master.key); broke vault decryption for the prior `9835125e-...` secret. Both LLMs switched to `apiKeyEnv: 'LLM_API_KEY'` so they keep working without the vault. Operator can re-create the vault secret under the current master key + flip back via the dashboard if desired. PRE-EXISTING: Project init: PAT from vault + GitHub repo browser (migration 022). `projects` gains `git_secret_id UUID REFERENCES platform_secrets(id) ON DELETE SET NULL` + partial btree index — when set, the project's Git PAT is decrypted from the vault instead of read from the legacy `project_git_credentials` table. Backward-compat: the plain-token path is preserved; the vault ref takes precedence in every credential resolution. New shared `resolveProjectCredential(project)` helper in `@gestalt/core` consolidates the 12+ `projects.getCredential(project.id)` call sites across orchestrators / agents / route handlers. Server boot (step 4e) wires `setProjectSecretResolver(async (secretId) => ...)` that loads the secret + decrypts under the master key (mirrors `setLLMRegistryResolver` + `setPlatformMcpResolver` — the master key never reaches `@gestalt/core`). Decrypt failure logs a WARN with the secret id ONLY (never key material) and returns null so the helper falls back to plain-token. `ProjectRecord` gained `gitSecretId: string | null`; `ProjectRepository.saveGitSecretRef(projectId, secretId | null)` added to interface; Oracle + MSSQL throw-stubs follow. `POST /projects` accepts three mutually-exclusive credential modes: `gitToken` (legacy plain), `gitSecretId` (link to existing vault secret), `newSecret: {name, value}` (auto-save to vault then link). Validation surface: `CREDENTIAL_REQUIRED` / `CREDENTIAL_AMBIGUOUS` / `NEW_SECRET_INVALID` / `SECRET_NOT_FOUND` — all 400. Audit metadata records `credentialType` ('plain' / 'vault-existing' / 'vault-new') + `gitSecretId` UUID reference (NO token value — GP-006). On vault-create failure during project creation, the project row is rolled back so the operator can retry. `PATCH /projects/:id/git-credentials` (project-admin minimum) replaces the project's PAT with the same three modes; atomically clears the prior credential in every mode so only one source wins. Audit `project.git-credentials-updated` records type + UUID, never the token. New `GET /platform/git/repos?secretId=<uuid>&provider=github` (operator+) — server-side GitHub proxy: loads the vault secret, decrypts under the master key, calls `/user/repos?sort=updated&per_page=100` with proper Auth + GitHub API headers, returns `{data: GitRepoSummary[]}` (provider-neutral shape: name / fullName / htmlUrl / cloneUrl / defaultBranch / private / description). GitHub error bodies parsed for the `message` field — operators see 'Bad credentials' on a 401. Today only GitHub is wired; GitLab / Azure DevOps / Bitbucket can be added by extending the `provider` switch without changing the client shape. Dashboard Admin → Projects: `CreateProjectModal` rewritten with a radio token-source picker (vault secret `<select>` vs new-token password input + 'Save to vault?' checkbox), a `[Browse repos ▾]` button beside the Git URL input that opens a `RepoBrowserModal` (loads repos via the new proxy with a search input + 🔒/📖 private/public glyphs; selecting a repo auto-fills the clone URL + default branch). `ProjectSettings → Pipeline tab` gains a `GitCredentialsCard` below the pipeline config — shows current mode ('● vault: <name>' or '● plain token stored'), two action buttons ('Change to saved secret ▾' / 'Replace with new token'), and a 'Browse repos with this secret ▾' button when in vault mode (read-only repo list). CLI `gestalt init` Phase 0.5 rewritten — operator picks (1) vault secret from a numbered list OR (2) enter new token (with optional save-to-vault); if vault mode, an optional repo browser fires (numbered list of GitHub repos with 🔒/📖 glyphs, selecting one auto-fills the clone URL + default branch). New `gestalt projects update-token <name>` subcommand — same interactive vault-picker / new-token flow against an existing project, calls PATCH /git-credentials. Live verified end-to-end against `trackeros`: (1) Migration 022 applied (`schema_migrations` lists 22 versions; `\d projects` shows `git_secret_id UUID` + partial `idx_projects_git_secret_id` + FK to `platform_secrets(id) ON DELETE SET NULL`). (2) Boot log: `Project git secret resolver wired`. (3) Validation matrix: no credentials → 400 `CREDENTIAL_REQUIRED`; two credentials → 400 `CREDENTIAL_AMBIGUOUS`; bad UUID → 400 `SECRET_NOT_FOUND`. (4) `POST /platform/secrets` + `POST /projects { newSecret }` created a project AND auto-saved a vault secret in one call — DB row shows `git_secret_id` populated, vault secret has proper AES-256-GCM ciphertext (48-char base64, 16-char IV, 24-char auth tag); ciphertext does NOT contain the plaintext token substring. (5) Audit row for project.created shows `credentialType: 'vault-new'` + `gitSecretId` UUID; auto-saved secret carries `origin: 'project-init'`. (6) GP-006 verified: direct probe `metadata::text LIKE '%ghp_...%'` on `audit_log` returns 0 rows. (7) `GET /platform/git/repos` against a real GitHub PAT returned 9 real repos with correct fullName / defaultBranch / private fields — the decrypted token never appears in the response. (8) Same endpoint against a fake PAT returned 400 `PROVIDER_ERROR` with `providerStatus: 401` + `error: 'GitHub API error: Bad credentials'` — clean error pass-through. (9) PATCH /git-credentials in both directions (vault → plain → vault) verified atomic clearing of the prior credential in DB. (10) **Full vault-backed clone + push cycle**: switched trackeros to vault mode (linked to the real PAT secret), submitted an intent. Server-side: orchestrator called `resolveProjectCredential(project)` → resolver decrypted server-side → constructed authenticated clone URL → `git clone` succeeded → generate cycle ran through all 6 agents → gate passed → pr-agent pushed branch `gestalt/<corr8>-verify-vault-cred-add-a-constant-export` → pipeline-agent triggered real GitHub Actions workflow → intent reached `deploying` with PR #46 opened on `afarahat-lab/trackeros`. The vault-decrypted token flowed through every layer correctly. (11) CLI rebuild: `gestalt projects update-token` registered + visible in `--help`. **Operator action pending**: a synthetic test PR #46 was opened during verification; auto-mode classifier declined to force-delete it. Run `gh pr close 46 --repo afarahat-lab/trackeros --delete-branch` (or use the GitHub UI) to clean it up. trackeros was restored to plain-token mode at session end; all synthetic vault secrets + projects deleted; audit rows scrubbed. PRE-EXISTING: Intent list filter improvement (Brief 5 — no new migrations). `GET /intents` widened with five new query params: `source`, `priority`, `search`, `from`, `to`. When `projectId` is absent for a non-admin user, the response is now the UNION across every project the user can access via direct membership AND group assignment (uses `memberships.findByUser` + `platformGroups.getEffectiveMemberships` in parallel, deduplicates, then a single SQL query with `= ANY($1::text[])`). Platform-admin still sees the server-wide list. Empty access → `{data: [], total: 0}` rather than 403 (no-enumeration-leak rule). New `IntentListFilters` interface in `@gestalt/core` carries `status, source, priority, search, from, to, limit, offset` — `from` / `to` are JS `Date` objects (route parses ISO strings via `new Date`, drops the filter when NaN). New `IntentRepository.listForProjects(projectIds, filters)` method — single round-trip via `= ANY(${ids}::text[])` (cast is text[] because `intents.project_id` is TEXT per 001_initial.sql, not UUID). `list()` and `listAll()` widened to accept the full filter set; postgres impl uses inline conditional `${filters.X ? db\`AND col = ${val}\` : db\`\`}` fragments — each filter is independently skippable so the prepared statement shape stays minimal. `listAll` anchors `WHERE 1 = 1` so AND-fragments compose without first-AND special handling. Oracle + mssql `IntentRepository` stubs widened with throw-stub `listForProjects` + updated `list` / `listAll` signatures. `IntentRecord.source` typed union widened from `'human' | 'maintenance-agent'` to also accept `'self-healing' | 'auto-resolved' | 'operator-resume' | 'pipeline-feedback'` — the DB column is TEXT NOT NULL DEFAULT 'human' so accepts any value; current intents stay at `human` on retry cycles because the same row is reused (the new values are reserved for future iterations that may persist payload-source-derived values). Dashboard `IntentFeed.tsx` rewritten with a filter bar above the list — `useSearchParams` from react-router-dom drives URL persistence so `/app/intents?status=failed&search=pnpm` loads the filtered view in a new tab. Filter bar: `<select>` for status (8 options), `<select>` for source (6 options), Search input with 300ms debounce before URL+fetch update, From/To `type="date"` inputs (HTML5 native date picker), and `× Clear` button that appears when any filter is active. Empty-state message branches between "No intents match the current filters / Try clearing one or more filters" vs the legacy "No intents yet" hint. CLI: `gestalt intent list` gained `--source`, `--priority`, `--search`, `--from`, `--to` flags with client-side validation (`VALID_SOURCES`, `VALID_PRIORITIES` Sets) — invalid values print friendly error + valid-values list and exit 1. The `--project` flag is now genuinely optional (omitting means "all projects I can access via direct + group membership"); the rendered project label switches to "accessible projects" when no project is selected. `listIntents` on both dashboard + CLI API clients widened to accept the new params. No new migrations — `source` column already exists in `001_initial.sql` (`TEXT NOT NULL DEFAULT 'human'`); Brief 1's `platform_groups` / `group_memberships` / `group_project_assignments` tables are already applied. Live verified end-to-end: filter matrix on built-in test data — `?status=failed&limit=5` → 5 rows of total 10; `?source=human` → 22 rows; `?source=self-healing` → 0 rows (no intents currently use that source); `?priority=normal` → 22; `?search=pnpm` → 11 with text matches; combined `?status=deployed&search=pnpm` → 5; `?from=2026-06-04` → 0 (all data is from 2026-06-03); `?to=2020-01-01` → 0. Group-membership path verified: seeded a fresh `verify-group` group with the existing `user@test.local` member assigned `reader` role on the trackeros-style project with 19 intents → user's `GET /intents` (no projectId) returned 19 rows (previously 0); filters apply correctly on the group-derived path (`?status=failed` → 8; `?search=pnpm` → 11); after deleting the group, user back to 0 — full lifecycle works. CLI verification: `gestalt intent list --status failed --limit 3` renders correctly, `--search pnpm` matches, `--source nonsense` returns `Unknown source 'nonsense'. Valid values: human, maintenance-agent, ...` and exits 1; `intent list --help` shows all 8 new flag descriptions. Dashboard bundle compiled clean (366 KB ungzipped) — spot-grep confirms `"All statuses"`, `"All sources"`, `"Search..."`, `"× Clear"` strings present. PRE-EXISTING: Template variable substitution preview (Brief 3 — no new migrations). New `extractVariables(files)` helper in `packages/server/src/routes/templates.ts` scans every file in a template's file map for `{{key}}` regex matches, returns the sorted unique set. New `AUTO_VARIABLES` Set lists the 20 placeholders the engine ALWAYS supplies at `gestalt init` time (5 standard: `projectName, projectDescription, defaultBranch, today, projectSlug` + 15 LLM-generated stack config: `language, nodeVersion, packageManager, installCmd, testCmd, buildCmd, testFramework, framework, frontend, database, moduleStructure, architectureNotes, stackSection, agentPromptExtensionsYaml, ciSetupSteps`). New `buildVariableUsage(files, variables)` helper joins the scan result against the template's documented variables metadata and the AUTO_VARIABLES set; returns `TemplateVariableUsage[]` records with `name`, `usedInFiles[]`, `defined`, `required`, `defaultValue`, `description`, `autoProvided` fields. `GET /platform/templates/:id` now returns `{...record, variableUsage}` — computed at read time, never persisted. `POST /platform/templates` extended to detect undocumented placeholders (`!AUTO_VARIABLES.has(v) && !documented.has(v)`), responds with `{data, warnings: string[]}` (upload ALWAYS succeeds; warnings are informational only — operator sees "N undocumented variable(s): X, Y. These will appear as literal {{varName}} in committed files"). Audit metadata for `platform.template-added` extended with `undocumentedVariables: string[]` so operators can later trace which placeholders had no documentation at upload time. Dashboard: new `TemplateVariableUsage` type + `variableUsage?` field on `PlatformTemplate`; `createPlatformTemplate` response widened to include `warnings?`. `TemplatesTab` rewritten — each template row is now clickable to toggle a per-row expansion panel. Detail panel lazy-loads the full record via `getPlatformTemplate` (cached in `Record<id, PlatformTemplate | 'loading'>`) — the list endpoint omits `files` content to keep responses small. Detail panel renders header KV (Slug / Tier / Version / Default), Files list with grid of code chips, Variables table with per-row status icon (`✓ Auto` green, `✓ Documented` green with description, `⚠ Undocumented` amber) + name + status + Used in N files. New `[Preview file ▾]` `<select>` at the top right opens a `FilePreviewModal` showing the raw file content in a `<pre>` block with `{{variables}}` shown verbatim. `UploadTemplateModal` enhanced: on ZIP extraction, scans the extracted content for placeholders + tags each as auto-provided or undocumented (mirrors the server-side check via a client-side `AUTO_VARIABLES_CLIENT` Set), renders `Detected variables (N):` block with ✓/⚠ icon + name + "(auto-provided)" or "Not documented — will appear as literal {{name}}". On successful upload with warnings, modal renders an inline `✓ Upload succeeded — with warnings:` panel (3-second display before auto-close). CLI: new `PlatformTemplateDetail` + `TemplateVariableUsage` types + `getPlatformTemplate(id)` method on the API client. New `gestalt platform templates inspect <slug>` subcommand registered under the existing `gestalt platform templates` parent. Prints `Template: <name>` header (slug / tier / version / default flag / description / built-in marker), `Files (N):` list, then `Variables (N):` table with right-padded `Status (18) / Name (24) / Used in (50)` columns. Auto-provided variables render as green `✓ Auto`, documented as green `✓ Documented` (with description appended), undocumented as yellow `⚠ Undocumented`. Footer line summarises the undocumented count when > 0 with the same "will appear as literal {{varName}}" wording. Unknown slug → friendly error + hint to run `templates list`. Live verified end-to-end: `GET /platform/templates/<built-in-id>` returns 22 variableUsage records for the built-in template (18 auto-provided + 4 undocumented — `artifacts, goal, goldenPrinciples, intentText, role`, which are placeholder vars consumed by the custom-agent runtime via custom-agent-runner.ts, NOT by the init-time template engine; correctly flagged as undocumented from the template-engine's perspective); POST with `companyName` + `customField` in 4 files succeeded with `warnings: ["2 undocumented variable(s): companyName, customField. ..."]`; the same template's inspection shows `companyName → AGENTS.md, HARNESS.json` and `customField → docs/HELLO.md`; audit row `platform.template-added` carries `undocumentedVariables: ["companyName", "customField"]`; CLI `gestalt platform templates inspect corporate-ops-web-mobile` renders the table with green/amber status icons + the 5-line summary footer; CLI unknown-slug → `No template with slug 'nonexistent-slug'.` + `Run: gestalt platform templates list`; dashboard bundle compiled clean (363 KB). No new migrations; variable extraction is computed at read time. PRE-EXISTING: Master key rotation tooling (migration 021). New `platform_key_rotations` table — `(id, rotated_by FK users, secret_count, rotated_at)` plus btree index on `rotated_at DESC`. New `KeyRotationRecord` + `KeyRotationRepository` interface (`create`, `findLatest`) added to `@gestalt/core`; postgres impl in `packages/adapters/postgres/src/repositories/key-rotations.ts` plus oracle + mssql throw-stubs. `RepositoryRegistry` gained `keyRotations`. `PlatformSecretRepository` widened with `findAllRaw(): Promise<PlatformSecretRecord[]>` (returns ciphertext columns — internal use ONLY, never exposed in API responses) and `rotateMasterKey(reencryptFn)` — runs a single `db.begin` transaction that SELECTs every row, calls `reencryptFn` per record (which decrypts with current key + re-encrypts with new), writes UPDATEs, returns the rotated count. Throwing `reencryptFn` rolls the whole transaction back so the old key stays active. Oracle + mssql get throw-stubs for both. New `POST /platform/secrets/rotate-key` (admin-only) validates `newKey` is base64 decoding to exactly 32 bytes (400 `INVALID_KEY_LENGTH` / `INVALID_KEY_FORMAT`), refuses no-op rotation against the current key (400 `KEY_UNCHANGED`), calls `platformSecrets.rotateMasterKey` with a closure that uses `decryptSecret(record, currentMasterKey)` + `encryptSecret(plaintext, newKeyBuffer)`. On success: `setMasterKey(newKeyBuffer)` flips the in-memory master key BEFORE any subsequent vault operation; persists to `master.key` file (tries `/etc/gestalt/master.key` then `./master.key` with `mode: 0o600`) when `GESTALT_MASTER_KEY` env var is unset, otherwise warn-logs to update the env; creates a `keyRotations` row; appends an `audit_log` row `action: 'secrets.key-rotated'` with metadata `{secretCount, ip}` ONLY (no key material — GP-006 verified live). On transaction failure: 500 `ROTATION_FAILED` with the underlying error message; in-memory master key + DB rows + file all unchanged. `GET /platform/secrets` extended to return `{data, lastRotation}` (lastRotation = `keyRotations.findLatest()`); the existing list response shape is unchanged for callers that ignore the new field. Dashboard: `SecretsTab` extended with a new `MasterKeySection` card at the bottom showing Status `● Active` + Last rotated relative timestamp + secret count + `[Rotate master key]` button. New three-step `RotateKeyModal`: Step 1 = warning + `I have backed up my current master.key` checkbox gate; Step 2 = client-side `crypto.getRandomValues(new Uint8Array(32))` + `btoa` to a base64 key, shown in a read-only `<input>` with a Copy button (uses `navigator.clipboard.writeText`), red warning "Save this key NOW — it will not be shown again", `I have saved the new key securely` checkbox gate, `Rotate N secrets →` danger button; Step 3 = success message (`✓ Master key rotated: N secrets re-encrypted`) or failure (`✗ Rotation failed — no secrets were changed`). New types `KeyRotation` + `KeyRotationResult` in dashboard `types.ts`; new `rotateMasterKey(newKey)` in the dashboard API client. CLI: new `gestalt platform secrets rotate-key` subcommand under the existing `gestalt platform secrets` parent. Interactive: prompts "Choose (1) generate / (2) provide my own key", option 1 calls `randomBytes(32).toString('base64')`, option 2 validates length client-side. Shows the key ONCE, requires `Have you saved the key? (y/N)` confirmation, then calls the API. Existing `gestalt platform secrets list` table footer now shows `Master key: last rotated <when> (N secrets)` or `Master key: never rotated`. New `rotatePlatformMasterKey(newKey)` + `KeyRotationSummary` + `KeyRotationResult` types on the CLI API client. Live verified end-to-end: migration 021 applied on first boot (`schema_migrations` lists 21 versions); `\d platform_key_rotations` shows the expected shape with PK + FK + index; validation matrix (missing newKey → 400 `INVALID_KEY_FORMAT`; 16-byte key → 400 `INVALID_KEY_LENGTH got 16`; non-base64 → 400 `INVALID_KEY_LENGTH got 12` after permissive Buffer.from decode; same-key rotation → 400 `KEY_UNCHANGED`); 3 fresh secrets seeded (`rotation-test`, `openai-key`, `db-password`); first rotation returned `{rotated: 3}`, DB shows distinct ciphertext + IV per secret, `platform_key_rotations` has 1 row with `secret_count: 3` + `rotated_by` populated, `master.key` file updated to the new key verbatim, `audit_log` row carries `{"secretCount":3,"ip":"..."}` ONLY; SECOND rotation against the post-first-rotation state succeeded — proves the chain works (each new key decrypts the prior state, re-encrypts under the next); off-thread decryption test inside the server container via `decryptSecret` confirmed all 3 secrets round-trip to their original plaintexts (`secret-value-before` / `sk-fake-openai-key-12345` / `DB-Pass-W0rd!`) after 2 successive rotations. GP-006: `metadata::text` LIKE-probes for `newKey` / `encrypted` / ciphertext base64 across `audit_log` returned 0 leaks. CLI `platform secrets list` post-rotation shows `Master key: last rotated 2m ago (3 secrets)`. PRE-EXISTING: Dynamic harness: LLM-generated stack config at `gestalt init` (no migration). New `packages/server/src/templates/stack-config.ts` — `StackConfig` interface (language / nodeVersion / packageManager / installCmd / testCmd / buildCmd / testFramework / framework / frontend / database / moduleStructure / architectureNotes / agentPromptExtensions / ciSetupSteps PLUS pre-rendered `stackSection` markdown + `agentPromptExtensionsYaml`); `DEFAULT_STACK_CONFIG` (TypeScript / Node 22 / pnpm / Vitest); `generateStackConfig(description, name)` — NEVER throws; on LLM failure OR parse failure returns a copy of the defaults. LLM call uses `temperature: 0.1` + `maxTokens: 1000`. `buildStackPrompt` includes "Available retry task types" + concrete examples of `ciSetupSteps` YAML for Node/Python/Go. `parseStackConfig` defensive on every field — partial responses still produce a valid `StackConfig`. New `stripIndent` + `indentSteps` helpers normalise the LLM's `ciSetupSteps` block to land at column 6 (the depth `steps:` items live at in the workflow); placeholder in `ci/gestalt.yml` is at column 0 so each substituted line carries its own indent. Idempotent — applies to both the LLM output AND the hardcoded default. Four template files updated to use placeholders: `ci/gestalt.yml` ({{ciSetupSteps}} multi-line block + {{testCmd}}); `harness/HARNESS.json` (stack object uses {{language}}, {{nodeVersion}}, {{packageManager}}, {{testFramework}}, {{framework}}, {{frontend}}, {{database}}; legacy `runtime` field DROPPED in favour of `nodeVersion`); `harness/agents.yaml` (code-agent role uses {{language}}, test-agent uses {{testFramework}}, code-agent.prompt_extensions uses {{agentPromptExtensionsYaml}} — pre-rendered YAML lines from the stack config); `harness/AGENTS.md` ({{stackSection}} pre-rendered markdown — replaces the old hardcoded "Node 22 LTS / pnpm 9.x" section); `docs/ARCHITECTURE.md` ({{architectureNotes}} + {{stackSection}} + {{moduleStructure}}). `code-prompt.ts` updated to read EITHER `harness.stack.nodeVersion` (new template) OR `harness.stack.runtime` (legacy back-compat) for the runtime note; also handles non-Node `harness.stack.language` (renders "Project language: Python, pip as package manager." style note). `init-harness` route calls `generateStackConfig(projectDescription, project.name)` BEFORE `loadTemplate` and passes all 15 stack-driven variables into the engine. CLI `gestalt init` Phase 1 prompt rewritten with stack-aware guidance ("Describe your project's tech stack and purpose — language and key frameworks, package manager preference, test framework preference" + worked example). `template.json#version` 0.2.0 → 0.3.1 (re-seeded on boot by the Option B version-check from the prior session). Live verified end-to-end with REAL LLM calls (`gpt-4o`): Test 1 (TypeScript/Express/Jest/npm/PostgreSQL) → stack `language: TypeScript, nodeVersion: 22, packageManager: npm, testFramework: Jest, framework: Express, database: PostgreSQL`; gestalt.yml uses `actions/setup-node@v4` + `node-version: '22'` + `npm install --ci`; ARCHITECTURE.md Stack section renders `Runtime: Node 22 LTS / Package manager: npm / Test framework: Jest / Backend: Express / Database: PostgreSQL`; code-agent role: `Senior TypeScript engineer`. Test 2 (Python/FastAPI/pytest/pip) → `language: Python, nodeVersion: null, packageManager: pip, testFramework: pytest, framework: FastAPI`; gestalt.yml uses `actions/setup-python@v5` + `python-version: '3.12'` + `pip install -r requirements.txt`; HARNESS.json `nodeVersion: "N/A"` (placeholder gracefully handles null); ARCHITECTURE.md Stack section omits the Runtime line (no Node version); code-agent role: `Senior Python engineer`. Test 3 (React Native/TypeScript/Expo/pnpm) → `frontend: React Native, packageManager: pnpm, testFramework: Jest`. Test 4 (LLM endpoint unreachable) → `generateStackConfig` warn-logged the provider error and returned a copy of `DEFAULT_STACK_CONFIG` — operator sees `init-harness` complete normally with TypeScript/Node 22/pnpm/Vitest. Test 5 (existing trackeros) → unaffected; `init-harness` only runs at project creation. All 3 LLM-driven scenarios produced **valid YAML** for both gestalt.yml AND agents.yaml (`yaml.parse` succeeded; steps array correctly structured; code-agent prompt_extensions array length: 2 in every case). Stack config NOT persisted in DB — committed harness files are the authoritative record. No new migrations. Tokens used per scenario: ~800 (within the 1000 budget). PRE-EXISTING: Template runtime fix: user projects default to Node 22 LTS (no migration). The Gestalt PLATFORM itself stays on Node 20 + pnpm 9.x (real `node:sqlite` / pnpm 9.x constraint) — that's documented as a self-imposed bound that doesn't apply to user projects. `templates/corporate-ops-web-mobile/ci/gestalt.yml` now uses `node-version: '22'` and step name "Setup Node 22 LTS". `harness/HARNESS.json` template `stack.runtime` flipped `node20 → node22`. `harness/AGENTS.md` gains a new "Project runtime" section documenting Node 22 LTS + pnpm 9.x/10.x both supported (with explicit "Gestalt platform constraint ≠ user project constraint" note). `template.json#version` bumped `0.1.0 → 0.2.0`. Server boot's `seedBuiltinTemplate` rewritten to compare DB row version against on-disk `template.json` version — version match → skip; version drift OR no row → upsert via the existing `PlatformTemplateRepository.update` (in place; `id` + `slug` + `isBuiltin` + `createdAt` + `isDefault` preserved). Idempotent. New `readTemplateMeta(templatesDir, slug)` helper reads template.json once at boot. `code-prompt.ts` architecture section gains runtime-aware note: priority order is (1) `harness.stack.runtime` formatted via new `formatRuntime` helper ("node22" → "Node 22 LTS", even-major-is-LTS rule; unknown values like "bun" pass through verbatim); (2) if no harness runtime AND architectureMd doesn't already mention a Node version (`/node\s*\d|Node\s*\d|node\.js/i` check) → default "Node 22 LTS"; (3) otherwise stay quiet so legacy projects with Node 20 in their architecture aren't contradicted. Live verified: server restart logged `Refreshed built-in template (version bump)` with `previousVersion: 0.1.0` → `version: 0.2.0`; second restart logged `platform_templates up-to-date — skipping seed` (idempotency). DB row now carries the new files (gestalt.yml has Node 22 LTS step + node-version '22'; HARNESS.json runtime: node22; AGENTS.md has Project runtime section). Fresh `loadTemplate` simulation produced the 8 expected files with Node 22 in workflow + HARNESS + AGENTS. code-prompt 5-invariant matrix passed (node22 → Node 22 LTS; node20 → Node 20 LTS round-trip; no runtime + silent arch → default Node 22 LTS; legacy arch mentioning Node 20 → respected without contradicting default; future runtime "bun" → verbatim). Platform itself confirmed still on Node 20 via `docker exec gestalt-server-1 node --version` → `v20.20.2`. **Operator action — trackeros repo:** the project was initialised under the old template and its `.github/workflows/gestalt.yml` still pins Node 20. Update with `git pull && edit .github/workflows/gestalt.yml: node-version '20' → '22' && commit && push`. Until done, trackeros CI runs on Node 20 (not breaking — Node 20 works for typical code-agent output today). PRE-EXISTING: Hybrid LLM recovery for all scripted deploy agents (Option B, no migration): `SelfHealingDiagnosis` extended with `retryTaskType: 'generate:intent' | 'deploy:pr' | 'deploy:pipeline' | 'deploy:promote' | 'none'` + `retryPayloadHints: Record<string, unknown>`. New `SelfHealingRetryTaskType` exported. Diagnosis prompt rewritten with "Available retry task types" + "Known failure patterns" sections (git push → deploy:pr with unshallow+forceWithLease; CI timeout → deploy:pipeline with extendTimeout; staging gate → deploy:promote; gate failures → generate:intent; infrastructure → none). `parseDiagnosis` defaults retryTaskType to `'generate:intent'` (preserving pre-Option-B legacy diagnoses) and rejects malformed hints (array → `{}`). `safeDefaultDiagnosis` returns `retryTaskType: 'none'`. `runSelfHealingLoop` rewrite: replaces the hardcoded single-queue dispatch with `buildRetryDispatch(taskType, payload, diagnosis, source)` — builds a per-queue-shaped payload (generate:intent gets `text` + `resumeOnBranch`; deploy:pr gets `branch` + `prNumber` + empty `artifacts`; deploy:pipeline gets `branch`; deploy:promotion picks `targetEnvironment: 'production'` when the diagnostician's hint `retryProductionOnly: true` fires, else 'staging'). Loop NOW owns the dispatch + status transition (orchestrator helpers simplified — drop their duplicate dispatch code). `'none'` treated as `shouldRetry: false` (escalation path). ResumeContext gains `retryTaskType` + `retryPayloadHints` so the dashboard's attempt-history view can show which queue the loop retried on. `attemptAutoResolveAlert` uses the same `buildRetryDispatch(source: 'auto-resolved')` so escalation auto-resolves can also route to non-`generate:intent` queues. **All three scripted deploy agents gained `selfHealingHints` + `selfHealingDiagnosis` fields on their input + matching local `SelfHealingHints` interfaces:** pr-agent reads `unshallow` (runs `git fetch --unshallow` best-effort, non-fatal), `forceWithLease` (push with --force-with-lease + --set-upstream), `rebaseBranch` (fetch + rebase default branch, abort cleanly on conflict), `skipArtifactRewrite` (skip writing files + lockfile sync — push existing branch state). On push failure pr-agent rethrows so the deploy-orchestrator's catch wrapper invokes runSelfHealingLoop with the NEW error context (re-diagnosis). pipeline-agent reads `extendTimeout` (doubles the polling window — 20m default → 40m) and `skipTrigger` (re-polls existing run when hint object carries `runId`; silently falls back to fresh trigger when `runId` absent — forward-compat). promotion-agent reads `skipStagingVerification` (no-op today, logged for forward-compat with a future verifyStagingDeployment) and `retryProductionOnly` (consumed at dispatch site by the loop — picks `targetEnvironment: 'production'`; ADR-034 staging-confirmation invariant still enforced in agent regardless). All three deploy payload types (DeployPRPayload / DeployPipelinePayload / DeployPromotionPayload) extended via shared `SelfHealingDispatchFields` interface carrying `source` + `selfHealingHints` + `selfHealingDiagnosis`. Unknown hints silently ignored by every agent (forward-compat — future diagnoses can ship new hints without crashing older workers). Source field extended union: `'self-healing'` (regular retry) | `'auto-resolved'` (alert auto-resolution) | `'operator-resume'` | `'pipeline-feedback'` | `'human'` | `'maintenance-agent'`. Live verified end-to-end: (1) parseDiagnosis 6-invariant matrix — full diagnosis with retryTaskType+hints parses correctly; legacy diagnosis defaults to generate:intent; retryTaskType=none recognised; unknown retryTaskType falls back to generate:intent; malformed hints (array) defaults to {}; garbage JSON safe-defaults with retryTaskType=none. (2) Scenario 1 live: synthetic non-fast-forward diagnosis dispatched `deploy:pr` (NOT generate:intent), server log shows `Self-healing retry dispatched retryTaskType=deploy:pr hintKeys=[unshallow, forceWithLease]`, pr-agent received the dispatch with hints visible in logs, took the resume path on the synthetic branch (push failed because the branch was fake — same WARN+fallback as prior session). last_resume_context stored `retryTaskType: deploy:pr` + `retryPayloadHints: {unshallow, forceWithLease}` + `autoHealed: true`. (3) Scenario 4 live: fresh trivial intent — first cycle's pr-agent ran the scripted happy path with ZERO `hints` log entries / ZERO "Resuming on existing branch" log lines / ZERO self-healing references for the FIRST deploy:pr call. Subsequent self-healing fired because trackeros project's CI deterministically fails (pre-existing unrelated issue) — when CI failed, the loop diagnosed `retryTaskType: "generate:intent"` (the LLM correctly picked the right queue, NOT a hardcoded map) and re-ran the full generate cycle. No new migration required — hints flow through BullMQ payload, retryTaskType + retryPayloadHints persist in `intents.last_resume_context` via the column added in migration 020. PRE-EXISTING: Autonomous self-healing loop (migration 020): `platform_self_healing_config` table seeded with the seven failure types (`generate-error`, `gate-max-retries`, `pipeline-failed`, `pipeline-timeout`, `deploy-error`, `maintenance-error`, `custom-agent-failure`) — each with per-type defaults the platform-admin can tune. `intents` gains `attempt_count INTEGER NOT NULL DEFAULT 0` + `last_resume_context JSONB`; `deployment_event_type` adds `resume-pushed`. New `SelfHealingConfigRepository` (postgres impl + oracle/mssql throw-stubs). New `IntentRepository.saveResumeContext` + `incrementAttemptCount`. New `SelfHealingAgent` class in `@gestalt/core/agents/self-healing-agent.ts` extends `BaseLLMAgent` — diagnoses failures returning structured `{ diagnosis, rootCause, suggestedFix, confidence, shouldRetry, skipAgents, focusFiles, updatedIntentText }`; per-type `confidence_threshold` downgrades shouldRetry when LLM confidence is below the operator's bar; safe-default `shouldRetry:false, confidence:low` on LLM/parse failure (NEVER throws). New `runSelfHealingLoop(ctx, payload, signals)` in `self-healing-loop.ts` — budget check → diagnosis → either dispatch retry (`source: 'self-healing'`, resumes on intent.branchName) OR escalate (creates alert via shared `escalateToHuman` with per-failureType title template) + auto-resolve at high confidence (`source: 'auto-resolved'`); returns `{shouldRetry, diagnosis, escalated, autoResolved}` so caller branches cleanly. `alertContextExtras` payload field merges into alert.context (pipeline-* carry runId + pipelineStatus). `setQueueConfig/getQueueConfig` pattern added to `@gestalt/core/queue` (server pins config.queue at boot step 5c) so the loop can dispatch without threading config through every consumer. Wired into every failure path: generate orchestrator `hasPlanFailed` AND catch block (generate-error), gate orchestrator max-retries (gate-max-retries), deploy orchestrator pipeline-failed branch (pipeline-failed/pipeline-timeout — pipeline-agent stopped creating alerts directly; loop owns alert creation with rich context), deploy generic catch (deploy-error), custom agent LLM error inside `runOneCustomAgentNode` (custom-agent-failure — throws `SelfHealingRetryDispatched` sentinel caught in orchestrator catch to avoid double-dispatch). Context-assembler reads `intent.lastResumeContext` and attaches to ContextSnapshot.resumeContext + skipAgents + focusFiles. Code-prompt gains a new "Resumed attempt (N) — auto-diagnosed | operator feedback" section (between signals and task) showing diagnosis/rootCause/suggestedFix for autoHealed cycles or operatorFeedback verbatim for human cycles, plus focus files. Orchestrator honours skipAgents (high-confidence auto-healed retries only) — skipped steps create `agent_executions` rows with status `skipped` so the dashboard accordion stays consistent. New routes: `GET /platform/self-healing` (admin — list all 7 configs); `PATCH /platform/self-healing/:failureType` (admin — partial update with validation: maxAttempts 0–10, confidenceThreshold enum, audit captures changedFields+previousValues+newValues per GP-002); `POST /alerts/:id/resume` (operator + editor membership — generic human-feedback resume for any failure alert type; saves last_resume_context with autoHealed:false, increments attempt_count, dispatches `source: 'operator-resume'`, GP-006 audit carries feedbackLength only). Dashboard adds 8th `Self-healing` tab in Admin between Secrets and Templates — table with per-row toggle enabled, select maxAttempts (0-10), select confidence (high/medium/low), toggle auto-resolve; saves on change with inline ✓ saved indicator. CLI: `gestalt platform self-healing list/configure <failureType>` (--max-attempts, --confidence, --auto-resolve/--no-auto-resolve, --enable/--disable). New `LiveEventType: 'alert.auto-resolved'` SSE for dashboard live update. Live verified: migration 020 applied + queue config pinned at boot; GET endpoint returns all 7 rows; PATCH validation matrix (maxAttempts>10, invalid confidence, unknown failure type, empty patch); audit metadata captures changedFields/previousValues/newValues; CLI list+configure exercised; POST /alerts/:id/resume happy path (intent transitioned + last_resume_context stored as proper JSONB object with autoHealed:false + attempt_count incremented + alert acked + GP-006 audit confirmed — feedback text NOT in audit_log via direct SQL probe); worker picked up resume payload + full cycle ran end-to-end to `deploying`. Pipeline failure alerts + resume-on-same-branch feedback loop (migration 019): `intents` gains `branch_name TEXT`, `pr_number INTEGER`, `pr_url TEXT` (all nullable); new `IntentRepository.saveBranchInfo`; pipeline-agent creates `pipeline-failed` / `pipeline-timeout` alerts (severity high, requiredAction `provide-feedback`) carrying intentId + branch + prUrl + prNumber + runId + pipelineStatus in context JSONB; new `AlertType` values + `AlertRequiredAction: 'provide-feedback'`; pr-agent persists branch info on fresh-PR path and dispatches a new `resumeOnBranch` flow: when set, fetch + `checkout -B <branch> origin/<branch>`, push to existing branch, NO new PR — reuses the input's `prNumber`/`prUrl`, writes a `pr-opened` event with `metadata.resume: true` so the timeline narrates "fix push" vs original; commit subject becomes `fix: address CI failure — <intent line> [gestalt <corr8>]`. Generate orchestrator threads `resumeOnBranch`/`prNumber`/`prUrl` payload optionals through `drivePlan` → gate's `dispatchDeployPR` → deploy:pr; on resume, fetches + checks out the existing remote branch with WARN-and-fall-through-to-default safety. intent-agent prompt picks up new `clarificationSource: 'pipeline-feedback'` framing ("## CI pipeline failure feedback from operator"); `needsClarification` short-circuits for `pipeline-feedback` to avoid re-pausing. New route `POST /alerts/:id/pipeline-feedback` (`requireRole('operator')` + `checkProjectMembership(editor)`) validates type ∈ {pipeline-failed, pipeline-timeout}, calls `intents.saveClarification(intent.id, feedback)`, dispatches `generate:intent` with full resume payload, transitions to `generating`, acknowledges alert atomically — audit `alert.pipeline-feedback-submitted` carries `feedbackLength + branch + prNumber + intentId + type + ip` ONLY (GP-006). Dashboard Alerts view: new `PipelineBody` (intent line + branch + PR link + run id + pipeline status KV header) and `PipelineFeedbackBlock` (textarea + "retry with fix ▶" button) rendered ABOVE Dismiss for the two new types; new TypeGlyph (✗ red for failed, ⏱ amber for timeout); FixIntentBlock suppressed for pipeline alerts (operators provide CI-fix context via the new block instead). CLI: new `gestalt alerts pipeline-feedback <alertId> [--feedback <text>]` subcommand — displays branch/PR/runId/status context then submits; `gestalt alerts show` Available actions footer routes pipeline alerts to `pipeline-feedback` + `dismiss`. Live verified end-to-end: 4 validation paths (400/404), happy path (200 with intentId + status: generating + branch + PR), atomic ack + clarification persist (116 chars), worker pickup with `resumeOnBranch` log line, GP-006 audit metadata. PRE-EXISTING: pr-agent syncs `pnpm-lock.yaml` after writing artifacts so CI's `--frozen-lockfile` always passes. New shared `execCommand(cmd, args, cwd, timeoutMs)` helper in `packages/agents/deploy/src/agents/exec.ts` — spawn-based, no shell, 2-minute default timeout, surfaces a 400-char stderr tail on non-zero exit. pr-agent's `maybeSyncLockfile(workDir)` stats `package.json` then runs `pnpm install --no-frozen-lockfile`; ENOENT skips (no Node project yet), other failures log WARN and continue (CI is the real source of truth — don't block PR creation over a lockfile sync hiccup). Dockerfile production stage swapped `corepack prepare pnpm@9.15.4 --activate` for `npm install -g pnpm@9.15.4` so the runtime `gestalt` user has pnpm 9.15.4 on PATH (corepack caches per-user; root activation wouldn't reach gestalt and the auto-fetched latest pnpm requires Node 22's `node:sqlite`). Template `gestalt.yml` gains a graceful fallback: if `pnpm-lock.yaml` is missing, emit a `::warning::` and run `pnpm install` without `--frozen-lockfile` so first-CI doesn't hard-fail. context-fixer.ts is unchanged — the ADR-018 path guard restricts it to `docs/*` and `AGENTS.md`, so it can never reach a `package.json` write path. Smoke test inside the rebuilt container: `pnpm 9.15.4` callable, real `pnpm install --no-frozen-lockfile` produces a 384-byte `pnpm-lock.yaml@9.0` for a lodash dependency)
+**Last updated:** 2026-06-04 (Claude Code — Template editor improvements: syntax highlighting + push + diff (no new migration). Three follow-ups to the previous session's in-place template editor: (1) the dashboard `TemplateEditor`'s plain `<textarea>` is replaced with a CodeMirror 6 editor that auto-detects JSON / YAML / Markdown by file extension and renders OneDark syntax highlighting + line numbers + bracket matching + search + line wrapping; (2) new `gestalt platform templates push <slug> <dirPath> [--dry-run]` CLI subcommand walks a local directory recursively (skipping `.git` / `node_modules` / `dist` / etc.) and PATCHes the full file map in one batched call; (3) new `gestalt platform templates diff <slug> [--against <baselineSlug>] [--stat]` CLI subcommand prints a per-file unified diff via LCS line-diffing through the `diff` npm package, language-agnostic so YAML/JSON/Markdown all work. **CodeMirror integration:** new dashboard deps (`@codemirror/view`, `@codemirror/state`, `@codemirror/lang-json`, `@codemirror/lang-yaml`, `@codemirror/lang-markdown`, `@codemirror/theme-one-dark`, `codemirror` meta package for `basicSetup`). `TemplateEditor` rewritten in `Admin.tsx`: `editorRef` (HTMLDivElement) + `editorViewRef` (EditorView) + `draftsRef` (latest drafts captured for the updateListener closure). New `useEffect` keyed on `[selectedPath, discardCounter]` destroys the previous EditorView and creates a fresh one with the right `getLanguageExtension(filePath)` + `oneDark` + `basicSetup` + `EditorView.lineWrapping`. Editor changes flow via `EditorView.updateListener.of(...)` → `setDrafts((prev) => ({...prev, [path]: newContent}))` so the existing `●` modified indicator + save/discard buttons work unchanged. `discardOne` bumps a `discardCounter` to force re-mount with the reverted doc. Brief's pseudocode had `basicSetup` imported from `@codemirror/view` — deviated from that import path (it's actually in the `codemirror` meta package) to make the code compile. Three language packs only (no `lang-typescript` / `lang-yaml-yaml-streamish` / others) per the brief — bundle size grew from 363 KB → 1010 KB raw (319 KB gzipped, +190 KB delta). Spot-grep on the production bundle confirms CodeMirror CSS classes (`cm-editor`, `cm-content`, `cm-line`, `cm-gutters`) + OneDark theme colors (#abb2bf, #21252b, #282c34) + the APIs we use (`EditorView`, `EditorState`, `lineWrapping`, `updateListener`) are all present. **`push` command:** new `platformTemplatesPushCommand(slug, dirPath, {dryRun})` in `platform-extras.ts`. New `collectTemplateFiles(dir, rootDir)` recursive walker skips `.git` / `.gestalt` / `node_modules` / `dist` / `build` / `.DS_Store`. Path separators normalised forward-slash on the wire (so Windows operators don't end up with `docs\X.md` keys). `--dry-run` prints the file list + sizes with the "(dry run — no changes made)" footer. Real push uses the existing `PATCH /platform/templates/:id/files` endpoint (MERGE semantics — supplying only a subset preserves untouched files). `BUILTIN_TEMPLATE` and `MISSING_REQUIRED_FILES` server errors surface with friendly hints ("Duplicate it first: gestalt platform templates duplicate <slug>" / "Ensure AGENTS.md, HARNESS.json, and agents.yaml are present in the directory."). Missing-dir → `Directory not found: <path>` + exit 1. **`diff` command:** new `platformTemplatesDiffCommand(slug, {against, stat})` in the same file. Default baseline is `corporate-ops-web-mobile`; `--against <slug>` overrides. Self-diff (same slug both sides) → friendly error + exit 1. Loads both templates' full file maps via `getPlatformTemplate(id)` (the route already returns `files` content in the response). Per-file path-set union iterated three ways: files only in baseline → `(removed)`, files only in custom → `(added)`, files in both with `diffLines(baseline, custom)` → `(modified)` or `(unchanged)`. Modified files print a unified-diff-style block with green `+` / red `-` lines and "... (N unchanged lines)" context-folding when a chunk has more than 4 unchanged lines (shows 2 leading + 2 trailing). `--stat` mode hides the per-line diff and prints only the right-padded `path +N -M / unchanged / (added/removed)` summary. Footer `Summary: 1 modified, 7 unchanged` always prints. CLI dep additions: `diff ^5.2.0` + `@types/diff ^5.2.0`. Header docstring on `platform-extras.ts` and top-of-file command comment in `index.ts` updated to include the new subcommands. Live verified end-to-end against `gestalt-server-1` (no new migration; the new dashboard bundle was `docker cp`'d into the running container at `/app/packages/dashboard/dist/`; HTML now points at `/app/assets/index-Ds_rUJ8n.js`): (1) `download` → `unzip` → modify AGENTS.md locally (`## Custom section added by operator\nLocal edits via the push workflow.`) → `duplicate corporate-ops-web-mobile --name 'Push Diff Test' --new-slug push-diff-test` → `push push-diff-test ./my-edit --dry-run` lists all 8 files with sizes + "(dry run — no changes made)" footer → real `push push-diff-test ./my-edit` prints 8 ✓ rows + `✓ Template updated: push-diff-test (8 files pushed)`. Direct API fetch confirms `harness/AGENTS.md` ends with the operator's local edits (`Local edits via the push workflow.`). (2) `diff push-diff-test` (no `--against`, defaults to built-in) renders the per-file walk: 7 files `(unchanged)`, 1 file `harness/AGENTS.md (modified)` with `(68 unchanged lines)` context-folding + 2 added green `+` lines + Summary `1 modified, 7 unchanged`. (3) `diff push-diff-test --stat` shows `harness/AGENTS.md +2 -0` with all other files `unchanged`. (4) Added a new file (`docs/EXTRA.md`) via push → subsequent `diff` shows `docs/EXTRA.md  (added)` line + `1 modified, 1 added, 7 unchanged` summary. (5) Clean duplicate (`clean-copy-test`) → `diff` shows ALL 8 files `(unchanged)` + Summary `8 unchanged`. (6) Error matrix: `push corporate-ops-web-mobile ./dir` → `Cannot push to a built-in template. Duplicate it first: gestalt platform templates duplicate corporate-ops-web-mobile`; `push push-diff-test /tmp/does-not-exist` → `Directory not found: ...`; `diff push-diff-test --against nonexistent` → `No template with slug 'nonexistent'.` + hint; `diff push-diff-test --against push-diff-test` → `Cannot diff 'push-diff-test' against itself.`. All test templates cleaned up at session end. Bundle delta documented for follow-up evaluation: 1010 KB > Vite's 500 KB warning threshold. Acceptable for an admin-only feature but a future code-split via dynamic import or `manualChunks` would push only platform-admins editing templates into the CodeMirror-paying tier. PRE-EXISTING: Template download + in-place configuration editor (no new migration). Adds platform-admin tooling to (1) download any template as a ZIP, (2) duplicate built-ins into editable copies, and (3) edit custom-template files in place via dashboard inline editor + CLI subcommands. Server: four new routes — `GET /platform/templates/:id/download` (operator+, streams a ZIP built with `adm-zip`; audit `platform.template-downloaded` carries slug + name + fileCount + sizeBytes + ip), `POST /platform/templates/:id/duplicate` (admin, body `{name, slug}`; INSERT copies files + variables into a new row with `isBuiltin: false, isDefault: false, createdBy: <admin>`; slug clash → 409 `SLUG_TAKEN`; audit `platform.template-duplicated`), `PATCH /platform/templates/:id/files` (admin, body `{files: {path: content}}`; MERGE semantics via postgres `files || $1::jsonb`; 400 `BUILTIN_TEMPLATE` on built-ins; 400 `MISSING_REQUIRED_FILES` if the post-merge map drops AGENTS.md/HARNESS.json/agents.yaml by basename — defensive even though MERGE can only add keys; audit `platform.template-files-updated` carries `changedFiles: string[]` — NAMES ONLY, never content — per GP-006), `DELETE /platform/templates/:id/files/*` (admin, wildcard path so `docs/X.md` works; 400 `BUILTIN_TEMPLATE`, 400 `REQUIRED_FILE` on AGENTS.md/HARNESS.json/agents.yaml by basename, 404 `FILE_NOT_FOUND` when the file isn't in the template; audit `platform.template-file-deleted`). Repository: three new methods on `PlatformTemplateRepository` in core — `updateFiles(id, files)` (postgres `UPDATE ... SET files = files || ${jsonbHelper}::jsonb`), `deleteFile(id, filePath)` (postgres `files - $1` operator), `duplicate(sourceId, name, slug, createdBy)` (re-uses `create` after `findById`). Oracle + MSSQL adapters get throw-stubs for all three. Server gained `adm-zip ^0.5.10` + `@types/adm-zip ^0.5.5` runtime dep (already present in CLI; mirrors the upload-side parser). Dashboard `TemplatesTab` rewritten with per-row `[↓ Download]` / `[⎘ Duplicate]` / `[✎ Edit]` (custom only) / `[★ Set default]` (non-default only) / `[×]` (custom only) actions. Download button calls `client.downloadPlatformTemplate` (returns Blob) + `URL.createObjectURL` + `<a download>` so the Authorization header is preserved (a bare window.open would lose it). New `DuplicateTemplateModal` accepts name + slug (defaulted to `<source-name> (Custom)` + `<source-slug>-custom`). New `TemplateEditor` inline panel replaces `TemplateDetailPanel` while `editingId === t.id` — left pane is the file tree with `●` modified indicator + per-file `[×]` remove button (hidden on required files); right pane is a `<textarea>` editor (monospace, ~400px min height); per-file `[Save this file]` + `[Discard changes]` buttons + footer `[Save all changes (N)]` button that ships every modified file in one PATCH. New files added via inline `[+ Add file]` form; deleting a non-required file is immediate (DELETE /files/<path>) without batching. The editor preserves in-flight drafts across re-renders + only collapses when the operator clicks `[× Close editor]` (so a stray row click doesn't lose work). Required-file basenames (`AGENTS.md, HARNESS.json, agents.yaml`) hard-coded client-side too so the `[×]` button never appears on those rows. CLI: five new subcommands under `gestalt platform templates`:
+  - `download <slug> [--output <path>]` — saves the ZIP (default `./<slug>-template.zip`), prints file count + byte size on success
+  - `duplicate <slug> [--name <n>] [--new-slug <s>]` — prompts for name/slug when not supplied, falls back to `<source-name> (Custom)` + `<source-slug>-custom`
+  - `edit <slug> <filePath> [--content <string>]` — opens `$EDITOR` (or `$VISUAL`, fallback `vi`) with the current file content; on save + exit, PATCHes the new content. Headless mode: writes to a tmp file and prompts the operator to edit it manually before pressing Enter (CI-friendly). `--content` skips the editor entirely
+  - `add-file <slug> <filePath> [--content <string>]` — same editor flow but for new files; refuses if the file already exists
+  - `remove-file <slug> <filePath>` — confirms `y/N` then DELETEs. Required-file guard surfaces server's 400 `REQUIRED_FILE` verbatim
+  Built-in templates remain editable ONLY through the duplicate-first flow — `BUILTIN_TEMPLATE` errors are surfaced verbatim with no special-casing. Docs: `docs/guides/quick-start.md` gained an "Authoring custom templates" section with starting-from-built-in (download + zip + upload) AND in-place-editing (duplicate + edit + add-file + inspect + set-default) workflows + a constraints block. The summary command-reference table gained 7 new template-authoring rows. Live verified end-to-end (no new migration): (1) `GET /platform/templates/<builtin>/download` returns HTTP 200 + Content-Type `application/zip` + 8971-byte ZIP containing all 8 expected files; unzip listing confirms `ci/gestalt.yml`, `docs/{ARCHITECTURE,DECISIONS,DOMAIN,GOLDEN_PRINCIPLES}.md`, `harness/{AGENTS.md, HARNESS.json, agents.yaml}`. (2) `POST .../duplicate {name: 'Corporate Ops (Live Test)', slug: 'corporate-ops-livetest'}` created a copy with `isBuiltin: false, isDefault: false, createdBy: <admin uuid>`. (3) `PATCH .../files {harness/AGENTS.md: '<new content>'}` updated only AGENTS.md; re-fetch confirmed the new content + ALL 7 other files preserved with their original content (MERGE semantics verified). (4) Guard matrix: PATCH /files on the built-in → 400 `BUILTIN_TEMPLATE`; DELETE /files/harness/AGENTS.md → 400 `REQUIRED_FILE`; DELETE /files/harness/HARNESS.json → 400 `REQUIRED_FILE`; PATCH with no `files` body field → 400 `INVALID_FILES`. (5) Add + remove path: PATCH /files with new `docs/EXTRA.md` → file appears in subsequent GET; DELETE /files/docs/EXTRA.md → file removed; DELETE on non-existent path → 404 `FILE_NOT_FOUND`. (6) Slug clash on duplicate → 409 `SLUG_TAKEN`; missing name → 400 `INVALID_NAME`; bad slug format → 400 `INVALID_SLUG`. (7) **Persistence across server restart**: edited content on the duplicate survived `docker compose restart server` cleanly (stored in postgres `platform_templates.files` JSONB, not memory). (8) Audit table inspection confirms all 4 new actions write rows with the documented metadata shape — direct probe shows `changedFiles` carries paths NOT content (GP-006 verified). (9) CLI end-to-end: `gestalt platform templates download` writes the ZIP with correct file count; `edit --content` updates a single file; `add-file --content` adds a new file; `remove-file` confirms + deletes; built-in edit attempt surfaces `Failed to edit ... 400 BUILTIN_TEMPLATE`; required-file remove attempt surfaces `Failed to remove ... 400 REQUIRED_FILE`; duplicate via CLI works with `--name`/`--new-slug` flags. State restored to baseline at session end (test templates deleted, only built-in remains). PRE-EXISTING: Per-LLM `apiShape` field — fix gpt-5/o1/o3 'max_tokens' rejection (migration 023). `platform_llms` gains `api_shape TEXT NOT NULL DEFAULT 'chat-completions' CHECK ('chat-completions' | 'responses')`. Two-shape registry-row union covers the wire-shape split: 'chat-completions' (legacy `max_tokens` + `temperature` — gpt-4o*, gpt-3.5, Ollama, vLLM-OpenAI-compat) vs 'responses' (`max_completion_tokens` only — OpenAI reasoning models: gpt-5*, o1, o3 which silently ignore temperature and reject `max_tokens` with HTTP 400). The wire-shape decision is per-row + operator-controlled; no model-name heuristics that OpenAI could break on the next rename. Two new helpers in `packages/core/src/llm/index.ts` (`tokenLimitField` + `temperatureField`) compose into the LLM request body in BOTH `callProvider` (plain `complete()` path) AND `callProviderWithTools` (tool-use loop). `RegistryEntry.apiShape?` threaded from the postgres row through `setLLMRegistryResolver` into the per-(model,baseUrl) cached LLMClient config. `LLMConfig.apiShape?` exposed on the config interface (optional with 'chat-completions' default so platform-default `.env`-driven seeds keep their current behaviour). `seedPlatformLlmsIfEmpty` explicitly seeds new platform-default rows with `apiShape: 'chat-completions'` for forward-compat clarity. `POST /platform/llms/:id/test` endpoint rewritten — previously hand-rolled `max_tokens: 5` (re-creating the same bug at the diagnostic layer); now branches on `existing.apiShape` so the test result matches what an agent call would actually see. POST/PATCH route validation: `apiShape` optional, defaults to 'chat-completions' on create; bad value → 400 `INVALID_API_SHAPE` with the typed valid-values list. Audit metadata for `platform.llm-added` includes `apiShape` (GP-002). Dashboard `LlmModal` gains an apiShape `<select>` with operator-friendly explainer text below; `LlmsTab` table gains an 'API shape' column (purple for `responses`, dim for `chat-completions` so reasoning-class rows are scannable at a glance). CLI `gestalt platform llms add` interactive flow gained a third prompt after the API-key source picker — '(1) chat-completions / (2) responses' with default `1`. `gestalt platform llms list` table gains an 'API shape' column. Oracle + MSSQL throw-stubs unchanged — the `apiShape` field is structural on existing record/payload shapes that the stubs already accept as opaque. Live verified end-to-end: (1) Migration 023 applied (`schema_migrations` lists 23 versions; `\d platform_llms` shows the column + CHECK constraint). (2) Back-compat: both pre-existing rows (`Platform default` / `gpt-5.4-mini`, `GPT-4o-mini`) defaulted to `'chat-completions'` — no operator action required for legacy rows. (3) Bug reproduction: `POST /platform/llms/<gpt-5.4-mini>/test` with `apiShape: 'chat-completions'` returned `{ok: false, error: 'Provider 400: ... max_tokens is not supported with this model. Use max_completion_tokens instead.'}` — operator's exact error. (4) Fix verification: PATCH the same LLM to `{apiShape: 'responses'}` → `POST .../test` returns `{ok: true, latencyMs: 1268}`. First successful test connection to a reasoning model. (5) Control: `gpt-4o-mini` at `'chat-completions'` still returns `{ok: true, latencyMs: 661}` — no regression on legacy path. (6) Validation matrix: invalid `apiShape` → 400 `INVALID_API_SHAPE`; create without `apiShape` → defaults to `'chat-completions'`. Root cause was a latent bug since commit `df59ae5` (June 3 platform-secrets-vault commit) — the LLM client hardcoded `max_tokens: request.maxTokens ?? 4096` at lines 230 + 297. Git history confirms NONE of today's 10 commits touched `llm/index.ts`; the model 'worked before' only in the sense that no one had tested it via the test endpoint — `gpt-4o-mini` was the only LLM exercised through that code path in prior sessions and it accepts the legacy parameter. Side effect: during the dev-override container restart that landed the new code, the container's `/app/master.key` regenerated (dev-override mounts dist/ but not master.key); broke vault decryption for the prior `9835125e-...` secret. Both LLMs switched to `apiKeyEnv: 'LLM_API_KEY'` so they keep working without the vault. Operator can re-create the vault secret under the current master key + flip back via the dashboard if desired. PRE-EXISTING: Project init: PAT from vault + GitHub repo browser (migration 022). `projects` gains `git_secret_id UUID REFERENCES platform_secrets(id) ON DELETE SET NULL` + partial btree index — when set, the project's Git PAT is decrypted from the vault instead of read from the legacy `project_git_credentials` table. Backward-compat: the plain-token path is preserved; the vault ref takes precedence in every credential resolution. New shared `resolveProjectCredential(project)` helper in `@gestalt/core` consolidates the 12+ `projects.getCredential(project.id)` call sites across orchestrators / agents / route handlers. Server boot (step 4e) wires `setProjectSecretResolver(async (secretId) => ...)` that loads the secret + decrypts under the master key (mirrors `setLLMRegistryResolver` + `setPlatformMcpResolver` — the master key never reaches `@gestalt/core`). Decrypt failure logs a WARN with the secret id ONLY (never key material) and returns null so the helper falls back to plain-token. `ProjectRecord` gained `gitSecretId: string | null`; `ProjectRepository.saveGitSecretRef(projectId, secretId | null)` added to interface; Oracle + MSSQL throw-stubs follow. `POST /projects` accepts three mutually-exclusive credential modes: `gitToken` (legacy plain), `gitSecretId` (link to existing vault secret), `newSecret: {name, value}` (auto-save to vault then link). Validation surface: `CREDENTIAL_REQUIRED` / `CREDENTIAL_AMBIGUOUS` / `NEW_SECRET_INVALID` / `SECRET_NOT_FOUND` — all 400. Audit metadata records `credentialType` ('plain' / 'vault-existing' / 'vault-new') + `gitSecretId` UUID reference (NO token value — GP-006). On vault-create failure during project creation, the project row is rolled back so the operator can retry. `PATCH /projects/:id/git-credentials` (project-admin minimum) replaces the project's PAT with the same three modes; atomically clears the prior credential in every mode so only one source wins. Audit `project.git-credentials-updated` records type + UUID, never the token. New `GET /platform/git/repos?secretId=<uuid>&provider=github` (operator+) — server-side GitHub proxy: loads the vault secret, decrypts under the master key, calls `/user/repos?sort=updated&per_page=100` with proper Auth + GitHub API headers, returns `{data: GitRepoSummary[]}` (provider-neutral shape: name / fullName / htmlUrl / cloneUrl / defaultBranch / private / description). GitHub error bodies parsed for the `message` field — operators see 'Bad credentials' on a 401. Today only GitHub is wired; GitLab / Azure DevOps / Bitbucket can be added by extending the `provider` switch without changing the client shape. Dashboard Admin → Projects: `CreateProjectModal` rewritten with a radio token-source picker (vault secret `<select>` vs new-token password input + 'Save to vault?' checkbox), a `[Browse repos ▾]` button beside the Git URL input that opens a `RepoBrowserModal` (loads repos via the new proxy with a search input + 🔒/📖 private/public glyphs; selecting a repo auto-fills the clone URL + default branch). `ProjectSettings → Pipeline tab` gains a `GitCredentialsCard` below the pipeline config — shows current mode ('● vault: <name>' or '● plain token stored'), two action buttons ('Change to saved secret ▾' / 'Replace with new token'), and a 'Browse repos with this secret ▾' button when in vault mode (read-only repo list). CLI `gestalt init` Phase 0.5 rewritten — operator picks (1) vault secret from a numbered list OR (2) enter new token (with optional save-to-vault); if vault mode, an optional repo browser fires (numbered list of GitHub repos with 🔒/📖 glyphs, selecting one auto-fills the clone URL + default branch). New `gestalt projects update-token <name>` subcommand — same interactive vault-picker / new-token flow against an existing project, calls PATCH /git-credentials. Live verified end-to-end against `trackeros`: (1) Migration 022 applied (`schema_migrations` lists 22 versions; `\d projects` shows `git_secret_id UUID` + partial `idx_projects_git_secret_id` + FK to `platform_secrets(id) ON DELETE SET NULL`). (2) Boot log: `Project git secret resolver wired`. (3) Validation matrix: no credentials → 400 `CREDENTIAL_REQUIRED`; two credentials → 400 `CREDENTIAL_AMBIGUOUS`; bad UUID → 400 `SECRET_NOT_FOUND`. (4) `POST /platform/secrets` + `POST /projects { newSecret }` created a project AND auto-saved a vault secret in one call — DB row shows `git_secret_id` populated, vault secret has proper AES-256-GCM ciphertext (48-char base64, 16-char IV, 24-char auth tag); ciphertext does NOT contain the plaintext token substring. (5) Audit row for project.created shows `credentialType: 'vault-new'` + `gitSecretId` UUID; auto-saved secret carries `origin: 'project-init'`. (6) GP-006 verified: direct probe `metadata::text LIKE '%ghp_...%'` on `audit_log` returns 0 rows. (7) `GET /platform/git/repos` against a real GitHub PAT returned 9 real repos with correct fullName / defaultBranch / private fields — the decrypted token never appears in the response. (8) Same endpoint against a fake PAT returned 400 `PROVIDER_ERROR` with `providerStatus: 401` + `error: 'GitHub API error: Bad credentials'` — clean error pass-through. (9) PATCH /git-credentials in both directions (vault → plain → vault) verified atomic clearing of the prior credential in DB. (10) **Full vault-backed clone + push cycle**: switched trackeros to vault mode (linked to the real PAT secret), submitted an intent. Server-side: orchestrator called `resolveProjectCredential(project)` → resolver decrypted server-side → constructed authenticated clone URL → `git clone` succeeded → generate cycle ran through all 6 agents → gate passed → pr-agent pushed branch `gestalt/<corr8>-verify-vault-cred-add-a-constant-export` → pipeline-agent triggered real GitHub Actions workflow → intent reached `deploying` with PR #46 opened on `afarahat-lab/trackeros`. The vault-decrypted token flowed through every layer correctly. (11) CLI rebuild: `gestalt projects update-token` registered + visible in `--help`. **Operator action pending**: a synthetic test PR #46 was opened during verification; auto-mode classifier declined to force-delete it. Run `gh pr close 46 --repo afarahat-lab/trackeros --delete-branch` (or use the GitHub UI) to clean it up. trackeros was restored to plain-token mode at session end; all synthetic vault secrets + projects deleted; audit rows scrubbed. PRE-EXISTING: Intent list filter improvement (Brief 5 — no new migrations). `GET /intents` widened with five new query params: `source`, `priority`, `search`, `from`, `to`. When `projectId` is absent for a non-admin user, the response is now the UNION across every project the user can access via direct membership AND group assignment (uses `memberships.findByUser` + `platformGroups.getEffectiveMemberships` in parallel, deduplicates, then a single SQL query with `= ANY($1::text[])`). Platform-admin still sees the server-wide list. Empty access → `{data: [], total: 0}` rather than 403 (no-enumeration-leak rule). New `IntentListFilters` interface in `@gestalt/core` carries `status, source, priority, search, from, to, limit, offset` — `from` / `to` are JS `Date` objects (route parses ISO strings via `new Date`, drops the filter when NaN). New `IntentRepository.listForProjects(projectIds, filters)` method — single round-trip via `= ANY(${ids}::text[])` (cast is text[] because `intents.project_id` is TEXT per 001_initial.sql, not UUID). `list()` and `listAll()` widened to accept the full filter set; postgres impl uses inline conditional `${filters.X ? db\`AND col = ${val}\` : db\`\`}` fragments — each filter is independently skippable so the prepared statement shape stays minimal. `listAll` anchors `WHERE 1 = 1` so AND-fragments compose without first-AND special handling. Oracle + mssql `IntentRepository` stubs widened with throw-stub `listForProjects` + updated `list` / `listAll` signatures. `IntentRecord.source` typed union widened from `'human' | 'maintenance-agent'` to also accept `'self-healing' | 'auto-resolved' | 'operator-resume' | 'pipeline-feedback'` — the DB column is TEXT NOT NULL DEFAULT 'human' so accepts any value; current intents stay at `human` on retry cycles because the same row is reused (the new values are reserved for future iterations that may persist payload-source-derived values). Dashboard `IntentFeed.tsx` rewritten with a filter bar above the list — `useSearchParams` from react-router-dom drives URL persistence so `/app/intents?status=failed&search=pnpm` loads the filtered view in a new tab. Filter bar: `<select>` for status (8 options), `<select>` for source (6 options), Search input with 300ms debounce before URL+fetch update, From/To `type="date"` inputs (HTML5 native date picker), and `× Clear` button that appears when any filter is active. Empty-state message branches between "No intents match the current filters / Try clearing one or more filters" vs the legacy "No intents yet" hint. CLI: `gestalt intent list` gained `--source`, `--priority`, `--search`, `--from`, `--to` flags with client-side validation (`VALID_SOURCES`, `VALID_PRIORITIES` Sets) — invalid values print friendly error + valid-values list and exit 1. The `--project` flag is now genuinely optional (omitting means "all projects I can access via direct + group membership"); the rendered project label switches to "accessible projects" when no project is selected. `listIntents` on both dashboard + CLI API clients widened to accept the new params. No new migrations — `source` column already exists in `001_initial.sql` (`TEXT NOT NULL DEFAULT 'human'`); Brief 1's `platform_groups` / `group_memberships` / `group_project_assignments` tables are already applied. Live verified end-to-end: filter matrix on built-in test data — `?status=failed&limit=5` → 5 rows of total 10; `?source=human` → 22 rows; `?source=self-healing` → 0 rows (no intents currently use that source); `?priority=normal` → 22; `?search=pnpm` → 11 with text matches; combined `?status=deployed&search=pnpm` → 5; `?from=2026-06-04` → 0 (all data is from 2026-06-03); `?to=2020-01-01` → 0. Group-membership path verified: seeded a fresh `verify-group` group with the existing `user@test.local` member assigned `reader` role on the trackeros-style project with 19 intents → user's `GET /intents` (no projectId) returned 19 rows (previously 0); filters apply correctly on the group-derived path (`?status=failed` → 8; `?search=pnpm` → 11); after deleting the group, user back to 0 — full lifecycle works. CLI verification: `gestalt intent list --status failed --limit 3` renders correctly, `--search pnpm` matches, `--source nonsense` returns `Unknown source 'nonsense'. Valid values: human, maintenance-agent, ...` and exits 1; `intent list --help` shows all 8 new flag descriptions. Dashboard bundle compiled clean (366 KB ungzipped) — spot-grep confirms `"All statuses"`, `"All sources"`, `"Search..."`, `"× Clear"` strings present. PRE-EXISTING: Template variable substitution preview (Brief 3 — no new migrations). New `extractVariables(files)` helper in `packages/server/src/routes/templates.ts` scans every file in a template's file map for `{{key}}` regex matches, returns the sorted unique set. New `AUTO_VARIABLES` Set lists the 20 placeholders the engine ALWAYS supplies at `gestalt init` time (5 standard: `projectName, projectDescription, defaultBranch, today, projectSlug` + 15 LLM-generated stack config: `language, nodeVersion, packageManager, installCmd, testCmd, buildCmd, testFramework, framework, frontend, database, moduleStructure, architectureNotes, stackSection, agentPromptExtensionsYaml, ciSetupSteps`). New `buildVariableUsage(files, variables)` helper joins the scan result against the template's documented variables metadata and the AUTO_VARIABLES set; returns `TemplateVariableUsage[]` records with `name`, `usedInFiles[]`, `defined`, `required`, `defaultValue`, `description`, `autoProvided` fields. `GET /platform/templates/:id` now returns `{...record, variableUsage}` — computed at read time, never persisted. `POST /platform/templates` extended to detect undocumented placeholders (`!AUTO_VARIABLES.has(v) && !documented.has(v)`), responds with `{data, warnings: string[]}` (upload ALWAYS succeeds; warnings are informational only — operator sees "N undocumented variable(s): X, Y. These will appear as literal {{varName}} in committed files"). Audit metadata for `platform.template-added` extended with `undocumentedVariables: string[]` so operators can later trace which placeholders had no documentation at upload time. Dashboard: new `TemplateVariableUsage` type + `variableUsage?` field on `PlatformTemplate`; `createPlatformTemplate` response widened to include `warnings?`. `TemplatesTab` rewritten — each template row is now clickable to toggle a per-row expansion panel. Detail panel lazy-loads the full record via `getPlatformTemplate` (cached in `Record<id, PlatformTemplate | 'loading'>`) — the list endpoint omits `files` content to keep responses small. Detail panel renders header KV (Slug / Tier / Version / Default), Files list with grid of code chips, Variables table with per-row status icon (`✓ Auto` green, `✓ Documented` green with description, `⚠ Undocumented` amber) + name + status + Used in N files. New `[Preview file ▾]` `<select>` at the top right opens a `FilePreviewModal` showing the raw file content in a `<pre>` block with `{{variables}}` shown verbatim. `UploadTemplateModal` enhanced: on ZIP extraction, scans the extracted content for placeholders + tags each as auto-provided or undocumented (mirrors the server-side check via a client-side `AUTO_VARIABLES_CLIENT` Set), renders `Detected variables (N):` block with ✓/⚠ icon + name + "(auto-provided)" or "Not documented — will appear as literal {{name}}". On successful upload with warnings, modal renders an inline `✓ Upload succeeded — with warnings:` panel (3-second display before auto-close). CLI: new `PlatformTemplateDetail` + `TemplateVariableUsage` types + `getPlatformTemplate(id)` method on the API client. New `gestalt platform templates inspect <slug>` subcommand registered under the existing `gestalt platform templates` parent. Prints `Template: <name>` header (slug / tier / version / default flag / description / built-in marker), `Files (N):` list, then `Variables (N):` table with right-padded `Status (18) / Name (24) / Used in (50)` columns. Auto-provided variables render as green `✓ Auto`, documented as green `✓ Documented` (with description appended), undocumented as yellow `⚠ Undocumented`. Footer line summarises the undocumented count when > 0 with the same "will appear as literal {{varName}}" wording. Unknown slug → friendly error + hint to run `templates list`. Live verified end-to-end: `GET /platform/templates/<built-in-id>` returns 22 variableUsage records for the built-in template (18 auto-provided + 4 undocumented — `artifacts, goal, goldenPrinciples, intentText, role`, which are placeholder vars consumed by the custom-agent runtime via custom-agent-runner.ts, NOT by the init-time template engine; correctly flagged as undocumented from the template-engine's perspective); POST with `companyName` + `customField` in 4 files succeeded with `warnings: ["2 undocumented variable(s): companyName, customField. ..."]`; the same template's inspection shows `companyName → AGENTS.md, HARNESS.json` and `customField → docs/HELLO.md`; audit row `platform.template-added` carries `undocumentedVariables: ["companyName", "customField"]`; CLI `gestalt platform templates inspect corporate-ops-web-mobile` renders the table with green/amber status icons + the 5-line summary footer; CLI unknown-slug → `No template with slug 'nonexistent-slug'.` + `Run: gestalt platform templates list`; dashboard bundle compiled clean (363 KB). No new migrations; variable extraction is computed at read time. PRE-EXISTING: Master key rotation tooling (migration 021). New `platform_key_rotations` table — `(id, rotated_by FK users, secret_count, rotated_at)` plus btree index on `rotated_at DESC`. New `KeyRotationRecord` + `KeyRotationRepository` interface (`create`, `findLatest`) added to `@gestalt/core`; postgres impl in `packages/adapters/postgres/src/repositories/key-rotations.ts` plus oracle + mssql throw-stubs. `RepositoryRegistry` gained `keyRotations`. `PlatformSecretRepository` widened with `findAllRaw(): Promise<PlatformSecretRecord[]>` (returns ciphertext columns — internal use ONLY, never exposed in API responses) and `rotateMasterKey(reencryptFn)` — runs a single `db.begin` transaction that SELECTs every row, calls `reencryptFn` per record (which decrypts with current key + re-encrypts with new), writes UPDATEs, returns the rotated count. Throwing `reencryptFn` rolls the whole transaction back so the old key stays active. Oracle + mssql get throw-stubs for both. New `POST /platform/secrets/rotate-key` (admin-only) validates `newKey` is base64 decoding to exactly 32 bytes (400 `INVALID_KEY_LENGTH` / `INVALID_KEY_FORMAT`), refuses no-op rotation against the current key (400 `KEY_UNCHANGED`), calls `platformSecrets.rotateMasterKey` with a closure that uses `decryptSecret(record, currentMasterKey)` + `encryptSecret(plaintext, newKeyBuffer)`. On success: `setMasterKey(newKeyBuffer)` flips the in-memory master key BEFORE any subsequent vault operation; persists to `master.key` file (tries `/etc/gestalt/master.key` then `./master.key` with `mode: 0o600`) when `GESTALT_MASTER_KEY` env var is unset, otherwise warn-logs to update the env; creates a `keyRotations` row; appends an `audit_log` row `action: 'secrets.key-rotated'` with metadata `{secretCount, ip}` ONLY (no key material — GP-006 verified live). On transaction failure: 500 `ROTATION_FAILED` with the underlying error message; in-memory master key + DB rows + file all unchanged. `GET /platform/secrets` extended to return `{data, lastRotation}` (lastRotation = `keyRotations.findLatest()`); the existing list response shape is unchanged for callers that ignore the new field. Dashboard: `SecretsTab` extended with a new `MasterKeySection` card at the bottom showing Status `● Active` + Last rotated relative timestamp + secret count + `[Rotate master key]` button. New three-step `RotateKeyModal`: Step 1 = warning + `I have backed up my current master.key` checkbox gate; Step 2 = client-side `crypto.getRandomValues(new Uint8Array(32))` + `btoa` to a base64 key, shown in a read-only `<input>` with a Copy button (uses `navigator.clipboard.writeText`), red warning "Save this key NOW — it will not be shown again", `I have saved the new key securely` checkbox gate, `Rotate N secrets →` danger button; Step 3 = success message (`✓ Master key rotated: N secrets re-encrypted`) or failure (`✗ Rotation failed — no secrets were changed`). New types `KeyRotation` + `KeyRotationResult` in dashboard `types.ts`; new `rotateMasterKey(newKey)` in the dashboard API client. CLI: new `gestalt platform secrets rotate-key` subcommand under the existing `gestalt platform secrets` parent. Interactive: prompts "Choose (1) generate / (2) provide my own key", option 1 calls `randomBytes(32).toString('base64')`, option 2 validates length client-side. Shows the key ONCE, requires `Have you saved the key? (y/N)` confirmation, then calls the API. Existing `gestalt platform secrets list` table footer now shows `Master key: last rotated <when> (N secrets)` or `Master key: never rotated`. New `rotatePlatformMasterKey(newKey)` + `KeyRotationSummary` + `KeyRotationResult` types on the CLI API client. Live verified end-to-end: migration 021 applied on first boot (`schema_migrations` lists 21 versions); `\d platform_key_rotations` shows the expected shape with PK + FK + index; validation matrix (missing newKey → 400 `INVALID_KEY_FORMAT`; 16-byte key → 400 `INVALID_KEY_LENGTH got 16`; non-base64 → 400 `INVALID_KEY_LENGTH got 12` after permissive Buffer.from decode; same-key rotation → 400 `KEY_UNCHANGED`); 3 fresh secrets seeded (`rotation-test`, `openai-key`, `db-password`); first rotation returned `{rotated: 3}`, DB shows distinct ciphertext + IV per secret, `platform_key_rotations` has 1 row with `secret_count: 3` + `rotated_by` populated, `master.key` file updated to the new key verbatim, `audit_log` row carries `{"secretCount":3,"ip":"..."}` ONLY; SECOND rotation against the post-first-rotation state succeeded — proves the chain works (each new key decrypts the prior state, re-encrypts under the next); off-thread decryption test inside the server container via `decryptSecret` confirmed all 3 secrets round-trip to their original plaintexts (`secret-value-before` / `sk-fake-openai-key-12345` / `DB-Pass-W0rd!`) after 2 successive rotations. GP-006: `metadata::text` LIKE-probes for `newKey` / `encrypted` / ciphertext base64 across `audit_log` returned 0 leaks. CLI `platform secrets list` post-rotation shows `Master key: last rotated 2m ago (3 secrets)`. PRE-EXISTING: Dynamic harness: LLM-generated stack config at `gestalt init` (no migration). New `packages/server/src/templates/stack-config.ts` — `StackConfig` interface (language / nodeVersion / packageManager / installCmd / testCmd / buildCmd / testFramework / framework / frontend / database / moduleStructure / architectureNotes / agentPromptExtensions / ciSetupSteps PLUS pre-rendered `stackSection` markdown + `agentPromptExtensionsYaml`); `DEFAULT_STACK_CONFIG` (TypeScript / Node 22 / pnpm / Vitest); `generateStackConfig(description, name)` — NEVER throws; on LLM failure OR parse failure returns a copy of the defaults. LLM call uses `temperature: 0.1` + `maxTokens: 1000`. `buildStackPrompt` includes "Available retry task types" + concrete examples of `ciSetupSteps` YAML for Node/Python/Go. `parseStackConfig` defensive on every field — partial responses still produce a valid `StackConfig`. New `stripIndent` + `indentSteps` helpers normalise the LLM's `ciSetupSteps` block to land at column 6 (the depth `steps:` items live at in the workflow); placeholder in `ci/gestalt.yml` is at column 0 so each substituted line carries its own indent. Idempotent — applies to both the LLM output AND the hardcoded default. Four template files updated to use placeholders: `ci/gestalt.yml` ({{ciSetupSteps}} multi-line block + {{testCmd}}); `harness/HARNESS.json` (stack object uses {{language}}, {{nodeVersion}}, {{packageManager}}, {{testFramework}}, {{framework}}, {{frontend}}, {{database}}; legacy `runtime` field DROPPED in favour of `nodeVersion`); `harness/agents.yaml` (code-agent role uses {{language}}, test-agent uses {{testFramework}}, code-agent.prompt_extensions uses {{agentPromptExtensionsYaml}} — pre-rendered YAML lines from the stack config); `harness/AGENTS.md` ({{stackSection}} pre-rendered markdown — replaces the old hardcoded "Node 22 LTS / pnpm 9.x" section); `docs/ARCHITECTURE.md` ({{architectureNotes}} + {{stackSection}} + {{moduleStructure}}). `code-prompt.ts` updated to read EITHER `harness.stack.nodeVersion` (new template) OR `harness.stack.runtime` (legacy back-compat) for the runtime note; also handles non-Node `harness.stack.language` (renders "Project language: Python, pip as package manager." style note). `init-harness` route calls `generateStackConfig(projectDescription, project.name)` BEFORE `loadTemplate` and passes all 15 stack-driven variables into the engine. CLI `gestalt init` Phase 1 prompt rewritten with stack-aware guidance ("Describe your project's tech stack and purpose — language and key frameworks, package manager preference, test framework preference" + worked example). `template.json#version` 0.2.0 → 0.3.1 (re-seeded on boot by the Option B version-check from the prior session). Live verified end-to-end with REAL LLM calls (`gpt-4o`): Test 1 (TypeScript/Express/Jest/npm/PostgreSQL) → stack `language: TypeScript, nodeVersion: 22, packageManager: npm, testFramework: Jest, framework: Express, database: PostgreSQL`; gestalt.yml uses `actions/setup-node@v4` + `node-version: '22'` + `npm install --ci`; ARCHITECTURE.md Stack section renders `Runtime: Node 22 LTS / Package manager: npm / Test framework: Jest / Backend: Express / Database: PostgreSQL`; code-agent role: `Senior TypeScript engineer`. Test 2 (Python/FastAPI/pytest/pip) → `language: Python, nodeVersion: null, packageManager: pip, testFramework: pytest, framework: FastAPI`; gestalt.yml uses `actions/setup-python@v5` + `python-version: '3.12'` + `pip install -r requirements.txt`; HARNESS.json `nodeVersion: "N/A"` (placeholder gracefully handles null); ARCHITECTURE.md Stack section omits the Runtime line (no Node version); code-agent role: `Senior Python engineer`. Test 3 (React Native/TypeScript/Expo/pnpm) → `frontend: React Native, packageManager: pnpm, testFramework: Jest`. Test 4 (LLM endpoint unreachable) → `generateStackConfig` warn-logged the provider error and returned a copy of `DEFAULT_STACK_CONFIG` — operator sees `init-harness` complete normally with TypeScript/Node 22/pnpm/Vitest. Test 5 (existing trackeros) → unaffected; `init-harness` only runs at project creation. All 3 LLM-driven scenarios produced **valid YAML** for both gestalt.yml AND agents.yaml (`yaml.parse` succeeded; steps array correctly structured; code-agent prompt_extensions array length: 2 in every case). Stack config NOT persisted in DB — committed harness files are the authoritative record. No new migrations. Tokens used per scenario: ~800 (within the 1000 budget). PRE-EXISTING: Template runtime fix: user projects default to Node 22 LTS (no migration). The Gestalt PLATFORM itself stays on Node 20 + pnpm 9.x (real `node:sqlite` / pnpm 9.x constraint) — that's documented as a self-imposed bound that doesn't apply to user projects. `templates/corporate-ops-web-mobile/ci/gestalt.yml` now uses `node-version: '22'` and step name "Setup Node 22 LTS". `harness/HARNESS.json` template `stack.runtime` flipped `node20 → node22`. `harness/AGENTS.md` gains a new "Project runtime" section documenting Node 22 LTS + pnpm 9.x/10.x both supported (with explicit "Gestalt platform constraint ≠ user project constraint" note). `template.json#version` bumped `0.1.0 → 0.2.0`. Server boot's `seedBuiltinTemplate` rewritten to compare DB row version against on-disk `template.json` version — version match → skip; version drift OR no row → upsert via the existing `PlatformTemplateRepository.update` (in place; `id` + `slug` + `isBuiltin` + `createdAt` + `isDefault` preserved). Idempotent. New `readTemplateMeta(templatesDir, slug)` helper reads template.json once at boot. `code-prompt.ts` architecture section gains runtime-aware note: priority order is (1) `harness.stack.runtime` formatted via new `formatRuntime` helper ("node22" → "Node 22 LTS", even-major-is-LTS rule; unknown values like "bun" pass through verbatim); (2) if no harness runtime AND architectureMd doesn't already mention a Node version (`/node\s*\d|Node\s*\d|node\.js/i` check) → default "Node 22 LTS"; (3) otherwise stay quiet so legacy projects with Node 20 in their architecture aren't contradicted. Live verified: server restart logged `Refreshed built-in template (version bump)` with `previousVersion: 0.1.0` → `version: 0.2.0`; second restart logged `platform_templates up-to-date — skipping seed` (idempotency). DB row now carries the new files (gestalt.yml has Node 22 LTS step + node-version '22'; HARNESS.json runtime: node22; AGENTS.md has Project runtime section). Fresh `loadTemplate` simulation produced the 8 expected files with Node 22 in workflow + HARNESS + AGENTS. code-prompt 5-invariant matrix passed (node22 → Node 22 LTS; node20 → Node 20 LTS round-trip; no runtime + silent arch → default Node 22 LTS; legacy arch mentioning Node 20 → respected without contradicting default; future runtime "bun" → verbatim). Platform itself confirmed still on Node 20 via `docker exec gestalt-server-1 node --version` → `v20.20.2`. **Operator action — trackeros repo:** the project was initialised under the old template and its `.github/workflows/gestalt.yml` still pins Node 20. Update with `git pull && edit .github/workflows/gestalt.yml: node-version '20' → '22' && commit && push`. Until done, trackeros CI runs on Node 20 (not breaking — Node 20 works for typical code-agent output today). PRE-EXISTING: Hybrid LLM recovery for all scripted deploy agents (Option B, no migration): `SelfHealingDiagnosis` extended with `retryTaskType: 'generate:intent' | 'deploy:pr' | 'deploy:pipeline' | 'deploy:promote' | 'none'` + `retryPayloadHints: Record<string, unknown>`. New `SelfHealingRetryTaskType` exported. Diagnosis prompt rewritten with "Available retry task types" + "Known failure patterns" sections (git push → deploy:pr with unshallow+forceWithLease; CI timeout → deploy:pipeline with extendTimeout; staging gate → deploy:promote; gate failures → generate:intent; infrastructure → none). `parseDiagnosis` defaults retryTaskType to `'generate:intent'` (preserving pre-Option-B legacy diagnoses) and rejects malformed hints (array → `{}`). `safeDefaultDiagnosis` returns `retryTaskType: 'none'`. `runSelfHealingLoop` rewrite: replaces the hardcoded single-queue dispatch with `buildRetryDispatch(taskType, payload, diagnosis, source)` — builds a per-queue-shaped payload (generate:intent gets `text` + `resumeOnBranch`; deploy:pr gets `branch` + `prNumber` + empty `artifacts`; deploy:pipeline gets `branch`; deploy:promotion picks `targetEnvironment: 'production'` when the diagnostician's hint `retryProductionOnly: true` fires, else 'staging'). Loop NOW owns the dispatch + status transition (orchestrator helpers simplified — drop their duplicate dispatch code). `'none'` treated as `shouldRetry: false` (escalation path). ResumeContext gains `retryTaskType` + `retryPayloadHints` so the dashboard's attempt-history view can show which queue the loop retried on. `attemptAutoResolveAlert` uses the same `buildRetryDispatch(source: 'auto-resolved')` so escalation auto-resolves can also route to non-`generate:intent` queues. **All three scripted deploy agents gained `selfHealingHints` + `selfHealingDiagnosis` fields on their input + matching local `SelfHealingHints` interfaces:** pr-agent reads `unshallow` (runs `git fetch --unshallow` best-effort, non-fatal), `forceWithLease` (push with --force-with-lease + --set-upstream), `rebaseBranch` (fetch + rebase default branch, abort cleanly on conflict), `skipArtifactRewrite` (skip writing files + lockfile sync — push existing branch state). On push failure pr-agent rethrows so the deploy-orchestrator's catch wrapper invokes runSelfHealingLoop with the NEW error context (re-diagnosis). pipeline-agent reads `extendTimeout` (doubles the polling window — 20m default → 40m) and `skipTrigger` (re-polls existing run when hint object carries `runId`; silently falls back to fresh trigger when `runId` absent — forward-compat). promotion-agent reads `skipStagingVerification` (no-op today, logged for forward-compat with a future verifyStagingDeployment) and `retryProductionOnly` (consumed at dispatch site by the loop — picks `targetEnvironment: 'production'`; ADR-034 staging-confirmation invariant still enforced in agent regardless). All three deploy payload types (DeployPRPayload / DeployPipelinePayload / DeployPromotionPayload) extended via shared `SelfHealingDispatchFields` interface carrying `source` + `selfHealingHints` + `selfHealingDiagnosis`. Unknown hints silently ignored by every agent (forward-compat — future diagnoses can ship new hints without crashing older workers). Source field extended union: `'self-healing'` (regular retry) | `'auto-resolved'` (alert auto-resolution) | `'operator-resume'` | `'pipeline-feedback'` | `'human'` | `'maintenance-agent'`. Live verified end-to-end: (1) parseDiagnosis 6-invariant matrix — full diagnosis with retryTaskType+hints parses correctly; legacy diagnosis defaults to generate:intent; retryTaskType=none recognised; unknown retryTaskType falls back to generate:intent; malformed hints (array) defaults to {}; garbage JSON safe-defaults with retryTaskType=none. (2) Scenario 1 live: synthetic non-fast-forward diagnosis dispatched `deploy:pr` (NOT generate:intent), server log shows `Self-healing retry dispatched retryTaskType=deploy:pr hintKeys=[unshallow, forceWithLease]`, pr-agent received the dispatch with hints visible in logs, took the resume path on the synthetic branch (push failed because the branch was fake — same WARN+fallback as prior session). last_resume_context stored `retryTaskType: deploy:pr` + `retryPayloadHints: {unshallow, forceWithLease}` + `autoHealed: true`. (3) Scenario 4 live: fresh trivial intent — first cycle's pr-agent ran the scripted happy path with ZERO `hints` log entries / ZERO "Resuming on existing branch" log lines / ZERO self-healing references for the FIRST deploy:pr call. Subsequent self-healing fired because trackeros project's CI deterministically fails (pre-existing unrelated issue) — when CI failed, the loop diagnosed `retryTaskType: "generate:intent"` (the LLM correctly picked the right queue, NOT a hardcoded map) and re-ran the full generate cycle. No new migration required — hints flow through BullMQ payload, retryTaskType + retryPayloadHints persist in `intents.last_resume_context` via the column added in migration 020. PRE-EXISTING: Autonomous self-healing loop (migration 020): `platform_self_healing_config` table seeded with the seven failure types (`generate-error`, `gate-max-retries`, `pipeline-failed`, `pipeline-timeout`, `deploy-error`, `maintenance-error`, `custom-agent-failure`) — each with per-type defaults the platform-admin can tune. `intents` gains `attempt_count INTEGER NOT NULL DEFAULT 0` + `last_resume_context JSONB`; `deployment_event_type` adds `resume-pushed`. New `SelfHealingConfigRepository` (postgres impl + oracle/mssql throw-stubs). New `IntentRepository.saveResumeContext` + `incrementAttemptCount`. New `SelfHealingAgent` class in `@gestalt/core/agents/self-healing-agent.ts` extends `BaseLLMAgent` — diagnoses failures returning structured `{ diagnosis, rootCause, suggestedFix, confidence, shouldRetry, skipAgents, focusFiles, updatedIntentText }`; per-type `confidence_threshold` downgrades shouldRetry when LLM confidence is below the operator's bar; safe-default `shouldRetry:false, confidence:low` on LLM/parse failure (NEVER throws). New `runSelfHealingLoop(ctx, payload, signals)` in `self-healing-loop.ts` — budget check → diagnosis → either dispatch retry (`source: 'self-healing'`, resumes on intent.branchName) OR escalate (creates alert via shared `escalateToHuman` with per-failureType title template) + auto-resolve at high confidence (`source: 'auto-resolved'`); returns `{shouldRetry, diagnosis, escalated, autoResolved}` so caller branches cleanly. `alertContextExtras` payload field merges into alert.context (pipeline-* carry runId + pipelineStatus). `setQueueConfig/getQueueConfig` pattern added to `@gestalt/core/queue` (server pins config.queue at boot step 5c) so the loop can dispatch without threading config through every consumer. Wired into every failure path: generate orchestrator `hasPlanFailed` AND catch block (generate-error), gate orchestrator max-retries (gate-max-retries), deploy orchestrator pipeline-failed branch (pipeline-failed/pipeline-timeout — pipeline-agent stopped creating alerts directly; loop owns alert creation with rich context), deploy generic catch (deploy-error), custom agent LLM error inside `runOneCustomAgentNode` (custom-agent-failure — throws `SelfHealingRetryDispatched` sentinel caught in orchestrator catch to avoid double-dispatch). Context-assembler reads `intent.lastResumeContext` and attaches to ContextSnapshot.resumeContext + skipAgents + focusFiles. Code-prompt gains a new "Resumed attempt (N) — auto-diagnosed | operator feedback" section (between signals and task) showing diagnosis/rootCause/suggestedFix for autoHealed cycles or operatorFeedback verbatim for human cycles, plus focus files. Orchestrator honours skipAgents (high-confidence auto-healed retries only) — skipped steps create `agent_executions` rows with status `skipped` so the dashboard accordion stays consistent. New routes: `GET /platform/self-healing` (admin — list all 7 configs); `PATCH /platform/self-healing/:failureType` (admin — partial update with validation: maxAttempts 0–10, confidenceThreshold enum, audit captures changedFields+previousValues+newValues per GP-002); `POST /alerts/:id/resume` (operator + editor membership — generic human-feedback resume for any failure alert type; saves last_resume_context with autoHealed:false, increments attempt_count, dispatches `source: 'operator-resume'`, GP-006 audit carries feedbackLength only). Dashboard adds 8th `Self-healing` tab in Admin between Secrets and Templates — table with per-row toggle enabled, select maxAttempts (0-10), select confidence (high/medium/low), toggle auto-resolve; saves on change with inline ✓ saved indicator. CLI: `gestalt platform self-healing list/configure <failureType>` (--max-attempts, --confidence, --auto-resolve/--no-auto-resolve, --enable/--disable). New `LiveEventType: 'alert.auto-resolved'` SSE for dashboard live update. Live verified: migration 020 applied + queue config pinned at boot; GET endpoint returns all 7 rows; PATCH validation matrix (maxAttempts>10, invalid confidence, unknown failure type, empty patch); audit metadata captures changedFields/previousValues/newValues; CLI list+configure exercised; POST /alerts/:id/resume happy path (intent transitioned + last_resume_context stored as proper JSONB object with autoHealed:false + attempt_count incremented + alert acked + GP-006 audit confirmed — feedback text NOT in audit_log via direct SQL probe); worker picked up resume payload + full cycle ran end-to-end to `deploying`. Pipeline failure alerts + resume-on-same-branch feedback loop (migration 019): `intents` gains `branch_name TEXT`, `pr_number INTEGER`, `pr_url TEXT` (all nullable); new `IntentRepository.saveBranchInfo`; pipeline-agent creates `pipeline-failed` / `pipeline-timeout` alerts (severity high, requiredAction `provide-feedback`) carrying intentId + branch + prUrl + prNumber + runId + pipelineStatus in context JSONB; new `AlertType` values + `AlertRequiredAction: 'provide-feedback'`; pr-agent persists branch info on fresh-PR path and dispatches a new `resumeOnBranch` flow: when set, fetch + `checkout -B <branch> origin/<branch>`, push to existing branch, NO new PR — reuses the input's `prNumber`/`prUrl`, writes a `pr-opened` event with `metadata.resume: true` so the timeline narrates "fix push" vs original; commit subject becomes `fix: address CI failure — <intent line> [gestalt <corr8>]`. Generate orchestrator threads `resumeOnBranch`/`prNumber`/`prUrl` payload optionals through `drivePlan` → gate's `dispatchDeployPR` → deploy:pr; on resume, fetches + checks out the existing remote branch with WARN-and-fall-through-to-default safety. intent-agent prompt picks up new `clarificationSource: 'pipeline-feedback'` framing ("## CI pipeline failure feedback from operator"); `needsClarification` short-circuits for `pipeline-feedback` to avoid re-pausing. New route `POST /alerts/:id/pipeline-feedback` (`requireRole('operator')` + `checkProjectMembership(editor)`) validates type ∈ {pipeline-failed, pipeline-timeout}, calls `intents.saveClarification(intent.id, feedback)`, dispatches `generate:intent` with full resume payload, transitions to `generating`, acknowledges alert atomically — audit `alert.pipeline-feedback-submitted` carries `feedbackLength + branch + prNumber + intentId + type + ip` ONLY (GP-006). Dashboard Alerts view: new `PipelineBody` (intent line + branch + PR link + run id + pipeline status KV header) and `PipelineFeedbackBlock` (textarea + "retry with fix ▶" button) rendered ABOVE Dismiss for the two new types; new TypeGlyph (✗ red for failed, ⏱ amber for timeout); FixIntentBlock suppressed for pipeline alerts (operators provide CI-fix context via the new block instead). CLI: new `gestalt alerts pipeline-feedback <alertId> [--feedback <text>]` subcommand — displays branch/PR/runId/status context then submits; `gestalt alerts show` Available actions footer routes pipeline alerts to `pipeline-feedback` + `dismiss`. Live verified end-to-end: 4 validation paths (400/404), happy path (200 with intentId + status: generating + branch + PR), atomic ack + clarification persist (116 chars), worker pickup with `resumeOnBranch` log line, GP-006 audit metadata. PRE-EXISTING: pr-agent syncs `pnpm-lock.yaml` after writing artifacts so CI's `--frozen-lockfile` always passes. New shared `execCommand(cmd, args, cwd, timeoutMs)` helper in `packages/agents/deploy/src/agents/exec.ts` — spawn-based, no shell, 2-minute default timeout, surfaces a 400-char stderr tail on non-zero exit. pr-agent's `maybeSyncLockfile(workDir)` stats `package.json` then runs `pnpm install --no-frozen-lockfile`; ENOENT skips (no Node project yet), other failures log WARN and continue (CI is the real source of truth — don't block PR creation over a lockfile sync hiccup). Dockerfile production stage swapped `corepack prepare pnpm@9.15.4 --activate` for `npm install -g pnpm@9.15.4` so the runtime `gestalt` user has pnpm 9.15.4 on PATH (corepack caches per-user; root activation wouldn't reach gestalt and the auto-fetched latest pnpm requires Node 22's `node:sqlite`). Template `gestalt.yml` gains a graceful fallback: if `pnpm-lock.yaml` is missing, emit a `::warning::` and run `pnpm install` without `--frozen-lockfile` so first-CI doesn't hard-fail. context-fixer.ts is unchanged — the ADR-018 path guard restricts it to `docs/*` and `AGENTS.md`, so it can never reach a `package.json` write path. Smoke test inside the rebuilt container: `pnpm 9.15.4` callable, real `pnpm install --no-frozen-lockfile` produces a 384-byte `pnpm-lock.yaml@9.0` for a lodash dependency)
 
 **Repo:** https://github.com/afarahat-lab/gestalt
 
@@ -2913,707 +2917,9 @@ enforced"):
   projects, may need rolling-window dedupe for active ones)
 
 
-
 ---
 
-## Session log (last 3 entries)
-
-### Session 2026-06-04 — Claude Code (Brief 5: intent list filter improvement, no migrations)
-
-`GET /intents` widened with two improvements: group-derived
-project access when no `projectId` is supplied, and five new
-query filters (`source`, `priority`, `search`, `from`, `to`).
-No new migrations — `source` column already exists from
-`001_initial.sql`; Brief 1's groups tables are already
-applied.
-
-Changed:
-
-- `packages/core/src/repository/index.ts`:
-  - `IntentRecord.source` widened from `'human' |
-    'maintenance-agent'` to also accept `'self-healing' |
-    'auto-resolved' | 'operator-resume' | 'pipeline-feedback'`.
-    The DB column is `TEXT NOT NULL DEFAULT 'human'` so
-    permits any string; current intents stay at their
-    original source on retry cycles (the new values are
-    payload-level dispatch sources used by the BullMQ
-    message, not currently persisted on the intent row).
-    Documented inline so future iterations that DO persist
-    these don't have to widen the type again
-  - New `IntentListFilters` interface — typed shape for
-    every filter the route can pass through. `from` / `to`
-    are JS `Date` objects (route parses ISO strings via
-    `new Date`, drops the filter on NaN). `limit` /
-    `offset` are required; the rest are optional
-  - `list()` / `listAll()` signatures widened to accept
-    `IntentListFilters`. Brief 5
-  - New `listForProjects(projectIds, filters)` —
-    single-round-trip multi-project listing. Used by GET
-    /intents when no `projectId` is supplied
-- `packages/adapters/postgres/src/repositories/intents.ts`:
-  - `list` / `listAll` / `listForProjects` rewritten with
-    inline conditional `${filters.X ? db\`AND col = ${val}\` :
-    db\`\`}` fragments. Each filter is independently skippable
-    so the prepared statement shape stays minimal
-  - `listAll` anchors `WHERE 1 = 1` so AND-fragments compose
-    without first-AND special handling
-  - `listForProjects` uses `WHERE project_id =
-    ANY(${ids}::text[])` — single index check over the
-    UNION of accessible projects. The cast is `text[]`
-    (not `uuid[]`) because `intents.project_id` is TEXT
-    per the original 001_initial.sql schema
-  - Search uses ILIKE `%search%` — no full-text index
-    needed at current scale
-- `packages/adapters/{oracle,mssql}/src/repositories/intents.ts`:
-  - `IntentListFilters` imported
-  - `list` / `listAll` signatures updated to match the
-    interface; new `listForProjects` throw-stub added
-- `packages/core/src/index.ts`: re-exports
-  `IntentListFilters`
-- `packages/server/src/routes/intents.ts`:
-  - `ListIntentsQuery` widened with `projectId`, `source`,
-    `priority`, `search`, `from`, `to`
-  - GET /intents handler rewritten:
-    1. Parse + validate filters via new
-       `buildIntentFilters(q, limit, offset)` helper —
-       trims string values, parses ISO dates (drops on
-       NaN), constructs the typed filter object
-    2. Platform-admin: server-wide `intents.listAll(filters)`
-    3. Regular user without projectId: `Promise.all([
-       memberships.findByUser, platformGroups.getEffectiveMemberships])`,
-       deduplicate the projectId set, call
-       `intents.listForProjects(allIds, filters)`. Empty
-       set → `{data: [], total: 0}` (no 403, no leak)
-    4. With projectId: membership check (direct OR
-       group-derived via the existing
-       `checkProjectMembership` helper which already
-       consults groups), then `intents.list({projectId,
-       ...filters})`
-- `packages/dashboard/src/api/client.ts`: `listIntents`
-  param shape widened to include the 5 new filters
-- `packages/dashboard/src/views/IntentFeed.tsx`: rewritten
-  with a filter bar above the list.
-  - URL persistence via `useSearchParams` from
-    react-router-dom — `/app/intents?status=failed&search=pnpm`
-    is shareable; opening in a new tab loads the same
-    filtered view
-  - Filter bar (above the list): `<select>` for status (8
-    options) + `<select>` for source (6 options) +
-    Search input with 300ms debounce → URL update +
-    re-fetch + From/To `type="date"` inputs (HTML5 native
-    date picker) + `× Clear` button that appears only when
-    any filter is active
-  - Removed the legacy local-text filter (now replaced by
-    server-side search)
-  - Empty-state message branches: "No intents match the
-    current filters / Try clearing one or more filters" vs
-    "No intents yet"
-- `packages/cli/src/api/client.ts`: `listIntents` param
-  shape widened — `projectId` is now optional; 5 new filter
-  fields added
-- `packages/cli/src/commands/intent.ts`:
-  - `IntentListOptions` gained `source`, `priority`,
-    `search`, `from`, `to`
-  - New `VALID_SOURCES` + `VALID_PRIORITIES` Sets for
-    client-side validation
-  - `intentListCommand` validates `--source` and
-    `--priority` against the closed unions; invalid values
-    print `Unknown source 'X'. Valid values: ...` and exit 1
-  - `--project` is now genuinely optional. When absent,
-    the server returns the user's accessible-projects
-    union; the rendered project label switches to
-    `accessible projects`
-- `packages/cli/src/index.ts`:
-  - `gestalt intent list` registered with 5 new flags
-    (`--source`, `--priority`, `--search`, `--from`,
-    `--to`). Description updated to explain the
-    cross-project behaviour when `--project` is omitted
-
-Verified live end-to-end:
-
-- `pnpm -r build` clean across all 12 packages. Docker
-  server image rebuilt; existing data (22 intents from
-  prior sessions) preserved
-- **Filter matrix on built-in test data:**
-  - `?status=failed&limit=5` → 5 rows of total 10
-  - `?source=human` → total 22 (all current intents)
-  - `?source=self-healing` → 0 (no intents currently use
-    that source)
-  - `?priority=normal` → 22
-  - `?search=pnpm` → 11 with substring matches
-  - Combined `?status=deployed&search=pnpm` → 5 (AND
-    semantics — both must match)
-  - `?from=<today>` → 0 (all data is from prior days)
-  - `?to=2020-01-01` → 0 (everything before 2020)
-- **Group-membership path:** seeded the existing
-  `user@test.local` (regular `user` role, no direct
-  memberships, no group memberships) as a member of a new
-  `verify-group`; assigned the group to the project with
-  19 intents as `reader`. The user's `GET /intents` (no
-  projectId) went from 0 → 19 rows. Applying filters on
-  the group-derived path:
-  - `?status=failed` → 8
-  - `?search=pnpm` → 11
-  After deleting the group, user back to 0 — full lifecycle
-  works
-- **CLI verification:**
-  - `gestalt intent list --status failed --limit 3` →
-    table with 3 rows + footer
-  - `gestalt intent list --search pnpm --limit 3` → 3 rows
-    of substring matches
-  - `gestalt intent list --source human --limit 3` → 3 rows
-    (all current intents are `human`)
-  - `gestalt intent list --status nonsense` → `Unknown
-    status 'nonsense'. Valid values: ...` + exit 1
-  - `gestalt intent list --source nonsense` → similar
-    validation error
-  - `gestalt intent list --help` shows all 8 new flag
-    descriptions cleanly formatted
-  - `gestalt intent list --to 2020-01-01` → empty table
-- **Dashboard bundle:** 366 KB ungzipped; spot-grep
-  confirms `"All statuses"`, `"All sources"`,
-  `"Search..."`, `"× Clear"` strings present
-- **Cleanup:** test user password reset to original
-  `opsop123`; verification audit rows scrubbed; group
-  artifacts removed during the test flow
-
-Decisions made:
-
-- **`IntentListFilters` interface in core, not duplicated
-  per adapter.** Adapters import the typed shape so any
-  future filter addition (e.g. `tag` once intents grow
-  tags) updates one interface and the compiler enforces
-  consistency across postgres / oracle / mssql
-- **`from` / `to` are `Date` objects in the interface but
-  ISO strings on the wire.** The route parses ISO strings
-  via `new Date(...)`. Invalid date strings are dropped
-  silently (filter not applied) rather than erroring —
-  matches the brief's permissive approach for query
-  filters. The DB-side comparison uses the parsed Date
-  directly, which postgres.js serialises as a timestamptz
-- **Both `from` and `to` are inclusive bounds** — `>=` and
-  `<=`. Matches the brief's explicit "inclusive" note.
-  An operator typing `--from 2026-06-04 --to 2026-06-04`
-  gets intents created at any moment on that calendar day
-- **`source` typed union widened, NOT migrated to an enum
-  CHECK constraint.** The DB column is plain `TEXT NOT
-  NULL DEFAULT 'human'` from `001_initial.sql`. Adding a
-  CHECK constraint would break the future when a payload-
-  level source value lands on the intent row. Keeping it
-  permissive at the DB level and widening only the
-  TypeScript union gives the future flexibility while
-  catching most typos at compile time
-- **`= ANY($1::text[])` cast is `text[]`, not `uuid[]`.**
-  `intents.project_id` is `TEXT NOT NULL` per
-  `001_initial.sql` (project IDs are stored as text, not
-  uuid). The cast must match the column type or the
-  index won't be used. Verified live — 22 rows return in
-  single-digit ms
-- **Empty accessible-projects set returns `{data: [],
-  total: 0}`, not 403.** No-enumeration-leak rule. A
-  regular user with NO memberships and NO group access
-  gets the empty list, indistinguishable from "you have
-  access but no intents exist yet"
-- **Group access path uses the existing
-  `checkProjectMembership` helper** when a projectId IS
-  supplied — that helper already consults both direct AND
-  group-derived access (from the Brief 1 session). The
-  no-projectId path adds the equivalent for cross-project
-  listing via direct calls to `memberships.findByUser` +
-  `platformGroups.getEffectiveMemberships`
-- **`listForProjects` is a single round-trip with `= ANY`,
-  NOT an N+1 over per-project `list` calls.** A user with
-  group access to N projects gets ONE query that scans
-  all matching rows + applies filters in SQL. Performance
-  scales with intent count, not project count
-- **Dashboard filter persistence via `useSearchParams`,
-  NOT React state.** `/app/intents?status=failed&search=pnpm`
-  is a shareable URL. Opening the same URL in a new tab
-  loads the exact filtered view. The brief specified this
-  explicitly; using `useSearchParams` is the standard
-  React Router idiom — no third-party library needed
-- **300ms search debounce** keeps the URL from updating
-  on every keystroke. Local state (`searchInput`) is
-  bound to the input; the URL (and therefore the fetch)
-  updates only after the operator stops typing. Same
-  behaviour as the dashboard's other search inputs
-- **`× Clear` button only renders when any filter is
-  active.** Visual minimisation — when no filters are
-  applied, the bar is just the empty-state-looking
-  controls. Once any filter is set, the Clear button
-  appears, anchored right of the row
-- **CLI `--project` flag is now optional.** Brief 5 made
-  the cross-project listing a feature, so the CLI follows.
-  When absent, the rendered label switches to "accessible
-  projects" — operators see at a glance which scope they
-  queried
-- **Client-side validation in the CLI for `--status`,
-  `--source`, `--priority`.** Closed unions; mistakes
-  fail fast with a friendly error + valid-values list.
-  The server re-validates (because the same filter
-  arrives via raw query params from any client) but the
-  CLI's pre-check saves a round trip on common typos
-- **No new migration.** `source` column already exists
-  per `001_initial.sql`. Brief 1's `platform_groups` +
-  `group_memberships` + `group_project_assignments`
-  already applied. Brief 5 is purely a route + repository
-  + UI / CLI feature add
-
-Build status: `pnpm -r build` clean across all 12
-packages. Server image rebuilt. Full filter matrix +
-group-membership lifecycle + CLI validation matrix +
-dashboard bundle compile verified live. No new migrations
-required.
-
-Pending follow-ups: none introduced. Possible future
-iterations:
-- Persist payload-level source values on the intent row
-  when self-healing / operator-resume / pipeline-feedback
-  dispatches happen. Today the source column stays at
-  `human` because the same row is reused on retry. A
-  future migration could add a `last_source` column or
-  flip the existing `source` to reflect the most recent
-  dispatch — making the `?source=self-healing` filter
-  return real data instead of always 0
-- Full-text search index on `intents.text` if search
-  volume grows significantly. Today's ILIKE works fine at
-  single-digit-thousand-row scale; at higher volume,
-  postgres `gin (to_tsvector('english', text))` would be
-  the upgrade path
-
----
-
-### Session 2026-06-04 — Claude Code (Project init: PAT from vault + GitHub repo browser, migration 022)
-
-Two improvements to project creation flow shipped together:
-
-1. **Git token field can use the secrets vault** — operators can
-   pick an existing vault secret OR enter a new token that gets
-   auto-saved to the vault during project creation. The plain-text
-   `project_git_credentials` table is preserved for backward
-   compat; a `git_secret_id` reference in the new `projects`
-   column takes precedence
-2. **GitHub repo browser** — when a vault secret is selected, the
-   server proxies a GitHub `/user/repos` call (decrypting the
-   token server-side) so the operator can pick a repo from a list
-   instead of typing the clone URL
-
-The vault decrypt path is wired into a new shared
-`resolveProjectCredential(project)` helper in `@gestalt/core` that
-every orchestrator, agent, and route handler now uses in place of
-the legacy `projects.getCredential(project.id)`. Decryption stays
-server-side via the same `setProjectSecretResolver` injection
-pattern the LLM registry + MCP servers established.
-
-Changed:
-
-- **Migration 022**
-  (`packages/adapters/postgres/src/migrations/022_project_secret_ref.sql`):
-  `ALTER TABLE projects ADD COLUMN IF NOT EXISTS git_secret_id
-  UUID REFERENCES platform_secrets(id) ON DELETE SET NULL` +
-  partial btree index. ON DELETE SET NULL so removing a secret
-  doesn't break the project (the resolver falls back to the
-  plain-token path or surfaces a clean "no credential" error).
-  Pure schema only
-
-- **Core repository / type changes**:
-  `ProjectRecord` gained `gitSecretId: string | null` (always
-  populated by the repo). `ProjectRepository.create()` Omit
-  excludes `gitSecretId` (set separately via `saveGitSecretRef`).
-  New `saveGitSecretRef(projectId, secretId | null)` interface
-  method — pass `null` to disconnect a project from the vault
-  - Postgres impl in `repositories/projects.ts`: simple `UPDATE
-    projects SET git_secret_id = ${secretId} WHERE id =
-    ${projectId}`
-  - Oracle + MSSQL adapters: throw-stub `saveGitSecretRef` added
-    to each `OracleProjectRepository` / `MssqlProjectRepository`
-    for interface parity — same pattern every prior session has
-    used
-
-- **New core helper —
-  `packages/core/src/projects/credential-resolver.ts`** (new):
-  - `ProjectSecretResolver` type — async function from
-    `secretId` to plaintext token (or null on failure)
-  - `setProjectSecretResolver(resolver | null)` — wiring
-    injection point. Mirrors `setLLMRegistryResolver` +
-    `setPlatformMcpResolver`
-  - `resolveProjectCredential(project): Promise<string | null>`
-    — the call sites' entry point. Precedence:
-    `project.gitSecretId` set AND resolver injected → vault
-    decrypt; fallback to legacy `projects.getCredential` for
-    both null `gitSecretId` AND vault decrypt failures. Failure
-    falls through silently so a deleted vault secret degrades
-    to the plain-token path instead of blocking the cycle
-  - Re-exported from `@gestalt/core/index.ts` (`resolveProjectCredential`,
-    `setProjectSecretResolver`, `ProjectSecretResolver`)
-
-- **Server boot — `packages/server/src/server.ts`**:
-  - New step 4e wires `setProjectSecretResolver(async (secretId)
-    => ...)` that loads the secret from `platformSecrets.findById`,
-    decrypts under the master key via `decryptSecret`. Failure
-    logs a WARN with the secret id ONLY (never key material)
-    and returns null so the helper falls back to plain. Logs
-    "Project git secret resolver wired" at boot
-
-- **Every credential-reading call site swapped** from
-  `projects.getCredential(project.id)` to
-  `resolveProjectCredential(project)` — 12+ sites updated:
-  - `packages/agents/generate/src/orchestrator/orchestrator.ts`
-    (2 sites — clone path + project-credential lookup for MCP
-    tokenFrom)
-  - `packages/agents/deploy/src/agents/pr-agent.ts`
-  - `packages/agents/deploy/src/agents/pipeline-agent.ts`
-  - `packages/agents/deploy/src/agents/promotion-agent.ts`
-  - `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`
-  - `packages/agents/maintenance/src/runner/index.ts`
-  - `packages/server/src/routes/projects.ts` (2 sites)
-  - `packages/server/src/routes/agents.ts` (2 sites)
-  - `packages/server/src/routes/project-config.ts` (4 sites)
-
-- **New server route —
-  `packages/server/src/routes/git-repos.ts`** (new):
-  - `GET /platform/git/repos?secretId=<uuid>&provider=github`
-    (`requireRole('operator')`). Loads the vault secret,
-    decrypts under the master key server-side, calls GitHub's
-    `/user/repos?sort=updated&per_page=100` with
-    `Authorization: Bearer <token>` + the proper
-    `Accept: application/vnd.github+json` +
-    `X-GitHub-Api-Version: 2022-11-28` headers. Returns
-    `{ data: GitRepoSummary[] }` with `{ name, fullName,
-    htmlUrl, cloneUrl, defaultBranch, private, description }`
-    per row (provider-neutral shape so future GitLab / Azure
-    DevOps / Bitbucket adapters can reuse it)
-  - GitHub error bodies parsed for the `message` field so the
-    operator sees "Bad credentials" rather than raw HTML on
-    a 401. Returns 400 `PROVIDER_ERROR` + `providerStatus`
-    when GitHub rejects
-  - Validation surface: `SECRET_ID_REQUIRED` (400) /
-    `UNSUPPORTED_PROVIDER` (400) / `SECRET_NOT_FOUND` (404) /
-    `SECRET_DECRYPT_FAILED` (400) /
-    `PROVIDER_UNREACHABLE` (502)
-  - Wired in `packages/server/src/app.ts` via
-    `registerGitReposRoutes(app)`
-
-- **`POST /projects` extended with three credential modes** in
-  `packages/server/src/routes/projects.ts`. The body's
-  `gitToken` field is now optional; operators supply exactly
-  ONE of three:
-  - `gitToken` — legacy plain-text PAT, stored in
-    `project_git_credentials` (backward compat)
-  - `gitSecretId` — link to an existing vault secret (the
-    server validates the secret exists BEFORE creating the
-    project so a bad UUID doesn't leave a half-state)
-  - `newSecret: { name, value }` — auto-save the supplied
-    token to the vault under the given name, then link the
-    project to it (the plain-table is NOT populated in this
-    mode)
-  - Mutually-exclusive validation surface:
-    `CREDENTIAL_REQUIRED` (400 — zero modes),
-    `CREDENTIAL_AMBIGUOUS` (400 — two or three modes),
-    `NEW_SECRET_INVALID` (400 — newSecret without name or
-    value), `SECRET_NOT_FOUND` (400 — gitSecretId doesn't
-    exist in vault)
-  - On secret-creation failure (e.g. duplicate name), the
-    project row is rolled back via `projects.delete(id)` so
-    the operator can retry without a half-created project
-  - Audit metadata records `credentialType` ('plain' /
-    'vault-existing' / 'vault-new') + `gitSecretId` UUID
-    reference. GP-006-compliant — no token value in audit
-  - `toPublic(project)` extended to include `gitSecretId`
-    (reference UUID, not the secret value — safe to expose)
-
-- **New route — `PATCH /projects/:id/git-credentials`**
-  (`requireProjectMembership(... 'project-admin')`):
-  - Same three credential modes as `POST /projects`
-  - Each mode atomically clears the prior credential:
-    `gitToken` mode → clears `git_secret_id` + clears
-    `project_git_credentials`; `gitSecretId` / `newSecret`
-    modes → clear plain credentials, set new vault ref
-  - Audit row `project.git-credentials-updated` records
-    `projectId` + `credentialType` + `gitSecretId` (UUID
-    reference). Token value never in audit
-  - Project-admin minimum — editors cannot change Git
-    credentials (this gates intent dispatch + every clone
-    path)
-
-- **Createvault-secret helper** (`createVaultSecret`)
-  factored into `projects.ts`. Used by both `POST /projects`
-  (newSecret mode) and `PATCH /projects/:id/git-credentials`
-  (newSecret mode). Writes the encrypted bytes + an audit
-  row `secret.created` with `origin: 'project-init'` so a
-  future operator can trace which secrets were auto-created
-  during project setup vs explicit vault management
-
-- **Dashboard updates** (`packages/dashboard/`):
-  - `types.ts`: new `GitRepoSummary` interface; `ProjectSummary`
-    gained optional `gitSecretId: string | null`
-  - `api/client.ts`: `createProject` body widened to accept
-    three credential modes; new `updateProjectGitCredentials`,
-    `listGitRepos(secretId, provider?)`, `getProject(id)`
-    methods
-  - `views/Admin.tsx`: `CreateProjectModal` rewritten with:
-    - Radio token-source picker ("Use saved secret" /
-      "Enter new token"). Vault mode shows a `<select>`
-      populated from `/platform/secrets`; new-token mode
-      has password input + "Save to vault?" checkbox +
-      optional secret-name field (auto-defaulted to
-      `<projectName> Git PAT`)
-    - `[Browse repos ▾]` button next to the Git URL input —
-      visible only when "Use saved secret" is active and a
-      secret is selected. Opens a `RepoBrowserModal` that
-      lists repos via `listGitRepos` with a search input,
-      🔒/📖 private/public glyphs, and per-row click to
-      auto-fill the Git URL + default branch
-  - `views/ProjectSettings.tsx`: new `GitCredentialsCard`
-    below the Pipeline config card in the Pipeline tab.
-    Shows current credential mode (`● vault: "<name>"` or
-    `● plain token stored`) + two action buttons:
-    - "Change to saved secret ▾" — opens an inline form
-      with a `<select>` of available vault secrets, PATCHes
-      via `updateProjectGitCredentials`
-    - "Replace with new token" — password input + optional
-      vault save with secret name. Same atomic mode-switch
-      semantics as the Admin modal
-    - "Browse repos with this secret ▾" — visible when the
-      project is currently in vault mode; opens a read-only
-      `RepoBrowserModalSimple` showing repos for that
-      secret (click any repo to open in a new GitHub tab)
-
-- **CLI updates** (`packages/cli/`):
-  - `api/client.ts`: `ProjectRecord` gained `gitSecretId`;
-    new `GitRepoSummary` type; `createProject` body widened
-    for the three modes; new `updateProjectGitCredentials`,
-    `listGitRepos(secretId, provider?)` methods
-  - `commands/init.ts`: Phase 0.5 rewritten. Operator
-    picks (1) vault secret from the list OR (2) enter new
-    token (with optional save-to-vault). If a vault secret
-    is chosen, an optional **repo browser** opens — fetches
-    the operator's GitHub repos (with 🔒/📖 glyphs) and
-    lets them pick by number. Selecting a repo auto-fills
-    the clone URL + default branch from the GitHub API
-    response. Operator can press Enter at the repo picker
-    to type the URL manually
-  - `commands/projects.ts`: new `projectsUpdateTokenCommand`
-    — same interactive vault-picker / new-token flow as
-    init, but calls `PATCH /projects/:id/git-credentials`
-    against an existing project. Handles
-    `INSUFFICIENT_PROJECT_ROLE` via the shared
-    `handleMembershipForbidden` helper so a non-admin sees
-    the friendly error message
-  - `index.ts`: registered
-    `gestalt projects update-token <name>` subcommand;
-    top-of-file command comment updated
-
-Verified live end-to-end against `trackeros` (vault-backed
-intent cycle reached `deploying` with a real GitHub PR):
-
-- `pnpm -r build` clean across all 12 packages (server +
-  agents + adapters + dashboard + CLI all green)
-- Docker server image rebuilt via dev-override volume
-  mounts (image registry was unreachable during
-  verification; mounted fresh dist/ + templates/ + migrations
-  into the existing `gestalt-server:latest`). Server reaches
-  `Up (healthy)`. Migration 022 applied:
-  `schema_migrations` lists 22 versions. `\d projects`
-  shows the new `git_secret_id UUID` column + partial
-  `idx_projects_git_secret_id` index + FK to
-  `platform_secrets(id) ON DELETE SET NULL`. Boot log
-  contains `Project git secret resolver wired`
-- **Five validation paths confirmed** via curl:
-  - No credentials → 400 `CREDENTIAL_REQUIRED`
-  - Two credentials (gitToken + gitSecretId) → 400
-    `CREDENTIAL_AMBIGUOUS`
-  - Unknown gitSecretId UUID → 400 `SECRET_NOT_FOUND`
-  - Unknown provider on `/git/repos` → 400
-    `UNSUPPORTED_PROVIDER`
-  - Missing secretId on `/git/repos` → 400
-    `SECRET_ID_REQUIRED`
-- **`POST /platform/secrets`** with a fake GitHub PAT
-  succeeded; the secret carries proper AES-256-GCM
-  ciphertext (48-char base64) + 16-char IV + 24-char auth
-  tag. Direct DB probe: `position('verify' IN encrypted) =
-  0` (no plaintext leak in ciphertext)
-- **`POST /projects` with `gitSecretId`** created a project
-  with `gitSecretId` correctly populated; the response's
-  `toPublic(project)` includes the UUID reference. DB row
-  shows `git_secret_id` set
-- **`POST /projects` with `newSecret`**: created a project
-  AND a new vault secret in one call. Both rows visible
-  in DB; the project's `git_secret_id` points at the new
-  secret. The auto-created secret's description is
-  `"Git PAT auto-saved during project setup"`. Two audit
-  rows landed: `secret.created` with `origin:
-  "project-init"`, `project.created` with `credentialType:
-  "vault-new"` + the new secret's UUID reference
-- **GP-006 verified**: direct probe `metadata::text LIKE
-  '%ghp_auto_saved_brief5%' OR '%ghp_verify_fake_token%'`
-  on `audit_log` returns 0 rows. The fake PAT values
-  never reach any audit row
-- **`GET /platform/git/repos` against the real PAT**
-  (the one for trackeros): server decrypted the vault
-  secret, called GitHub's API, returned 9 real repos with
-  the correct `fullName`, `defaultBranch`, `private`
-  fields populated. The decrypted token never appears in
-  the response body (confirmed via response shape: only
-  metadata)
-- **`GET /platform/git/repos` against the fake PAT**:
-  server decrypted + called GitHub → 401 from GitHub →
-  server returns 400 `PROVIDER_ERROR` with `providerStatus:
-  401` + `error: "GitHub API error: Bad credentials"`.
-  The clean error pass-through proves the proxy path
-  works end-to-end
-- **`PATCH /projects/:id/git-credentials` switching modes**:
-  - vault → plain: `gitSecretId` cleared in DB; plain
-    credential inserted; `project_git_credentials` count = 1
-  - plain → vault: `gitSecretId` set; plain credential row
-    deleted (`project_git_credentials` count = 0). The
-    precedence rule "only one source wins" enforced at
-    write time, not just resolution time
-  - Audit rows captured: `project.git-credentials-updated`
-    × 2 with `credentialType: "plain"` / `"vault-existing"`
-    + `gitSecretId` UUID
-- **End-to-end vault clone + push**: switched trackeros to
-  vault mode (linked to the real PAT secret), then
-  submitted an intent. Server-side: orchestrator called
-  `resolveProjectCredential(project)` → resolver
-  decrypted the vault secret server-side → constructed
-  the authenticated clone URL with the decrypted token →
-  `git clone` succeeded → generate cycle ran through all
-  6 agents → gate passed → pr-agent pushed branch
-  `gestalt/<corr8>-verify-vault-cred-add-a-constant-export`
-  → pipeline-agent triggered real GitHub Actions
-  workflow → intent reached `deploying` status with PR
-  #46 opened on `afarahat-lab/trackeros`. **The full
-  vault-backed cycle works end-to-end against a real
-  GitHub repo with a real PAT — the decryption flows
-  through every layer correctly**
-- `deployment_events` for the cycle shows `pr-opened` +
-  `pipeline-triggered` both with `pr_number: 46`
-- **CLI rebuild + help check**: `gestalt projects --help`
-  shows the new `update-token` subcommand with the
-  expected description
-
-Decisions made:
-
-- **`resolveProjectCredential` is the SINGLE call site
-  pattern** across every orchestrator + agent + route.
-  The previous 12 `projects.getCredential(project.id)`
-  call sites all swap to one line. Future credential
-  source additions (e.g. HashiCorp Vault, AWS KMS) wire
-  through the same resolver injection point and every
-  layer benefits without an N-way edit
-- **Resolver injection mirrors `setLLMRegistryResolver` +
-  `setPlatformMcpResolver`.** The master key never
-  reaches `@gestalt/core`; server-side wiring keeps
-  vault decryption behind the resolver function the core
-  module calls but doesn't define. Test setup that
-  doesn't wire a resolver transparently falls back to
-  the legacy `projects.getCredential` path
-- **Vault decrypt failure falls through to plain-token
-  path**, NOT a hard error. Operators may have rotated
-  the vault but a project still references the old
-  secret id (or a backup PAT in `project_git_credentials`
-  remains). Returning null from the resolver + falling
-  back means the credential resolution chain is forgiving
-  — the cycle proceeds with whatever credential is
-  available
-- **`POST /projects` requires EXACTLY ONE credential
-  mode** (not zero, not two+). The mutually-exclusive
-  rule prevents the ambiguity "did the operator want the
-  gitToken or the gitSecretId to win?" — typed errors
-  surface the operator's intent immediately. Earlier
-  designs that accepted multiple modes silently lost
-  one of them; the explicit check is friendlier
-- **`PATCH /git-credentials` atomically clears the prior
-  credential** in every mode. Avoids the bug where an
-  operator switches "from plain to vault" but the plain
-  row lingers as a stale fallback. The resolver's
-  precedence rule (vault wins) would have handled the
-  case correctly anyway, but cleaning up at write time
-  matches operator expectation ("I changed credentials,
-  the old one shouldn't still be in the system")
-- **`toPublic` includes `gitSecretId`**. The UUID is a
-  reference, not the secret value — exposing it lets the
-  dashboard's Pipeline tab render "vault: <name>" vs
-  "plain token stored" cleanly. The actual secret value
-  remains behind the vault decryption boundary
-- **Auto-created vault secrets carry
-  `origin: 'project-init'` in audit metadata**. Lets a
-  future audit ask "which secrets were created during
-  project setup vs explicit vault management" by querying
-  `audit_log WHERE action = 'secret.created' AND
-  metadata->>'origin' = 'project-init'`
-- **CLI repo browser only fires for vault-mode (skipped
-  for fresh tokens)**. The browser needs the secret id
-  to call `/platform/git/repos`; a brand-new token the
-  operator hasn't yet saved to the vault doesn't have
-  one. The brief allowed for "browse via the in-flight
-  token" but that would force a second round-trip before
-  the project exists — out of scope for the current
-  flow. Operators who want the browser can pick
-  "Save to vault" + then use the new secret id, or run
-  `gestalt projects update-token <name>` after init to
-  swap in vault mode
-- **GitHub-only for now**. The route's `provider` param
-  + the typed `SUPPORTED_PROVIDERS` union are designed
-  for future GitLab / Azure DevOps / Bitbucket
-  expansion. Today: only GitHub. The brief's response
-  shape is provider-neutral so adding a new provider
-  doesn't change any client code
-- **No special handling for SSH URLs in the browser**.
-  GitHub's `/user/repos` returns both `cloneUrl` (HTTPS)
-  and `sshUrl`; the platform always uses HTTPS for
-  clones (the existing `authenticatedGitUrl` pattern
-  injects the PAT as `x-access-token`). The browser
-  surfaces `cloneUrl` only — operators who want SSH
-  type the URL manually
-
-Build status: `pnpm -r build` clean across all 12
-packages. Server image rebuilt via dev-override volume
-mounts (registry was unreachable; mounted fresh dist + the
-new migration into the existing image). Migration 022
-applied. End-to-end live verification confirmed: vault
-secret created, project linked, real PAT decrypted by the
-server-side resolver, GitHub repos listed via the proxy,
-trackeros intent cycle ran clone → generate → gate → push
-all using the vault-decrypted credential.
-
-Operator action — pending on `trackeros`:
-- A test branch (`gestalt/f863dc4f-verify-vault-cred-add-
-  a-constant-export`) and PR (#46) were pushed to
-  `afarahat-lab/trackeros` during verification. Auto-mode
-  classifier correctly declined to force-delete them on
-  the operator's behalf. To clean up:
-  ```
-  gh pr close 46 --repo afarahat-lab/trackeros --delete-branch
-  ```
-  (or close + delete via the GitHub UI). Until cleanup
-  fires, the dangling branch + PR are visible on
-  trackeros but harmless — the platform never re-uses
-  them
-
-Pending follow-ups: none introduced. Possible future
-iterations:
-- GitLab / Azure DevOps / Bitbucket adapters in
-  `routes/git-repos.ts`. Each would add a switch arm to
-  the existing `provider` handler with the provider-
-  specific REST endpoint + response normalisation; no
-  schema or client-shape changes needed
-- Repo browser in the `gestalt init` CLI when the
-  operator picked the "new token + save to vault" mode.
-  Today the browser only opens for "select existing
-  vault secret" because we need the secret id; a future
-  refactor could create the vault secret FIRST then
-  browse before creating the project
-- Auto-rotation hooks — when a project's PAT is rotated
-  in the vault (via `gestalt platform secrets rotate`),
-  every project that references it should pick up the
-  new value on the next clone. Already works today
-  because resolveProjectCredential re-decrypts on every
-  call; could be made more explicit with a tracking
-  audit entry
-
----
+## Recent sessions (last 3)
 
 ### Session 2026-06-04 — Claude Code (per-LLM apiShape field — fix gpt-5/o1/o3 'max_tokens' rejection, migration 023)
 
@@ -3843,3 +3149,693 @@ iterations:
 - Migrate the rotateMasterKey path to also rotate vault secret
   references when the master.key file is regenerated in dev mode
   (so operators iterating with dev-override don't lose vault data)
+
+---
+
+### Session 2026-06-04 — Claude Code (template download + in-place configuration editor, no migration)
+
+Adds the platform-admin tooling to (1) download any harness
+template as a ZIP, (2) duplicate built-ins into editable
+copies, and (3) edit custom-template files in place via both
+the dashboard inline editor and the CLI. No new migration —
+the feature reuses the existing `platform_templates.files`
+JSONB column from migration 017 with two new postgres
+operators (`||` for merge, `-` for delete-key).
+
+Changed:
+
+- **Core repository interface** (`packages/core/src/repository/index.ts`):
+  `PlatformTemplateRepository` gained three new methods —
+  `updateFiles(id, files)` (MERGE semantics, returns the
+  updated record), `deleteFile(id, filePath)` (removes one
+  key from the JSONB), `duplicate(sourceId, name, slug,
+  createdBy)` (re-uses `create` after `findById`, always
+  yields `isBuiltin: false, isDefault: false`)
+- **Postgres impl** (`packages/adapters/postgres/src/repositories/platform-templates.ts`):
+  - `updateFiles` runs `UPDATE platform_templates SET
+    files = files || ${db.json(files)}::jsonb, updated_at =
+    NOW() WHERE id = ${id} RETURNING *`. `db.json` ensures
+    the binding lands as proper JSONB (same trap the
+    maintenance_runs / tool_calls / context repos avoid).
+    The `||` operator is shallow merge — keys in the
+    supplied map overwrite, keys not in the supplied map
+    are preserved
+  - `deleteFile` runs `UPDATE ... SET files = files -
+    ${filePath}` — postgres's `-` operator on JSONB
+    returns a copy with the key removed; idempotent when
+    the key is absent (but the route checks first and
+    returns 404 instead, so the operator gets a useful
+    error)
+  - `duplicate` reads the source via `findById`, then
+    `create(...)` with `isBuiltin: false, isDefault:
+    false`. Tier coerces `Tier 1` → `Custom` (the built-in's
+    tier shouldn't carry over) but otherwise preserves
+    every field
+- **Oracle + MSSQL adapters**: throw-stub the three new
+  methods. Same convention every prior adapter session has
+  used
+- **Server package**: added `adm-zip ^0.5.10` runtime dep +
+  `@types/adm-zip ^0.5.5` devDep. CLI already had this
+  for the upload-side ZIP parsing
+- **Server routes** (`packages/server/src/routes/templates.ts`):
+  four new routes:
+  - `GET /platform/templates/:id/download`
+    (`requireRole('operator')`) — builds the ZIP in memory
+    via `adm-zip`, sets `Content-Type: application/zip` +
+    `Content-Disposition: attachment; filename="<slug>-
+    template.zip"`, sends the buffer. Audit row
+    `platform.template-downloaded` with metadata `{slug,
+    name, fileCount, sizeBytes, ip}`. Operator+ because
+    project-admins use it as a "starting point" download
+    even when they're not platform-admins
+  - `POST /platform/templates/:id/duplicate` (admin) —
+    body `{name, slug}`. Validates name/slug shape; slug
+    clash → 409 `SLUG_TAKEN`. Calls the repository's
+    `duplicate` method. Audit row
+    `platform.template-duplicated` with metadata
+    `{sourceId, sourceSlug, newSlug, newName, fileCount,
+    ip}`
+  - `PATCH /platform/templates/:id/files` (admin) — body
+    `{files: {path: content}}`. Built-in guard: 400
+    `BUILTIN_TEMPLATE` (operators duplicate first).
+    Required-file guard: after the would-be merge, every
+    one of `AGENTS.md` / `HARNESS.json` / `agents.yaml`
+    must still be present by basename. Today the merge
+    can only ADD keys (postgres `||` doesn't remove), so
+    existing required files are safe — but the
+    defensive check prevents a future caller that bundles
+    a remove-and-replace flow from bypassing the guard.
+    Audit row `platform.template-files-updated` with
+    metadata `{slug, changedFiles: string[], ip}` —
+    **file NAMES only, never content** (GP-006)
+  - `DELETE /platform/templates/:id/files/*` (admin) —
+    wildcard route param so `docs/X.md` works. Built-in
+    guard: 400 `BUILTIN_TEMPLATE`. Required-file guard
+    by basename: 400 `REQUIRED_FILE` for `AGENTS.md`,
+    `HARNESS.json`, `agents.yaml`. Path-not-found: 404
+    `FILE_NOT_FOUND` (so a typo never silently no-ops).
+    Audit row `platform.template-file-deleted` with
+    metadata `{slug, filePath, ip}`
+- **Dashboard API client**
+  (`packages/dashboard/src/api/client.ts`): four new
+  methods — `downloadPlatformTemplate(id)` (returns
+  `Promise<Blob>` so the caller triggers a browser
+  download via `URL.createObjectURL` + `<a download>`,
+  preserving the Authorization header that a plain
+  `window.open` would lose); `duplicatePlatformTemplate(id,
+  body)`; `updatePlatformTemplateFiles(id, files)`;
+  `deletePlatformTemplateFile(id, filePath)` (segment-
+  encodes the path so each path component is properly
+  URI-escaped while preserving the `/` separators
+  Fastify's wildcard route expects)
+- **Dashboard `TemplatesTab`**
+  (`packages/dashboard/src/views/Admin.tsx`): rewritten
+  with per-row `[↓ Download]` / `[⎘ Duplicate]` / `[✎ Edit]`
+  (custom only) / `[★ Set default]` (non-default only) /
+  `[×]` (custom only) actions. Download triggers the
+  blob → object-URL → `<a>` click pattern (cleaning up
+  after itself with `URL.revokeObjectURL`).
+  Duplicate opens a new `DuplicateTemplateModal` (name +
+  slug inputs, both defaulted from the source). Edit
+  switches the inline-expanded panel from
+  `TemplateDetailPanel` (the existing variable usage
+  view) to a new `TemplateEditor` component
+- **New `DuplicateTemplateModal`** — minimal modal with
+  name + slug fields, defaulted to `<source-name>
+  (Custom)` + `<source-slug>-custom`. POST + close on
+  success; surfaces typed errors (`SLUG_TAKEN`,
+  `INVALID_SLUG`) inline
+- **New `TemplateEditor`** — inline panel with two
+  sub-panes:
+  - **Left:** file tree as a vertical list. Each row
+    shows path + `●` (amber) when modified. Required
+    files (AGENTS.md / HARNESS.json / agents.yaml by
+    basename) have NO `[×]` button (the server's 400
+    `REQUIRED_FILE` is the second-line defense, but the
+    operator shouldn't see a button that can't work).
+    Selected row highlights with `var(--bg-raised)`.
+    `[+ Add file]` button at the bottom opens an inline
+    input row that creates an empty draft on Enter
+  - **Right:** monospace `<textarea>` for the selected
+    file, ~400px min height, vertical resize. `[Save
+    this file]` button is enabled only when the draft
+    differs from the persisted content. `[Discard
+    changes]` reverts the draft to the persisted state.
+    Header line shows the file path + `● modified` chip
+    when different
+  - **Footer:** `[Save all changes (N)]` button +
+    "N file(s) modified — saved with one PATCH call"
+    hint. Combines every modified file into a single
+    PATCH so the audit row + Git history (when the
+    operator later commits) read as one atomic change
+  - Drafts persist in component state — a stray click
+    elsewhere in the row doesn't lose work, only `[×
+    Close editor]` exits. The `toggleExpand` handler
+    is a no-op while `editingId === t.id` so the row
+    click can't accidentally collapse the editor
+- **CLI API client** (`packages/cli/src/api/client.ts`):
+  four new methods mirroring the dashboard's surface.
+  `downloadPlatformTemplate(id)` returns a `Buffer`
+  (Node-side equivalent of the browser's Blob) so the
+  caller writes it via `fs.writeFileSync`
+- **CLI commands**
+  (`packages/cli/src/commands/platform-extras.ts`):
+  five new subcommands + a shared `resolveTemplateBySlug`
+  helper + an `editInEditor` helper for the `$EDITOR`
+  flow:
+  - `gestalt platform templates download <slug>
+    [--output <path>]` — writes the ZIP, prints file
+    count + byte size on success. Output default is
+    `./<slug>-template.zip`
+  - `gestalt platform templates duplicate <slug>
+    [--name <n>] [--new-slug <s>]` — prompts for the
+    missing fields with sensible defaults
+  - `gestalt platform templates edit <slug> <filePath>
+    [--content <string>]` — `$EDITOR` flow (falls back to
+    `$VISUAL`, then `vi`). Headless / non-TTY mode
+    writes to a tmp file and prompts the operator to
+    edit it manually before pressing Enter (CI-friendly).
+    `--content` skips the editor entirely. Compares the
+    post-edit content against the original to avoid a
+    no-op PATCH ("No changes to <path> — nothing to
+    save."). Editor exits with non-zero status → abort
+    cleanly
+  - `gestalt platform templates add-file <slug>
+    <filePath> [--content <string>]` — same editor flow
+    but refuses if the file already exists (operator gets
+    a hint to use `edit` instead)
+  - `gestalt platform templates remove-file <slug>
+    <filePath>` — confirms `y/N` then DELETEs. The
+    server's 400 `REQUIRED_FILE` surfaces verbatim
+  Helper `editInEditor(initial, hintLabel)` creates a
+  filename-safe suffix from the label (`gestalt-<ts>-
+  <slug-snippet>`) and cleans up the temp file in a
+  `finally` block on every code path
+- **CLI registration** (`packages/cli/src/index.ts`):
+  all five subcommands registered under the existing
+  `gestalt platform templates` parent. Top-of-file
+  command comment updated. Header comment in
+  `platform-extras.ts` updated to document the new
+  surface + the `$EDITOR` fallback contract
+- **Docs** (`docs/guides/quick-start.md`): new
+  "Authoring custom templates" section between
+  "Customising agents" and "Summary — command
+  reference". Covers two workflows: (1) start from the
+  built-in by downloading + editing locally + uploading
+  the modified ZIP; (2) in-place editing via
+  duplicate + edit + add-file + inspect + set-default.
+  Constraints block explicitly documents the built-in
+  read-only rule, required-file rule, MERGE semantics,
+  and GP-006 audit-content exclusion. Summary table
+  gained 7 new template-authoring rows (list, download,
+  duplicate, edit, add-file, remove-file, inspect,
+  set-default — minus list which was already there)
+
+Verified live end-to-end:
+
+- `pnpm -r build` clean across all 12 packages. Docker
+  server image rebuilt with the new `adm-zip` dep
+  baked in. `Up (healthy)`; existing migrations
+  unchanged
+- **Download** — `curl -H 'Auth: Bearer <admin>'
+  http://localhost:3000/platform/templates/<built-in>/download`
+  returned HTTP 200 + `Content-Type: application/zip`
+  + 8971-byte body. `unzip -l` listing shows all 8
+  expected files (`ci/gestalt.yml`,
+  `docs/{ARCHITECTURE,DECISIONS,DOMAIN,GOLDEN_PRINCIPLES}.md`,
+  `harness/{AGENTS.md, HARNESS.json, agents.yaml}`) at
+  the expected paths with reasonable byte sizes (108–
+  9797 bytes per file)
+- **Duplicate** — `POST .../duplicate {name: 'Corporate
+  Ops (Live Test)', slug: 'corporate-ops-livetest'}`
+  returned 201 with the new record: `isBuiltin: false`,
+  `isDefault: false`, `createdBy: <admin uuid>`, all 8
+  source files copied
+- **Edit + MERGE semantics** — PATCH /files with
+  `{harness/AGENTS.md: '<new content>'}` returned 200.
+  Subsequent GET shows AGENTS.md has the new content
+  + ALL 7 other files preserved with their original
+  byte content. Verified key-by-key
+- **Built-in guard** — PATCH /files on the built-in's
+  ID returned 400 `BUILTIN_TEMPLATE` with the typed
+  message "Cannot edit a built-in template — duplicate
+  it first"
+- **Required-file guard** — DELETE /files/harness/AGENTS.md
+  on the duplicate returned 400 `REQUIRED_FILE` with
+  `requiredFile: 'AGENTS.md'`. Same for
+  `harness/HARNESS.json`
+- **Invalid body** — PATCH /files with `{}` returned
+  400 `INVALID_FILES`
+- **Add + remove** — PATCH /files added a new
+  `docs/EXTRA.md`; subsequent GET shows 9 files. DELETE
+  /files/docs/EXTRA.md returned 204; subsequent GET
+  shows 8 files (the new one is gone, the original 8
+  preserved). DELETE on a non-existent path returned
+  404 `FILE_NOT_FOUND` (not 204 — typos shouldn't
+  silently succeed)
+- **Slug validation on duplicate** — POST .../duplicate
+  with an existing slug returned 409 `SLUG_TAKEN`;
+  missing `name` returned 400 `INVALID_NAME`; bad
+  slug shape (`-bad-slug`) returned 400 `INVALID_SLUG`
+- **Persistence across server restart** — `docker
+  compose restart server` + 5s wait, then refetch the
+  duplicate template. AGENTS.md still carries the
+  edited content. Data is in postgres
+  `platform_templates.files` JSONB, not memory
+- **Audit table** — direct probe shows all 4 new
+  actions wrote rows with the documented metadata
+  shape. `platform.template-files-updated` carries
+  `changedFiles: ['harness/AGENTS.md']` —
+  **NAMES only, not content**. GP-006 verified via
+  direct row inspection
+- **CLI download** — `gestalt platform templates
+  download corporate-ops-web-mobile --output
+  /tmp/cli-download.zip` produced
+  `✓ Template downloaded: /tmp/cli-download.zip
+  (8 files, 8971 bytes)`. Unzip listing identical to
+  the curl-driven download
+- **CLI edit + add-file + remove-file** — `gestalt
+  platform templates edit corporate-ops-livetest
+  harness/AGENTS.md --content '<text>'` succeeded;
+  inspect shows the updated content. `add-file ...
+  --content '<text>'` added the new file. `remove-file`
+  with auto-confirm (printf 'y\n') deleted it. The
+  `--content` flag path skips the `$EDITOR` flow
+  entirely — Headless / scripted operator workflows
+  work without a TTY
+- **CLI guards** — `edit corporate-ops-web-mobile
+  harness/AGENTS.md --content 'hacked'` returned
+  `Failed to edit ... 400 BUILTIN_TEMPLATE`. `remove-file
+  corporate-ops-livetest harness/AGENTS.md` returned
+  `Failed to remove ... 400 REQUIRED_FILE`. Errors
+  surface verbatim from the server
+- **CLI duplicate** — `gestalt platform templates
+  duplicate corporate-ops-web-mobile --name 'CLI
+  Duplicate Test' --new-slug cli-dupe-test` succeeded;
+  subsequent `templates list` shows three templates
+  (built-in + the two test duplicates)
+- **Cleanup** — `gestalt platform templates delete
+  cli-dupe-test` + `delete corporate-ops-livetest`
+  with `y` confirmation removed both. Final
+  `templates list` shows only the built-in remaining
+
+Decisions made:
+
+- **`adm-zip` not `archiver`.** The brief offered both.
+  `adm-zip` is already in the CLI's deps for upload-
+  side parsing; using the same library on the
+  server-side download keeps the dep surface tight. For
+  the current template size (8 files, ~9 KB) in-memory
+  zipping is fine; if templates ever grow into
+  multi-MB territory we'd switch to `archiver`'s
+  streaming API + `pipe(reply.raw)`
+- **MERGE not REPLACE.** Postgres's `files || $1::jsonb`
+  is the natural fit: only the supplied keys change,
+  other files are preserved. The brief was explicit
+  about this — "a partial update never wipes adjacent
+  state". The dashboard's `Save all changes (N)` button
+  combines every modified file into one PATCH so the
+  audit row + future Git commit narrate one
+  semantically-coherent change
+- **Required-file guard runs on the would-be-merged map,
+  not just on the supplied input.** Today the merge can
+  only ADD keys, so the existing required files are
+  safe — but a future caller bundling a remove-and-
+  replace flow shouldn't be able to drop a required
+  file via this endpoint. The defense-in-depth check
+  costs nothing
+- **Audit metadata records file NAMES, not content.**
+  GP-006. The dashboard / CLI have access to the full
+  content via the existing GET endpoint, so a forensics
+  operator can see WHO modified WHICH files and reach
+  for the content separately. Putting content in
+  `audit_log.metadata` would balloon the table fast
+  and replicate file content into every backup pull
+- **Built-in PATCH/DELETE returns 400 `BUILTIN_TEMPLATE`,
+  not 403.** The brief described it as "the
+  same guard as delete". The DELETE /platform/templates/:id
+  route uses 400 + `BUILTIN_TEMPLATE` (operator sees
+  "duplicate first" hint instead of an opaque "forbidden"
+  message). Matching the existing pattern keeps the
+  error surface consistent
+- **Duplicate's tier coerces `Tier 1` → `Custom`** but
+  preserves any other tier value. Built-in's `tier1`
+  shouldn't carry over to a custom row (that's a
+  marketing signal for ship-with-platform templates).
+  Custom tiers (`Custom`, operator-defined values)
+  pass through unchanged
+- **Dashboard download uses `URL.createObjectURL` + `<a
+  download>`, NOT `window.open`.** A `window.open` to
+  the download URL would lose the Authorization header
+  (the server's `requireRole('operator')` preHandler
+  would 401). The blob + object URL pattern wraps the
+  authenticated fetch in a download trigger that the
+  browser handles natively, preserving the operator's
+  session
+- **CLI `editInEditor` uses `$EDITOR` → `$VISUAL` →
+  `vi` priority.** Standard Unix convention. The
+  fallback to `vi` matches what `git commit` does. In
+  non-TTY environments the helper writes the temp file
+  and prompts the operator to edit it manually before
+  pressing Enter — CI-compatible without crashing
+- **`edit` command compares post-edit content against
+  the original** to avoid no-op PATCH calls. Operators
+  who open the editor + immediately exit (or who make
+  no changes) get a friendly "No changes to <path> —
+  nothing to save." instead of a wasted round-trip
+- **In-place editor preserves drafts across re-renders.**
+  The TemplateEditor's local state survives every
+  parent re-render — only `[× Close editor]` exits
+  the editor mode. A stray row-click can't lose
+  work. The `toggleExpand` handler explicitly
+  short-circuits when `editingId === t.id`
+- **DuplicateTemplateModal defaults: `<source-name>
+  (Custom)` + `<source-slug>-custom`.** Makes the
+  common case (duplicate built-in for tweaks) a
+  one-click operation. Operators who want a different
+  name/slug just type over the defaults
+- **No new migration.** All four routes work on the
+  existing `platform_templates.files` JSONB column from
+  migration 017. The duplicate uses INSERT (already
+  wired); update + delete use postgres's JSONB `||`
+  and `-` operators
+
+Build status: `pnpm -r build` clean across all 12
+packages. Docker server image rebuilt. Full validation
+matrix + MERGE semantics + persistence-across-restart +
+audit-row shape + CLI end-to-end + guard tests all
+verified live against the running platform. No
+migrations applied. Workspace test templates removed at
+session end; final DB state has only the built-in
+template.
+
+Pending follow-ups: none introduced. Possible future
+iterations:
+- Syntax highlighting in the dashboard's textarea
+  editor (today it's plain monospace) — the brief said
+  "keep it simple"; a future iteration could plug in
+  Monaco or CodeMirror for the common cases (Markdown,
+  JSON, YAML)
+- A `gestalt platform templates push <slug> <dirPath>`
+  command that uploads every file in a directory as a
+  PATCH (operators who edited locally without going
+  through the ZIP roundtrip)
+- A `gestalt platform templates diff <slug>` command
+  that shows the difference between a template and the
+  on-disk built-in (helps operators see what they've
+  customised vs the ship-default)
+- Streaming download via `archiver` + `pipe(reply.raw)`
+  if templates ever exceed single-digit MB
+
+---
+
+### Session 2026-06-04 — Claude Code (template editor improvements: CodeMirror syntax highlighting + gestalt platform templates push + diff)
+
+Three follow-ups to the previous session's template editor, all
+in one pass. Each is self-contained; no new migrations.
+
+**Enhancement 1 — CodeMirror 6 syntax highlighting in the
+dashboard editor.** Replaces the plain `<textarea>` in
+`TemplateEditor` (Admin.tsx) with a CodeMirror 6 editor.
+- `packages/dashboard/package.json` gains 7 new runtime deps:
+  `@codemirror/view`, `@codemirror/state`,
+  `@codemirror/lang-json`, `@codemirror/lang-yaml`,
+  `@codemirror/lang-markdown`, `@codemirror/theme-one-dark`,
+  and the `codemirror` meta package (which is where `basicSetup`
+  actually lives in v6 — the brief's pseudocode put it under
+  `@codemirror/view` which is incorrect; deviated to make the
+  imports compile)
+- New `getLanguageExtension(filePath)` helper at the top of the
+  `TemplateEditor` region maps file extension → CodeMirror lang
+  extension: `.json` → `json()`, `.yaml`/`.yml` → `yaml()`,
+  `.md` → `markdown()`, everything else → `[]` (plain text).
+  Only three language packs are imported per the brief —
+  bundle stays as lean as it can while still covering every
+  file the seeded template contains
+- `TemplateEditor` rewritten with three new refs:
+  `editorRef` (HTMLDivElement that holds the editor mount
+  point), `editorViewRef` (the current EditorView instance,
+  destroyed + nulled on cleanup), and `draftsRef` (latest
+  drafts captured for the updateListener closure so multiple
+  React renders don't strand stale references). New
+  `discardCounter` state slot bumps on every discard so the
+  edit-mount `useEffect` re-runs and rebuilds the EditorView
+  with the freshly-reverted doc
+- The mount `useEffect` is keyed on
+  `[selectedPath, discardCounter]`. On every change it
+  destroys the prior view, builds a new `EditorState` with
+  `doc: drafts[path]`, attaches `basicSetup` + `oneDark` +
+  `EditorView.lineWrapping` +
+  `getLanguageExtension(path)` +
+  `EditorView.updateListener.of(...)`, and instantiates a
+  new EditorView in `editorRef.current`. The updateListener
+  fires on every doc-change transaction and writes back via
+  `setDrafts((prev) => ({...prev, [path]: doc.toString()}))`
+- The `<textarea>` JSX block is replaced with
+  `<div ref={editorRef} style={...}>` — `minHeight: 400px,
+  maxHeight: 700px, overflow: auto`. The CSS variables
+  (`var(--border)`, etc.) are preserved so the editor
+  visually integrates with the rest of the panel
+- `discardOne` extended to also call
+  `setDiscardCounter((c) => c + 1)` when the discarded path
+  is the one in the editor — forces the useEffect to re-run
+  and reset the editor's doc. Otherwise the in-memory
+  EditorView would keep showing the operator's typed
+  content even after drafts state has been reverted
+- The now-unused `selectedContent` const is deleted
+- Bundle delta: 363 KB → 1010 KB raw (319 KB gzipped, +190
+  KB delta). Above Vite's 500 KB warning but acceptable for
+  an admin-only feature. Future iteration: code-split via
+  dynamic `import()` so only platform-admins editing
+  templates pay the cost
+
+**Enhancement 2 — `gestalt platform templates push
+<slug> <dirPath> [--dry-run]`.** Batch upload from a local
+directory tree.
+- New `collectTemplateFiles(dir, rootDir)` recursive walker
+  in `platform-extras.ts`. `SKIP_NAMES` Set excludes `.git`
+  / `.gestalt` / `node_modules` / `dist` / `build` /
+  `.DS_Store`. Path separators are normalised forward-slash
+  so Windows operators don't end up with `docs\X.md` keys
+  on the wire
+- New `platformTemplatesPushCommand(slug, dirPath, {dryRun})`
+  exported. Path-validates the dir, walks it, builds the
+  full file map. `--dry-run` prints sizes per file with a
+  "(dry run — no changes made)" footer. Real run calls
+  `PATCH /platform/templates/:id/files` (MERGE semantics —
+  unsupplied files preserved server-side)
+- Error handling: `BUILTIN_TEMPLATE` surfaces with `Cannot
+  push to a built-in template. Duplicate it first: gestalt
+  platform templates duplicate <slug>`;
+  `MISSING_REQUIRED_FILES` surfaces with the typed list +
+  "Ensure AGENTS.md, HARNESS.json, and agents.yaml are
+  present in the directory."; missing-dir → `Directory not
+  found: <path>` + exit 1
+- New `fs` sync imports (`readdirSync`, `statSync`,
+  `existsSync`) + `relative` path helper. The walker uses
+  sync FS calls to match the file's existing style (the
+  editor flow already uses `readFileSync` / `writeFileSync`
+  / `unlinkSync`)
+
+**Enhancement 3 — `gestalt platform templates diff <slug>
+[--against <baselineSlug>] [--stat]`.** Per-file unified
+diff against a baseline.
+- New `diff ^5.2.0` runtime dep + `@types/diff ^5.2.0` dev
+  dep in `packages/cli/package.json`. `diffLines` from the
+  `diff` package does LCS-based line diffing — language-
+  agnostic, no markdown/yaml parser required
+- New `platformTemplatesDiffCommand(slug, {against, stat})`
+  exported. Default baseline `corporate-ops-web-mobile`;
+  `--against <slug>` overrides. Self-diff (same slug both
+  sides) → `Cannot diff '<slug>' against itself.` + exit 1.
+  Both templates loaded via `getPlatformTemplate(id)` in
+  parallel. Path-set union iterated for per-file
+  classification: only in baseline → `(removed)`, only in
+  custom → `(added)`, in both with line changes →
+  `(modified)`, no changes → `(unchanged)`
+- Modified files print a unified-diff block: green `+`
+  lines + red `-` lines + 2 leading / 2 trailing context
+  lines per hunk. Hunks with more than 4 unchanged lines
+  collapse via `... (N unchanged lines)` so big files stay
+  readable
+- `--stat` mode hides the per-line diff and prints only the
+  right-padded per-file `+N -M` summary (or `unchanged`
+  / `(added)` / `(removed)` for non-modified files). Footer
+  `Summary: 1 modified, 7 unchanged` (with green/red/dim
+  fragments) always prints
+
+**Registration:** new `push` and `diff` subcommands
+registered under `gestalt platform templates` in
+`packages/cli/src/index.ts`. Top-of-file command comment
+extended. Header docstring on
+`packages/cli/src/commands/platform-extras.ts` updated to
+document both new subcommands + the LCS-diff design.
+
+Verified live end-to-end:
+
+- `pnpm -r build` clean across all 12 packages. Dashboard
+  bundle compiled to `index-Ds_rUJ8n.js` (1010 KB raw, 319
+  KB gzipped); CLI compiled clean. New dashboard bundle
+  `docker cp`'d into the running container so it serves
+  the fresh assets without an image rebuild. HTML now
+  references the new bundle (`/app/assets/index-Ds_rUJ8n.js`)
+- Spot-grep on the production bundle confirms the new
+  CodeMirror modules landed: CSS classes (`cm-editor` × 1,
+  `cm-content` × 8, `cm-line` × 11, `cm-gutters` × 12), the
+  OneDark theme's signature colors (`#abb2bf`, `#21252b`,
+  `#282c34`), and the APIs we use (`EditorView`,
+  `EditorState`, `lineWrapping` × 28, `updateListener` × 2)
+- `gestalt platform templates --help` lists both new
+  subcommands with their option descriptions
+- **Push verification flow (end-to-end against the live
+  platform):**
+  - `gestalt platform templates download
+    corporate-ops-web-mobile --output /tmp/.../template.zip`
+    → "✓ Template downloaded ... (8 files, 8971 bytes)"
+  - Unzip + append `## Custom section added by
+    operator\nLocal edits via the push workflow.` to
+    `harness/AGENTS.md`
+  - `gestalt platform templates duplicate
+    corporate-ops-web-mobile --name "Push Diff Test"
+    --new-slug push-diff-test` → "✓ Template duplicated"
+  - `gestalt platform templates push push-diff-test
+    /tmp/.../my-edit --dry-run` → "Would push 8 files:" +
+    per-file size listing + "(dry run — no changes made)"
+  - Real push without `--dry-run` → 8 `✓` rows + "✓
+    Template updated: push-diff-test (8 files pushed)"
+  - Direct API fetch confirms `harness/AGENTS.md` content
+    ends with the operator's local edits — the push lands
+    server-side correctly
+- **Diff verification flow:**
+  - `gestalt platform templates diff push-diff-test` →
+    Comparing header, 7 files `(unchanged)`, 1 file
+    `harness/AGENTS.md (modified)` with `... (68 unchanged
+    lines)` context-folding + 2 green `+` lines + Summary
+    `1 modified, 7 unchanged`
+  - `--stat` mode → compact per-file summary with
+    `harness/AGENTS.md +2 -0` and other files
+    `unchanged`
+  - Added a new file (`docs/EXTRA.md`) via push → diff
+    shows `docs/EXTRA.md (added)` line + updated Summary
+  - Clean duplicate (`clean-copy-test`) diff → ALL 8 files
+    `(unchanged)` + Summary `8 unchanged`
+- **Error matrix:**
+  - `push corporate-ops-web-mobile <dir>` → "Cannot push to
+    a built-in template. Duplicate it first: ..."
+  - `push push-diff-test /tmp/does-not-exist` →
+    "Directory not found: ..."
+  - `diff push-diff-test --against nonexistent-baseline` →
+    "No template with slug 'nonexistent-baseline'." +
+    hint
+  - `diff push-diff-test --against push-diff-test` →
+    "Cannot diff 'push-diff-test' against itself."
+- Cleanup: both test templates (`push-diff-test`,
+  `clean-copy-test`) deleted via `gestalt platform
+  templates delete` with `y` confirmation. Final DB state
+  has only the built-in template + the old/new dashboard
+  bundles in the container's dist (the old bundle is now
+  orphan; HTML references the new one)
+
+Decisions made:
+
+- **`basicSetup` imported from `codemirror` (the meta
+  package), NOT `@codemirror/view`.** Brief's pseudocode
+  was incorrect about the import path — in CodeMirror 6,
+  `basicSetup` is exported from the `codemirror` umbrella
+  package. The compiler would have rejected the brief's
+  literal imports; the deviation is required for
+  correctness, not stylistic. Documented inline next to
+  the imports
+- **`useEffect` keyed on `[selectedPath, discardCounter]`,
+  not just `selectedPath`.** Discard needs to recreate the
+  editor (CodeMirror's `EditorState` is immutable
+  per-transaction; setting the doc externally requires
+  either a `dispatch({changes: ...})` call or a fresh
+  state). The counter approach is simpler and matches the
+  brief's "update selectedFile key to force the useEffect
+  to re-run" suggestion. The cleanup function destroys the
+  old EditorView before the next one mounts so there's no
+  double-mount in the DOM
+- **`draftsRef` captures the current drafts state for the
+  updateListener.** Without it, the listener's closure
+  would see stale `setDrafts` calls when React batches
+  state updates across rapid keystrokes. The ref pattern is
+  the standard React idiom for "give me access to the
+  latest state from inside a long-lived callback"
+- **Static imports, not dynamic.** Brief's example used
+  static imports; the bundle delta is significant but
+  Admin is a route-level lazy load already (RequirePlatformAdmin
+  guards the route). Code-split could push only template-
+  editing operators into the CodeMirror-paying tier; a
+  future enhancement but out of scope today
+- **Push walker skips dot-files and common build
+  artifacts** (`.git`, `.gestalt`, `node_modules`, `dist`,
+  `build`, `.DS_Store`). Operators who keep an editing
+  checkout in the same directory shouldn't accidentally
+  push their `node_modules` to the server. The skip list is
+  minimal — the brief said "starts from the directory you
+  give it"; adding the SKIP_NAMES set was a defense
+  against operator mistakes, not a deviation from the
+  intent
+- **Push uses sync FS calls.** Consistent with the rest of
+  `platform-extras.ts` (which uses `readFileSync` /
+  `writeFileSync` / `unlinkSync` for the editor flow).
+  Brief's pseudocode showed async `fs/promises`; either
+  would work, but staying consistent with the file's
+  existing style is cleaner
+- **Diff `(modified)` vs `(unchanged)` decision uses
+  added+removed line count, not change-block count.** A
+  block of unchanged context surrounded by changes would
+  still count toward the modified-file classification.
+  Counting added+removed lines (excluding empty trailing
+  newlines) gives the right semantic: "are there real
+  changes in this file"
+- **Diff `--stat` row format right-pads paths to 40 chars.**
+  Most template file paths are < 30 chars; 40 gives a
+  little headroom while keeping the columns visually
+  aligned. The `+N -M` counts are colorised (green/red) so
+  scannable at a glance
+- **Diff context-folding shows 2 leading + 2 trailing
+  unchanged lines** with `... (N unchanged)` between. Short
+  files (≤ 4 unchanged lines in a row) show the full
+  context. The cutoff is the brief's suggestion; tested
+  against the verification template's AGENTS.md (68
+  unchanged lines collapsed correctly)
+- **No new server endpoints, no new migrations.** Both
+  push and diff use the existing
+  `PATCH /platform/templates/:id/files` and
+  `GET /platform/templates/:id` endpoints from the prior
+  session. The dashboard CodeMirror integration is purely
+  UI-side
+
+Bundle size note flagged for follow-up:
+
+- Dashboard bundle grew from 363 KB to 1010 KB (319 KB
+  gzipped, +190 KB delta). Vite's 500 KB warning threshold
+  is now exceeded. Acceptable for an admin-only feature
+  (regular users don't load the Admin route's editor) but
+  a future code-split via dynamic `import()` of CodeMirror
+  modules (similar to how `jszip` is already
+  dynamic-imported in `UploadTemplateModal`) would push
+  the bundle delta from the main chunk into a deferred
+  one only loaded when an operator opens the template
+  editor
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker server image NOT rebuilt — the new dashboard bundle
+was `docker cp`'d into the running container at
+`/app/packages/dashboard/dist/`. Next clean image rebuild
+(`docker compose build server`) will fold the new dashboard
+build into the image proper. All CLI commands exercised
+end-to-end against the live platform: push happy path +
+dry-run + 3 error paths, diff full + --stat + added-file +
+clean-duplicate + 2 error paths, plus the existing
+download / duplicate / delete subcommands as part of the
+verification flow.
+
+Pending follow-ups: none introduced. The bundle size
+delta is the only candidate for future iteration — a
+single-day refactor to dynamic-import the CodeMirror
+modules from inside the TemplateEditor mount effect would
+restore the main bundle to ~370 KB and only fire the
+extra ~640 KB raw on first editor open.

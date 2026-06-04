@@ -19,11 +19,13 @@
     "adm-zip": "^0.5.10",
     "chalk": "^4.1.2",
     "commander": "^12.0.0",
+    "diff": "^5.2.0",
     "eventsource": "^2.0.2",
     "ora": "^5.4.1"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.5",
+    "@types/diff": "^5.2.0",
     "@types/eventsource": "^1.1.15",
     "@types/node": "^20.0.0",
     "tsx": "^4.7.0",

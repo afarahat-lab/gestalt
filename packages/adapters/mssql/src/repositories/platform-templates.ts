@@ -20,4 +20,7 @@ export class MssqlPlatformTemplateRepository implements PlatformTemplateReposito
   async update(_id: string, _updates: Partial<Omit<PlatformTemplateRecord, 'id' | 'createdAt'>>): Promise<PlatformTemplateRecord> { return notImplemented(); }
   async setDefault(_id: string): Promise<void> { return notImplemented(); }
   async delete(_id: string): Promise<void> { return notImplemented(); }
+  async updateFiles(_id: string, _files: Record<string, string>): Promise<PlatformTemplateRecord> { return notImplemented(); }
+  async deleteFile(_id: string, _filePath: string): Promise<PlatformTemplateRecord> { return notImplemented(); }
+  async duplicate(_sourceId: string, _name: string, _slug: string, _createdBy: string | null): Promise<PlatformTemplateRecord> { return notImplemented(); }
 }

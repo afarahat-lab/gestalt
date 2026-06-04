@@ -39,6 +39,9 @@
  *   gestalt platform projects create                        — interactive register + init-harness
  *   gestalt platform projects delete <name>                 — typed-name confirmation
  *   gestalt platform templates list/upload/inspect/set-default/delete   — harness templates
+ *   gestalt platform templates download/duplicate/edit/add-file/remove-file — template editor
+ *   gestalt platform templates push <slug> <dirPath>           — batch-upload a local directory
+ *   gestalt platform templates diff <slug> [--against ...]     — diff against the baseline built-in
  *   gestalt platform mcp list/add/enable/disable/test/remove    — platform-wide MCP servers
  *   gestalt platform tools list                                 — built-in tool inspector
  *   gestalt platform identity show/configure/reload/...         — corporate identity
@@ -123,6 +126,10 @@ import {
 import {
   platformTemplatesListCommand, platformTemplatesUploadCommand,
   platformTemplatesInspectCommand,
+  platformTemplatesDownloadCommand, platformTemplatesDuplicateCommand,
+  platformTemplatesEditCommand, platformTemplatesAddFileCommand,
+  platformTemplatesRemoveFileCommand,
+  platformTemplatesPushCommand, platformTemplatesDiffCommand,
   platformTemplatesSetDefaultCommand, platformTemplatesDeleteCommand,
   platformMcpListCommand, platformMcpAddCommand,
   platformMcpEnableCommand, platformMcpDisableCommand,
@@ -857,6 +864,72 @@ platformTemplates
   .option('--server <url>', 'Server URL (one-shot override for this invocation)')
   .action(async (slug: string, opts: { server?: string }) => {
     await platformTemplatesInspectCommand(slug, { server: opts.server }).catch(fatalError);
+  });
+
+// ─── Template download / duplicate / edit / file CRUD (in-place editor) ──────
+
+platformTemplates
+  .command('download <slug>')
+  .description('Download a template as a ZIP archive (default: ./<slug>-template.zip).')
+  .option('--output <path>', 'Output path for the ZIP')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (slug: string, opts: { output?: string; server?: string }) => {
+    await platformTemplatesDownloadCommand(slug, { output: opts.output, server: opts.server }).catch(fatalError);
+  });
+
+platformTemplates
+  .command('duplicate <slug>')
+  .description('Copy an existing template into a new editable one. Especially useful for built-ins.')
+  .option('--name <name>', 'New template name (prompts if omitted)')
+  .option('--new-slug <slug>', 'New template slug (prompts if omitted)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (slug: string, opts: { name?: string; newSlug?: string; server?: string }) => {
+    await platformTemplatesDuplicateCommand(slug, { name: opts.name, newSlug: opts.newSlug, server: opts.server }).catch(fatalError);
+  });
+
+platformTemplates
+  .command('edit <slug> <filePath>')
+  .description('Edit a single file in a custom template. Opens $EDITOR if --content is omitted. Built-ins are read-only — duplicate first.')
+  .option('--content <string>', 'New file content (skips the editor)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (slug: string, filePath: string, opts: { content?: string; server?: string }) => {
+    await platformTemplatesEditCommand(slug, filePath, { content: opts.content, server: opts.server }).catch(fatalError);
+  });
+
+platformTemplates
+  .command('add-file <slug> <filePath>')
+  .description('Add a new file to a custom template. Opens $EDITOR if --content is omitted.')
+  .option('--content <string>', 'New file content (skips the editor)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (slug: string, filePath: string, opts: { content?: string; server?: string }) => {
+    await platformTemplatesAddFileCommand(slug, filePath, { content: opts.content, server: opts.server }).catch(fatalError);
+  });
+
+platformTemplates
+  .command('remove-file <slug> <filePath>')
+  .description('Remove a non-required file from a custom template. Required files (AGENTS.md, HARNESS.json, agents.yaml) cannot be removed.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (slug: string, filePath: string, opts: { server?: string }) => {
+    await platformTemplatesRemoveFileCommand(slug, filePath, { server: opts.server }).catch(fatalError);
+  });
+
+platformTemplates
+  .command('push <slug> <dirPath>')
+  .description('Push every file in a local directory to a custom template (MERGE semantics — unsupplied files preserved). Built-ins are read-only.')
+  .option('--dry-run', 'Print the file list without making any changes')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (slug: string, dirPath: string, opts: { dryRun?: boolean; server?: string }) => {
+    await platformTemplatesPushCommand(slug, dirPath, { dryRun: opts.dryRun, server: opts.server }).catch(fatalError);
+  });
+
+platformTemplates
+  .command('diff <slug>')
+  .description('Show line-by-line differences between a template and a baseline (default: the built-in `corporate-ops-web-mobile`).')
+  .option('--against <baselineSlug>', 'Compare against a different baseline template')
+  .option('--stat', 'Print only the per-file +added -removed summary')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (slug: string, opts: { against?: string; stat?: boolean; server?: string }) => {
+    await platformTemplatesDiffCommand(slug, { against: opts.against, stat: opts.stat, server: opts.server }).catch(fatalError);
   });
 
 // gestalt platform mcp — platform-wide MCP servers (Session 3 — migration 017)

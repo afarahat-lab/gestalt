@@ -1,11 +1,16 @@
 /**
- * Platform templates routes (Session 3 — migration 017).
+ * Platform templates routes (Session 3 — migration 017; download +
+ * editor follow-up).
  *
  *   GET    /platform/templates           — any authenticated user
  *   GET    /platform/templates/:id       — any authenticated user
+ *   GET    /platform/templates/:id/download — operator+, streams a ZIP
  *   POST   /platform/templates           — platform-admin only
  *   POST   /platform/templates/:id/set-default — platform-admin only
- *   DELETE /platform/templates/:id       — platform-admin only
+ *   POST   /platform/templates/:id/duplicate    — platform-admin only
+ *   PATCH  /platform/templates/:id/files        — platform-admin only
+ *   DELETE /platform/templates/:id/files/*      — platform-admin only
+ *   DELETE /platform/templates/:id              — platform-admin only
  *
  * The list endpoint is open to every authenticated user because the
  * dashboard's project-creation flow needs to populate a template
@@ -14,12 +19,19 @@
  * multi-KB content on the wire when only the chooser needs slug +
  * name + version.
  *
- * Built-in templates (`isBuiltin: true`) are read-only — they can't
- * be updated or deleted via the API. The default flag is the one
- * thing operators flip on a built-in.
+ * Built-in templates (`isBuiltin: true`) cannot be edited or deleted
+ * — only downloaded, duplicated, and set as default. Operators who
+ * want to customise a built-in flow duplicate it first, then edit
+ * the copy via PATCH /files / DELETE /files/*.
+ *
+ * Required files (AGENTS.md, HARNESS.json, agents.yaml) cannot be
+ * removed from any template — DELETE /files/* returns 400 REQUIRED_FILE.
+ * PATCH /files is a MERGE not a REPLACE — unspecified files are
+ * preserved unchanged so a partial update never wipes adjacent state.
  */
 
 import type { FastifyInstance } from 'fastify';
+import AdmZip from 'adm-zip';
 import {
   getRepositories, createContextLogger,
   type PlatformTemplateRecord, type PlatformTemplateSummary,
@@ -293,6 +305,245 @@ export async function registerTemplateRoutes(app: FastifyInstance): Promise<void
       });
 
       log.info({ slug: existing.slug }, 'Platform template deleted');
+      return reply.code(204).send();
+    },
+  );
+
+  // ─── Download (operator+) — streams a ZIP of every file in the template.
+  // Reachable by anyone who can register a project so they can crack open
+  // the built-in as a starting point for an upload.
+  app.get<{ Params: { id: string } }>(
+    '/platform/templates/:id/download',
+    { preHandler: requireRole('operator') },
+    async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+      const { platformTemplates, audit } = getRepositories();
+      const template = await platformTemplates.findById(request.params.id);
+      if (!template) return reply.code(404).send({ error: 'Template not found' });
+
+      // adm-zip builds the archive in memory; the operator's templates
+      // (8 files ≈ low-double-digit KB) fit comfortably without
+      // streaming. For very large templates we'd switch to `archiver`
+      // streamed to reply.raw, but the current ceiling is fine.
+      const zip = new AdmZip();
+      for (const [filePath, content] of Object.entries(template.files)) {
+        zip.addFile(filePath, Buffer.from(content, 'utf8'));
+      }
+      const buffer = zip.toBuffer();
+
+      await audit.append({
+        actor: request.user.id,
+        action: 'platform.template-downloaded',
+        entityType: 'platform_templates',
+        entityId: template.id,
+        correlationId: request.correlationId,
+        metadata: {
+          slug: template.slug,
+          name: template.name,
+          fileCount: Object.keys(template.files).length,
+          sizeBytes: buffer.length,
+          ip: request.ip,
+        },
+      });
+
+      log.info({ slug: template.slug, sizeBytes: buffer.length }, 'Platform template downloaded');
+      return reply
+        .header('Content-Type', 'application/zip')
+        .header('Content-Disposition', `attachment; filename="${template.slug}-template.zip"`)
+        .send(buffer);
+    },
+  );
+
+  // ─── Duplicate (admin) — copies a template into a new editable row.
+  // Operators duplicate the built-in to customise it; the copy lands as
+  // `isBuiltin: false, isDefault: false`. Slug clash → 409 SLUG_TAKEN.
+  app.post<{ Params: { id: string }; Body: { name?: unknown; slug?: unknown } }>(
+    '/platform/templates/:id/duplicate',
+    { preHandler: requireRole('admin') },
+    async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+      const { platformTemplates, audit } = getRepositories();
+      const source = await platformTemplates.findById(request.params.id);
+      if (!source) return reply.code(404).send({ error: 'Template not found' });
+
+      const body = request.body ?? {};
+      if (typeof body.name !== 'string' || !body.name.trim()) {
+        return reply.code(400).send({ error: 'name is required (non-empty string)', code: 'INVALID_NAME' });
+      }
+      if (typeof body.slug !== 'string' || !body.slug.trim()) {
+        return reply.code(400).send({ error: 'slug is required (non-empty string)', code: 'INVALID_SLUG' });
+      }
+      if (!/^[a-z0-9][a-z0-9-]*[a-z0-9]$/i.test(body.slug.trim())) {
+        return reply.code(400).send({
+          error: 'slug must be kebab-case (letters/digits/hyphens; no leading or trailing hyphen)',
+          code: 'INVALID_SLUG',
+        });
+      }
+      const newName = body.name.trim();
+      const newSlug = body.slug.trim();
+      const clash = await platformTemplates.findBySlug(newSlug);
+      if (clash) {
+        return reply.code(409).send({
+          error: `Template with slug '${newSlug}' already exists`,
+          code: 'SLUG_TAKEN',
+        });
+      }
+
+      const created = await platformTemplates.duplicate(source.id, newName, newSlug, request.user.id);
+
+      await audit.append({
+        actor: request.user.id,
+        action: 'platform.template-duplicated',
+        entityType: 'platform_templates',
+        entityId: created.id,
+        correlationId: request.correlationId,
+        metadata: {
+          sourceId: source.id,
+          sourceSlug: source.slug,
+          newSlug: created.slug,
+          newName: created.name,
+          fileCount: Object.keys(created.files).length,
+          ip: request.ip,
+        },
+      });
+
+      log.info({ sourceSlug: source.slug, newSlug: created.slug }, 'Platform template duplicated');
+      return reply.code(201).send({ data: toSummary(created) });
+    },
+  );
+
+  // ─── PATCH /files (admin) — merge the supplied files into the template.
+  // Only the keys included in `body.files` change; other files are
+  // preserved (postgres `files || $1::jsonb` semantics). Built-ins are
+  // immutable; required files cannot be removed via this endpoint
+  // (the JSONB merge can't delete keys anyway, but we still validate
+  // every required file remains present after the merge).
+  app.patch<{ Params: { id: string }; Body: { files?: unknown } }>(
+    '/platform/templates/:id/files',
+    { preHandler: requireRole('admin') },
+    async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+      const { platformTemplates, audit } = getRepositories();
+      const template = await platformTemplates.findById(request.params.id);
+      if (!template) return reply.code(404).send({ error: 'Template not found' });
+      if (template.isBuiltin) {
+        return reply.code(400).send({
+          error: 'Cannot edit a built-in template — duplicate it first',
+          code: 'BUILTIN_TEMPLATE',
+        });
+      }
+
+      const body = request.body ?? {};
+      if (body.files === undefined || typeof body.files !== 'object' || body.files === null || Array.isArray(body.files)) {
+        return reply.code(400).send({
+          error: 'files is required (object: { path: content })',
+          code: 'INVALID_FILES',
+        });
+      }
+      const filesIn: Record<string, string> = {};
+      for (const [path, content] of Object.entries(body.files as Record<string, unknown>)) {
+        if (typeof content !== 'string') {
+          return reply.code(400).send({
+            error: `files['${path}']: content must be a string`,
+            code: 'INVALID_FILES',
+          });
+        }
+        if (!path.trim()) {
+          return reply.code(400).send({
+            error: 'files: path keys must be non-empty',
+            code: 'INVALID_FILES',
+          });
+        }
+        filesIn[path] = content;
+      }
+
+      // Brief 3 / required-file guard: after the merge the resulting
+      // file map must still carry AGENTS.md + HARNESS.json + agents.yaml
+      // by basename. Today the merge only ADDS keys (can't remove),
+      // so existing required files are safe — but a future caller that
+      // bundles a remove-and-replace flow shouldn't bypass the guard.
+      const mergedKeys = new Set([...Object.keys(template.files), ...Object.keys(filesIn)]);
+      const basenames = new Set([...mergedKeys].map((p) => p.split('/').pop() ?? p));
+      const missing = REQUIRED_FILES.filter((f) => !basenames.has(f));
+      if (missing.length > 0) {
+        return reply.code(400).send({
+          error: `Template is missing required files: ${missing.join(', ')}`,
+          code: 'MISSING_REQUIRED_FILES',
+          missingFiles: missing,
+        });
+      }
+
+      const updated = await platformTemplates.updateFiles(template.id, filesIn);
+
+      await audit.append({
+        actor: request.user.id,
+        action: 'platform.template-files-updated',
+        entityType: 'platform_templates',
+        entityId: template.id,
+        correlationId: request.correlationId,
+        metadata: {
+          slug: template.slug,
+          // names ONLY — file CONTENT never reaches the audit row
+          changedFiles: Object.keys(filesIn).sort(),
+          ip: request.ip,
+        },
+      });
+
+      log.info({ slug: template.slug, changedFiles: Object.keys(filesIn).length }, 'Platform template files updated');
+      return reply.send({ data: toSummary(updated) });
+    },
+  );
+
+  // ─── DELETE /files/* (admin) — remove ONE file from the template.
+  // Required files cannot be removed (returns 400 REQUIRED_FILE).
+  // Built-ins are immutable. Wildcard route param so `docs/X.md` works.
+  app.delete<{ Params: { id: string; '*': string } }>(
+    '/platform/templates/:id/files/*',
+    { preHandler: requireRole('admin') },
+    async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+      const filePath = request.params['*'];
+      if (!filePath || !filePath.trim()) {
+        return reply.code(400).send({ error: 'file path required', code: 'INVALID_PATH' });
+      }
+      const { platformTemplates, audit } = getRepositories();
+      const template = await platformTemplates.findById(request.params.id);
+      if (!template) return reply.code(404).send({ error: 'Template not found' });
+      if (template.isBuiltin) {
+        return reply.code(400).send({
+          error: 'Cannot edit a built-in template — duplicate it first',
+          code: 'BUILTIN_TEMPLATE',
+        });
+      }
+      // Match against the file path's basename — same convention as the
+      // upload validator. An operator cannot remove `whatever/AGENTS.md`.
+      const basename = filePath.split('/').pop() ?? filePath;
+      if (REQUIRED_FILES.includes(basename)) {
+        return reply.code(400).send({
+          error: `Cannot remove required file: ${basename}`,
+          code: 'REQUIRED_FILE',
+          requiredFile: basename,
+        });
+      }
+      if (!Object.prototype.hasOwnProperty.call(template.files, filePath)) {
+        return reply.code(404).send({
+          error: `File not found in template: ${filePath}`,
+          code: 'FILE_NOT_FOUND',
+        });
+      }
+
+      await platformTemplates.deleteFile(template.id, filePath);
+
+      await audit.append({
+        actor: request.user.id,
+        action: 'platform.template-file-deleted',
+        entityType: 'platform_templates',
+        entityId: template.id,
+        correlationId: request.correlationId,
+        metadata: { slug: template.slug, filePath, ip: request.ip },
+      });
+
+      log.info({ slug: template.slug, filePath }, 'Platform template file deleted');
       return reply.code(204).send();
     },
   );

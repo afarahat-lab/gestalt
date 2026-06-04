@@ -219,4 +219,68 @@ export class PostgresPlatformTemplateRepository implements PlatformTemplateRepos
     const db = getDb();
     await db`DELETE FROM platform_templates WHERE id = ${id}`;
   }
+
+  /**
+   * Merge the supplied files map into the existing JSONB. `files || $1::jsonb`
+   * keeps unsupplied keys untouched. `db.json(...)` ensures the binding lands
+   * as proper JSONB (same trap the maintenance_runs / tool_calls repos avoid).
+   */
+  async updateFiles(id: string, files: Record<string, string>): Promise<PlatformTemplateRecord> {
+    const db = getDb();
+    const filesJson = db.json(files as unknown as Parameters<typeof db.json>[0]);
+    const [row] = await db<TemplateRow[]>`
+      UPDATE platform_templates
+      SET files = files || ${filesJson}::jsonb,
+          updated_at = NOW()
+      WHERE id = ${id}
+      RETURNING *
+    `;
+    if (!row) throw new Error(`Platform template ${id} not found`);
+    return rowToRecord(row);
+  }
+
+  /**
+   * Remove one key from the `files` JSONB. The `-` operator on JSONB returns
+   * a copy with the key removed; idempotent when the key is absent.
+   */
+  async deleteFile(id: string, filePath: string): Promise<PlatformTemplateRecord> {
+    const db = getDb();
+    const [row] = await db<TemplateRow[]>`
+      UPDATE platform_templates
+      SET files = files - ${filePath},
+          updated_at = NOW()
+      WHERE id = ${id}
+      RETURNING *
+    `;
+    if (!row) throw new Error(`Platform template ${id} not found`);
+    return rowToRecord(row);
+  }
+
+  /**
+   * Read the source template and INSERT a copy with new name/slug/createdBy.
+   * `isBuiltin: false, isDefault: false` regardless of source — operators flip
+   * the default afterwards. Slug clash → unique constraint violation (caller
+   * route translates to 409 SLUG_TAKEN).
+   */
+  async duplicate(
+    sourceId: string,
+    name: string,
+    slug: string,
+    createdBy: string | null,
+  ): Promise<PlatformTemplateRecord> {
+    const source = await this.findById(sourceId);
+    if (!source) throw new Error(`Platform template ${sourceId} not found`);
+    return this.create({
+      slug,
+      name,
+      description: source.description,
+      tier: source.tier === 'Tier 1' ? 'Custom' : source.tier,
+      version: source.version,
+      isDefault: false,
+      isBuiltin: false,
+      files: source.files,
+      variables: source.variables,
+      createdBy,
+    });
+  }
 }

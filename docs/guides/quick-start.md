@@ -416,6 +416,81 @@ gestalt agents validate <projectName>  # check agents.yaml parses + valid
 
 ---
 
+## Authoring custom templates
+
+The harness files committed to every new project (`AGENTS.md`,
+`HARNESS.json`, `agents.yaml`, `docs/*`, `.github/workflows/gestalt.yml`)
+come from a platform-admin-managed template. Operators who want to ship
+their own conventions can either start from the built-in template or
+edit a custom one in place.
+
+### Starting from the built-in template
+
+```bash
+# 1. Download the built-in as a starting point
+gestalt platform templates download corporate-ops-web-mobile \
+  --output ./my-template.zip
+
+# 2. Unzip, modify files locally (AGENTS.md / HARNESS.json /
+#    constraint rules / architecture patterns), then re-zip
+unzip my-template.zip -d ./my-template
+# ... edit files ...
+cd my-template && zip -r ../my-template.zip . && cd -
+
+# 3. Upload as a new custom template
+gestalt platform templates upload ./my-template.zip
+# Prompts for name / slug / tier / version
+```
+
+### Editing a template in place
+
+For small tweaks, duplicate the built-in and edit through the platform:
+
+```bash
+# 1. Duplicate the built-in (built-ins are read-only)
+gestalt platform templates duplicate corporate-ops-web-mobile \
+  --name "My Template" --new-slug my-template
+
+# 2. Edit files via $EDITOR
+gestalt platform templates edit my-template harness/AGENTS.md
+# Opens $EDITOR with the current AGENTS.md content; saving + exiting
+# pushes the change. Use --content "<string>" to skip the editor.
+
+# 3. Add a new file (e.g. operator-runbook.md)
+gestalt platform templates add-file my-template docs/RUNBOOK.md
+
+# 4. Remove a non-required file
+gestalt platform templates remove-file my-template docs/DECISIONS.md
+
+# 5. Inspect what variables the template uses
+gestalt platform templates inspect my-template
+
+# 6. Set as default so `gestalt init` uses it
+gestalt platform templates set-default my-template
+```
+
+The same surface is available in the dashboard at
+`/app/admin/templates` — each row has `[↓ Download]`, `[⎘ Duplicate]`,
+and (for custom rows) `[✎ Edit]` buttons. The edit panel renders a
+file tree on the left + a textarea editor on the right with per-file
+save / discard / delete + a "save all changes" button at the bottom.
+
+### Constraints
+
+- **Built-in templates are read-only.** `PATCH /files` and
+  `DELETE /files/*` return `400 BUILTIN_TEMPLATE`. Duplicate first.
+- **Required files cannot be removed** — `AGENTS.md`, `HARNESS.json`,
+  and `agents.yaml` (by basename). `remove-file` returns
+  `400 REQUIRED_FILE` on these. They can still be EDITED.
+- **PATCH /files is a MERGE not a REPLACE.** Only the keys you supply
+  change; other files are preserved. Saving one file doesn't wipe
+  adjacent state.
+- **Audit metadata records changed file NAMES only** — never content.
+  GP-006 holds: a forensics operator can see who-changed-what but
+  never the file content from `audit_log`.
+
+---
+
 ## Summary — command reference
 
 | Command | When | Purpose |
@@ -452,6 +527,14 @@ gestalt agents validate <projectName>  # check agents.yaml parses + valid
 | `gestalt agents active [--project <name>]` | As needed | Currently-running agents with intent text + token total |
 | `gestalt agents list <name>` | As needed | Show framework + custom agents for a project |
 | `gestalt agents validate <name>` | As needed | Validate `agents.yaml` and report warnings |
+| `gestalt platform templates list` | As needed | List registered harness templates |
+| `gestalt platform templates download <slug> [--output <path>]` | Authoring | Download a template as a ZIP |
+| `gestalt platform templates duplicate <slug> --name <n> --new-slug <s>` | Authoring | Copy a template into a new editable one |
+| `gestalt platform templates edit <slug> <filePath> [--content <str>]` | Authoring | Edit a single file in a custom template ($EDITOR fallback) |
+| `gestalt platform templates add-file <slug> <filePath>` | Authoring | Add a new file to a custom template |
+| `gestalt platform templates remove-file <slug> <filePath>` | Authoring | Remove a non-required file from a custom template |
+| `gestalt platform templates inspect <slug>` | Authoring | List files + per-`{{variable}}` usage |
+| `gestalt platform templates set-default <slug>` | Authoring | Make `<slug>` the default for `gestalt init` |
 
 ---
 

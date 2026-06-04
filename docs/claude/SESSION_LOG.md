@@ -15515,3 +15515,693 @@ iterations:
 - Migrate the rotateMasterKey path to also rotate vault secret
   references when the master.key file is regenerated in dev mode
   (so operators iterating with dev-override don't lose vault data)
+
+---
+
+### Session 2026-06-04 — Claude Code (template download + in-place configuration editor, no migration)
+
+Adds the platform-admin tooling to (1) download any harness
+template as a ZIP, (2) duplicate built-ins into editable
+copies, and (3) edit custom-template files in place via both
+the dashboard inline editor and the CLI. No new migration —
+the feature reuses the existing `platform_templates.files`
+JSONB column from migration 017 with two new postgres
+operators (`||` for merge, `-` for delete-key).
+
+Changed:
+
+- **Core repository interface** (`packages/core/src/repository/index.ts`):
+  `PlatformTemplateRepository` gained three new methods —
+  `updateFiles(id, files)` (MERGE semantics, returns the
+  updated record), `deleteFile(id, filePath)` (removes one
+  key from the JSONB), `duplicate(sourceId, name, slug,
+  createdBy)` (re-uses `create` after `findById`, always
+  yields `isBuiltin: false, isDefault: false`)
+- **Postgres impl** (`packages/adapters/postgres/src/repositories/platform-templates.ts`):
+  - `updateFiles` runs `UPDATE platform_templates SET
+    files = files || ${db.json(files)}::jsonb, updated_at =
+    NOW() WHERE id = ${id} RETURNING *`. `db.json` ensures
+    the binding lands as proper JSONB (same trap the
+    maintenance_runs / tool_calls / context repos avoid).
+    The `||` operator is shallow merge — keys in the
+    supplied map overwrite, keys not in the supplied map
+    are preserved
+  - `deleteFile` runs `UPDATE ... SET files = files -
+    ${filePath}` — postgres's `-` operator on JSONB
+    returns a copy with the key removed; idempotent when
+    the key is absent (but the route checks first and
+    returns 404 instead, so the operator gets a useful
+    error)
+  - `duplicate` reads the source via `findById`, then
+    `create(...)` with `isBuiltin: false, isDefault:
+    false`. Tier coerces `Tier 1` → `Custom` (the built-in's
+    tier shouldn't carry over) but otherwise preserves
+    every field
+- **Oracle + MSSQL adapters**: throw-stub the three new
+  methods. Same convention every prior adapter session has
+  used
+- **Server package**: added `adm-zip ^0.5.10` runtime dep +
+  `@types/adm-zip ^0.5.5` devDep. CLI already had this
+  for the upload-side ZIP parsing
+- **Server routes** (`packages/server/src/routes/templates.ts`):
+  four new routes:
+  - `GET /platform/templates/:id/download`
+    (`requireRole('operator')`) — builds the ZIP in memory
+    via `adm-zip`, sets `Content-Type: application/zip` +
+    `Content-Disposition: attachment; filename="<slug>-
+    template.zip"`, sends the buffer. Audit row
+    `platform.template-downloaded` with metadata `{slug,
+    name, fileCount, sizeBytes, ip}`. Operator+ because
+    project-admins use it as a "starting point" download
+    even when they're not platform-admins
+  - `POST /platform/templates/:id/duplicate` (admin) —
+    body `{name, slug}`. Validates name/slug shape; slug
+    clash → 409 `SLUG_TAKEN`. Calls the repository's
+    `duplicate` method. Audit row
+    `platform.template-duplicated` with metadata
+    `{sourceId, sourceSlug, newSlug, newName, fileCount,
+    ip}`
+  - `PATCH /platform/templates/:id/files` (admin) — body
+    `{files: {path: content}}`. Built-in guard: 400
+    `BUILTIN_TEMPLATE` (operators duplicate first).
+    Required-file guard: after the would-be merge, every
+    one of `AGENTS.md` / `HARNESS.json` / `agents.yaml`
+    must still be present by basename. Today the merge
+    can only ADD keys (postgres `||` doesn't remove), so
+    existing required files are safe — but the
+    defensive check prevents a future caller that bundles
+    a remove-and-replace flow from bypassing the guard.
+    Audit row `platform.template-files-updated` with
+    metadata `{slug, changedFiles: string[], ip}` —
+    **file NAMES only, never content** (GP-006)
+  - `DELETE /platform/templates/:id/files/*` (admin) —
+    wildcard route param so `docs/X.md` works. Built-in
+    guard: 400 `BUILTIN_TEMPLATE`. Required-file guard
+    by basename: 400 `REQUIRED_FILE` for `AGENTS.md`,
+    `HARNESS.json`, `agents.yaml`. Path-not-found: 404
+    `FILE_NOT_FOUND` (so a typo never silently no-ops).
+    Audit row `platform.template-file-deleted` with
+    metadata `{slug, filePath, ip}`
+- **Dashboard API client**
+  (`packages/dashboard/src/api/client.ts`): four new
+  methods — `downloadPlatformTemplate(id)` (returns
+  `Promise<Blob>` so the caller triggers a browser
+  download via `URL.createObjectURL` + `<a download>`,
+  preserving the Authorization header that a plain
+  `window.open` would lose); `duplicatePlatformTemplate(id,
+  body)`; `updatePlatformTemplateFiles(id, files)`;
+  `deletePlatformTemplateFile(id, filePath)` (segment-
+  encodes the path so each path component is properly
+  URI-escaped while preserving the `/` separators
+  Fastify's wildcard route expects)
+- **Dashboard `TemplatesTab`**
+  (`packages/dashboard/src/views/Admin.tsx`): rewritten
+  with per-row `[↓ Download]` / `[⎘ Duplicate]` / `[✎ Edit]`
+  (custom only) / `[★ Set default]` (non-default only) /
+  `[×]` (custom only) actions. Download triggers the
+  blob → object-URL → `<a>` click pattern (cleaning up
+  after itself with `URL.revokeObjectURL`).
+  Duplicate opens a new `DuplicateTemplateModal` (name +
+  slug inputs, both defaulted from the source). Edit
+  switches the inline-expanded panel from
+  `TemplateDetailPanel` (the existing variable usage
+  view) to a new `TemplateEditor` component
+- **New `DuplicateTemplateModal`** — minimal modal with
+  name + slug fields, defaulted to `<source-name>
+  (Custom)` + `<source-slug>-custom`. POST + close on
+  success; surfaces typed errors (`SLUG_TAKEN`,
+  `INVALID_SLUG`) inline
+- **New `TemplateEditor`** — inline panel with two
+  sub-panes:
+  - **Left:** file tree as a vertical list. Each row
+    shows path + `●` (amber) when modified. Required
+    files (AGENTS.md / HARNESS.json / agents.yaml by
+    basename) have NO `[×]` button (the server's 400
+    `REQUIRED_FILE` is the second-line defense, but the
+    operator shouldn't see a button that can't work).
+    Selected row highlights with `var(--bg-raised)`.
+    `[+ Add file]` button at the bottom opens an inline
+    input row that creates an empty draft on Enter
+  - **Right:** monospace `<textarea>` for the selected
+    file, ~400px min height, vertical resize. `[Save
+    this file]` button is enabled only when the draft
+    differs from the persisted content. `[Discard
+    changes]` reverts the draft to the persisted state.
+    Header line shows the file path + `● modified` chip
+    when different
+  - **Footer:** `[Save all changes (N)]` button +
+    "N file(s) modified — saved with one PATCH call"
+    hint. Combines every modified file into a single
+    PATCH so the audit row + Git history (when the
+    operator later commits) read as one atomic change
+  - Drafts persist in component state — a stray click
+    elsewhere in the row doesn't lose work, only `[×
+    Close editor]` exits. The `toggleExpand` handler
+    is a no-op while `editingId === t.id` so the row
+    click can't accidentally collapse the editor
+- **CLI API client** (`packages/cli/src/api/client.ts`):
+  four new methods mirroring the dashboard's surface.
+  `downloadPlatformTemplate(id)` returns a `Buffer`
+  (Node-side equivalent of the browser's Blob) so the
+  caller writes it via `fs.writeFileSync`
+- **CLI commands**
+  (`packages/cli/src/commands/platform-extras.ts`):
+  five new subcommands + a shared `resolveTemplateBySlug`
+  helper + an `editInEditor` helper for the `$EDITOR`
+  flow:
+  - `gestalt platform templates download <slug>
+    [--output <path>]` — writes the ZIP, prints file
+    count + byte size on success. Output default is
+    `./<slug>-template.zip`
+  - `gestalt platform templates duplicate <slug>
+    [--name <n>] [--new-slug <s>]` — prompts for the
+    missing fields with sensible defaults
+  - `gestalt platform templates edit <slug> <filePath>
+    [--content <string>]` — `$EDITOR` flow (falls back to
+    `$VISUAL`, then `vi`). Headless / non-TTY mode
+    writes to a tmp file and prompts the operator to
+    edit it manually before pressing Enter (CI-friendly).
+    `--content` skips the editor entirely. Compares the
+    post-edit content against the original to avoid a
+    no-op PATCH ("No changes to <path> — nothing to
+    save."). Editor exits with non-zero status → abort
+    cleanly
+  - `gestalt platform templates add-file <slug>
+    <filePath> [--content <string>]` — same editor flow
+    but refuses if the file already exists (operator gets
+    a hint to use `edit` instead)
+  - `gestalt platform templates remove-file <slug>
+    <filePath>` — confirms `y/N` then DELETEs. The
+    server's 400 `REQUIRED_FILE` surfaces verbatim
+  Helper `editInEditor(initial, hintLabel)` creates a
+  filename-safe suffix from the label (`gestalt-<ts>-
+  <slug-snippet>`) and cleans up the temp file in a
+  `finally` block on every code path
+- **CLI registration** (`packages/cli/src/index.ts`):
+  all five subcommands registered under the existing
+  `gestalt platform templates` parent. Top-of-file
+  command comment updated. Header comment in
+  `platform-extras.ts` updated to document the new
+  surface + the `$EDITOR` fallback contract
+- **Docs** (`docs/guides/quick-start.md`): new
+  "Authoring custom templates" section between
+  "Customising agents" and "Summary — command
+  reference". Covers two workflows: (1) start from the
+  built-in by downloading + editing locally + uploading
+  the modified ZIP; (2) in-place editing via
+  duplicate + edit + add-file + inspect + set-default.
+  Constraints block explicitly documents the built-in
+  read-only rule, required-file rule, MERGE semantics,
+  and GP-006 audit-content exclusion. Summary table
+  gained 7 new template-authoring rows (list, download,
+  duplicate, edit, add-file, remove-file, inspect,
+  set-default — minus list which was already there)
+
+Verified live end-to-end:
+
+- `pnpm -r build` clean across all 12 packages. Docker
+  server image rebuilt with the new `adm-zip` dep
+  baked in. `Up (healthy)`; existing migrations
+  unchanged
+- **Download** — `curl -H 'Auth: Bearer <admin>'
+  http://localhost:3000/platform/templates/<built-in>/download`
+  returned HTTP 200 + `Content-Type: application/zip`
+  + 8971-byte body. `unzip -l` listing shows all 8
+  expected files (`ci/gestalt.yml`,
+  `docs/{ARCHITECTURE,DECISIONS,DOMAIN,GOLDEN_PRINCIPLES}.md`,
+  `harness/{AGENTS.md, HARNESS.json, agents.yaml}`) at
+  the expected paths with reasonable byte sizes (108–
+  9797 bytes per file)
+- **Duplicate** — `POST .../duplicate {name: 'Corporate
+  Ops (Live Test)', slug: 'corporate-ops-livetest'}`
+  returned 201 with the new record: `isBuiltin: false`,
+  `isDefault: false`, `createdBy: <admin uuid>`, all 8
+  source files copied
+- **Edit + MERGE semantics** — PATCH /files with
+  `{harness/AGENTS.md: '<new content>'}` returned 200.
+  Subsequent GET shows AGENTS.md has the new content
+  + ALL 7 other files preserved with their original
+  byte content. Verified key-by-key
+- **Built-in guard** — PATCH /files on the built-in's
+  ID returned 400 `BUILTIN_TEMPLATE` with the typed
+  message "Cannot edit a built-in template — duplicate
+  it first"
+- **Required-file guard** — DELETE /files/harness/AGENTS.md
+  on the duplicate returned 400 `REQUIRED_FILE` with
+  `requiredFile: 'AGENTS.md'`. Same for
+  `harness/HARNESS.json`
+- **Invalid body** — PATCH /files with `{}` returned
+  400 `INVALID_FILES`
+- **Add + remove** — PATCH /files added a new
+  `docs/EXTRA.md`; subsequent GET shows 9 files. DELETE
+  /files/docs/EXTRA.md returned 204; subsequent GET
+  shows 8 files (the new one is gone, the original 8
+  preserved). DELETE on a non-existent path returned
+  404 `FILE_NOT_FOUND` (not 204 — typos shouldn't
+  silently succeed)
+- **Slug validation on duplicate** — POST .../duplicate
+  with an existing slug returned 409 `SLUG_TAKEN`;
+  missing `name` returned 400 `INVALID_NAME`; bad
+  slug shape (`-bad-slug`) returned 400 `INVALID_SLUG`
+- **Persistence across server restart** — `docker
+  compose restart server` + 5s wait, then refetch the
+  duplicate template. AGENTS.md still carries the
+  edited content. Data is in postgres
+  `platform_templates.files` JSONB, not memory
+- **Audit table** — direct probe shows all 4 new
+  actions wrote rows with the documented metadata
+  shape. `platform.template-files-updated` carries
+  `changedFiles: ['harness/AGENTS.md']` —
+  **NAMES only, not content**. GP-006 verified via
+  direct row inspection
+- **CLI download** — `gestalt platform templates
+  download corporate-ops-web-mobile --output
+  /tmp/cli-download.zip` produced
+  `✓ Template downloaded: /tmp/cli-download.zip
+  (8 files, 8971 bytes)`. Unzip listing identical to
+  the curl-driven download
+- **CLI edit + add-file + remove-file** — `gestalt
+  platform templates edit corporate-ops-livetest
+  harness/AGENTS.md --content '<text>'` succeeded;
+  inspect shows the updated content. `add-file ...
+  --content '<text>'` added the new file. `remove-file`
+  with auto-confirm (printf 'y\n') deleted it. The
+  `--content` flag path skips the `$EDITOR` flow
+  entirely — Headless / scripted operator workflows
+  work without a TTY
+- **CLI guards** — `edit corporate-ops-web-mobile
+  harness/AGENTS.md --content 'hacked'` returned
+  `Failed to edit ... 400 BUILTIN_TEMPLATE`. `remove-file
+  corporate-ops-livetest harness/AGENTS.md` returned
+  `Failed to remove ... 400 REQUIRED_FILE`. Errors
+  surface verbatim from the server
+- **CLI duplicate** — `gestalt platform templates
+  duplicate corporate-ops-web-mobile --name 'CLI
+  Duplicate Test' --new-slug cli-dupe-test` succeeded;
+  subsequent `templates list` shows three templates
+  (built-in + the two test duplicates)
+- **Cleanup** — `gestalt platform templates delete
+  cli-dupe-test` + `delete corporate-ops-livetest`
+  with `y` confirmation removed both. Final
+  `templates list` shows only the built-in remaining
+
+Decisions made:
+
+- **`adm-zip` not `archiver`.** The brief offered both.
+  `adm-zip` is already in the CLI's deps for upload-
+  side parsing; using the same library on the
+  server-side download keeps the dep surface tight. For
+  the current template size (8 files, ~9 KB) in-memory
+  zipping is fine; if templates ever grow into
+  multi-MB territory we'd switch to `archiver`'s
+  streaming API + `pipe(reply.raw)`
+- **MERGE not REPLACE.** Postgres's `files || $1::jsonb`
+  is the natural fit: only the supplied keys change,
+  other files are preserved. The brief was explicit
+  about this — "a partial update never wipes adjacent
+  state". The dashboard's `Save all changes (N)` button
+  combines every modified file into one PATCH so the
+  audit row + future Git commit narrate one
+  semantically-coherent change
+- **Required-file guard runs on the would-be-merged map,
+  not just on the supplied input.** Today the merge can
+  only ADD keys, so the existing required files are
+  safe — but a future caller bundling a remove-and-
+  replace flow shouldn't be able to drop a required
+  file via this endpoint. The defense-in-depth check
+  costs nothing
+- **Audit metadata records file NAMES, not content.**
+  GP-006. The dashboard / CLI have access to the full
+  content via the existing GET endpoint, so a forensics
+  operator can see WHO modified WHICH files and reach
+  for the content separately. Putting content in
+  `audit_log.metadata` would balloon the table fast
+  and replicate file content into every backup pull
+- **Built-in PATCH/DELETE returns 400 `BUILTIN_TEMPLATE`,
+  not 403.** The brief described it as "the
+  same guard as delete". The DELETE /platform/templates/:id
+  route uses 400 + `BUILTIN_TEMPLATE` (operator sees
+  "duplicate first" hint instead of an opaque "forbidden"
+  message). Matching the existing pattern keeps the
+  error surface consistent
+- **Duplicate's tier coerces `Tier 1` → `Custom`** but
+  preserves any other tier value. Built-in's `tier1`
+  shouldn't carry over to a custom row (that's a
+  marketing signal for ship-with-platform templates).
+  Custom tiers (`Custom`, operator-defined values)
+  pass through unchanged
+- **Dashboard download uses `URL.createObjectURL` + `<a
+  download>`, NOT `window.open`.** A `window.open` to
+  the download URL would lose the Authorization header
+  (the server's `requireRole('operator')` preHandler
+  would 401). The blob + object URL pattern wraps the
+  authenticated fetch in a download trigger that the
+  browser handles natively, preserving the operator's
+  session
+- **CLI `editInEditor` uses `$EDITOR` → `$VISUAL` →
+  `vi` priority.** Standard Unix convention. The
+  fallback to `vi` matches what `git commit` does. In
+  non-TTY environments the helper writes the temp file
+  and prompts the operator to edit it manually before
+  pressing Enter — CI-compatible without crashing
+- **`edit` command compares post-edit content against
+  the original** to avoid no-op PATCH calls. Operators
+  who open the editor + immediately exit (or who make
+  no changes) get a friendly "No changes to <path> —
+  nothing to save." instead of a wasted round-trip
+- **In-place editor preserves drafts across re-renders.**
+  The TemplateEditor's local state survives every
+  parent re-render — only `[× Close editor]` exits
+  the editor mode. A stray row-click can't lose
+  work. The `toggleExpand` handler explicitly
+  short-circuits when `editingId === t.id`
+- **DuplicateTemplateModal defaults: `<source-name>
+  (Custom)` + `<source-slug>-custom`.** Makes the
+  common case (duplicate built-in for tweaks) a
+  one-click operation. Operators who want a different
+  name/slug just type over the defaults
+- **No new migration.** All four routes work on the
+  existing `platform_templates.files` JSONB column from
+  migration 017. The duplicate uses INSERT (already
+  wired); update + delete use postgres's JSONB `||`
+  and `-` operators
+
+Build status: `pnpm -r build` clean across all 12
+packages. Docker server image rebuilt. Full validation
+matrix + MERGE semantics + persistence-across-restart +
+audit-row shape + CLI end-to-end + guard tests all
+verified live against the running platform. No
+migrations applied. Workspace test templates removed at
+session end; final DB state has only the built-in
+template.
+
+Pending follow-ups: none introduced. Possible future
+iterations:
+- Syntax highlighting in the dashboard's textarea
+  editor (today it's plain monospace) — the brief said
+  "keep it simple"; a future iteration could plug in
+  Monaco or CodeMirror for the common cases (Markdown,
+  JSON, YAML)
+- A `gestalt platform templates push <slug> <dirPath>`
+  command that uploads every file in a directory as a
+  PATCH (operators who edited locally without going
+  through the ZIP roundtrip)
+- A `gestalt platform templates diff <slug>` command
+  that shows the difference between a template and the
+  on-disk built-in (helps operators see what they've
+  customised vs the ship-default)
+- Streaming download via `archiver` + `pipe(reply.raw)`
+  if templates ever exceed single-digit MB
+
+---
+
+### Session 2026-06-04 — Claude Code (template editor improvements: CodeMirror syntax highlighting + gestalt platform templates push + diff)
+
+Three follow-ups to the previous session's template editor, all
+in one pass. Each is self-contained; no new migrations.
+
+**Enhancement 1 — CodeMirror 6 syntax highlighting in the
+dashboard editor.** Replaces the plain `<textarea>` in
+`TemplateEditor` (Admin.tsx) with a CodeMirror 6 editor.
+- `packages/dashboard/package.json` gains 7 new runtime deps:
+  `@codemirror/view`, `@codemirror/state`,
+  `@codemirror/lang-json`, `@codemirror/lang-yaml`,
+  `@codemirror/lang-markdown`, `@codemirror/theme-one-dark`,
+  and the `codemirror` meta package (which is where `basicSetup`
+  actually lives in v6 — the brief's pseudocode put it under
+  `@codemirror/view` which is incorrect; deviated to make the
+  imports compile)
+- New `getLanguageExtension(filePath)` helper at the top of the
+  `TemplateEditor` region maps file extension → CodeMirror lang
+  extension: `.json` → `json()`, `.yaml`/`.yml` → `yaml()`,
+  `.md` → `markdown()`, everything else → `[]` (plain text).
+  Only three language packs are imported per the brief —
+  bundle stays as lean as it can while still covering every
+  file the seeded template contains
+- `TemplateEditor` rewritten with three new refs:
+  `editorRef` (HTMLDivElement that holds the editor mount
+  point), `editorViewRef` (the current EditorView instance,
+  destroyed + nulled on cleanup), and `draftsRef` (latest
+  drafts captured for the updateListener closure so multiple
+  React renders don't strand stale references). New
+  `discardCounter` state slot bumps on every discard so the
+  edit-mount `useEffect` re-runs and rebuilds the EditorView
+  with the freshly-reverted doc
+- The mount `useEffect` is keyed on
+  `[selectedPath, discardCounter]`. On every change it
+  destroys the prior view, builds a new `EditorState` with
+  `doc: drafts[path]`, attaches `basicSetup` + `oneDark` +
+  `EditorView.lineWrapping` +
+  `getLanguageExtension(path)` +
+  `EditorView.updateListener.of(...)`, and instantiates a
+  new EditorView in `editorRef.current`. The updateListener
+  fires on every doc-change transaction and writes back via
+  `setDrafts((prev) => ({...prev, [path]: doc.toString()}))`
+- The `<textarea>` JSX block is replaced with
+  `<div ref={editorRef} style={...}>` — `minHeight: 400px,
+  maxHeight: 700px, overflow: auto`. The CSS variables
+  (`var(--border)`, etc.) are preserved so the editor
+  visually integrates with the rest of the panel
+- `discardOne` extended to also call
+  `setDiscardCounter((c) => c + 1)` when the discarded path
+  is the one in the editor — forces the useEffect to re-run
+  and reset the editor's doc. Otherwise the in-memory
+  EditorView would keep showing the operator's typed
+  content even after drafts state has been reverted
+- The now-unused `selectedContent` const is deleted
+- Bundle delta: 363 KB → 1010 KB raw (319 KB gzipped, +190
+  KB delta). Above Vite's 500 KB warning but acceptable for
+  an admin-only feature. Future iteration: code-split via
+  dynamic `import()` so only platform-admins editing
+  templates pay the cost
+
+**Enhancement 2 — `gestalt platform templates push
+<slug> <dirPath> [--dry-run]`.** Batch upload from a local
+directory tree.
+- New `collectTemplateFiles(dir, rootDir)` recursive walker
+  in `platform-extras.ts`. `SKIP_NAMES` Set excludes `.git`
+  / `.gestalt` / `node_modules` / `dist` / `build` /
+  `.DS_Store`. Path separators are normalised forward-slash
+  so Windows operators don't end up with `docs\X.md` keys
+  on the wire
+- New `platformTemplatesPushCommand(slug, dirPath, {dryRun})`
+  exported. Path-validates the dir, walks it, builds the
+  full file map. `--dry-run` prints sizes per file with a
+  "(dry run — no changes made)" footer. Real run calls
+  `PATCH /platform/templates/:id/files` (MERGE semantics —
+  unsupplied files preserved server-side)
+- Error handling: `BUILTIN_TEMPLATE` surfaces with `Cannot
+  push to a built-in template. Duplicate it first: gestalt
+  platform templates duplicate <slug>`;
+  `MISSING_REQUIRED_FILES` surfaces with the typed list +
+  "Ensure AGENTS.md, HARNESS.json, and agents.yaml are
+  present in the directory."; missing-dir → `Directory not
+  found: <path>` + exit 1
+- New `fs` sync imports (`readdirSync`, `statSync`,
+  `existsSync`) + `relative` path helper. The walker uses
+  sync FS calls to match the file's existing style (the
+  editor flow already uses `readFileSync` / `writeFileSync`
+  / `unlinkSync`)
+
+**Enhancement 3 — `gestalt platform templates diff <slug>
+[--against <baselineSlug>] [--stat]`.** Per-file unified
+diff against a baseline.
+- New `diff ^5.2.0` runtime dep + `@types/diff ^5.2.0` dev
+  dep in `packages/cli/package.json`. `diffLines` from the
+  `diff` package does LCS-based line diffing — language-
+  agnostic, no markdown/yaml parser required
+- New `platformTemplatesDiffCommand(slug, {against, stat})`
+  exported. Default baseline `corporate-ops-web-mobile`;
+  `--against <slug>` overrides. Self-diff (same slug both
+  sides) → `Cannot diff '<slug>' against itself.` + exit 1.
+  Both templates loaded via `getPlatformTemplate(id)` in
+  parallel. Path-set union iterated for per-file
+  classification: only in baseline → `(removed)`, only in
+  custom → `(added)`, in both with line changes →
+  `(modified)`, no changes → `(unchanged)`
+- Modified files print a unified-diff block: green `+`
+  lines + red `-` lines + 2 leading / 2 trailing context
+  lines per hunk. Hunks with more than 4 unchanged lines
+  collapse via `... (N unchanged lines)` so big files stay
+  readable
+- `--stat` mode hides the per-line diff and prints only the
+  right-padded per-file `+N -M` summary (or `unchanged`
+  / `(added)` / `(removed)` for non-modified files). Footer
+  `Summary: 1 modified, 7 unchanged` (with green/red/dim
+  fragments) always prints
+
+**Registration:** new `push` and `diff` subcommands
+registered under `gestalt platform templates` in
+`packages/cli/src/index.ts`. Top-of-file command comment
+extended. Header docstring on
+`packages/cli/src/commands/platform-extras.ts` updated to
+document both new subcommands + the LCS-diff design.
+
+Verified live end-to-end:
+
+- `pnpm -r build` clean across all 12 packages. Dashboard
+  bundle compiled to `index-Ds_rUJ8n.js` (1010 KB raw, 319
+  KB gzipped); CLI compiled clean. New dashboard bundle
+  `docker cp`'d into the running container so it serves
+  the fresh assets without an image rebuild. HTML now
+  references the new bundle (`/app/assets/index-Ds_rUJ8n.js`)
+- Spot-grep on the production bundle confirms the new
+  CodeMirror modules landed: CSS classes (`cm-editor` × 1,
+  `cm-content` × 8, `cm-line` × 11, `cm-gutters` × 12), the
+  OneDark theme's signature colors (`#abb2bf`, `#21252b`,
+  `#282c34`), and the APIs we use (`EditorView`,
+  `EditorState`, `lineWrapping` × 28, `updateListener` × 2)
+- `gestalt platform templates --help` lists both new
+  subcommands with their option descriptions
+- **Push verification flow (end-to-end against the live
+  platform):**
+  - `gestalt platform templates download
+    corporate-ops-web-mobile --output /tmp/.../template.zip`
+    → "✓ Template downloaded ... (8 files, 8971 bytes)"
+  - Unzip + append `## Custom section added by
+    operator\nLocal edits via the push workflow.` to
+    `harness/AGENTS.md`
+  - `gestalt platform templates duplicate
+    corporate-ops-web-mobile --name "Push Diff Test"
+    --new-slug push-diff-test` → "✓ Template duplicated"
+  - `gestalt platform templates push push-diff-test
+    /tmp/.../my-edit --dry-run` → "Would push 8 files:" +
+    per-file size listing + "(dry run — no changes made)"
+  - Real push without `--dry-run` → 8 `✓` rows + "✓
+    Template updated: push-diff-test (8 files pushed)"
+  - Direct API fetch confirms `harness/AGENTS.md` content
+    ends with the operator's local edits — the push lands
+    server-side correctly
+- **Diff verification flow:**
+  - `gestalt platform templates diff push-diff-test` →
+    Comparing header, 7 files `(unchanged)`, 1 file
+    `harness/AGENTS.md (modified)` with `... (68 unchanged
+    lines)` context-folding + 2 green `+` lines + Summary
+    `1 modified, 7 unchanged`
+  - `--stat` mode → compact per-file summary with
+    `harness/AGENTS.md +2 -0` and other files
+    `unchanged`
+  - Added a new file (`docs/EXTRA.md`) via push → diff
+    shows `docs/EXTRA.md (added)` line + updated Summary
+  - Clean duplicate (`clean-copy-test`) diff → ALL 8 files
+    `(unchanged)` + Summary `8 unchanged`
+- **Error matrix:**
+  - `push corporate-ops-web-mobile <dir>` → "Cannot push to
+    a built-in template. Duplicate it first: ..."
+  - `push push-diff-test /tmp/does-not-exist` →
+    "Directory not found: ..."
+  - `diff push-diff-test --against nonexistent-baseline` →
+    "No template with slug 'nonexistent-baseline'." +
+    hint
+  - `diff push-diff-test --against push-diff-test` →
+    "Cannot diff 'push-diff-test' against itself."
+- Cleanup: both test templates (`push-diff-test`,
+  `clean-copy-test`) deleted via `gestalt platform
+  templates delete` with `y` confirmation. Final DB state
+  has only the built-in template + the old/new dashboard
+  bundles in the container's dist (the old bundle is now
+  orphan; HTML references the new one)
+
+Decisions made:
+
+- **`basicSetup` imported from `codemirror` (the meta
+  package), NOT `@codemirror/view`.** Brief's pseudocode
+  was incorrect about the import path — in CodeMirror 6,
+  `basicSetup` is exported from the `codemirror` umbrella
+  package. The compiler would have rejected the brief's
+  literal imports; the deviation is required for
+  correctness, not stylistic. Documented inline next to
+  the imports
+- **`useEffect` keyed on `[selectedPath, discardCounter]`,
+  not just `selectedPath`.** Discard needs to recreate the
+  editor (CodeMirror's `EditorState` is immutable
+  per-transaction; setting the doc externally requires
+  either a `dispatch({changes: ...})` call or a fresh
+  state). The counter approach is simpler and matches the
+  brief's "update selectedFile key to force the useEffect
+  to re-run" suggestion. The cleanup function destroys the
+  old EditorView before the next one mounts so there's no
+  double-mount in the DOM
+- **`draftsRef` captures the current drafts state for the
+  updateListener.** Without it, the listener's closure
+  would see stale `setDrafts` calls when React batches
+  state updates across rapid keystrokes. The ref pattern is
+  the standard React idiom for "give me access to the
+  latest state from inside a long-lived callback"
+- **Static imports, not dynamic.** Brief's example used
+  static imports; the bundle delta is significant but
+  Admin is a route-level lazy load already (RequirePlatformAdmin
+  guards the route). Code-split could push only template-
+  editing operators into the CodeMirror-paying tier; a
+  future enhancement but out of scope today
+- **Push walker skips dot-files and common build
+  artifacts** (`.git`, `.gestalt`, `node_modules`, `dist`,
+  `build`, `.DS_Store`). Operators who keep an editing
+  checkout in the same directory shouldn't accidentally
+  push their `node_modules` to the server. The skip list is
+  minimal — the brief said "starts from the directory you
+  give it"; adding the SKIP_NAMES set was a defense
+  against operator mistakes, not a deviation from the
+  intent
+- **Push uses sync FS calls.** Consistent with the rest of
+  `platform-extras.ts` (which uses `readFileSync` /
+  `writeFileSync` / `unlinkSync` for the editor flow).
+  Brief's pseudocode showed async `fs/promises`; either
+  would work, but staying consistent with the file's
+  existing style is cleaner
+- **Diff `(modified)` vs `(unchanged)` decision uses
+  added+removed line count, not change-block count.** A
+  block of unchanged context surrounded by changes would
+  still count toward the modified-file classification.
+  Counting added+removed lines (excluding empty trailing
+  newlines) gives the right semantic: "are there real
+  changes in this file"
+- **Diff `--stat` row format right-pads paths to 40 chars.**
+  Most template file paths are < 30 chars; 40 gives a
+  little headroom while keeping the columns visually
+  aligned. The `+N -M` counts are colorised (green/red) so
+  scannable at a glance
+- **Diff context-folding shows 2 leading + 2 trailing
+  unchanged lines** with `... (N unchanged)` between. Short
+  files (≤ 4 unchanged lines in a row) show the full
+  context. The cutoff is the brief's suggestion; tested
+  against the verification template's AGENTS.md (68
+  unchanged lines collapsed correctly)
+- **No new server endpoints, no new migrations.** Both
+  push and diff use the existing
+  `PATCH /platform/templates/:id/files` and
+  `GET /platform/templates/:id` endpoints from the prior
+  session. The dashboard CodeMirror integration is purely
+  UI-side
+
+Bundle size note flagged for follow-up:
+
+- Dashboard bundle grew from 363 KB to 1010 KB (319 KB
+  gzipped, +190 KB delta). Vite's 500 KB warning threshold
+  is now exceeded. Acceptable for an admin-only feature
+  (regular users don't load the Admin route's editor) but
+  a future code-split via dynamic `import()` of CodeMirror
+  modules (similar to how `jszip` is already
+  dynamic-imported in `UploadTemplateModal`) would push
+  the bundle delta from the main chunk into a deferred
+  one only loaded when an operator opens the template
+  editor
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker server image NOT rebuilt — the new dashboard bundle
+was `docker cp`'d into the running container at
+`/app/packages/dashboard/dist/`. Next clean image rebuild
+(`docker compose build server`) will fold the new dashboard
+build into the image proper. All CLI commands exercised
+end-to-end against the live platform: push happy path +
+dry-run + 3 error paths, diff full + --stat + added-file +
+clean-duplicate + 2 error paths, plus the existing
+download / duplicate / delete subcommands as part of the
+verification flow.
+
+Pending follow-ups: none introduced. The bundle size
+delta is the only candidate for future iteration — a
+single-day refactor to dynamic-import the CodeMirror
+modules from inside the TemplateEditor mount effect would
+restore the main bundle to ~370 KB and only fire the
+extra ~640 KB raw on first editor open.

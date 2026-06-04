@@ -839,6 +839,24 @@ export interface PlatformTemplateRepository extends BaseRepository {
   /** Atomically clears the existing default and sets the new one. */
   setDefault(id: string): Promise<void>;
   delete(id: string): Promise<void>;
+  /**
+   * Merge the supplied files map into the template's existing `files` JSONB.
+   * MERGE semantics: only the keys included in `files` are changed; other
+   * files are preserved unchanged (matches `files || $1::jsonb`).
+   * `updatedAt` is set to NOW(). Caller is responsible for built-in guards.
+   */
+  updateFiles(id: string, files: Record<string, string>): Promise<PlatformTemplateRecord>;
+  /**
+   * Remove a single file from the template's `files` JSONB. Caller is
+   * responsible for guards (built-in, required-file).
+   */
+  deleteFile(id: string, filePath: string): Promise<PlatformTemplateRecord>;
+  /**
+   * Copy an existing template's files + variables into a NEW row with the
+   * supplied name/slug. The new row is always `isBuiltin: false` and
+   * `isDefault: false` (operators set default separately).
+   */
+  duplicate(sourceId: string, name: string, slug: string, createdBy: string | null): Promise<PlatformTemplateRecord>;
 }
 
 // ─── Platform MCP servers (Session 3 — migration 017) ────────────────────────

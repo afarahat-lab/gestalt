@@ -24,6 +24,7 @@
     "@gestalt/agents-maintenance": "workspace:*",
     "@gestalt/core": "workspace:*",
     "@node-saml/node-saml": "^4.0.5",
+    "adm-zip": "^0.5.10",
     "bcrypt": "^5.1.1",
     "fastify": "^4.27.0",
     "jose": "^5.2.0",
@@ -35,6 +36,7 @@
     "kerberos": "^2.1.0"
   },
   "devDependencies": {
+    "@types/adm-zip": "^0.5.5",
     "@types/bcrypt": "^5.0.2",
     "@types/node": "^20.0.0",
     "tsx": "^4.7.0",

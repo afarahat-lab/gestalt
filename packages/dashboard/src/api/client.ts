@@ -486,6 +486,48 @@ export class DashboardApiClient {
     await this.delete(`/platform/templates/${id}`);
   }
 
+  /**
+   * Fetch the template as a ZIP blob. The caller triggers a browser
+   * download by creating an object URL + an anchor click.
+   */
+  async downloadPlatformTemplate(id: string): Promise<Blob> {
+    const res = await fetch(`${this.baseUrl}/platform/templates/${id}/download`, {
+      headers: this.headers(),
+    });
+    if (!res.ok) throw new ApiError(res.status, await res.text());
+    return res.blob();
+  }
+
+  async duplicatePlatformTemplate(
+    id: string,
+    body: { name: string; slug: string },
+  ): Promise<{ data: PlatformTemplateSummary }> {
+    return this.post(`/platform/templates/${id}/duplicate`, body);
+  }
+
+  /**
+   * MERGE semantics: only the keys in `files` are changed. Other files
+   * in the template are preserved unchanged. Pass a single entry to
+   * save one file; pass several to save multiple files in one round
+   * trip + one commit's worth of audit metadata.
+   */
+  async updatePlatformTemplateFiles(
+    id: string,
+    files: Record<string, string>,
+  ): Promise<{ data: PlatformTemplateSummary }> {
+    return this.patch(`/platform/templates/${id}/files`, { files });
+  }
+
+  /**
+   * Remove a single non-required file from a custom template. The path
+   * is appended verbatim to the URL (Fastify's wildcard `*` route
+   * accepts slashes) — modern fetch URL-encodes the path automatically.
+   */
+  async deletePlatformTemplateFile(id: string, filePath: string): Promise<void> {
+    const encoded = filePath.split('/').map(encodeURIComponent).join('/');
+    await this.delete(`/platform/templates/${id}/files/${encoded}`);
+  }
+
   // ─── Platform MCP servers (Session 3 — migration 017) ────────────────────
 
   async listPlatformMcpServers(): Promise<{ data: PlatformMcpServer[] }> {

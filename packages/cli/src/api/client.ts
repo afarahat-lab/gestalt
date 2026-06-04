@@ -652,6 +652,39 @@ export class GestaltApiClient {
   async deletePlatformTemplate(id: string): Promise<void> {
     await this.delete(`/platform/templates/${id}`);
   }
+  /**
+   * Stream the template ZIP as a Buffer so the CLI can write it to
+   * disk. Returns the raw bytes; the caller wraps with `fs.writeFile`.
+   */
+  async downloadPlatformTemplate(id: string): Promise<Buffer> {
+    const res = await fetch(`${this.baseUrl}/platform/templates/${id}/download`, {
+      headers: this.authHeaders(),
+    });
+    if (!res.ok) throw new ApiClientError(res.status, await res.text());
+    const arrayBuf = await res.arrayBuffer();
+    return Buffer.from(arrayBuf);
+  }
+  async duplicatePlatformTemplate(
+    id: string,
+    body: { name: string; slug: string },
+  ): Promise<{ data: PlatformTemplateSummary }> {
+    return this.post(`/platform/templates/${id}/duplicate`, body);
+  }
+  /**
+   * MERGE semantics: only the keys included in `files` are changed;
+   * unsupplied files preserved. Pass a single `{[path]: content}` to
+   * save one file.
+   */
+  async updatePlatformTemplateFiles(
+    id: string,
+    files: Record<string, string>,
+  ): Promise<{ data: PlatformTemplateSummary }> {
+    return this.patch(`/platform/templates/${id}/files`, { files });
+  }
+  async deletePlatformTemplateFile(id: string, filePath: string): Promise<void> {
+    const encoded = filePath.split('/').map(encodeURIComponent).join('/');
+    await this.delete(`/platform/templates/${id}/files/${encoded}`);
+  }
 
   async listPlatformMcpServers(): Promise<{ data: PlatformMcpServer[] }> {
     return this.get('/platform/mcp-servers');

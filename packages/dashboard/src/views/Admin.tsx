@@ -16,8 +16,15 @@
  * 'platform-admin'`, so a regular user has no DOM trace of this view.
  */
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { EditorView } from '@codemirror/view';
+import { EditorState, type Extension } from '@codemirror/state';
+import { basicSetup } from 'codemirror';
+import { json } from '@codemirror/lang-json';
+import { yaml } from '@codemirror/lang-yaml';
+import { markdown } from '@codemirror/lang-markdown';
+import { oneDark } from '@codemirror/theme-one-dark';
 import { useDashboardApi } from '../hooks/useApi';
 import { useCurrentUser } from '../context/CurrentUserContext';
 import { useProject } from '../context/ProjectContext';
@@ -2592,10 +2599,15 @@ function TemplatesTab() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [duplicating, setDuplicating] = useState<PlatformTemplateSummary | null>(null);
   // Brief 3 — clicking a template row expands a detail panel showing
   // file list + per-variable usage. The full record is lazy-loaded
   // (the list endpoint omits `files` to keep responses small).
+  // The editor + duplicate modal land on top of the same expansion
+  // state — `editingId` tracks whether the panel renders the editor
+  // (custom templates only) instead of the detail viewer.
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [detailCache, setDetailCache] = useState<Record<string, PlatformTemplate | 'loading'>>({});
 
   async function load() {
@@ -2623,7 +2635,65 @@ function TemplatesTab() {
     catch (err) { setError(err instanceof ApiError ? extractError(err) : String(err)); }
   }
 
+  /**
+   * Stream the template ZIP to the browser. We could open a window
+   * with the URL, but that would lose the Authorization header — fetch
+   * via the API client (which adds the header) and trigger a download
+   * via an object URL.
+   */
+  async function handleDownload(t: PlatformTemplateSummary) {
+    setError(null);
+    try {
+      const blob = await api.downloadPlatformTemplate(t.id);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${t.slug}-template.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    }
+  }
+
+  async function handleEdit(t: PlatformTemplateSummary) {
+    if (t.isBuiltin) return; // guard mirrors the server's BUILTIN_TEMPLATE check
+    setExpandedId(t.id);
+    setEditingId(t.id);
+    // Preload the full record so the editor mounts with files in hand.
+    if (!detailCache[t.id] || detailCache[t.id] === 'loading') {
+      setDetailCache((c) => ({ ...c, [t.id]: 'loading' }));
+      try {
+        const res = await api.getPlatformTemplate(t.id);
+        setDetailCache((c) => ({ ...c, [t.id]: res.data }));
+      } catch (err) {
+        setDetailCache((c) => { const next = { ...c }; delete next[t.id]; return next; });
+        setError(err instanceof ApiError ? extractError(err) : String(err));
+      }
+    }
+  }
+
+  /**
+   * Force-reload a single template after a save. The editor caches its
+   * draft state in the parent's `detailCache` so subsequent renders see
+   * the persisted shape (not the in-flight draft).
+   */
+  async function reloadDetail(id: string) {
+    try {
+      const res = await api.getPlatformTemplate(id);
+      setDetailCache((c) => ({ ...c, [id]: res.data }));
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    }
+  }
+
   async function toggleExpand(t: PlatformTemplateSummary) {
+    // If we're currently editing this row, the row click should NOT
+    // collapse — operator clicked elsewhere on the page to escape;
+    // they should use [× Close editor] to leave the editor explicitly.
+    if (editingId === t.id) return;
     if (expandedId === t.id) { setExpandedId(null); return; }
     setExpandedId(t.id);
     // Lazy-load the full record on first expansion
@@ -2648,8 +2718,9 @@ function TemplatesTab() {
         <button style={styles.primaryBtn} onClick={() => setUploading(true)}>+ Upload template</button>
       </div>
       <p style={{ color: 'var(--text-dim)', fontSize: '12px', margin: '0 0 12px' }}>
-        Built-in templates ship with the platform and cannot be deleted. Custom templates can be
-        set as default — the default is used by `gestalt init` for every new project.
+        Built-in templates ship with the platform and cannot be edited or deleted. Duplicate a
+        built-in to customise it. Custom templates can be edited inline — required files
+        (AGENTS.md, HARNESS.json, agents.yaml) cannot be removed.
       </p>
       {error && <div style={styles.errorBanner}>{error}</div>}
       <table style={styles.table}>
@@ -2669,18 +2740,20 @@ function TemplatesTab() {
           )}
           {rows.map((t) => {
             const isExpanded = expandedId === t.id;
+            const isEditing = editingId === t.id;
             const detail = detailCache[t.id];
             return (
               <React.Fragment key={t.id}>
                 <tr
                   onClick={() => void toggleExpand(t)}
-                  style={{ cursor: 'pointer', background: isExpanded ? 'var(--bg-subtle)' : undefined }}
+                  style={{ cursor: isEditing ? 'default' : 'pointer', background: isExpanded ? 'var(--bg-subtle)' : undefined }}
                 >
                   <td style={styles.td}>
                     <span style={{ marginRight: '6px', color: 'var(--text-dim)', fontSize: '10px' }}>
                       {isExpanded ? '▼' : '▶'}
                     </span>
                     {t.name}
+                    {isEditing && <span style={{ marginLeft: '8px', color: 'var(--accent)', fontSize: '11px' }}>✎ Editing</span>}
                     {t.description && <div style={{ color: 'var(--text-dim)', fontSize: '11px' }}>{t.description}</div>}
                   </td>
                   <td style={styles.td}><code>{t.slug}</code></td>
@@ -2688,7 +2761,12 @@ function TemplatesTab() {
                   <td style={styles.td}>{t.version}</td>
                   <td style={styles.td}>{t.isDefault ? '★' : ''}</td>
                   <td style={styles.td} onClick={(e) => e.stopPropagation()}>
-                    <div style={{ display: 'flex', gap: '6px' }}>
+                    <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                      <button style={styles.linkBtn} title="Download as ZIP" onClick={() => void handleDownload(t)}>↓ Download</button>
+                      <button style={styles.linkBtn} title="Make a copy you can edit" onClick={() => setDuplicating(t)}>⎘ Duplicate</button>
+                      {!t.isBuiltin && (
+                        <button style={styles.linkBtn} title="Edit files in place" onClick={() => void handleEdit(t)}>✎ Edit</button>
+                      )}
                       {!t.isDefault && (
                         <button style={styles.linkBtn} onClick={() => void handleSetDefault(t)}>★ Set default</button>
                       )}
@@ -2701,7 +2779,13 @@ function TemplatesTab() {
                 {isExpanded && (
                   <tr>
                     <td colSpan={6} style={{ ...styles.td, padding: 0, background: 'var(--bg-subtle)' }}>
-                      <TemplateDetailPanel detail={detail} />
+                      {isEditing
+                        ? <TemplateEditor
+                            detail={detail}
+                            onClose={() => setEditingId(null)}
+                            onSaved={() => void reloadDetail(t.id)}
+                          />
+                        : <TemplateDetailPanel detail={detail} />}
                     </td>
                   </tr>
                 )}
@@ -2716,6 +2800,394 @@ function TemplatesTab() {
           onUploaded={async () => { setUploading(false); await load(); }}
         />
       )}
+      {duplicating && (
+        <DuplicateTemplateModal
+          source={duplicating}
+          onClose={() => setDuplicating(null)}
+          onDuplicated={async () => { setDuplicating(null); await load(); }}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * Confirms a new name + slug before POST /platform/templates/:id/duplicate.
+ * Slug defaults to `<source-slug>-copy`; operator can edit.
+ */
+function DuplicateTemplateModal(props: {
+  source: PlatformTemplateSummary;
+  onClose: () => void;
+  onDuplicated: () => Promise<void> | void;
+}) {
+  const api = useDashboardApi();
+  const [name, setName] = useState(`${props.source.name} (Custom)`);
+  const [slug, setSlug] = useState(`${props.source.slug}-custom`);
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  async function submit() {
+    setError(null);
+    if (!name.trim()) { setError('Name is required'); return; }
+    if (!slug.trim()) { setError('Slug is required'); return; }
+    setSubmitting(true);
+    try {
+      await api.duplicatePlatformTemplate(props.source.id, { name: name.trim(), slug: slug.trim() });
+      await props.onDuplicated();
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div style={styles.modalBackdrop} onClick={props.onClose}>
+      <div style={{ ...styles.modal, maxWidth: '480px' }} onClick={(e) => e.stopPropagation()}>
+        <h3 style={styles.cardTitle}>Duplicate template</h3>
+        {error && <div style={styles.errorBanner}>{error}</div>}
+        <p style={{ fontSize: '12px', color: 'var(--text-dim)', margin: '0 0 12px' }}>
+          Source: <strong>{props.source.name}</strong> ({props.source.slug})
+        </p>
+        <label style={styles.label}>New name
+          <input style={styles.input} value={name} onChange={(e) => setName(e.target.value)} />
+        </label>
+        <label style={styles.label}>New slug
+          <input style={styles.input} value={slug} onChange={(e) => setSlug(e.target.value)} />
+        </label>
+        <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+          <button style={styles.linkBtn} onClick={props.onClose}>Cancel</button>
+          <button style={styles.primaryBtn} onClick={() => void submit()} disabled={submitting}>
+            {submitting ? 'Duplicating...' : 'Duplicate'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Pick the right CodeMirror language extension for a given file path.
+ * Only three are loaded into the bundle (json, yaml, markdown) — every
+ * other extension renders as plain text so we avoid pulling in language
+ * packs we never need.
+ */
+function getLanguageExtension(filePath: string): Extension {
+  if (filePath.endsWith('.json')) return json();
+  if (filePath.endsWith('.yaml') || filePath.endsWith('.yml')) return yaml();
+  if (filePath.endsWith('.md')) return markdown();
+  return [];
+}
+
+/**
+ * Inline editor for a custom template. Left panel = file list with
+ * per-file modified dot + delete. Right panel = CodeMirror editor with
+ * Save this file / Discard / Save all. The detail prop reflects the
+ * persisted state; per-file drafts live in the editor's local state.
+ *
+ * Required files (AGENTS.md, HARNESS.json, agents.yaml — by basename)
+ * cannot be removed — the delete button is hidden on those rows so the
+ * server's 400 REQUIRED_FILE never gets a chance to fire.
+ *
+ * The CodeMirror editor is recreated on every file switch (the useEffect
+ * keyed on `selectedPath`) so each file's doc state lives in the
+ * EditorView and React only sees the post-edit string via the
+ * updateListener.
+ */
+function TemplateEditor(props: {
+  detail: PlatformTemplate | 'loading' | undefined;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const api = useDashboardApi();
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [savingPath, setSavingPath] = useState<string | null>(null);
+  const [savingAll, setSavingAll] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [newPath, setNewPath] = useState('');
+  // Bump this counter on discard so the editor's useEffect re-runs and
+  // recreates the EditorView with the freshly-reverted doc. Switching to
+  // a different file already triggers re-creation via `selectedPath`.
+  const [discardCounter, setDiscardCounter] = useState(0);
+
+  // CodeMirror editor refs. The container <div> is rendered below; the
+  // useEffect that mounts the EditorView fires whenever `selectedPath`
+  // (or `discardCounter`) changes.
+  const editorRef = useRef<HTMLDivElement>(null);
+  const editorViewRef = useRef<EditorView | null>(null);
+  // We capture `drafts[selectedPath]` once at mount time and never
+  // re-sync from outside — typing flows draft → state, not state →
+  // editor. Without this `draftsRef`, the updateListener closure would
+  // see stale `setDrafts` calls when React batches state updates.
+  const draftsRef = useRef(drafts);
+  draftsRef.current = drafts;
+
+  // Initialise drafts + auto-select first file when the detail loads.
+  useEffect(() => {
+    if (props.detail === undefined || props.detail === 'loading') return;
+    const files = props.detail.files;
+    setDrafts((cur) => {
+      // Preserve in-flight edits while picking up newly-added files
+      const next = { ...cur };
+      for (const [p, content] of Object.entries(files)) {
+        if (!(p in next)) next[p] = content;
+      }
+      return next;
+    });
+    if (selectedPath === null) {
+      const first = Object.keys(files).sort()[0];
+      if (first) setSelectedPath(first);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.detail]);
+
+  // Mount / re-mount the CodeMirror editor whenever the selected file
+  // changes — or when a discard happens. Destroy the previous instance
+  // on cleanup so the DOM stays clean.
+  useEffect(() => {
+    if (!editorRef.current || selectedPath === null) return;
+    editorViewRef.current?.destroy();
+    editorViewRef.current = null;
+
+    const path = selectedPath; // closure capture for the updateListener
+    const initialDoc = draftsRef.current[path] ?? '';
+    const state = EditorState.create({
+      doc: initialDoc,
+      extensions: [
+        basicSetup,
+        oneDark,
+        EditorView.lineWrapping,
+        getLanguageExtension(path),
+        EditorView.updateListener.of((update) => {
+          if (update.docChanged) {
+            const newContent = update.state.doc.toString();
+            setDrafts((prev) => ({ ...prev, [path]: newContent }));
+          }
+        }),
+      ],
+    });
+    editorViewRef.current = new EditorView({
+      state,
+      parent: editorRef.current,
+    });
+
+    return () => {
+      editorViewRef.current?.destroy();
+      editorViewRef.current = null;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedPath, discardCounter]);
+
+  if (props.detail === undefined || props.detail === 'loading') {
+    return <div style={{ padding: '12px', color: 'var(--text-dim)' }}>Loading template detail...</div>;
+  }
+  const t = props.detail;
+  const REQUIRED_BASENAMES = ['AGENTS.md', 'HARNESS.json', 'agents.yaml'];
+  const persistedFiles = t.files;
+  // A file is "modified" when its draft differs from the persisted
+  // value. New files (not yet on the server) are marked too.
+  const isModified = (p: string): boolean => {
+    if (!(p in drafts)) return false;
+    if (!(p in persistedFiles)) return true;
+    return drafts[p] !== persistedFiles[p];
+  };
+  const allPaths = Array.from(new Set([...Object.keys(persistedFiles), ...Object.keys(drafts)])).sort();
+  const modifiedPaths = allPaths.filter(isModified);
+
+  async function saveOne(path: string) {
+    setError(null);
+    setSavingPath(path);
+    try {
+      await api.updatePlatformTemplateFiles(t.id, { [path]: drafts[path] ?? '' });
+      props.onSaved();
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally {
+      setSavingPath(null);
+    }
+  }
+  async function saveAll() {
+    if (modifiedPaths.length === 0) return;
+    setError(null);
+    setSavingAll(true);
+    try {
+      const payload: Record<string, string> = {};
+      for (const p of modifiedPaths) payload[p] = drafts[p] ?? '';
+      await api.updatePlatformTemplateFiles(t.id, payload);
+      props.onSaved();
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    } finally {
+      setSavingAll(false);
+    }
+  }
+  function discardOne(path: string) {
+    setDrafts((d) => {
+      const next = { ...d };
+      if (path in persistedFiles) next[path] = persistedFiles[path]!;
+      else delete next[path];
+      return next;
+    });
+    // If the discarded file is the one currently in the editor, force
+    // the EditorView to re-mount so the reverted content appears.
+    if (path === selectedPath) setDiscardCounter((c) => c + 1);
+  }
+  async function deleteOne(path: string) {
+    if (!window.confirm(`Remove '${path}' from this template?`)) return;
+    setError(null);
+    try {
+      await api.deletePlatformTemplateFile(t.id, path);
+      setDrafts((d) => { const next = { ...d }; delete next[path]; return next; });
+      if (selectedPath === path) {
+        const remaining = allPaths.filter((p) => p !== path);
+        setSelectedPath(remaining[0] ?? null);
+      }
+      props.onSaved();
+    } catch (err) {
+      setError(err instanceof ApiError ? extractError(err) : String(err));
+    }
+  }
+  function addFile() {
+    const path = newPath.trim();
+    if (!path) { setError('File path required'); return; }
+    if (path in drafts || path in persistedFiles) {
+      setError(`File already exists: ${path}`);
+      return;
+    }
+    setDrafts((d) => ({ ...d, [path]: '' }));
+    setSelectedPath(path);
+    setNewPath('');
+    setAdding(false);
+    setError(null);
+  }
+
+  const isRequired = (p: string): boolean => REQUIRED_BASENAMES.includes(p.split('/').pop() ?? p);
+
+  return (
+    <div style={{ padding: '16px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '12px' }}>
+        <div>
+          <span style={{ fontSize: '12px', color: 'var(--accent)' }}>✎ Editing</span>
+          <span style={{ marginLeft: '8px', fontSize: '12px', color: 'var(--text-dim)' }}>
+            {modifiedPaths.length > 0 ? `${modifiedPaths.length} unsaved change(s)` : 'No changes'}
+          </span>
+        </div>
+        <button style={styles.linkBtn} onClick={props.onClose}>× Close editor</button>
+      </div>
+      {error && <div style={styles.errorBanner}>{error}</div>}
+      <div style={{ display: 'flex', gap: '12px' }}>
+        <div style={{ width: '240px', flexShrink: 0 }}>
+          <div style={{ fontSize: '11px', color: 'var(--text-dim)', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+            Files
+          </div>
+          <ul style={{ listStyle: 'none', margin: 0, padding: 0, border: '1px solid var(--border)', borderRadius: '4px', overflow: 'hidden' }}>
+            {allPaths.map((p) => {
+              const isSelected = selectedPath === p;
+              const isMod = isModified(p);
+              return (
+                <li
+                  key={p}
+                  style={{
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                    padding: '6px 8px', cursor: 'pointer',
+                    background: isSelected ? 'var(--bg-raised)' : undefined,
+                    borderBottom: '1px solid var(--border)',
+                  }}
+                  onClick={() => setSelectedPath(p)}
+                >
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'var(--font-mono)', fontSize: '11px' }}>
+                    {isMod && <span style={{ color: 'var(--amber)', marginRight: '4px' }}>●</span>}
+                    {p}
+                  </span>
+                  {!isRequired(p) && (
+                    <button
+                      style={{ ...styles.linkBtn, padding: '2px 6px', marginLeft: '4px' }}
+                      onClick={(e) => { e.stopPropagation(); void deleteOne(p); }}
+                      title="Remove file"
+                    >×</button>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+          <div style={{ marginTop: '8px' }}>
+            {adding ? (
+              <div style={{ display: 'flex', gap: '4px' }}>
+                <input
+                  style={{ ...styles.input, fontSize: '11px' }}
+                  value={newPath}
+                  onChange={(e) => setNewPath(e.target.value)}
+                  placeholder="path/to/new-file.md"
+                  autoFocus
+                  onKeyDown={(e) => { if (e.key === 'Enter') addFile(); if (e.key === 'Escape') { setAdding(false); setNewPath(''); } }}
+                />
+                <button style={styles.linkBtn} onClick={addFile}>Add</button>
+                <button style={styles.linkBtn} onClick={() => { setAdding(false); setNewPath(''); }}>Cancel</button>
+              </div>
+            ) : (
+              <button style={styles.linkBtn} onClick={() => setAdding(true)}>+ Add file</button>
+            )}
+          </div>
+        </div>
+
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: '11px', color: 'var(--text-dim)', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+            Editor
+          </div>
+          {selectedPath !== null ? (
+            <>
+              <div style={{ fontSize: '11px', color: 'var(--text-dim)', marginBottom: '4px', fontFamily: 'var(--font-mono)' }}>
+                {selectedPath}
+                {isModified(selectedPath) && <span style={{ color: 'var(--amber)', marginLeft: '6px' }}>● modified</span>}
+              </div>
+              <div
+                ref={editorRef}
+                style={{
+                  width: '100%', minHeight: '400px', maxHeight: '700px',
+                  boxSizing: 'border-box',
+                  border: '1px solid var(--border)',
+                  borderRadius: '4px',
+                  overflow: 'auto',
+                  fontSize: '12px',
+                }}
+              />
+              <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
+                <button
+                  style={styles.primaryBtn}
+                  onClick={() => void saveOne(selectedPath!)}
+                  disabled={savingPath === selectedPath || !isModified(selectedPath)}
+                >
+                  {savingPath === selectedPath ? 'Saving...' : 'Save this file'}
+                </button>
+                <button
+                  style={styles.linkBtn}
+                  onClick={() => discardOne(selectedPath!)}
+                  disabled={!isModified(selectedPath)}
+                >
+                  Discard changes
+                </button>
+              </div>
+            </>
+          ) : (
+            <p style={{ color: 'var(--text-dim)', fontSize: '12px' }}>Select a file from the list to edit it.</p>
+          )}
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', gap: '8px', marginTop: '14px', justifyContent: 'space-between', alignItems: 'center' }}>
+        <span style={{ fontSize: '11px', color: 'var(--text-dim)' }}>
+          {modifiedPaths.length === 0 ? 'No changes to save.' : `${modifiedPaths.length} file(s) modified — saved with one PATCH call.`}
+        </span>
+        <button
+          style={styles.primaryBtn}
+          onClick={() => void saveAll()}
+          disabled={savingAll || modifiedPaths.length === 0}
+        >
+          {savingAll ? 'Saving all...' : `Save all changes${modifiedPaths.length > 0 ? ` (${modifiedPaths.length})` : ''}`}
+        </button>
+      </div>
     </div>
   );
 }
