@@ -85,7 +85,12 @@ the `sessions/archive/` files (everything older)._
   three-mode chooser (single-line default / END-terminated /
   `$EDITOR`). The full body is passed verbatim into
   `generateStackConfig` and into the template's
-  `{{projectDescription}}` substitution.
+  `{{projectDescription}}` substitution. Template engine
+  JSON-escapes substituted values when the target file is `.json`
+  (engine.ts `substitute(..., { jsonEscape: true })`) so newlines
+  + quotes + control chars in the description land safely inside
+  HARNESS.json string literals; markdown / yaml files keep raw
+  newlines.
 - Vault-backed Git PATs (migration 022) — operators link a vault
   secret to a project; resolver decrypts server-side per-cycle.
 - GitHub repo browser via `/platform/git/repos` proxy.

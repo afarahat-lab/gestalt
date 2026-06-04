@@ -4,6 +4,143 @@ _Auto-maintained. The most recent session is prepended at the top; when this fil
 
 ---
 
+### Session 2026-06-04 — Claude Code (HARNESS.json multi-line description bug: JSON-escape values substituted into .json template files; repair trackeros)
+
+Bug fix. Every intent submission against the live trackeros project
+was failing in 1-4ms — before the intent-agent could make any LLM
+call — with `SyntaxError: Bad control character in string literal in
+JSON at position 187 (line 6 column 78)` from
+`HarnessEngine.loadHarnessConfig`. Same error also surfaced from the
+maintenance scheduler's `loadHarnessSubset` (it catches + warns, so
+maintenance didn't hard-fail, but the warning was the same root
+cause).
+
+Root cause:
+
+The previous session (multi-line description prompt) lifted
+`gestalt init` to accept >1 line of project description. That body
+is passed verbatim to the harness template engine which substitutes
+`{{projectDescription}}` into every template file — including
+`harness/HARNESS.json` line 6: `"description": "{{projectDescription}}"`.
+The substitution at `packages/server/src/templates/engine.ts:215`
+(`substitute()`) was a naive string-replace: it dropped the value's
+raw bytes — newlines and all — into the JSON string literal. JSON
+forbids unescaped control characters inside string literals, so the
+resulting HARNESS.json was unparseable. trackeros was the first
+project bootstrapped after the multi-line prompt change landed, so
+it was the first to hit this.
+
+Verification: cloned the live trackeros HEAD and confirmed byte 187
+was a raw `\n` (code 10) inside the description string, sitting
+between "company." and "Employees can apply".
+
+Changed:
+
+- **`packages/server/src/templates/engine.ts`** — `substitute()`
+  gains a third `options: { jsonEscape?: boolean }` parameter. When
+  `jsonEscape` is true, the substituted value is fed through
+  `JSON.stringify(value).slice(1, -1)` — produces a string body
+  with `\n`, `\"`, `\\`, control-char `\uXXXX` escapes, suitable
+  for dropping into an existing `"..."` literal in the template.
+  Unknown keys still leave the `{{key}}` placeholder verbatim.
+- **Same file** — both call sites (`applyVariablesFromFileMap` for
+  the DB-stored template path, `collectFiles` for the filesystem
+  fallback) now pass `{ jsonEscape: isJsonPath(templateRelativePath) }`
+  with a tiny local `isJsonPath()` helper that lowercases the path
+  and tests `.endsWith('.json')`. Markdown (`AGENTS.md` line 8 has
+  `{{projectDescription}}` too) and yaml stay verbatim so
+  human-readable bodies keep their real line breaks.
+- **trackeros `HARNESS.json`** — rewrote the description value
+  in-place with `\n`-escaped newlines via the same
+  `JSON.stringify().slice(1,-1)` trick, then verified
+  `JSON.parse(fixed)` succeeded before committing. Committed +
+  pushed to `main` (`0cb7528`). User explicitly authorized the
+  direct push to main; auto-mode classifier had blocked the first
+  attempt because main-branch pushes bypass PR review.
+
+Verified:
+
+- Round-trip unit-style test (Node driver against the compiled
+  `dist/templates/engine.js`): seeded the trackeros multi-line
+  description into the corporate-ops-web-mobile HARNESS.json
+  template, ran `substitute(raw, vars, { jsonEscape: true })`,
+  parsed the result with `JSON.parse()` — parses clean.
+  `parsed.description` contains real `\n` characters (the escape
+  sequences were resolved by the parser as expected); raw
+  description body had 7 lines, the result kept all 7 separated by
+  newlines.
+- Same driver against AGENTS.md (markdown) with
+  `jsonEscape: false` — newlines pass through verbatim (10-line
+  output for a 10-line template, no escaping applied).
+- `pnpm --filter @gestalt/server build` then `pnpm -r build` —
+  clean across all 12 packages. Dashboard re-emitted as
+  `index-DSlpzI_R.js` (no UI change; 1010 KB / 319 KB gzipped
+  identical to the prior session). Server `dist` hot-copied into
+  `gestalt-server-1:/app/packages/server/dist/` + container
+  restart.
+- Server back to `/health` 200 inside ~10 seconds.
+- `gestalt run "Smoke test: confirm intent-agent reaches the LLM
+  after HARNESS.json fix"` against the repaired trackeros:
+  intent-agent now completes in 2667 ms (real LLM call duration),
+  not the prior 1-4 ms instant failure. design-agent (3029 ms),
+  lint-config-agent (19 ms), and context-agent (4544 ms) all
+  succeed. code-agent fails with `Rate limit exceeded` from the
+  LLM provider — unrelated to this bug; downstream-only and
+  recoverable by waiting out the OpenAI rate limit.
+- `docker logs --since 3m gestalt-server-1 | grep "Bad control
+  character\|SyntaxError\|loadHarnessConfig"` returns zero hits
+  since the restart — the parse error is gone.
+
+Decisions made:
+
+- **Escape at the substitution boundary, not at intake.** The
+  multi-line description is correct data; it's only invalid when
+  rendered into a JSON string literal. Sanitising at the CLI /
+  dashboard intake path (stripping or replacing newlines) would
+  corrupt the value for the markdown path (AGENTS.md) and the
+  LLM stack-config-generator path (which already accepts
+  arbitrary-length strings). Escaping per-file-type at the
+  template engine is the right layer.
+- **File extension is the discriminator, not a flag in
+  `TemplateVariables`.** A template author can add a new `.json`
+  file (e.g. `package.json`, `tsconfig.json`) and the engine
+  will Do The Right Thing without per-variable wiring. The
+  alternative (marking individual variables as "is JSON-safe")
+  doesn't scale; the file knows what it is.
+- **`JSON.stringify(value).slice(1, -1)` rather than a hand-rolled
+  escape table.** Built-in `stringify` handles the full JSON
+  string-literal escape spec (`\b\f\n\r\t\"\\` + `\uXXXX` for
+  control chars + surrogate pair handling). Slicing the surrounding
+  quotes drops the body into the template's existing `"..."`.
+  Pseudocode for placeholder-not-in-string-context (e.g.
+  `"port": {{port}}`) doesn't apply here because every existing
+  HARNESS.json placeholder is inside a string literal; if a future
+  template needs a non-string injection it can use a typed
+  helper rather than the generic substitute.
+- **Direct push to trackeros/main, not a PR.** User explicitly
+  authorized after the auto-mode classifier blocked the first
+  attempt. The fix is a single-file `1 insertion, 7 deletions`
+  diff (the 7-line multi-line description collapses to a single
+  `\n`-escaped line) and unblocks the platform immediately.
+- **Hot-copy of server dist into the running container, not a
+  docker compose build.** Matches the pattern from the previous
+  template-editor session — restart picks up the new `dist/`
+  immediately; the next clean image rebuild folds the change in.
+
+Pending follow-ups:
+
+- **Code-agent rate limit** surfaced during the verification run
+  is environmental, not a code defect. Operator can wait out the
+  OpenAI rate limit and resubmit any intent.
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Engine fix landed in `packages/server/dist/templates/engine.js`
+and hot-copied into `gestalt-server-1`. The repaired
+trackeros HARNESS.json is pushed at commit `0cb7528` on
+`main`.
+
+---
+
 ### Session 2026-06-04 — Claude Code (multi-line description prompt: gestalt init now accepts >1 line of project description; dashboard create-project description is a textarea)
 
 Bug fix + small refactor. The Phase-1 description prompt in
@@ -319,296 +456,4 @@ Build status: no source changes. `pnpm -r build` still clean
 across all 12 packages (verified before commit). The
 restructure affects only `docs/claude/**` files.
 
----
-
-### Session 2026-06-04 — Claude Code (template editor improvements: CodeMirror syntax highlighting + gestalt platform templates push + diff)
-
-Three follow-ups to the previous session's template editor, all
-in one pass. Each is self-contained; no new migrations.
-
-**Enhancement 1 — CodeMirror 6 syntax highlighting in the
-dashboard editor.** Replaces the plain `<textarea>` in
-`TemplateEditor` (Admin.tsx) with a CodeMirror 6 editor.
-- `packages/dashboard/package.json` gains 7 new runtime deps:
-  `@codemirror/view`, `@codemirror/state`,
-  `@codemirror/lang-json`, `@codemirror/lang-yaml`,
-  `@codemirror/lang-markdown`, `@codemirror/theme-one-dark`,
-  and the `codemirror` meta package (which is where `basicSetup`
-  actually lives in v6 — the brief's pseudocode put it under
-  `@codemirror/view` which is incorrect; deviated to make the
-  imports compile)
-- New `getLanguageExtension(filePath)` helper at the top of the
-  `TemplateEditor` region maps file extension → CodeMirror lang
-  extension: `.json` → `json()`, `.yaml`/`.yml` → `yaml()`,
-  `.md` → `markdown()`, everything else → `[]` (plain text).
-  Only three language packs are imported per the brief —
-  bundle stays as lean as it can while still covering every
-  file the seeded template contains
-- `TemplateEditor` rewritten with three new refs:
-  `editorRef` (HTMLDivElement that holds the editor mount
-  point), `editorViewRef` (the current EditorView instance,
-  destroyed + nulled on cleanup), and `draftsRef` (latest
-  drafts captured for the updateListener closure so multiple
-  React renders don't strand stale references). New
-  `discardCounter` state slot bumps on every discard so the
-  edit-mount `useEffect` re-runs and rebuilds the EditorView
-  with the freshly-reverted doc
-- The mount `useEffect` is keyed on
-  `[selectedPath, discardCounter]`. On every change it
-  destroys the prior view, builds a new `EditorState` with
-  `doc: drafts[path]`, attaches `basicSetup` + `oneDark` +
-  `EditorView.lineWrapping` +
-  `getLanguageExtension(path)` +
-  `EditorView.updateListener.of(...)`, and instantiates a
-  new EditorView in `editorRef.current`. The updateListener
-  fires on every doc-change transaction and writes back via
-  `setDrafts((prev) => ({...prev, [path]: doc.toString()}))`
-- The `<textarea>` JSX block is replaced with
-  `<div ref={editorRef} style={...}>` — `minHeight: 400px,
-  maxHeight: 700px, overflow: auto`. The CSS variables
-  (`var(--border)`, etc.) are preserved so the editor
-  visually integrates with the rest of the panel
-- `discardOne` extended to also call
-  `setDiscardCounter((c) => c + 1)` when the discarded path
-  is the one in the editor — forces the useEffect to re-run
-  and reset the editor's doc. Otherwise the in-memory
-  EditorView would keep showing the operator's typed
-  content even after drafts state has been reverted
-- The now-unused `selectedContent` const is deleted
-- Bundle delta: 363 KB → 1010 KB raw (319 KB gzipped, +190
-  KB delta). Above Vite's 500 KB warning but acceptable for
-  an admin-only feature. Future iteration: code-split via
-  dynamic `import()` so only platform-admins editing
-  templates pay the cost
-
-**Enhancement 2 — `gestalt platform templates push
-<slug> <dirPath> [--dry-run]`.** Batch upload from a local
-directory tree.
-- New `collectTemplateFiles(dir, rootDir)` recursive walker
-  in `platform-extras.ts`. `SKIP_NAMES` Set excludes `.git`
-  / `.gestalt` / `node_modules` / `dist` / `build` /
-  `.DS_Store`. Path separators are normalised forward-slash
-  so Windows operators don't end up with `docs\X.md` keys
-  on the wire
-- New `platformTemplatesPushCommand(slug, dirPath, {dryRun})`
-  exported. Path-validates the dir, walks it, builds the
-  full file map. `--dry-run` prints sizes per file with a
-  "(dry run — no changes made)" footer. Real run calls
-  `PATCH /platform/templates/:id/files` (MERGE semantics —
-  unsupplied files preserved server-side)
-- Error handling: `BUILTIN_TEMPLATE` surfaces with `Cannot
-  push to a built-in template. Duplicate it first: gestalt
-  platform templates duplicate <slug>`;
-  `MISSING_REQUIRED_FILES` surfaces with the typed list +
-  "Ensure AGENTS.md, HARNESS.json, and agents.yaml are
-  present in the directory."; missing-dir → `Directory not
-  found: <path>` + exit 1
-- New `fs` sync imports (`readdirSync`, `statSync`,
-  `existsSync`) + `relative` path helper. The walker uses
-  sync FS calls to match the file's existing style (the
-  editor flow already uses `readFileSync` / `writeFileSync`
-  / `unlinkSync`)
-
-**Enhancement 3 — `gestalt platform templates diff <slug>
-[--against <baselineSlug>] [--stat]`.** Per-file unified
-diff against a baseline.
-- New `diff ^5.2.0` runtime dep + `@types/diff ^5.2.0` dev
-  dep in `packages/cli/package.json`. `diffLines` from the
-  `diff` package does LCS-based line diffing — language-
-  agnostic, no markdown/yaml parser required
-- New `platformTemplatesDiffCommand(slug, {against, stat})`
-  exported. Default baseline `corporate-ops-web-mobile`;
-  `--against <slug>` overrides. Self-diff (same slug both
-  sides) → `Cannot diff '<slug>' against itself.` + exit 1.
-  Both templates loaded via `getPlatformTemplate(id)` in
-  parallel. Path-set union iterated for per-file
-  classification: only in baseline → `(removed)`, only in
-  custom → `(added)`, in both with line changes →
-  `(modified)`, no changes → `(unchanged)`
-- Modified files print a unified-diff block: green `+`
-  lines + red `-` lines + 2 leading / 2 trailing context
-  lines per hunk. Hunks with more than 4 unchanged lines
-  collapse via `... (N unchanged lines)` so big files stay
-  readable
-- `--stat` mode hides the per-line diff and prints only the
-  right-padded per-file `+N -M` summary (or `unchanged`
-  / `(added)` / `(removed)` for non-modified files). Footer
-  `Summary: 1 modified, 7 unchanged` (with green/red/dim
-  fragments) always prints
-
-**Registration:** new `push` and `diff` subcommands
-registered under `gestalt platform templates` in
-`packages/cli/src/index.ts`. Top-of-file command comment
-extended. Header docstring on
-`packages/cli/src/commands/platform-extras.ts` updated to
-document both new subcommands + the LCS-diff design.
-
-Verified live end-to-end:
-
-- `pnpm -r build` clean across all 12 packages. Dashboard
-  bundle compiled to `index-Ds_rUJ8n.js` (1010 KB raw, 319
-  KB gzipped); CLI compiled clean. New dashboard bundle
-  `docker cp`'d into the running container so it serves
-  the fresh assets without an image rebuild. HTML now
-  references the new bundle (`/app/assets/index-Ds_rUJ8n.js`)
-- Spot-grep on the production bundle confirms the new
-  CodeMirror modules landed: CSS classes (`cm-editor` × 1,
-  `cm-content` × 8, `cm-line` × 11, `cm-gutters` × 12), the
-  OneDark theme's signature colors (`#abb2bf`, `#21252b`,
-  `#282c34`), and the APIs we use (`EditorView`,
-  `EditorState`, `lineWrapping` × 28, `updateListener` × 2)
-- `gestalt platform templates --help` lists both new
-  subcommands with their option descriptions
-- **Push verification flow (end-to-end against the live
-  platform):**
-  - `gestalt platform templates download
-    corporate-ops-web-mobile --output /tmp/.../template.zip`
-    → "✓ Template downloaded ... (8 files, 8971 bytes)"
-  - Unzip + append `## Custom section added by
-    operator\nLocal edits via the push workflow.` to
-    `harness/AGENTS.md`
-  - `gestalt platform templates duplicate
-    corporate-ops-web-mobile --name "Push Diff Test"
-    --new-slug push-diff-test` → "✓ Template duplicated"
-  - `gestalt platform templates push push-diff-test
-    /tmp/.../my-edit --dry-run` → "Would push 8 files:" +
-    per-file size listing + "(dry run — no changes made)"
-  - Real push without `--dry-run` → 8 `✓` rows + "✓
-    Template updated: push-diff-test (8 files pushed)"
-  - Direct API fetch confirms `harness/AGENTS.md` content
-    ends with the operator's local edits — the push lands
-    server-side correctly
-- **Diff verification flow:**
-  - `gestalt platform templates diff push-diff-test` →
-    Comparing header, 7 files `(unchanged)`, 1 file
-    `harness/AGENTS.md (modified)` with `... (68 unchanged
-    lines)` context-folding + 2 green `+` lines + Summary
-    `1 modified, 7 unchanged`
-  - `--stat` mode → compact per-file summary with
-    `harness/AGENTS.md +2 -0` and other files
-    `unchanged`
-  - Added a new file (`docs/EXTRA.md`) via push → diff
-    shows `docs/EXTRA.md (added)` line + updated Summary
-  - Clean duplicate (`clean-copy-test`) diff → ALL 8 files
-    `(unchanged)` + Summary `8 unchanged`
-- **Error matrix:**
-  - `push corporate-ops-web-mobile <dir>` → "Cannot push to
-    a built-in template. Duplicate it first: ..."
-  - `push push-diff-test /tmp/does-not-exist` →
-    "Directory not found: ..."
-  - `diff push-diff-test --against nonexistent-baseline` →
-    "No template with slug 'nonexistent-baseline'." +
-    hint
-  - `diff push-diff-test --against push-diff-test` →
-    "Cannot diff 'push-diff-test' against itself."
-- Cleanup: both test templates (`push-diff-test`,
-  `clean-copy-test`) deleted via `gestalt platform
-  templates delete` with `y` confirmation. Final DB state
-  has only the built-in template + the old/new dashboard
-  bundles in the container's dist (the old bundle is now
-  orphan; HTML references the new one)
-
-Decisions made:
-
-- **`basicSetup` imported from `codemirror` (the meta
-  package), NOT `@codemirror/view`.** Brief's pseudocode
-  was incorrect about the import path — in CodeMirror 6,
-  `basicSetup` is exported from the `codemirror` umbrella
-  package. The compiler would have rejected the brief's
-  literal imports; the deviation is required for
-  correctness, not stylistic. Documented inline next to
-  the imports
-- **`useEffect` keyed on `[selectedPath, discardCounter]`,
-  not just `selectedPath`.** Discard needs to recreate the
-  editor (CodeMirror's `EditorState` is immutable
-  per-transaction; setting the doc externally requires
-  either a `dispatch({changes: ...})` call or a fresh
-  state). The counter approach is simpler and matches the
-  brief's "update selectedFile key to force the useEffect
-  to re-run" suggestion. The cleanup function destroys the
-  old EditorView before the next one mounts so there's no
-  double-mount in the DOM
-- **`draftsRef` captures the current drafts state for the
-  updateListener.** Without it, the listener's closure
-  would see stale `setDrafts` calls when React batches
-  state updates across rapid keystrokes. The ref pattern is
-  the standard React idiom for "give me access to the
-  latest state from inside a long-lived callback"
-- **Static imports, not dynamic.** Brief's example used
-  static imports; the bundle delta is significant but
-  Admin is a route-level lazy load already (RequirePlatformAdmin
-  guards the route). Code-split could push only template-
-  editing operators into the CodeMirror-paying tier; a
-  future enhancement but out of scope today
-- **Push walker skips dot-files and common build
-  artifacts** (`.git`, `.gestalt`, `node_modules`, `dist`,
-  `build`, `.DS_Store`). Operators who keep an editing
-  checkout in the same directory shouldn't accidentally
-  push their `node_modules` to the server. The skip list is
-  minimal — the brief said "starts from the directory you
-  give it"; adding the SKIP_NAMES set was a defense
-  against operator mistakes, not a deviation from the
-  intent
-- **Push uses sync FS calls.** Consistent with the rest of
-  `platform-extras.ts` (which uses `readFileSync` /
-  `writeFileSync` / `unlinkSync` for the editor flow).
-  Brief's pseudocode showed async `fs/promises`; either
-  would work, but staying consistent with the file's
-  existing style is cleaner
-- **Diff `(modified)` vs `(unchanged)` decision uses
-  added+removed line count, not change-block count.** A
-  block of unchanged context surrounded by changes would
-  still count toward the modified-file classification.
-  Counting added+removed lines (excluding empty trailing
-  newlines) gives the right semantic: "are there real
-  changes in this file"
-- **Diff `--stat` row format right-pads paths to 40 chars.**
-  Most template file paths are < 30 chars; 40 gives a
-  little headroom while keeping the columns visually
-  aligned. The `+N -M` counts are colorised (green/red) so
-  scannable at a glance
-- **Diff context-folding shows 2 leading + 2 trailing
-  unchanged lines** with `... (N unchanged)` between. Short
-  files (≤ 4 unchanged lines in a row) show the full
-  context. The cutoff is the brief's suggestion; tested
-  against the verification template's AGENTS.md (68
-  unchanged lines collapsed correctly)
-- **No new server endpoints, no new migrations.** Both
-  push and diff use the existing
-  `PATCH /platform/templates/:id/files` and
-  `GET /platform/templates/:id` endpoints from the prior
-  session. The dashboard CodeMirror integration is purely
-  UI-side
-
-Bundle size note flagged for follow-up:
-
-- Dashboard bundle grew from 363 KB to 1010 KB (319 KB
-  gzipped, +190 KB delta). Vite's 500 KB warning threshold
-  is now exceeded. Acceptable for an admin-only feature
-  (regular users don't load the Admin route's editor) but
-  a future code-split via dynamic `import()` of CodeMirror
-  modules (similar to how `jszip` is already
-  dynamic-imported in `UploadTemplateModal`) would push
-  the bundle delta from the main chunk into a deferred
-  one only loaded when an operator opens the template
-  editor
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Docker server image NOT rebuilt — the new dashboard bundle
-was `docker cp`'d into the running container at
-`/app/packages/dashboard/dist/`. Next clean image rebuild
-(`docker compose build server`) will fold the new dashboard
-build into the image proper. All CLI commands exercised
-end-to-end against the live platform: push happy path +
-dry-run + 3 error paths, diff full + --stat + added-file +
-clean-duplicate + 2 error paths, plus the existing
-download / duplicate / delete subcommands as part of the
-verification flow.
-
-Pending follow-ups: none introduced. The bundle size
-delta is the only candidate for future iteration — a
-single-day refactor to dynamic-import the CodeMirror
-modules from inside the TemplateEditor mount effect would
-restore the main bundle to ~370 KB and only fire the
-extra ~640 KB raw on first editor open.
 

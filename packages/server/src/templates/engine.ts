@@ -133,7 +133,7 @@ function applyVariablesFromFileMap(
 ): HarnessFile[] {
   const files: HarnessFile[] = [];
   for (const [templateRelativePath, raw] of Object.entries(fileMap)) {
-    const content = substitute(raw, vars);
+    const content = substitute(raw, vars, { jsonEscape: isJsonPath(templateRelativePath) });
     const repoPath = resolveRepoPath(templateRelativePath);
     files.push({ repoPath, content });
   }
@@ -200,8 +200,8 @@ async function collectFiles(
     if (isTopLevel && SKIP_FILES.has(entry.name)) continue;
 
     const raw = await readFile(fullPath, 'utf8');
-    const content = substitute(raw, vars);
     const templateRelativePath = fullPath.slice(baseDir.length + 1);
+    const content = substitute(raw, vars, { jsonEscape: isJsonPath(templateRelativePath) });
     const repoPath = resolveRepoPath(templateRelativePath);
     files.push({ repoPath, content });
   }
@@ -211,16 +211,33 @@ async function collectFiles(
  * Replaces every `{{key}}` occurrence with `vars[key]`. Leaves
  * unknown keys in place (returning the original `{{key}}` literal)
  * so missing values are debuggable rather than silently empty.
+ *
+ * When `options.jsonEscape` is true the substituted value is
+ * JSON-escaped (newlines → `\n`, `"` → `\"`, control chars → `\uXXXX`,
+ * etc.) so multi-line values land safely inside a JSON string literal.
+ * Callers set this for `.json` template files; markdown / yaml stay
+ * verbatim so human-readable bodies keep their real line breaks.
  */
-export function substitute(content: string, vars: TemplateVariables): string {
+export function substitute(
+  content: string,
+  vars: TemplateVariables,
+  options: { jsonEscape?: boolean } = {},
+): string {
   return content.replace(/\{\{(\w+)\}\}/g, (_, key) => {
     const value = vars[key];
     if (value === undefined) {
       log.debug({ key }, 'Template variable not supplied — leaving placeholder in place');
       return `{{${key}}}`;
     }
+    if (options.jsonEscape) {
+      return JSON.stringify(value).slice(1, -1);
+    }
     return value;
   });
+}
+
+function isJsonPath(p: string): boolean {
+  return p.toLowerCase().endsWith('.json');
 }
 
 /**
