@@ -299,9 +299,27 @@ function buildReviewPrompt(
     `supertest, node …). Packages that ship their own types (dotenv, zod, ` +
     `pino, fastify, prisma …) are exempt. Flag missing @types/* as category ` +
     `"architecture", severity "medium".\n\n` +
-    `4. **Test file placement.** Test files live in \`tests/unit/\` or ` +
-    `\`tests/integration/\` mirroring the source structure — NOT inside ` +
-    `\`src/\`, NOT under invented \`src/modules/<config-name>/\` directories. ` +
+    `4. **Test file placement.** Test files live under \`tests/unit/\` ` +
+    `or \`tests/integration/\`, mirroring the source structure verbatim. ` +
+    `**The mirrored sub-directories ARE the correct layout — do NOT flag ` +
+    `them.** Worked examples that ARE correct (do not flag):\n` +
+    `   - \`src/shared/types/index.ts\` → \`tests/unit/shared/types/index.test.ts\` ✓\n` +
+    `   - \`src/shared/db/connection.ts\` → \`tests/unit/shared/db/connection.test.ts\` ✓\n` +
+    `   - \`src/modules/leave/leave.service.ts\` → \`tests/unit/modules/leave/leave.service.test.ts\` ✓\n` +
+    `   - Repo-root config tests (package.json, tsconfig.json, jest.config.js) ` +
+    `→ \`tests/unit/config/<name>.test.ts\` ✓\n\n` +
+    `   Only flag a placement violation when a test file is in one of these ` +
+    `**genuinely wrong** locations:\n` +
+    `   - Inside \`src/\` (co-located with source) — flag as misplaced\n` +
+    `   - Under an invented \`src/modules/<config-name>/\` directory for a ` +
+    `repo-root config file — flag as misplaced\n` +
+    `   - At an arbitrary path like \`test/\`, \`__tests__/\` at the root, ` +
+    `or \`spec/\` instead of the project's \`tests/\` convention — flag as ` +
+    `misplaced\n\n` +
+    `   Mirroring \`src/foo/bar/x.ts\` as \`tests/unit/foo/bar/x.test.ts\` ` +
+    `is the **canonical structure** for this project — that IS the rule, ` +
+    `not a violation of it. If every test file sits under \`tests/unit/\` ` +
+    `with a path that mirrors its source file, return zero placement items. ` +
     `Flag misplaced tests as category "style", severity "low".\n`;
 
   // Scaffolding mode — when the intent reads as "scaffold / set up /
