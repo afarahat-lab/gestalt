@@ -195,20 +195,33 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
-- **Re-run `TEST_REPORT_001`'s scaffold intent** after the
-  2026-06-04 follow-up session's seven fixes ship into the
-  running container. Goal: capture real intent-agent /
-  design-agent / context-agent / code-agent prompts +
-  responses for `TEST_REPORT_002.md`, with
-  `agent_executions.tokens_used` now non-zero (Fix D wired
-  the per-agent capture in
-  `packages/agents/generate/src/orchestrator/orchestrator.ts`).
-  Server `dist` needs to be hot-copied into
-  `gestalt-server-1` (or `docker compose up -d --build`) so
-  Fix B's UUID validator at `POST /intents` is live. The
-  CLI-side Fix A (`packages/cli/src/ui/resolve.ts` shared
-  helper) is enough on its own for the next intent to flow
-  correctly; Fix B is defence-in-depth.
+- **Env-default LLM client doesn't read `apiShape` from the
+  platform LLM registry** (TEST_REPORT_002 #1, HIGH).
+  `getLLMClient()` at `packages/core/src/llm/index.ts:420`
+  builds from `_defaultConfig` (env-only, no apiShape) →
+  always sends `max_tokens`. Every agent without a per-agent
+  model override hits this path. Blocked the 2026-06-04 live
+  test with `chat-latest` until `.env` was switched to
+  `LLM_MODEL=gpt-4o`. Fix: make `getLLMClient()` consult the
+  registry, or wire an `LLM_API_SHAPE` env var.
+- **Mount `master.key` as a docker volume** in
+  `docker-compose.yml` so rebuilds don't regenerate it
+  (TEST_REPORT_002 #2, MEDIUM). One-line compose edit.
+- **test-agent generates Vitest, not Jest** despite a Jest-
+  centric prompt (TEST_REPORT_002 #5, HIGH code quality).
+  Fix: pin import line + reject `from 'vitest'` in
+  constraint-agent for Jest projects.
+- **code-agent skips `@types/<dep>` for runtime deps with
+  typings on npm** (TEST_REPORT_002 #8, MEDIUM — `@types/pg`
+  missing). Generalise dependency-completion logic.
+- **review-agent doesn't cross-check artifacts**
+  (TEST_REPORT_002 #7, MEDIUM). Passed even though tests
+  won't execute. Add cross-artifact consistency section to
+  the prompt.
+- **context-agent has 4 tools configured but never uses
+  them** (TEST_REPORT_002 #4, very low). Drop unused tool
+  config OR extend prompt to read ARCHITECTURE.md /
+  GOLDEN_PRINCIPLES.md.
 - **Dashboard bundle is 1010 KB raw / 319 KB gzipped** after the
   CodeMirror addition (2026-06-04). Above Vite's 500 KB warning.
   Future code-split via dynamic `import()` would restore the
@@ -258,14 +271,22 @@ the `sessions/archive/` files (everything older)._
   during ADR-023 (apiShape) verification regenerated
   `master.key`, breaking the prior vault secret. Both LLMs are
   currently in env-var mode and working.
-- **Open alert** (type `generate-error`, severity `high`,
-  correlation `06299649-2db4-4d64-8785-167e025cbacb`) from the
-  2026-06-04 test-report cycle. Fix A + Fix B now landed in
-  the build, so a fresh re-run of the same scaffold intent
-  will succeed; the original alert row references an
-  unactionable intent (its `project_id` is the literal name
-  `'trackeros'`) and won't auto-resolve. Dismiss explicitly
-  with `gestalt alerts dismiss` once acknowledged.
+- **Two stale alerts** from the 2026-06-04 pre-fix runs
+  (correlations `06299649-…` Report-001 baseline and
+  `ed5c9a47-…` Report-002 LLM apiShape blocker) — dismissable
+  via `gestalt alerts dismiss`. The Report-001 baseline alert
+  was dismissed at the start of the Report-002 session.
+- **TEST_REPORT_002 successful run** correlation
+  `1e316bbf-…` — deployed to production via noop adapter,
+  branch `gestalt/1e316bbf-scaffold-the-project-foundation-create`
+  on trackeros (commit `05fbebd`). Operator may close /
+  delete that branch when ready.
+- **.env was changed** (`LLM_MODEL=chat-latest` → `gpt-4o`)
+  to unblock TEST_REPORT_002. The `platform_llms` row still
+  carries `model_string='chat-latest'` (mismatched with env).
+  Either update the row's `model_string` to `gpt-4o`, OR
+  restore `LLM_MODEL=chat-latest` after the registry-aware
+  env-default fix (active follow-up above) lands.
 
 ---
 

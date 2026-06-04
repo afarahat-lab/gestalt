@@ -58,20 +58,17 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
-- **Re-link CLI + hot-copy server `dist`** (or `docker compose
-  up -d --build`) so the 2026-06-04 follow-up session's seven
-  Test-Report-001 fixes are live in the running container.
-  ```bash
-  pnpm --filter @gestalt/cli build && cd packages/cli && npm link
-  # then either:
-  docker compose up -d --build
-  # OR hot-copy:
-  docker cp packages/server/dist gestalt-server-1:/app/packages/server/dist \
-    && docker restart gestalt-server-1
-  ```
-- **Re-run the `TEST_REPORT_001` scaffold intent** against the
-  patched build to author `TEST_REPORT_002.md`. Server `dist`
-  must be live first.
+- **Two pending platform fixes from `TEST_REPORT_002.md`**:
+  (1) make the env-default LLM client read `apiShape` from
+  `platform_llms` (currently the registry's apiShape is
+  ignored on the no-model path); (2) mount `master.key` as
+  a docker volume so rebuilds don't invalidate vault-
+  encrypted project Git PATs. Both blocked the 2026-06-04
+  live re-run of the scaffold intent until manually worked
+  around (`.env` model switch + re-set Git PAT via API).
+- **trackeros branch `gestalt/1e316bbf-scaffold-the-project-foundation-create`**
+  was pushed by the successful TEST_REPORT_002 cycle
+  (commit `05fbebd`). Operator may close or delete it.
 - **trackeros `.github/workflows/gestalt.yml`** still pins Node 20
   (project was bootstrapped before the 2026-06-04 Node 22 LTS
   template change). Edit `node-version: '20'` → `'22'` + commit.
