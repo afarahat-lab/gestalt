@@ -844,7 +844,18 @@ function CreateProjectModal(props: { onClose: () => void; onCreated: () => Promi
             </div>
 
             <label style={styles.label}>Description (optional)
-              <input style={styles.input} value={description} onChange={(e) => setDescription(e.target.value)} placeholder={`Project ${name || '<name>'} created via platform admin`} disabled={stage !== 'form'} />
+              <textarea
+                style={{ ...styles.input, fontFamily: 'inherit', resize: 'vertical', minHeight: '96px' }}
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                rows={4}
+                placeholder={
+                  'Describe your project: purpose, tech stack, key features.\n' +
+                  'Example: A corporate leave management system with TypeScript,\n' +
+                  'Express, PostgreSQL. Employees apply for leave, managers approve.'
+                }
+                disabled={stage !== 'form'}
+              />
             </label>
             <div style={{ color: 'var(--text-dim)', fontSize: '12px' }}>
               Template: <strong>★ Corporate Ops Web/Mobile</strong> (only template currently shipped)

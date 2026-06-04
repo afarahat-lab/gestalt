@@ -16,7 +16,7 @@ import { loadCliConfig, resolveServerUrl, updateCliConfig } from '../ui/config';
 import { printConnectionError, isConnectivityError } from '../ui/server-errors';
 import {
   c, blank, divider, createSpinner,
-  prompt, promptSecret,
+  prompt, promptSecret, promptMultilineDescription,
 } from '../ui/prompts';
 
 export async function initCommand(options: { server?: string } = {}): Promise<void> {
@@ -227,9 +227,11 @@ export async function initCommand(options: { server?: string } = {}): Promise<vo
       'PostgreSQL database, using npm and Jest"',
     ),
   );
-  blank();
 
-  const description = await prompt('Description');
+  const description = await promptMultilineDescription(
+    'Project description',
+    'Pick an input mode — multi-line and editor modes preserve every line.',
+  );
   if (!description.trim()) {
     console.log(c.error('Description is required.'));
     process.exit(1);

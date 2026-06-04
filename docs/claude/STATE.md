@@ -81,6 +81,11 @@ the `sessions/archive/` files (everything older)._
 - `gestalt init` registers project; server clones repo, generates
   stack config via LLM (`generateStackConfig`), substitutes
   variables into harness template, commits + pushes.
+- Phase-1 project description accepts multi-line input via a
+  three-mode chooser (single-line default / END-terminated /
+  `$EDITOR`). The full body is passed verbatim into
+  `generateStackConfig` and into the template's
+  `{{projectDescription}}` substitution.
 - Vault-backed Git PATs (migration 022) — operators link a vault
   secret to a project; resolver decrypts server-side per-cycle.
 - GitHub repo browser via `/platform/git/repos` proxy.
@@ -137,6 +142,11 @@ the `sessions/archive/` files (everything older)._
 - Intent: `intent list/show/submit` with `--watch` + filters
   (`--source`, `--priority`, `--search`, `--from`, `--to`).
 - Templates push + diff (added 2026-06-04).
+- Shared multi-line prompt helpers in `@gestalt/cli/ui/prompts`:
+  `promptMultiline` / `promptWithEditor` /
+  `promptMultilineDescription`. Used by `gestalt init` (Phase 1
+  description) and `gestalt project config add-custom-agent`
+  (prompt body). Backwards-compatible single-line default.
 
 ---
 

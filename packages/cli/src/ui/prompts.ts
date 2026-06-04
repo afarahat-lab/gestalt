@@ -8,6 +8,10 @@
 import chalk from 'chalk';
 import ora, { type Ora } from 'ora';
 import * as readline from 'readline';
+import { spawnSync } from 'child_process';
+import { writeFileSync, readFileSync, unlinkSync, mkdtempSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 // ─── Colours ──────────────────────────────────────────────────────────────────
 
@@ -127,6 +131,181 @@ export async function promptSecret(question: string): Promise<string> {
 
     process.stdin.on('data', handler);
   });
+}
+
+/**
+ * Buffered line reader. Attaches one `line` listener for the
+ * lifetime of the readline interface — that's necessary because
+ * readline emits `line` events as soon as bytes arrive, regardless
+ * of whether the consumer is currently awaiting. With piped stdin,
+ * registering a listener per-prompt would lose every line that
+ * arrived between prompts.
+ *
+ * `next()` returns the head of the buffer if a line is already
+ * queued, otherwise it waits for the next `line` event. On EOF it
+ * resolves with `null`.
+ */
+interface BufferedReader {
+  next(): Promise<string | null>;
+}
+
+function makeBufferedReader(rl: readline.Interface): BufferedReader {
+  const queue: string[] = [];
+  const waiters: Array<(line: string | null) => void> = [];
+  let closed = false;
+  rl.on('line', (line) => {
+    const waiter = waiters.shift();
+    if (waiter) waiter(line);
+    else queue.push(line);
+  });
+  rl.on('close', () => {
+    closed = true;
+    while (waiters.length) waiters.shift()!(null);
+  });
+  return {
+    next(): Promise<string | null> {
+      if (queue.length) return Promise.resolve(queue.shift()!);
+      if (closed) return Promise.resolve(null);
+      return new Promise((resolve) => waiters.push(resolve));
+    },
+  };
+}
+
+/**
+ * END-terminated multi-line input. Lines are collected verbatim
+ * until the operator types `END` (case-insensitive) on a line by
+ * itself, or stdin closes (EOF). Returns the joined body with no
+ * trailing newline.
+ *
+ * Used for description-style fields where the operator wants more
+ * than a single line of text. `fieldName` is shown in the header;
+ * `hint` is optional context shown above the prompt.
+ */
+export async function promptMultiline(
+  fieldName: string,
+  hint?: string,
+): Promise<string> {
+  console.log(`${chalk.cyan('?')} ${fieldName}`);
+  if (hint) console.log(chalk.dim(hint));
+  console.log(chalk.dim('  (type END on a new line to finish)'));
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: false,
+  });
+  const reader = makeBufferedReader(rl);
+  const lines: string[] = [];
+  while (true) {
+    const line = await reader.next();
+    if (line === null) break;
+    if (line.trim().toUpperCase() === 'END') break;
+    lines.push(line);
+  }
+  rl.close();
+  return lines.join('\n').trim();
+}
+
+/**
+ * Open the operator's `$EDITOR` (or `vi`) to compose a multi-line
+ * value. Returns the content with `#`-prefixed comment lines
+ * stripped (same convention as Git commit messages).
+ *
+ * `initial` is written to the temp file so the editor opens
+ * pre-populated. Useful for templated prompts that want the
+ * operator to fill in placeholders rather than start from blank.
+ *
+ * Falls back to `promptMultiline` when the editor binary can't
+ * launch — operators on minimal images (no `$EDITOR` set, no
+ * `vi`) still get a working multi-line capture.
+ */
+export async function promptWithEditor(
+  fieldName: string,
+  initial = '',
+): Promise<string> {
+  const editor = process.env['EDITOR'] || process.env['VISUAL'] || 'vi';
+  const dir = mkdtempSync(join(tmpdir(), 'gestalt-prompt-'));
+  const slug = fieldName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'value';
+  const file = join(dir, `${slug}.txt`);
+  const body = initial && initial.length > 0
+    ? initial
+    : `# Enter ${fieldName} below. Lines starting with '#' are ignored.\n# Save and close the editor when done.\n\n`;
+  writeFileSync(file, body, 'utf8');
+
+  const result = spawnSync(editor, [file], { stdio: 'inherit' });
+  if (result.error || (typeof result.status === 'number' && result.status !== 0)) {
+    console.log(c.warn(`Could not launch ${editor}. Falling back to END-terminated input.`));
+    try { unlinkSync(file); } catch { /* best-effort */ }
+    return promptMultiline(fieldName);
+  }
+
+  const raw = readFileSync(file, 'utf8');
+  try { unlinkSync(file); } catch { /* best-effort */ }
+  return raw
+    .split('\n')
+    .filter((line) => !line.startsWith('#'))
+    .join('\n')
+    .trim();
+}
+
+/**
+ * Three-mode description prompt:
+ *   (1) single line  (backwards compatible)
+ *   (2) multi-line   (END sentinel — works on any TTY, no editor needed)
+ *   (3) editor       (opens $EDITOR for full text editing)
+ *
+ * The default is (1) so existing single-line workflows keep working
+ * with one Enter press. Empty input is treated as the default. Any
+ * other input falls back to single-line mode.
+ *
+ * Shares one readline interface across the choice prompt and the
+ * subsequent capture so it behaves under piped stdin too (a fresh
+ * interface per call drains buffered bytes from the prior one).
+ */
+export async function promptMultilineDescription(
+  fieldName: string,
+  hint?: string,
+): Promise<string> {
+  blank();
+  console.log(`${chalk.cyan('?')} ${fieldName}`);
+  if (hint) console.log(chalk.dim(hint));
+  console.log(chalk.dim('  (1) Single line'));
+  console.log(chalk.dim('  (2) Multi-line (END to finish)'));
+  console.log(chalk.dim('  (3) Open in $EDITOR'));
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: false,
+  });
+  const reader = makeBufferedReader(rl);
+
+  process.stdout.write(`${chalk.cyan('?')} Choice [1] `);
+  const choice = ((await reader.next()) ?? '').trim() || '1';
+
+  if (choice === '3') {
+    rl.close();
+    return promptWithEditor(fieldName);
+  }
+
+  if (choice === '2') {
+    console.log(`${chalk.cyan('?')} ${fieldName}`);
+    console.log(chalk.dim('  (type END on a new line to finish)'));
+    const lines: string[] = [];
+    while (true) {
+      const line = await reader.next();
+      if (line === null) break;
+      if (line.trim().toUpperCase() === 'END') break;
+      lines.push(line);
+    }
+    rl.close();
+    return lines.join('\n').trim();
+  }
+
+  process.stdout.write(`${chalk.cyan('?')} ${fieldName} `);
+  const single = (await reader.next()) ?? '';
+  rl.close();
+  return single.trim();
 }
 
 export async function confirm(question: string, defaultYes = false): Promise<boolean> {

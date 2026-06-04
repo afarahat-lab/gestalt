@@ -20,10 +20,6 @@
  * lives here.
  */
 
-import { spawn } from 'child_process';
-import { writeFileSync, readFileSync, unlinkSync, mkdtempSync } from 'fs';
-import { join } from 'path';
-import { tmpdir } from 'os';
 import {
   GestaltApiClient,
   type EditableAgentConfig, type ProjectConfigCustomAgent,
@@ -34,7 +30,7 @@ import {
   printConnectionError, isConnectivityError, handleMembershipForbidden,
 } from '../ui/server-errors';
 import {
-  c, blank, divider, printTable, prompt, confirm,
+  c, blank, divider, printTable, prompt, confirm, promptWithEditor,
 } from '../ui/prompts';
 
 interface BaseOptions { server?: string; project?: string }
@@ -736,38 +732,21 @@ function projectRoleBadge(role: string): string {
 
 /**
  * Open the operator's $EDITOR (or vi as fallback) to compose the
- * multi-line prompt body for a new custom agent. Returns the saved
- * content. Same pattern git uses for commit messages.
+ * multi-line prompt body for a new custom agent. Delegates to the
+ * shared `promptWithEditor` helper, pre-populating the buffer with
+ * the placeholder reference that the server substitutes at run time.
  */
 async function openEditorForPrompt(): Promise<string> {
-  const editor = process.env['EDITOR'] || process.env['VISUAL'] || 'vi';
-  const dir = mkdtempSync(join(tmpdir(), 'gestalt-custom-agent-'));
-  const file = join(dir, 'PROMPT.txt');
-  writeFileSync(
-    file,
-    [
-      '# Compose the prompt template for your custom agent.',
-      '# Available placeholders (the server substitutes these at run time):',
-      '#   {{role}} {{goal}} {{artifacts}} {{goldenPrinciples}}',
-      '#   {{intentText}} {{projectName}}',
-      '# Lines starting with `#` are stripped before saving.',
-      '',
-      '',
-    ].join('\n'),
-    'utf8',
-  );
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn(editor, [file], { stdio: 'inherit' });
-    child.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`editor exited ${code}`)));
-    child.on('error', reject);
-  });
-  const raw = readFileSync(file, 'utf8');
-  unlinkSync(file);
-  const cleaned = raw
-    .split('\n')
-    .filter((line) => !line.startsWith('#'))
-    .join('\n')
-    .trim();
+  const initial = [
+    '# Compose the prompt template for your custom agent.',
+    '# Available placeholders (the server substitutes these at run time):',
+    '#   {{role}} {{goal}} {{artifacts}} {{goldenPrinciples}}',
+    '#   {{intentText}} {{projectName}}',
+    '# Lines starting with `#` are stripped before saving.',
+    '',
+    '',
+  ].join('\n');
+  const cleaned = await promptWithEditor('Custom agent prompt', initial);
   if (!cleaned) {
     console.log(c.error('Empty prompt — aborting.'));
     process.exit(1);
