@@ -4,6 +4,238 @@ _Auto-maintained. The most recent session is prepended at the top; when this fil
 
 ---
 
+### Session 2026-06-05 — Claude Code (Test Report 004: first domain-module intent on a real scaffold — Leave module foundation against trackeros — gate verdict false-positive blocks reveal three platform issues that need work before TEST_REPORT_005)
+
+Read-and-report session. Goal: re-run the platform against a
+domain-module intent on top of the TEST_REPORT_003 scaffold (now
+on trackeros `main` as commit `2a3d00d`, merged via PR #47), and
+produce a structured per-agent analysis covering all five
+brief-defined evaluation questions.
+
+Outcome: **failed at the quality gate on BOTH attempts** — the
+generate cycle reached gate verdict cleanly on the first round of
+each attempt, but the gate's signal set was dominated by
+false positives. The actual code produced is largely correct and
+near-shippable on a light review.
+
+Per the brief constraint, the OpenAI rate limit hit after the
+first round of attempt 1, so a 90-second wait + retry was
+performed before marking as failed. The retry surfaced the same
+gate false-positives plus an additional `no-console` violation
+the self-healing-amended retry introduced.
+
+What the user asked for:
+
+- Apply the one-paragraph placement-check prompt fix before
+  running. Already shipped in commit `90ced46` last session; no
+  re-edit needed.
+- Confirm the scaffold from TEST_REPORT_003 is on
+  `origin/main`. Verified — commit `2a3d00d` is on main via PR
+  #47; all three scaffold files (package.json,
+  src/shared/types/index.ts, src/shared/db/connection.ts) are
+  present at the expected paths.
+- Submit the Leave module intent and capture per-agent
+  prompts / responses / tool calls / signals + full artifact
+  content.
+- Answer the brief's per-agent evaluation questions.
+- Write TEST_REPORT_004.md, update RECENT.md, regenerate
+  SUMMARY.md.
+
+What happened on the platform:
+
+- Two attempts submitted with the same intent text. Attempt 1
+  correlation `3af30e7d-deec-417d-a53d-fd34ecb0a615`, attempt 2
+  correlation `a829c77b-2a31-4ea9-9f3e-439cb2cb53ea`. Both
+  reached `failed` after the gate verdict on round 1 + 2-3
+  auto-healing retries the rate limit eventually killed.
+- Total `agent_executions` across both attempts: 54. Round 1 of
+  each attempt completed the full generate cycle; round 2 of
+  attempt 2 also completed (but with degraded code from the
+  diagnostician-amended intent). Other rounds were rate-limited
+  on code-agent.
+- 38 artifacts written across the two attempts. The
+  context-agent **finally** wrote to `docs/DOMAIN.md` (~2 KB) —
+  Reports 002 + 003 had it returning `updates: []` because the
+  design specs were empty.
+- Total tokens consumed across both attempts: **~133,800**
+  (gpt-4o pricing puts this at $0.80–$1.30 USD; a single
+  successful cycle without retries would have been ~$0.10 like
+  TEST_REPORT_003).
+
+The five brief-defined evaluation questions (per-agent):
+
+- **intent-agent — extracted all 5 deliverables correctly?** ✓
+  Yes. IntentSpec captures the model + repository + 5 methods +
+  no-SQL-elsewhere rule. The original rawIntent text round-trips
+  verbatim.
+- **intent-agent — identified dependencies on existing files?**
+  ✗ Partial. IntentSpec doesn't have a "dependencies" block; the
+  code-agent independently discovered them via tool calls.
+- **design-agent — produced a meaningful design?** ✓ Yes,
+  **major improvement** over Reports 002 + 003's empty design
+  specs. Contains 1 `domainChanges` entry (LeaveRequest with 9
+  fields) + 5 `apiContracts` (POST / 3× GET / PATCH). The API
+  contracts are arguably out-of-scope but the entity design is
+  correct.
+- **design-agent — referenced the existing enums?** ✓ Yes
+  (`leaveType: LeaveType`, `status: LeaveStatus` reference the
+  scaffold's enum names).
+- **code-agent — used file tools to read existing files?** ✓✓
+  **Yes — 8 tool calls on the first round.** Listed in detail:
+  `listDirectory('src/modules/leave')` (ENOENT, correct),
+  three `searchFiles` against `src/shared/types/index.ts` for
+  each enum name (all hits), `searchFiles` against
+  `src/shared/db/connection.ts` for "pg Pool" (no match —
+  correct, source uses just `Pool`), `getFileTree({maxDepth:3})`,
+  two `readFile` calls returning the full content of both
+  scaffold files. Real reads, not hallucinations. Explains the
+  20,150-token cost (tool output is fed back into context for
+  every subsequent turn).
+- **code-agent — imports correct?** Mixed. Attempt-1 round-1 +
+  attempt-2 round-1 both correct: `import { LeaveType,
+  LeaveStatus } from '../../shared/types/index'` and `import
+  pool from '../../shared/db/connection'` (matches the scaffold's
+  default export). **Attempt-2 round-2 (self-healing-amended)
+  switches to `import { pool } from '...'` — named import on a
+  default export — which would fail at runtime.** The
+  diagnostician's amendment degraded the design.
+- **code-agent — all 5 methods with parameterised SQL?** ✓ Yes,
+  every round. `INSERT … RETURNING *`, `SELECT * WHERE id = $1`,
+  etc. Zero string interpolation.
+- **code-agent — any `any` types?** ✗ No. Strict-mode clean.
+- **test-agent — mocked pg Pool correctly?** ✓ Yes
+  (`jest.mock('pg', () => ({ Pool: jest.fn(() => ({ query:
+  jest.fn() })) }))`).
+- **test-agent — covered all 5 methods?** ✗ **No — punted.**
+  Attempt-1 round-1 only covers createRequest + findById, with
+  a trailing comment `// Additional tests for X can be added
+  similarly`. Attempt-2 round-1 split into separate model +
+  repository test files but still didn't cover all 5.
+- **test-agent — `tests/unit/modules/leave/`?** ✓ Yes, perfectly
+  mirrored.
+- **test-agent — `@jest/globals`?** ✓ Yes, every file.
+- **review-agent — caught import path errors?** ✗ No (didn't
+  spot the named-default mismatch on attempt-2 round-2).
+- **review-agent — placement check fire correctly?** ✓✓
+  **Yes — the placement-check sharpen from commit `90ced46`
+  holds for a second cycle in a row.** Zero false-positive
+  placement items. Review-agent's prose correctly affirms
+  mirrored placements.
+- **review-agent — checked SQL only in repository?** Indirect.
+  The constraint-agent's deterministic rule covers the same
+  ground; the review-agent doesn't specifically affirm or deny.
+
+Three real platform issues surfaced (these are TEST_REPORT_004's
+recommended fixes for TEST_REPORT_005):
+
+1. **constraint-agent's `no-direct-db-outside-shared-db` rule
+   doesn't distinguish type-only imports.** The regex pattern
+   `from\s+['"](pg|postgres|...)['"]` fires on
+   `import { Pool } from 'pg'` at line 1 column 17 of
+   `leave.repository.ts`. But this is a type-only import needed
+   for the constructor signature; the actual Pool *instance*
+   comes from the default singleton import on a later line. The
+   rule cannot tell the difference. **This is the blocking
+   false positive on every cycle of this intent.** Fix options:
+   (a) prompt code-agent to use `import type { Pool } from 'pg'`
+   and exempt that form, (b) carve out `*.repository.ts`
+   filenames, (c) move to AST-aware detection of `new Pool(...)`
+   outside `shared/db/`.
+
+2. **review-agent over-fires on out-of-scope rules.** The
+   intent says `"Create the Leave module foundation"` with
+   `outOfScope: ["UI layer","Infrastructure setup","Testing
+   beyond unit and integration tests","Any modules outside the
+   Leave module"]`. Review-agent still flags:
+   - "Missing audit record for state-changing operation"
+     (GP-001 audit) — Phase 2 concern
+   - "Input validation not at API boundary" (GP-003) — intent
+     doesn't include endpoints
+   - "Missing `@types/pg` in devDependencies" — scaffold's
+     package.json already has it; review-agent looks only at the
+     cycle's artifacts and treats absence-from-artifacts as
+     absence-from-project.
+   Fix: include `intentSpec.outOfScope` in the review prompt
+   and instruct the agent not to flag excluded layers. Also: let
+   the review-agent see (or read) the cloned project's
+   `package.json` so the @types/* check doesn't false-fire.
+
+3. **Self-healing diagnostician's amended-intent loop creates a
+   circular failure.** Round 1: review says "missing audit". The
+   diagnostician's auto-amended intent for round 2 reads
+   `"…with audit logging and input validation… include
+   @types/pg…"`. Round 2's code-agent obediently adds an audit
+   line using `console.log` (it doesn't know about
+   `createContextLogger from @gestalt/core` — that's a
+   Gestalt-platform internal). This trips the `no-console`
+   constraint rule. Now the next round needs to fix BOTH the
+   missing-audit AND the no-console violation. Diagnostician
+   keeps amending; can't actually fix it. Eventually rate
+   limit kills the loop. **Fix**: if a retry introduces a NEW
+   constraint violation that wasn't in the prior round's set,
+   the diagnostician should de-escalate (revert the amendment
+   that introduced it OR escalate to operator). Today it just
+   keeps amending.
+
+Decisions made:
+
+- **Did not modify any platform source code.** Brief explicitly
+  forbade source changes for this session. The one-paragraph
+  placement-check fix mentioned in the brief was already shipped
+  in commit `90ced46` last session — no re-edit. The three real
+  platform fixes surfaced here are recorded as TEST_REPORT_004
+  recommended fixes for a future session.
+- **Used Python with json_agg for batch SQL extraction** —
+  pulling per-row prompt/response/tool_calls in one query and
+  parsing on the client side. Faster + cleaner than per-agent
+  per-cycle SQL.
+- **Wrote the report against attempt-2 round-1's code** (the
+  "best" code the platform produced before the diagnostician
+  degraded it) for the §"Generated files" section. Attempt-1
+  round-1 documented in the deep-analysis section for
+  comparison.
+- **Per the brief constraint, waited 90 seconds + retried once
+  after the rate limit.** Both attempts ultimately failed for
+  the same reason (gate false positives), so the retry confirmed
+  the failure mode rather than resolving it. Logged in the
+  report as a "did the brief's wait+retry; same outcome" note.
+- **Did NOT close the failed alerts** for the two attempts
+  (carry them as operator follow-ups). Two new alerts will be
+  in the `alerts` table at completion of this session — operator
+  can dismiss with `gestalt alerts dismiss <id>` once Fix #1 +
+  #2 above ship.
+
+Pending follow-ups (for the design-chat + next session):
+
+- **TEST_REPORT_005 should start by shipping the three
+  TEST_REPORT_004 fixes above** (constraint-agent type-import
+  carve-out + review-agent outOfScope respect + diagnostician
+  escape hatch), then re-run THIS intent against the patched
+  platform. The current trackeros main + the scaffold should be
+  enough to reach `deployed` on the first cycle if the gate
+  false positives are eliminated.
+- **The intent-agent's IntentSpec could carry a `dependencies`
+  block** listing the upstream files this intent reads from
+  (`src/shared/types/index.ts`, `src/shared/db/connection.ts`).
+  The design-agent can verify the deps exist on `main` before
+  designing. Marked as MEDIUM in TEST_REPORT_004.
+- **test-agent should NOT punt on method coverage.** The
+  trailing "// Additional tests for X can be added similarly"
+  comment is a real defect. Test-prompt could pin: "emit one
+  test file per method named in the success criteria."
+- **Two trackeros branches were created** for the two attempts
+  but never pushed (cycle exited at gate before pr-agent).
+  Nothing to clean up on the remote.
+
+Build status: no source changes. `pnpm -r build` not re-run.
+Server container `gestalt-server-1` still running the image
+built last session (commit `90ced46`); no rebuild performed.
+Server `/health` 200 throughout. Trackeros `main` unchanged
+from PR #47 (scaffold at `2a3d00d`).
+
+---
+
+
 ### Session 2026-06-05 — Claude Code (Test Report 003 fixes + live evaluation: seven TEST_REPORT_002 fixes shipped — env-default LLM apiShape, master.key volume, test-agent Jest lock, constraint-agent framework rule, code-agent @types/* rule, review-agent cross-artifact check, test placement, AGENTS.md injection — and a real cycle that hits all five brief-defined success criteria)
 
 Bug fix + live evaluation session. Goal was the seven fixes
@@ -413,266 +645,5 @@ default). The pre-existing `chat-latest` model_string is now
 mismatched with the working model in env; an operator should
 either update the registry row's `model_string` to `gpt-4o` or
 restore `LLM_MODEL=chat-latest` once Issue #1 lands.
-
----
-
-
-### Session 2026-06-04 — Claude Code (Test Report 001 fixes: 7-fix platform PR — CLI project-name resolution + server-side UUID guard + diagnostician unrecoverable-error short-circuit + per-agent token capture + intent-prefix matching + `gestalt run --watch` + diagnostician punctuation polish)
-
-Implementation session. The prior session diagnosed seven
-platform defects against the live trackeros project and parked
-the proposed fixes in `docs/claude/TEST_REPORT_001.md` (Fix A
-through Fix G). This session ships all seven in one PR-shaped
-edit. No migration. `pnpm -r build` clean across all 12
-packages. Server `dist` needs to be hot-copied into the running
-container OR `docker compose up -d --build` before the test
-intent can be re-run.
-
-The goal here is **unblocking the live test**: without Fix A
-the operator workflow that supplies `--project <name>` is
-broken end-to-end, and without Fix B the server happily writes
-the bad row even after a CLI regression. Everything else is
-defence-in-depth, observability, or UX polish — small wins
-that together make platform failures vastly easier to debug.
-
-Changed:
-
-- **Fix A — `gestalt run --project <name>` resolves to UUID
-  before any server call.**
-  - **New** `packages/cli/src/ui/resolve.ts` —
-    `resolveProjectId(client, currentProjectId, projectName?)`.
-    Accepts a UUID verbatim; resolves a project name (case-
-    insensitive) via `client.listProjects()`; exits with a
-    `gestalt projects list` hint on miss.
-  - **`packages/cli/src/commands/run.ts`** now calls the
-    helper at the top of `runCommand` (the line that was
-    `options.projectId ?? config.currentProjectId` straight-
-    through, originally at `run.ts:34`). The literal-name
-    path that triggered the original `22P02 invalid input
-    syntax for type uuid` is gone.
-  - **Removed pre-existing duplicate local `resolveProjectId`
-    copies** in `commands/intent.ts`, `commands/deploy.ts`,
-    `commands/maintenance.ts` — they now import the shared
-    helper.
-  - **`commands/agents.ts` `resolveProjectByName`** widened
-    to also accept UUIDs (returns `{id, name}` so existing
-    call sites that print the name keep working).
-  - **`commands/project-config.ts` `openClient`** —
-    case-insensitive name match + UUID acceptance against
-    the projects list. Same shape as the shared helper but
-    inlined because `openClient` returns `{client, project,
-    projectId, projectName, serverUrl}` and the project
-    object needs to be passed downstream.
-  - **`packages/cli/src/index.ts`** — `--project <name>`
-    help text on `gestalt run` + `gestalt intent submit`
-    (was `<id>`; the resolver now accepts both forms so the
-    name is the operator-friendly default).
-
-- **Fix B — Server-side validation at `POST /intents`.**
-  - **`packages/server/src/routes/intents.ts`** — new UUID
-    regex check rejects non-UUID `projectId` with
-    `400 INVALID_PROJECT_ID`. Then `projects.findById` with
-    `404 PROJECT_NOT_FOUND` so a valid-but-unknown UUID
-    fails clean instead of poisoning the `intents` table.
-    Then the existing membership guard. Same
-    `trimmedProjectId` flows through the `intents.create`
-    row + the dispatched `TaskMessage` payload.
-
-- **Fix C — Self-healing diagnostician short-circuits on
-  known-unrecoverable errors.**
-  - **`packages/core/src/agents/self-healing-loop.ts`** —
-    `UNRECOVERABLE_ERROR_PATTERNS` substrings (`"invalid
-    input syntax for type uuid"`, `"relation does not
-    exist"`, `"column does not exist"`, `"econnrefused"`,
-    `"password authentication failed"`). Exported
-    `isUnrecoverableError(message)` helper. Inside
-    `runSelfHealingLoopUnsafe`, after the
-    `config.enabled` gate, check `context.technicalDetail`
-    then `context.failureSummary`; on a match, log
-    `'Unrecoverable error detected — skipping LLM diagnosis,
-    escalating immediately'` and `escalateToHuman` with a
-    reason of `"Unrecoverable infrastructure error: <first
-    200 chars>"`. No LLM call burned.
-  - **`packages/core/src/agents/self-healing-agent.ts`** —
-    same patterns appended to the diagnostician's prompt's
-    "Known failure patterns" section, marked
-    `shouldRetry: false / confidence: "high" /
-    retryTaskType: "none"`. Defence in depth for the
-    (unusual) case where the orchestrator captures the
-    substring on `failureSummary` but not on
-    `technicalDetail`.
-  - **`packages/core/src/index.ts`** — re-exports
-    `isUnrecoverableError` next to `runSelfHealingLoop` so
-    future callers (e.g. a generate-orchestrator pre-flight
-    check) can use the same predicate.
-
-- **Fix D — Capture `tokens_used` per agent execution row.**
-  - **`packages/core/src/agents/base-llm-agent.ts`** — new
-    instance field `lastTokensUsed: number = 0` reset on
-    every `run()` entry. `callLLMWithMessages` and the tool-
-    loop body both accumulate `result.value.tokensUsed` into
-    it after every successful LLM call. The accumulator
-    survives internal retry loops (an agent making multiple
-    LLM calls inside one `run` reports the sum).
-  - **`packages/agents/generate/src/orchestrator/orchestrator.ts`**
-    — computes
-    `effectiveTokensUsed = max(agentInstance.lastTokensUsed,
-    result.tokensUsed)` and writes it to BOTH
-    `executions.updateStatus(executionId, ..., { tokensUsed })`
-    and `step.result.tokensUsed`. The latter feeds the
-    per-cycle rollup at `buildResult(...)` line ~1233 so
-    the dashboard's "tokens so far" total reflects real
-    usage instead of staying at 0 forever.
-  - **`packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`**
-    — review-agent's `lastTokensUsed` is forwarded onto the
-    result via the existing `lastPrompt` / `lastLlmResponse`
-    side-channel, then `runWithObservability` reads it back
-    and threads it into `executions.updateStatus`.
-    Constraint-agent is non-LLM and continues to report 0.
-  - Custom-agent-runner already passed `result.value.
-    tokensUsed` through (`packages/agents/generate/src/
-    agents/custom-agent-runner.ts:100`) — no change needed.
-  - Deploy-layer + maintenance-layer agents are non-LLM
-    today; same pattern applies the day they become LLM
-    (extend `BaseLLMAgent`, read `lastTokensUsed` in the
-    observability wrapper).
-
-- **Fix E — `gestalt intent show <prefix>` matching.**
-  - **`packages/cli/src/ui/intent-resolver.ts`** — rewritten.
-    Full UUID inputs still resolve clean; 8-char (or longer)
-    prefixes now match against BOTH `correlationId` AND `id`
-    (the prior impl matched only `correlationId`, so
-    operators copy-pasting `intents.id` from the DB never
-    matched). On a current-project miss, the search broadens
-    to server-wide (empty `projectId` per the route
-    contract) — this catches the failure mode from
-    TEST_REPORT_001 where the bad-row intent's `project_id`
-    was the literal name `'trackeros'` and the current-
-    project filter excluded it. All matching now
-    case-insensitive.
-
-- **Fix F — `gestalt run --watch` flag.**
-  - **`packages/cli/src/types.ts`** — `RunOptions.watch?:
-    boolean`.
-  - **`packages/cli/src/commands/run.ts`** — after
-    `submitIntent` succeeds, `watchMode` skips the SSE
-    event ticker and instead enters the same periodic
-    full-graph re-render that `gestalt intent show --watch`
-    uses (3 s interval; Ctrl+C detaches; auto-exits when
-    the intent reaches a terminal status). Pulls
-    `renderExecutionGraph` / `clearScreen` /
-    `isTerminalIntentStatus` from `ui/execution-graph`.
-  - **`packages/cli/src/index.ts`** — `--watch` wired on
-    both `gestalt run` and `gestalt intent submit`.
-
-- **Fix G — Strip trailing period from escalation_reason.**
-  - **`packages/core/src/agents/self-healing-loop.ts`** —
-    new private `stripTrailingPunctuation(s)` (regex
-    `/[.!?\s]+$/u`). Applied to `diagnosis.diagnosis`
-    before joining `". Confidence: …"`. The double-period
-    in `"…uuid syntax.. Confidence: medium"` is gone.
-
-Verified:
-
-- `pnpm -r build` clean across all 12 packages. CLI: `tsc &&
-  chmod +x dist/index.js` clean. Server: `tsc` clean. Core:
-  `tsc` clean. Generate / quality-gate / deploy / maintenance:
-  all clean. Dashboard rebuilt to the same
-  `index-DSlpzI_R.js` bundle (1010.76 KB / 319.35 KB
-  gzipped) — no dashboard changes in this session, the
-  rebuild is incidental from the topo-sort.
-- Server-side `POST /intents` reject path traced manually:
-  body `{projectId: 'trackeros', text: 'x'}` hits the regex
-  guard and returns
-  `{error: 'INVALID_PROJECT_ID', message: 'projectId must
-  be a UUID. Run \`gestalt projects list\` to find your
-  project ID.'}` BEFORE the membership check, BEFORE the
-  insert. Body `{projectId: <random valid UUID>, text:
-  'x'}` hits the `projects.findById` 404 check next.
-- CLI-side resolver traced manually: `gestalt run "x"
-  --project trackeros` now calls
-  `client.listProjects()` → matches `trackeros` →
-  forwards `projectId = 5d99e2f3-f3cb-...` to
-  `submitIntent`. Before the fix the literal string
-  `'trackeros'` would have been forwarded.
-
-Decisions made:
-
-- **Single shared helper, not two.** `resolveProjectId` and
-  `resolveProjectByName` (the latter in `commands/agents.ts`)
-  both translate `--project <value>` to a project record, but
-  the former returns just an ID and the latter returns
-  `{id, name}` because the agents commands print the project
-  name in their output. Kept both, but widened
-  `resolveProjectByName` to also accept UUIDs so the
-  `--project <uuid>` form behaves identically across every
-  command surface.
-- **Server-side validation at the route, not the
-  repository.** The repository's `findById` already
-  effectively validates (postgres throws `22P02`) but only
-  in the failure path. Validating at the route boundary
-  gives a clean 400 + a structured error code instead of an
-  opaque 500 from the postgres driver bubbling up.
-- **Diagnostician check on TWO context fields, not one.**
-  The brief said "check `context.technicalDetail`" but the
-  generate-error path on the original incident only carried
-  the substring on `failureSummary` — the
-  diagnostician was diagnosing from the summary alone.
-  Checking both fields catches that case without changing
-  any orchestrator's context-population logic.
-- **Token-capture goes through the agent INSTANCE, not the
-  AgentResult shape.** Every agent's `run()` already returns
-  `tokensUsed: 0` in its result. Walking through every file
-  to thread `this.lastTokensUsed` would touch ~10 files
-  redundantly. The orchestrator already reads agent-instance
-  state (`lastPrompt`, `lastLlmResponse`, `lastModelUsed`)
-  after `run()` returns; piggy-backing on the same pattern
-  for `lastTokensUsed` is one-line and consistent.
-- **`max(instance, result)` not strictly `instance`.** Some
-  agents (custom-agent-runner) already populate
-  `result.tokensUsed` directly. Picking the max preserves
-  whichever path the agent uses without forcing one
-  convention.
-- **`gestalt run --watch` reuses the existing
-  execution-graph renderer.** The brief offered the option
-  of "either implement or document the two-step pattern."
-  Implementing is cleaner — the renderer is already
-  battle-tested by `gestalt intent show --watch`, and the
-  three-second re-render rhythm is exactly what an operator
-  watching a long generate cycle wants.
-
-Pending follow-ups:
-
-- **Hot-copy server `dist` into the running container OR
-  `docker compose up -d --build`** before the next live
-  test. The patched `intents.ts` route is in
-  `packages/server/dist/routes/intents.js` after the build;
-  the running container is still serving the prior binary
-  (which is fine — the missing Fix B isn't blocking, the
-  Fix A CLI change alone makes the next intent flow
-  correctly because the operator never sends a bad
-  projectId).
-- **Re-run the original test intent** (`gestalt run
-  "Scaffold the project foundation. …" --project trackeros
-  --watch`) to author `TEST_REPORT_002.md`. Capture the
-  intent-agent / design-agent / context-agent / code-agent
-  prompts + responses (now stored on
-  `agent_execution_logs` rows that this session DID NOT
-  touch — the logging infrastructure was already in
-  place). Token columns should be > 0 this time.
-- **Open alert** from the pre-fix run (correlation
-  `06299649-2db4-4d64-8785-167e025cbacb`) — dismiss via
-  `gestalt alerts dismiss` once the operator acknowledges
-  the diagnosis. Will not auto-resolve since the original
-  intent row is unactionable (its `project_id` is the
-  literal `'trackeros'`).
-- **Operator caveats from prior sessions still pending**
-  (Node 22 upgrade on trackeros `gestalt.yml`, PR #46
-  close, vault-secret re-creation) — unaffected.
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Server `dist` NOT yet hot-copied into `gestalt-server-1` —
-the operator can do this manually OR rebuild the image
-before the next live test.
 
 ---

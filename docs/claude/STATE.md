@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-05
+**Last updated:** 2026-06-05 (after TEST_REPORT_004)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -195,26 +195,40 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
-- **Review-agent placement check over-fires** (TEST_REPORT_003
-  Issue #1, LOW). Fix 5's review-agent now visibly walks the
-  cross-artifact checklist, but its "test file placement"
-  rule wording is too tight — flags correctly-mirrored paths
-  (`tests/unit/shared/types/index.test.ts`) as "should be at
-  `tests/unit/` directly." Verdict drops to `concerns` (LOW
-  severity, doesn't block cycle). Fix: add a worked example
-  in `llm-review-agent.ts` showing the deeper structure IS
-  correct.
+- **constraint-agent `no-direct-db-outside-shared-db` regex
+  fires on type-only imports** (TEST_REPORT_004 #1, HIGH —
+  blocking). `import { Pool } from 'pg'` in a `.repository.ts`
+  trips the rule even when the actual Pool instance comes from
+  `src/shared/db/connection`. Recommended: prompt code-agent
+  to use `import type { Pool }` + exempt that form.
+- **review-agent over-fires on out-of-scope rules**
+  (TEST_REPORT_004 #2, HIGH — blocking). Flags GP-001 audit /
+  GP-003 input-validation / missing @types/pg even when the
+  intent's `outOfScope` excludes those layers OR the scaffold's
+  package.json already has the types. Fix: thread
+  `intentSpec.outOfScope` into the review prompt + let
+  review-agent read the cloned project state, not just
+  artifacts.
+- **Self-healing diagnostician circular failure on retry**
+  (TEST_REPORT_004 #3, MEDIUM). Review says "missing audit"
+  → diagnostician amends intent → code-agent adds
+  `console.log` → no-console fires → diagnostician can't
+  reason about both. Fix: detect NEW-rule trips on retry and
+  de-escalate / escalate.
 - **Fix 1 (env-default apiShape) not yet live-verified.**
-  Code path is in place — `getLLMClientForModel(undefined)`
-  now resolves through the registry, and `LLM_API_SHAPE`
-  env override is wired. Needs a follow-up test: set
-  `LLM_MODEL=chat-latest` + `platform_llms.chat-latest.
-  api_shape='responses'` and confirm `max_completion_tokens`
-  flows.
-- **test-agent: untyped `let packageJson;` in generated
-  tests** (TEST_REPORT_003 Issue #2, very low). Compiles
-  under inferred-from-usage but trips full `noImplicitAny`.
-  One-line prompt addendum.
+  Code path in place; needs `LLM_MODEL=chat-latest` +
+  `platform_llms.chat-latest.api_shape='responses'` and a
+  test cycle to confirm `max_completion_tokens` flows.
+- **test-agent: untyped `let packageJson;`** (TEST_REPORT_003
+  #2, very low). One-line prompt addendum.
+- **test-agent punts on method coverage** (TEST_REPORT_004,
+  LOW). Test files end with `// Additional tests for X can
+  be added similarly` instead of emitting them. Prompt could
+  pin: "one test file per method named in success criteria."
+- **IntentSpec lacks a `dependencies` block**
+  (TEST_REPORT_004, MEDIUM). Intent-agent doesn't enumerate
+  upstream files the intent reads from; design-agent could
+  verify deps exist on `main` if it did.
 - **code-agent still uses `export default` on
   connection.ts** (TEST_REPORT_003 Issue #3, project-
   dependent). trackeros's AGENTS.md doesn't ban default
@@ -273,13 +287,21 @@ the `sessions/archive/` files (everything older)._
   during ADR-023 (apiShape) verification regenerated
   `master.key`, breaking the prior vault secret. Both LLMs are
   currently in env-var mode and working.
-- **Two synthetic test branches on trackeros** from the live
-  evaluation cycles:
+- **Synthetic trackeros branches from live test cycles**:
   - `gestalt/1e316bbf-…` (commit `05fbebd`) from
     TEST_REPORT_002, PR-less (noop).
   - `gestalt/57759963-…` (commit `2a3d00d`) from
-    TEST_REPORT_003, PR #4706 (noop). Operator may close /
-    delete these when ready.
+    TEST_REPORT_003, **merged via PR #47** — scaffold is on
+    `origin/main` and the foundation for TEST_REPORT_004.
+  - `gestalt/3af30e7d-…` + `gestalt/a829c77b-…` (TEST_REPORT_004)
+    — cycles failed at gate verdict, never pushed to remote.
+    Nothing to clean.
+- **Two open alerts** from the TEST_REPORT_004 attempts
+  (correlations `3af30e7d-…` and `a829c77b-…`, type
+  `generate-error`, severity `high`). Both will auto-resolve
+  once the three TEST_REPORT_004 fixes ship and the Leave
+  module intent succeeds — OR dismiss with
+  `gestalt alerts dismiss`.
 - **`.env`**: `LLM_MODEL=gpt-4o` (was changed from
   `chat-latest` to unblock TEST_REPORT_002). The
   `platform_llms` row still carries `model_string='chat-latest'`
