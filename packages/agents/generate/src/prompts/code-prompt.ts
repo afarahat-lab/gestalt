@@ -275,6 +275,51 @@ export function buildCodePrompt(
     `\`@types/*\` for a typed dependency will trip \`no-any\` on the ` +
     `consuming import and fail the quality gate.`;
 
+  // ── 6d. TypeScript import hygiene (TEST_REPORT_004 Fix 1) ──────────
+  //
+  // When a file imports from a database driver package (pg, postgres,
+  // mysql, …) ONLY to reference a type in a signature, use the
+  // `import type` form. The constraint-agent's
+  // `no-direct-db-outside-shared-db` rule treats `import type` as
+  // safe (it's erased at compile time and cannot reach the runtime
+  // database). The runtime client instance must still come from
+  // `src/shared/db/connection.ts`.
+  //
+  // Concretely: in `src/modules/<x>/<x>.repository.ts` write:
+  //   import type { Pool } from 'pg';
+  //   import pool from '../../shared/db/connection';
+  // NOT:
+  //   import { Pool } from 'pg';
+  //   import pool from '../../shared/db/connection';
+  // The second form trips the rule even though the runtime behaviour
+  // is identical.
+  const typeImportSection =
+    `## TypeScript import hygiene (avoid quality-gate false positives)\n\n` +
+    `When importing from a database driver package (\`pg\`, ` +
+    `\`postgres\`, \`mysql\`, \`mysql2\`, \`mssql\`, \`oracledb\`) ` +
+    `**only for use as a TypeScript type** (e.g. \`Pool\` in a ` +
+    `constructor signature, \`PoolClient\` in a method parameter), ` +
+    `use the type-only import form:\n\n` +
+    '```ts\n' +
+    `import type { Pool } from 'pg';\n` +
+    '```\n\n' +
+    `The runtime client instance must still come from the project's ` +
+    `\`src/shared/db/connection.ts\` singleton:\n\n` +
+    '```ts\n' +
+    `import type { Pool } from 'pg';\n` +
+    `import pool from '../../shared/db/connection';\n\n` +
+    `export class PostgresLeaveRepository {\n` +
+    `  constructor(private readonly pool: Pool = pool) {}\n` +
+    `  // ...\n` +
+    `}\n` +
+    '```\n\n' +
+    `The constraint-agent's \`no-direct-db-outside-shared-db\` rule ` +
+    `treats \`import type\` as safe (TypeScript erases it at compile ` +
+    `time — it cannot reach the runtime database). Writing \`import ` +
+    `{ Pool } from 'pg'\` (without \`type\`) in a file outside ` +
+    `\`shared/db/\` will trip the rule even if you never instantiate ` +
+    `a new Pool there.`;
+
   // ── 7. Signal feedback (retry cycles only) ─────────────────────────
   const signalsSection = buildSignalFeedback(priorSignals);
 
@@ -327,6 +372,7 @@ export function buildCodePrompt(
     domainSection,
     agentsConventionsSection,  // ← NEW (TEST_REPORT_002 Fix 7) — AGENTS.md
     depsTypingSection,         // ← NEW (TEST_REPORT_002 Fix 4) — @types/* coverage
+    typeImportSection,         // ← NEW (TEST_REPORT_004 Fix 1) — `import type` for db drivers
     signalsSection,
     resumeSection,             // ← NEW (migration 020) — self-healing / operator-feedback resume
     taskSection,

@@ -86,6 +86,36 @@ function stripTrailingPunctuation(s: string | undefined | null): string {
 }
 
 /**
+ * TEST_REPORT_004 Fix 4 — compare the current attempt's signals to
+ * the prior attempt's signals (carried on
+ * `intent.lastResumeContext.priorSignals`) and return the subset of
+ * current signals whose `(type, first-N-chars-of-message)` tuple was
+ * NOT present before. Those are the violations the diagnostician's
+ * amendment introduced — escalation rather than another amendment
+ * is the correct response.
+ *
+ * Comparing only `type` would be too coarse (a single rule firing on
+ * a different line shouldn't count as "new"). Comparing message
+ * verbatim is too strict (line numbers / file names change between
+ * attempts). The compromise is `type` + first 60 chars of the
+ * message — long enough to distinguish different rule firings on
+ * the same rule, short enough to tolerate path differences.
+ */
+const SIGNAL_FINGERPRINT_PREFIX = 60;
+function signalFingerprint(s: { type: string; message: string }): string {
+  return `${s.type}|${s.message.slice(0, SIGNAL_FINGERPRINT_PREFIX)}`;
+}
+
+function detectRetryIntroducedViolations(
+  currentSignals: PlatformSignal[],
+  priorSignals: ReadonlyArray<{ type: string; message: string; sourceAgent: string; severity: string }>,
+): PlatformSignal[] {
+  if (priorSignals.length === 0) return [];
+  const priorFingerprints = new Set(priorSignals.map(signalFingerprint));
+  return currentSignals.filter((s) => !priorFingerprints.has(signalFingerprint(s)));
+}
+
+/**
  * The seven failure types the platform recognises. Wired to
  * `platform_self_healing_config.failure_type` (migration 020).
  */
@@ -255,6 +285,61 @@ async function runSelfHealingLoopUnsafe(
       `Budget exhausted after ${currentAttempt - 1} self-healing attempt(s) (max ${config.maxAttempts})`,
     );
     return { shouldRetry: false, diagnosis: null, escalated: true, autoResolved };
+  }
+
+  // TEST_REPORT_004 Fix 4 — escape hatch on retry-introduced
+  // violations. If we're on attempt 2+ AND the current signal set
+  // contains rule/message combinations that weren't in the PRIOR
+  // attempt's signal set, the previous amendment backfired
+  // (introduced new violations the diagnostician can't reason
+  // through). Without this guard the diagnostician keeps amending
+  // the intent, each amendment trips a different rule, retries
+  // pile up, and the cycle ultimately fails with a confused state.
+  //
+  // Concrete trace from TEST_REPORT_004:
+  //   - Round 1 review says "missing audit"
+  //   - Diagnostician amends the intent: "…with audit logging…"
+  //   - Round 2 code-agent uses `console.log` for the audit
+  //   - The `no-console` rule fires
+  //   - Round 3 would need to fix BOTH the missing-audit AND
+  //     no-console at once — the diagnostician can't.
+  //
+  // Escalation here is preferable because:
+  //   - the loop has already tried at least once
+  //   - the new violation is evidence that the diagnostician's
+  //     last amendment caused the regression, not the original
+  //     intent
+  //   - the operator can review + decide whether to back out the
+  //     amendment or accept the new findings.
+  const priorResume = (intent?.lastResumeContext ?? null) as ResumeContext | null;
+  if (priorResume?.autoHealed && currentAttempt > 1) {
+    const newViolations = detectRetryIntroducedViolations(
+      signals,
+      priorResume.priorSignals ?? [],
+    );
+    if (newViolations.length > 0) {
+      log.info(
+        {
+          correlationId: payload.correlationId,
+          attempt: currentAttempt,
+          newViolations: newViolations.map(
+            (s) => `${s.type}:${s.message.slice(0, 60)}`,
+          ),
+        },
+        'Self-healing retry introduced new violations — escalating instead of amending again',
+      );
+      const summary = newViolations
+        .slice(0, 3)
+        .map((s) => `${s.type} (${s.sourceAgent}): ${s.message.slice(0, 80)}`)
+        .join(' | ');
+      const autoResolved = await escalateToHuman(
+        payload,
+        context,
+        signals,
+        `Self-healing retry introduced new violations not present in the prior attempt — the last amendment may have overcorrected. New: ${summary}`,
+      );
+      return { shouldRetry: false, diagnosis: null, escalated: true, autoResolved };
+    }
   }
 
   // Diagnosis. The agent itself never throws; even on parse failure

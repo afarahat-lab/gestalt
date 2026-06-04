@@ -41,7 +41,7 @@ import type {
   TaskMessage, TaskResult, TaskPriority, QueueConfig,
   Artifact, PlatformSignal, ExecutionStatus, IntentStatus,
 } from '@gestalt/core';
-import { runConstraintAgent } from '../agents/constraint-agent';
+import { runConstraintAgent, getConstraintAgentInstance } from '../agents/constraint-agent';
 import { ReviewAgent } from '../agents/llm-review-agent';
 import { synthesiseGateResult, summariseGateResult } from '../agents/review-agent';
 import type {
@@ -293,13 +293,34 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
     // Run constraint + review in parallel. Each step persists its own
     // agent_executions row and emits its own SSE events; concurrency is
     // safe because each owns its own DB rows.
+    // TEST_REPORT_005 — constraint-agent now does a Stage-2 LLM
+    // judgment pass. Forward the singleton's lastPrompt /
+    // lastLlmResponse / lastModelUsed / lastTokensUsed onto the
+    // result so the observability wrapper persists them on the
+    // agent_executions row. The instance is reused across cycles
+    // (it's stateless apart from the per-run `lastTokensUsed`
+    // accumulator which `runJudgment` resets on entry).
+    const constraintAgent = getConstraintAgentInstance();
     const [constraintRes, reviewRes] = await Promise.all([
       runWithObservability(
         'constraint-agent',
         'gate:constraint',
         correlationId,
         payload.intentId,
-        () => runConstraintAgent(gateTask),
+        async () => {
+          const r = await runConstraintAgent(gateTask);
+          const decorated = r as unknown as {
+            lastPrompt?: string;
+            llmResponse?: string;
+            modelUsed?: string;
+            tokensUsed?: number;
+          };
+          if (constraintAgent.lastPrompt) decorated.lastPrompt = constraintAgent.lastPrompt;
+          if (constraintAgent.lastLlmResponse) decorated.llmResponse = constraintAgent.lastLlmResponse;
+          if (constraintAgent.lastModelUsed) decorated.modelUsed = constraintAgent.lastModelUsed;
+          if (constraintAgent.lastTokensUsed > 0) decorated.tokensUsed = constraintAgent.lastTokensUsed;
+          return r;
+        },
         childLog,
       ),
       runWithObservability(
@@ -533,9 +554,11 @@ async function runWithObservability<T extends GateAgentResult>(
   const completedAt = new Date();
   const stepStatus: ExecutionStatus = result.status === 'errored'
     ? 'failed' : result.status === 'failed' ? 'failed' : 'completed';
-  // Fix D — review-agent now reports its accumulated token count
-  // through the `tokensUsed` field; constraint-agent is non-LLM and
-  // leaves it undefined → falls back to 0.
+  // Fix D — every LLM-backed gate agent reports its accumulated
+  // token count through the `tokensUsed` field on the decorated
+  // result. As of TEST_REPORT_005 this includes constraint-agent
+  // (Stage-2 LLM judgment) AND review-agent. Pre-LLM cycles where
+  // Stage 1 produced zero candidates leave it undefined → 0.
   const tokensUsed = ((result as unknown as { tokensUsed?: number }).tokensUsed) ?? 0;
   await executions.updateStatus(executionId, stepStatus, {
     tokensUsed,

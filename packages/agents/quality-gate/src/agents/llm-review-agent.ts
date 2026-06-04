@@ -101,6 +101,31 @@ export class ReviewAgent extends BaseLLMAgent {
     // noise that drives retry cycles to no useful end.
     const isScaffolding = detectScaffolding(task.intentText);
 
+    // TEST_REPORT_004 Fix 2 — extract `outOfScope` from the
+    // intent-spec artifact. The intent-agent's artifact lives at
+    // `.gestalt/<correlation-id>/intent-spec.json` and is on
+    // `task.artifacts` even though it's filtered out of
+    // `codeArtifacts` above (different `type`). When the operator
+    // says "create the repository foundation, no API endpoints",
+    // the resulting IntentSpec carries `outOfScope: ["UI layer",
+    // "Any modules outside the Leave module", …]`. Without this
+    // signal the review-agent extrapolates to layers the intent
+    // explicitly excludes (GP-001 audit / GP-003 input validation /
+    // missing @types/pg false-fires from TEST_REPORT_004).
+    const intentSpecOutOfScope = extractIntentSpecOutOfScope(task.artifacts);
+
+    // TEST_REPORT_004 Fix 3 — read project state files (package.json,
+    // tsconfig.json, AGENTS.md) from the cloned project root so the
+    // review-agent knows what's ALREADY on main. The
+    // gate-orchestrator clones the project to `harnessConfig.projectRoot`
+    // before dispatching this agent; reading from there is cheap.
+    // The review-agent had been flagging "missing @types/pg in
+    // devDependencies" even when the project's package.json on main
+    // already shipped it — because the code-agent (correctly) doesn't
+    // regenerate package.json on incremental intents, and the
+    // review-agent only saw the artifact set.
+    const projectStateFiles = await loadProjectStateFiles(task.harnessConfig.projectRoot);
+
     const prompt = buildReviewPrompt(
       codeArtifacts,
       task.harnessConfig.goldenPrinciples,
@@ -108,6 +133,8 @@ export class ReviewAgent extends BaseLLMAgent {
       agentConfig,
       isScaffolding,
       task.harnessConfig.stack?.testFramework,
+      intentSpecOutOfScope,
+      projectStateFiles,
     );
 
     let review: LLMReview;
@@ -211,6 +238,60 @@ async function loadConstraintRules(projectRoot: string): Promise<ConstraintRule[
   }
 }
 
+/**
+ * TEST_REPORT_004 Fix 2 — extract `outOfScope` from the intent-spec
+ * artifact (`.gestalt/<correlationId>/intent-spec.json` produced by
+ * intent-agent) so the review-agent can be told what NOT to flag.
+ * Returns an empty array when the artifact is absent or malformed —
+ * the prompt simply omits the section.
+ */
+function extractIntentSpecOutOfScope(artifacts: ArtifactRef[]): string[] {
+  const intentSpecArtifact = artifacts.find(
+    (a) => a.path.startsWith('.gestalt/') && a.path.endsWith('/intent-spec.json'),
+  );
+  if (!intentSpecArtifact) return [];
+  try {
+    const parsed = JSON.parse(intentSpecArtifact.content) as {
+      outOfScope?: unknown;
+    };
+    if (!Array.isArray(parsed.outOfScope)) return [];
+    return parsed.outOfScope.filter((s): s is string => typeof s === 'string');
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * TEST_REPORT_004 Fix 3 — read the project's key state files
+ * (`package.json`, `tsconfig.json`, `AGENTS.md`) from the cloned
+ * work-dir so the review-agent can check what's ALREADY on main
+ * before flagging "missing X" items. Without this the review-agent
+ * had been flagging items that the project already shipped (e.g.
+ * "missing @types/pg" on a project whose package.json already
+ * declared it) — because the code-agent correctly does NOT
+ * regenerate unchanged files, and the review-agent's prompt only
+ * saw the cycle's artifacts.
+ *
+ * Returns the empty object when none of the files exist; the
+ * prompt section is then omitted entirely.
+ *
+ * Content is truncated to 4 KB per file in the prompt builder to
+ * keep the input token budget bounded.
+ */
+async function loadProjectStateFiles(
+  projectRoot: string,
+): Promise<Record<string, string>> {
+  const files: Record<string, string> = {};
+  for (const relPath of ['package.json', 'tsconfig.json', 'AGENTS.md']) {
+    try {
+      files[relPath] = await readFile(join(projectRoot, relPath), 'utf8');
+    } catch {
+      // Best-effort — file may not exist on this project.
+    }
+  }
+  return files;
+}
+
 function buildReviewPrompt(
   artifacts: ArtifactRef[],
   goldenPrinciples: string[],
@@ -218,6 +299,8 @@ function buildReviewPrompt(
   agentConfig: AgentConfig,
   isScaffolding: boolean,
   testFramework?: string,
+  intentSpecOutOfScope?: string[],
+  projectStateFiles?: Record<string, string>,
 ): string {
   let used = 0;
   const files: string[] = [];
@@ -339,12 +422,68 @@ function buildReviewPrompt(
       `overallVerdict: "pass" and an empty items array\n`
     : '';
 
+  // TEST_REPORT_004 Fix 2 — out-of-scope section. Placed BEFORE the
+  // golden-principles section so the LLM reads "do NOT flag X" first
+  // and applies that exclusion when subsequently considering each
+  // golden principle. Without this guard the review-agent
+  // extrapolated GP-001 (audit) and GP-003 (input validation) to
+  // intents whose outOfScope explicitly excluded the API/audit
+  // layers, producing blocking false-positives.
+  const outOfScopeSection = (intentSpecOutOfScope && intentSpecOutOfScope.length > 0)
+    ? `\n## Out of scope for this intent — do NOT flag these\n\n` +
+      `The intent-agent's IntentSpec explicitly lists the following as ` +
+      `OUT OF SCOPE for this cycle. Do NOT flag their absence as ` +
+      `violations even if they would normally be required by a golden ` +
+      `principle:\n\n` +
+      intentSpecOutOfScope.map((s) => `- ${s}`).join('\n') + `\n\n` +
+      `Concretely: if the intent excludes "API layer" or "API endpoints", ` +
+      `do NOT flag missing input validation in route handlers, missing ` +
+      `RBAC middleware, or missing audit logging on hypothetical ` +
+      `endpoints. If the intent excludes "service layer", do NOT flag ` +
+      `missing business-rule enforcement that belongs there. Those ` +
+      `concerns belong to a FUTURE intent that includes the excluded ` +
+      `layer, not this one.\n` +
+      `\n` +
+      `Repository-only intents in particular: the repository's job is ` +
+      `parameterised SQL + a typed result. Audit logging, input ` +
+      `validation at the API boundary, and RBAC enforcement are ` +
+      `service / route layer concerns. Do NOT demand them in a ` +
+      `repository-only cycle.\n`
+    : '';
+
+  // TEST_REPORT_004 Fix 3 — project state section. Lets the
+  // review-agent see the project's existing package.json /
+  // tsconfig.json / AGENTS.md content so it stops flagging items
+  // that are already declared on main. The code-agent correctly
+  // does NOT regenerate unchanged files on incremental intents,
+  // which previously caused "missing @types/pg" false-positives
+  // when the scaffold's package.json already shipped them.
+  //
+  // Per-file truncation to 4 KB keeps the prompt budget bounded.
+  const PROJECT_STATE_TRUNCATE = 4000;
+  const projectStateSection = (projectStateFiles && Object.keys(projectStateFiles).length > 0)
+    ? `\n## Project state (existing files on main)\n\n` +
+      `These files already exist in the project's cloned tree. Use ` +
+      `them as the source of truth for what the project ALREADY has. ` +
+      `Do NOT flag an item as "missing" if it's present in any of ` +
+      `these files — only flag items that are absent from BOTH the ` +
+      `cycle's artifact set AND the project state below.\n\n` +
+      Object.entries(projectStateFiles)
+        .map(([path, content]) => {
+          const slice = content.length > PROJECT_STATE_TRUNCATE
+            ? `${content.slice(0, PROJECT_STATE_TRUNCATE)}\n/* TRUNCATED — full file is ${content.length} bytes */`
+            : content;
+          return `### ${path}\n\`\`\`\n${slice}\n\`\`\``;
+        })
+        .join('\n\n') + `\n`
+    : '';
+
   return `${persona}
 You are reviewing code generated by upstream agents. Your job is to
 identify concerns the generate layer missed. Be specific and concrete —
 no generic advice. Only flag concerns that are actually present in the
 code below.
-${scaffoldingSection}${constraintsSection}${principlesSection}${consistencySection}
+${outOfScopeSection}${projectStateSection}${scaffoldingSection}${constraintsSection}${principlesSection}${consistencySection}
 ## Files under review
 
 ${files.join('\n\n')}

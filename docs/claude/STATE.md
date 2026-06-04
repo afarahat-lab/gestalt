@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-05 (after TEST_REPORT_004)
+**Last updated:** 2026-06-05 (after TEST_REPORT_005)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -195,26 +195,26 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
-- **constraint-agent `no-direct-db-outside-shared-db` regex
-  fires on type-only imports** (TEST_REPORT_004 #1, HIGH —
-  blocking). `import { Pool } from 'pg'` in a `.repository.ts`
-  trips the rule even when the actual Pool instance comes from
-  `src/shared/db/connection`. Recommended: prompt code-agent
-  to use `import type { Pool }` + exempt that form.
+- **constraint-agent type-only pg import false-positive —
+  FIXED (TEST_REPORT_005 Fix 1).** Two-stage flow: scripted
+  detection → CandidateViolations; LLM judgment dismisses
+  type-only imports + context-dependent false positives;
+  only confirmed → signals. Live-verified — the
+  TEST_REPORT_004 blocking candidate now DISMISSED.
+  Code-prompt also gained an `import type` hygiene section.
 - **review-agent over-fires on out-of-scope rules**
-  (TEST_REPORT_004 #2, HIGH — blocking). Flags GP-001 audit /
-  GP-003 input-validation / missing @types/pg even when the
-  intent's `outOfScope` excludes those layers OR the scaffold's
-  package.json already has the types. Fix: thread
-  `intentSpec.outOfScope` into the review prompt + let
-  review-agent read the cloned project state, not just
-  artifacts.
-- **Self-healing diagnostician circular failure on retry**
-  (TEST_REPORT_004 #3, MEDIUM). Review says "missing audit"
-  → diagnostician amends intent → code-agent adds
-  `console.log` → no-console fires → diagnostician can't
-  reason about both. Fix: detect NEW-rule trips on retry and
-  de-escalate / escalate.
+  (TEST_REPORT_005, HIGH — blocking). Fix 2 + Fix 3 wired
+  (sections render; package.json with `@types/jest` is in
+  the prompt) but the LLM still flags "Missing audit" +
+  "Missing @types/jest". Prompt-prominence issue —
+  re-order outOfScope + project-state above the
+  file-under-review block + add a closing checklist, OR
+  apply constraint-agent's two-stage pattern to review-agent.
+- **Self-healing escape hatch wired (Fix 4) but not yet
+  exercised live.** When `attemptNumber > 1` AND current
+  signals contain fingerprints not in `priorSignals`,
+  escalate. Test cycle hit rate-limits before the trigger
+  condition could fire.
 - **Fix 1 (env-default apiShape) not yet live-verified.**
   Code path in place; needs `LLM_MODEL=chat-latest` +
   `platform_llms.chat-latest.api_shape='responses'` and a
