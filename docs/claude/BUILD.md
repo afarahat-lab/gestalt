@@ -58,6 +58,11 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+- **`gestalt run --project <name>` bug** (BLOCKING the operator
+  workflow that uses an explicit project flag). One-line CLI fix
+  + server defense-in-depth — see `docs/claude/TEST_REPORT_001.md`.
+  Workaround: use `gestalt projects use trackeros` first, then
+  `gestalt run "…"` without `--project`. Discovered 2026-06-04.
 - **trackeros `.github/workflows/gestalt.yml`** still pins Node 20
   (project was bootstrapped before the 2026-06-04 Node 22 LTS
   template change). Edit `node-version: '20'` → `'22'` + commit.

@@ -4,6 +4,202 @@ _Auto-maintained. The most recent session is prepended at the top; when this fil
 
 ---
 
+### Session 2026-06-04 — Claude Code (Test Report 001: live scaffold intent against trackeros surfaces a `gestalt run --project <name>` UUID-resolution bug — read-only diagnostic session, no code changes)
+
+Diagnostic / observational session. Goal: submit a real scaffolding
+intent against the live trackeros project, capture every agent's
+prompt + response, and produce a structured report
+(`docs/claude/TEST_REPORT_001.md`) for the platform owner to paste
+into the design chat. The user explicitly forbade any source or
+config changes — the deliverable is the report itself, not a fix.
+
+Outcome: the intent **failed before any agent dispatched**, blocked
+by a previously-undetected platform bug in the `--project` flag
+handling. The session pivoted from "review what the agents
+produced" to "explain why no agent ever ran and what the platform
+needs to fix to make the test repeatable."
+
+What the user asked for:
+
+- `gestalt run "Scaffold the project foundation. Create
+  package.json with express pg jsonwebtoken bcrypt and dotenv as
+  dependencies. Add typescript ts-node jest and the relevant type
+  definitions as dev dependencies. Create tsconfig.json with
+  strict mode targeting Node 22. Create jest.config.js. Create
+  src/shared/types/index.ts with the AppError class and Leave
+  domain enums for LeaveType LeaveStatus and UserRole. Create
+  src/shared/db/connection.ts with the pg Pool singleton."
+  --project trackeros --watch` — submitted (minus the `--watch`
+  flag, which doesn't exist on `gestalt run`; that surfaced
+  Issue #3 in the report).
+- Capture every agent's output via `gestalt intent show`,
+  `gestalt gate show`, `gestalt deploy show`, and direct DB
+  reads from `agent_executions` / `agent_execution_logs` /
+  `artifacts` / `signals`.
+- Write a detailed analysis to `docs/claude/TEST_REPORT_001.md`.
+
+What actually happened on the platform:
+
+- Intent ID `c867da2a-c5ed-49f1-82c4-1a4e4ae27c06`, correlation
+  `06299649-2db4-4d64-8785-167e025cbacb`. Status: `failed`
+  inside ~10s wall-clock, with `attempt_count = 1`.
+- **Zero rows in `agent_executions` / `agent_execution_logs` /
+  `artifacts` / `signals`** for this correlation. The
+  orchestrator threw `PostgresError: invalid input syntax for
+  type uuid: "trackeros"` from
+  `PostgresProjectRepository.findById` before any agent
+  dispatched. Three LLM calls (≈9 350 ms total) were consumed
+  by the self-healing diagnostician, which correctly identified
+  the symptom and ended at medium confidence with
+  `retryTaskType: none`. One row was written to `alerts`
+  (type=`generate-error`, severity=`high`, required_action=
+  `provide-feedback`).
+- Root cause traced (by an Explore subagent against the source):
+  - `packages/cli/src/commands/run.ts:34` reads `--project`
+    raw and forwards it as `projectId` to the server; **does
+    not** call the `resolveProjectId(client,
+    config.currentProjectId, options.project)` helper that
+    `packages/cli/src/commands/intent.ts:91` and `:274-289`
+    already implement and use correctly.
+  - `packages/server/src/routes/intents.ts:62-89` accepts the
+    raw value and INSERTs it into `intents.project_id` (a
+    `text` column) without any UUID validation or
+    name-to-UUID lookup.
+  - The first time the value is coerced to UUID is inside
+    `packages/adapters/postgres/src/repositories/projects.ts:43-49`
+    (`PostgresProjectRepository.findById`), which throws.
+  - Every prior intent in this project's history was
+    submitted via the "current project" path (where
+    `gestalt projects use trackeros` resolves the name to a
+    UUID via `packages/cli/src/commands/projects.ts:302`), so
+    the `--project <name>` failure mode had been masked until
+    this run.
+
+Why this surfaces now: the previous two sessions
+(multi-line-description prompt + JSON-escape fix) lifted
+`gestalt init` to accept multi-line bodies and fixed the
+HARNESS.json substitution to JSON-escape values — both
+prerequisites for the live test the user wants to run here. The
+test exposed an independent, longer-standing bug in the
+`--project` CLI surface.
+
+Captured (read-only):
+
+- Confirmed via `gestalt projects list` that trackeros
+  is registered (UUID `5d99e2f3-f3cb-4842-a03a-419790f70e2d`).
+- Confirmed via `gestalt project config show --project
+  trackeros` that all 9 generate / quality-gate / maintenance
+  agents are configured (intent / design / context / code /
+  test / review / drift / alignment / context-fixer), no
+  custom agents declared.
+- Pulled the orchestrator stack trace from
+  `docker logs gestalt-server-1` showing the exact `findById`
+  call site + postgres error code `22P02`.
+- Compared to control: the immediately-prior smoke-test cycle
+  (correlation `0389391b-…`) has 15 rows in `agent_executions`
+  across three retry rounds (intent → design → context →
+  lint-config → code-agent), with code-agent failing every
+  round on the OpenAI rate limit. The agent pipeline is
+  healthy when it gets to run; only the entry point is
+  broken.
+- Surfaced four secondary platform issues in passing:
+  (a) `agent_executions.tokens_used` is 0 on every row in the
+  control cycle despite real LLM calls;
+  (b) `gestalt intent list` did not include the new intent
+  because the server-side filter resolves `--project
+  trackeros` to a UUID and the broken row's `project_id` is
+  the literal name `'trackeros'`;
+  (c) `gestalt intent show <8-char-prefix>` returned "No
+  intent matches" despite the help text claiming prefix
+  support — only full UUID worked;
+  (d) the diagnostician's `escalation_reason` contains a
+  double period (`syntax..`).
+
+Deliverable:
+
+- **`docs/claude/TEST_REPORT_001.md`** (new file, ~17KB) —
+  full structured report with: per-agent status table,
+  per-agent analysis (every agent "not dispatched"),
+  artifacts table (empty), signals table (empty), alert row
+  contents, 9 numbered issues, 7 recommended platform fixes
+  (Fix A: resolve names in `run.ts:34`; Fix B: validate
+  `projectId` at `POST /intents`; Fix C: skip retry on
+  `22P02`; Fix D: capture per-agent tokens; Fix E: fix
+  prefix matching in `intent show`; Fix F: implement or
+  document `gestalt run --watch`; Fix G: strip trailing
+  period in diagnostician), verdict, and a raw-evidence
+  appendix with full server log timeline + alert context
+  + comparison control-cycle `agent_executions` dump.
+
+Decisions made:
+
+- **Did not run `pnpm` builds or restart the server.** The
+  brief explicitly forbade source + config changes. A bug
+  fix was tempting (it's a one-line change in `run.ts:34`)
+  but the user wants the report first, presumably to
+  decide which of the 7 recommended fixes to ship + in what
+  order. The fix can be applied in a follow-up session.
+- **Used Explore subagent for the code-path trace.** The
+  bug spans 4 files (CLI command, CLI client, server
+  route, postgres adapter). A subagent could read all four
+  and produce a citation-style trace without burning the
+  main conversation context. Returned a clean
+  file:line-keyed report which became the foundation of
+  the report's "Issue #1" section.
+- **Comparison control cycle pulled from the prior smoke
+  test** (correlation `0389391b-…`, 12 min earlier in this
+  same project). Demonstrates that the agent pipeline is
+  healthy and the failure is specifically at the
+  orchestrator's pre-flight project lookup, not in any
+  agent's prompt or behavior.
+- **Did not push a fix to the trackeros remote.** Same
+  rationale — this session is read-only by user
+  instruction. The pending operator alert (open, `severity:
+  high`, `required_action: provide-feedback`) is left
+  in-place for the operator to acknowledge or for a
+  follow-up session to clear with `gestalt alerts
+  dismiss`.
+- **Wrote the report as a single self-contained file at
+  `docs/claude/TEST_REPORT_001.md`** rather than inside
+  the session log, because the user will paste it into a
+  design chat and wants the deliverable to be independent
+  of Claude Code's session-log rotation. The session log
+  entry (this entry) is the meta-context for *how* the
+  report was produced.
+
+Pending follow-ups (for the design-chat + next session):
+
+- **Fix A (run.ts:34 resolveProjectId call)** is the
+  one-line blocking fix. Lands in `@gestalt/cli`. No
+  migration, no server change required for the CLI side.
+- **Fix B (server-side validation at `POST /intents`)** is
+  defense-in-depth and recommended to land in the same PR
+  as Fix A.
+- **Re-run the same scaffolding intent after Fix A + B
+  ship** to produce a real `TEST_REPORT_002.md` covering
+  what intent-agent / design-agent / context-agent /
+  code-agent actually produce. Correlation
+  `06299649-2db4-4d64-8785-167e025cbacb` is the permanent
+  reference point for the pre-fix baseline; the
+  follow-up report will diff against the agent prompts
+  + outputs that didn't exist this round.
+- **Open alert** (id not captured; query
+  `SELECT id FROM alerts WHERE correlation_id =
+  '06299649-…';`) remains open. Either dismiss via
+  `gestalt alerts dismiss` once Fix A ships, or let it
+  age out organically.
+- **Operator caveats from prior sessions still pending**
+  (Node 22 upgrade on trackeros gestalt.yml, PR #46
+  close, vault secret re-creation) are unaffected by this
+  session.
+
+Build status: no source changes made. `pnpm -r build` was
+not re-run (no need; nothing compiled differently). Server
+container `gestalt-server-1` still running the binary from
+the prior session's JSON-escape fix; no restart performed.
+
+---
+
 ### Session 2026-06-04 — Claude Code (HARNESS.json multi-line description bug: JSON-escape values substituted into .json template files; repair trackeros)
 
 Bug fix. Every intent submission against the live trackeros project
@@ -305,155 +501,4 @@ Build status: `pnpm -r build` clean across all 12 packages
 1010.76 KB / 319.35 KB gzipped, identical structure to the
 template-improvements session). Dashboard hot-copied into
 the running container; next image rebuild folds it in.
-
----
-
-### Session 2026-06-04 — Claude Code (modular docs/claude restructure — split STATE.md + SESSION_LOG.md to fix Claude Code large-file warnings)
-
-Documentation-only refactor. No source code touched. The
-always-loaded `docs/claude/` files had grown beyond Claude Code's
-40KB performance threshold (`STATE.md` 226KB, `SESSION_LOG.md`
-840KB). This session restructures them into modular files that
-each stay under the threshold, and adds a rotation protocol so
-they stay small over time.
-
-Changed:
-
-- **New directory structure:**
-  ```
-  docs/claude/
-    CLAUDE.md             ← (lives at repo root, not here)
-    STATE.md              ← current state only
-    BUILD.md              ← build status + known issues
-    CONSTRAINTS.md        ← coding rules
-    ARCHITECTURE.md       ← system reference (NEW; absorbed PLATFORM.md)
-    DECISIONS.md          ← ADR index (updated to cover ADR-001..ADR-040)
-    SUMMARY.md            ← regenerated from STATE+BUILD+RECENT
-    sessions/
-      RECENT.md           ← last 3 sessions (auto-maintained)
-      archive/
-        2026-05.md        ← all May sessions (30 entries)
-        2026-06-w1.md     ← June 1-4 sessions through apiShape (45 entries)
-  ```
-- **`PLATFORM.md` deleted** — its monorepo-structure + dependency-
-  order content was absorbed into the new `ARCHITECTURE.md` which
-  also includes the key type alignment rules previously hidden
-  inside `BUILD.md`.
-- **`SESSION_LOG.md` deleted** — its 78 session entries were
-  split: lines 20-3471 (30 May sessions) → `archive/2026-05.md`;
-  lines 3473-15519 (45 June 1-4 sessions through apiShape) →
-  `archive/2026-06-w1.md`; lines 15521-end (2 most recent
-  sessions: template-download + template-improvements) →
-  `sessions/RECENT.md`. Each archive file gets a small header
-  explaining it's append-only + read-on-demand.
-- **`STATE.md` rewritten** from 226KB → 10.8KB. Stripped the
-  giant "Last updated" narrative paragraph (which duplicated
-  session log content and grew layer-by-layer as PRE-EXISTING
-  chains). Kept only: what's built (concise one-line capability
-  bullets grouped by area), what's not built, active follow-ups,
-  current operator caveats, first-boot sequence.
-- **`BUILD.md` refreshed** from 3.7KB → 3.0KB. Fixed stale
-  migration count (003 → 023), removed stale "Known issues"
-  (git-token-encryption-at-rest is now handled by the vault),
-  moved type-alignment rules into ARCHITECTURE.md. Added current
-  operator-pending actions (Node 22 update on trackeros, PR #46
-  cleanup, vault secret re-creation).
-- **`DECISIONS.md` updated** from 6.7KB → 9.3KB. Extended the
-  ADR index from 12 entries to cover ADR-001 through ADR-040.
-  Added expanded summaries for ADR-018 / ADR-038 / ADR-039 /
-  ADR-040 which weren't previously summarised. New "ADR
-  fast-lookup matrix" at the bottom mapping code paths →
-  which ADRs to read first.
-- **`ARCHITECTURE.md` created** (8.5KB) — monorepo structure +
-  package dependency order + key type alignment rules + adapter
-  interface contract + agent execution model + event bus
-  notes. Plus a fast-lookup matrix pointing at the right file
-  for every concern (ADRs / constraints / build / runbooks /
-  per-package conventions).
-- **`CONSTRAINTS.md` unchanged** (2.0KB) — already concise.
-- **Root `CLAUDE.md` rewritten** from 0.9KB → 3.6KB. New
-  `@` imports point at the modular files (STATE / BUILD /
-  CONSTRAINTS / sessions/RECENT.md as always-loaded;
-  ARCHITECTURE / DECISIONS / sessions/archive as on-demand).
-  Added a detailed "After every session — mandatory"
-  protocol that spells out the prepend + rotate +
-  regenerate-SUMMARY flow with concrete bash for SUMMARY
-  regeneration. Added a file-size targets table so the next
-  agent knows the thresholds.
-- **`SUMMARY.md` regenerated** using the new sources
-  (STATE.md + BUILD.md + sessions/RECENT.md). The shell
-  recipe in CLAUDE.md uses `tail -n +2` to skip per-file
-  titles since SUMMARY.md provides its own. Generated date
-  stamp included via `$(date +%Y-%m-%d)`.
-
-Verification:
-
-- `wc -c` per file: STATE 10.8KB, BUILD 3.0KB, CONSTRAINTS
-  2.0KB, ARCHITECTURE 8.5KB, DECISIONS 9.3KB, sessions/RECENT
-  21.5KB (this entry + template-improvements; template-
-  download rotated into archive when 3 sessions exceeded the
-  40KB target by 600 bytes), CLAUDE 3.6KB. Every always-
-  loaded file is below 40KB. The two archive files (181KB +
-  640KB) live in `sessions/archive/` which is never
-  auto-loaded.
-- `grep -c '^### Session' sessions/RECENT.md` returns 2.
-  The brief's "3 sessions max" rule is the cap, not the
-  floor; the 40KB warning threshold takes precedence when 3
-  verbose sessions would exceed it (covered by the protocol
-  in `CLAUDE.md`).
-- `ls sessions/archive/` shows the two expected files.
-- `ls docs/claude/SESSION_LOG.md` returns "No such file or
-  directory".
-- `pnpm -r build` clean across all 12 packages (no source
-  changes; docs don't compile). Confirmed by post-migration
-  build.
-
-Decisions made:
-
-- **Three-tier loading strategy.** Files split into "always
-  loaded" (STATE, BUILD, CONSTRAINTS, RECENT — Claude Code
-  reads these on every session start) and "on demand"
-  (ARCHITECTURE, DECISIONS, sessions/archive — read only
-  when a task touches them). This matches the brief's intent
-  and keeps the always-loaded surface small.
-- **`PLATFORM.md` absorbed into `ARCHITECTURE.md`.** The brief
-  didn't list PLATFORM.md in the target structure but the
-  content overlapped (monorepo structure + dependency order
-  was in both). Consolidating into a single file is cleaner.
-- **Archive boundaries by week within June.** The brief
-  specified `2026-06-w1.md` for June 1-7. We currently only
-  have June 1-4 sessions; w1 covers them all. When a future
-  session lands on June 8 or later, the protocol will create
-  `2026-06-w2.md` (rolling weekly archive).
-- **`SUMMARY.md` regeneration uses `tail -n +2`** to skip
-  each source file's own title heading. Without this,
-  SUMMARY.md would have repeated "# STATE.md", "# BUILD.md",
-  etc. inline with its own title.
-- **Kept `CONSTRAINTS.md` mostly unchanged.** It was already
-  concise + factual. No reason to rewrite. Brief's note
-  about extracting from CLAUDE.md doesn't apply — that
-  content had been extracted in the 2026-05-30 split
-  session, before today.
-- **No `docs/claude/CLAUDE.md` file created.** The brief's
-  target structure listed `docs/claude/CLAUDE.md` as the
-  root entry point. Claude Code reads `CLAUDE.md` from the
-  workspace root (not from `docs/claude/`), so the actual
-  root CLAUDE.md was rewritten in place to use the new
-  imports. Documented this in the file-size targets table.
-- **Migration session log entry written concisely** to stay
-  within RECENT.md's 40KB target after prepending. Initial
-  3-session total landed at 40.6KB — 600 bytes over the
-  threshold. Per the protocol I wrote in `CLAUDE.md`,
-  rotated template-download (the oldest of the 3) into
-  `archive/2026-06-w1.md`, ending at 2 sessions / 21.5KB.
-  The brief's "3 sessions" wording is interpreted as a max,
-  not a floor; cleanly under 40KB matters more than session
-  count for the warning to disappear.
-
-Pending follow-ups: none introduced.
-
-Build status: no source changes. `pnpm -r build` still clean
-across all 12 packages (verified before commit). The
-restructure affects only `docs/claude/**` files.
-
 

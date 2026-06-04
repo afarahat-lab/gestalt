@@ -191,6 +191,29 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
+- **`gestalt run --project <name>` stores the literal NAME in
+  `intents.project_id`** instead of resolving to UUID. Orchestrator
+  then errors `invalid input syntax for type uuid` from
+  `PostgresProjectRepository.findById`. One-line fix: call the
+  existing `resolveProjectId` helper at
+  `packages/cli/src/commands/run.ts:34`. Server defense-in-depth:
+  validate `projectId` at `POST /intents`. Tracked in
+  `docs/claude/TEST_REPORT_001.md` (Fix A + Fix B). Discovered
+  2026-06-04 during live test against trackeros.
+- **`agent_executions.tokens_used` is always 0** even for cycles
+  where the `llm` module logs report real token usage. Per-agent
+  token rollups in `gestalt intent show` are wrong as a result.
+  Fix D in TEST_REPORT_001.
+- **`gestalt intent show <8-char-prefix>` no longer matches**
+  despite the help text claiming prefix support. Only full UUID
+  works. Fix E in TEST_REPORT_001.
+- **`gestalt run --watch` is undocumented / missing.** Operators
+  expect submit-and-tail in one step; today they must
+  `gestalt run … && gestalt intent show <id> --watch`. Fix F in
+  TEST_REPORT_001.
+- **Self-healing diagnostician retries on `22P02 invalid input
+  syntax for type uuid`** — wasted LLM call for an unrecoverable
+  error. Fix C in TEST_REPORT_001.
 - **Dashboard bundle is 1010 KB raw / 319 KB gzipped** after the
   CodeMirror addition (2026-06-04). Above Vite's 500 KB warning.
   Future code-split via dynamic `import()` would restore the
@@ -240,6 +263,11 @@ the `sessions/archive/` files (everything older)._
   during ADR-023 (apiShape) verification regenerated
   `master.key`, breaking the prior vault secret. Both LLMs are
   currently in env-var mode and working.
+- **Open alert** (type `generate-error`, severity `high`,
+  correlation `06299649-2db4-4d64-8785-167e025cbacb`) from the
+  2026-06-04 test-report cycle. Will auto-resolve once Fix A
+  lands and the same intent is re-run, or dismiss explicitly
+  with `gestalt alerts dismiss`.
 
 ---
 
