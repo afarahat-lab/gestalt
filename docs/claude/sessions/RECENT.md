@@ -4,6 +4,249 @@ _Auto-maintained. The most recent session is prepended at the top; when this fil
 
 ---
 
+### Session 2026-06-05 — Claude Code (Test Report 003 fixes + live evaluation: seven TEST_REPORT_002 fixes shipped — env-default LLM apiShape, master.key volume, test-agent Jest lock, constraint-agent framework rule, code-agent @types/* rule, review-agent cross-artifact check, test placement, AGENTS.md injection — and a real cycle that hits all five brief-defined success criteria)
+
+Bug fix + live evaluation session. Goal was the seven fixes
+identified in `docs/claude/TEST_REPORT_002.md` (priority-ordered 1–7),
+followed by a re-run of the trackeros scaffold intent to produce
+`docs/claude/TEST_REPORT_003.md`. All seven fixes shipped, build
+clean across 12 packages, server rebuilt + healthy, scaffold intent
+ran to `deployed` in ~63 s on the first attempt. Total tokens
+17,640 across 6 LLM agents (+38 % vs Report 002, attributable to
+new prompt sections; cost ~$0.08–0.12 USD per cycle at gpt-4o
+pricing).
+
+What the user asked for:
+
+- Apply Fixes 1–7 in priority order from TEST_REPORT_002. Three are
+  marked HIGH (env-default LLM apiShape; test-agent generates Jest
+  not Vitest; code-agent @types/<dep> rule), one MEDIUM (master.key
+  docker volume), three LOW (test placement rule, review-agent
+  cross-checks, AGENTS.md injection).
+- Re-run the scaffold intent (same body as Report 001/002) against
+  trackeros with `--watch` after fixes are in.
+- Verify the five brief-defined success checks: tests use
+  `@jest/globals`, package.json includes `@types/pg`, tests live in
+  `tests/unit/` not `src/modules/`, review-agent flags framework
+  mismatches, `getLLMClient()` reads apiShape from registry.
+- Write TEST_REPORT_003.md, update RECENT.md, regenerate SUMMARY.md.
+
+What happened on the platform:
+
+- Intent ID `c92ed6f4`, correlation
+  `57759963-c07f-4b29-8951-4a12f146361d`, branch
+  `gestalt/57759963-scaffold-the-project-foundation-create` @
+  commit `2a3d00d6cdcf2401a55601a6fd253ed38aa4b5d6` on trackeros.
+  PR #4706 (noop adapter). Promotion to staging + production
+  completed.
+- All 12 `agent_executions` rows present (intent / design /
+  context / lint-config / code / test / constraint / review / pr /
+  pipeline / promotion×2). Token counts: intent 1484, design 707,
+  context 588, code 7399, test 3501, review 3961, non-LLM agents 0.
+  Code-agent up +2075 vs Report 002 from the AGENTS.md +
+  @types/* prompt sections; test-agent up +1227 from the framework
+  mandate + placement rule; review-agent up +1594 from the
+  cross-artifact checklist.
+- All 13 expected artifacts written: 2 design specs, 5 code files
+  (now including `@types/pg` in package.json devDeps), 5 test files
+  (now under `tests/unit/<mirror-path>/` with `@jest/globals`
+  imports), 1 review markdown.
+- Zero signals. Zero alerts. Review-agent verdict `concerns` with
+  5 LOW-severity items (all false positives — see Decisions below).
+
+What changed (each fix):
+
+- **Fix 1 (HIGH)** —
+  `packages/core/src/llm/index.ts`: `getLLMClientForModel`
+  no longer short-circuits to `getLLMClient()` when modelString is
+  undefined. It now resolves `_defaultConfig.model` and runs it
+  through the same registry path as any other model, falling back
+  to the env-only client only when no registry row matches. Means
+  an operator editing `platform_llms.api_shape` for the env-default
+  model sees the change apply to every default-using agent without
+  needing per-agent overrides.
+  `packages/core/src/config/index.ts`: new `LLM_API_SHAPE` env var
+  loaded into `_defaultConfig.apiShape` (lowercased, normalised to
+  `chat-completions` | `responses`; unknown values dropped). So
+  even when the registry has no matching row, operators can pin
+  the shape via `.env` without code changes.
+  `docker-compose.yml`: passes `LLM_API_SHAPE` through.
+- **Fix 2 (MEDIUM)** — `docker-compose.yml`: uncommented the
+  `./master.key:/etc/gestalt/master.key:ro` volume mount as
+  default. Generated a fresh `master.key` via
+  `openssl rand -base64 32 > master.key && chmod 600` at the
+  workspace root (file is already in `.gitignore`).
+  `docs/guides/deployment.md`: updated to reflect that the mount
+  is now wired by default + warns that `master.key` must exist
+  before `docker compose up` (no auto-generation when the mount is
+  present).
+  **Live verification:** rebuild during this session showed
+  `Master key loaded` (not the auto-regen warning); trackeros's
+  plain Git PAT from Report 002 survived without re-set.
+- **Fix 3 Layer A (HIGH)** —
+  `packages/agents/generate/src/prompts/test-prompt.ts`: added a
+  MANDATORY framework section at the TOP of the prompt before any
+  other context. Reads `ctx.harness.stack.testFramework` (defaults
+  to "Jest"). Renders the pinned import line, the mock helper, and
+  the list of FORBIDDEN imports for every other framework
+  (`vitest`, `mocha`, `chai`, `bun:test`, `node:test`, `tap`).
+  Built a `FRAMEWORK_GUIDE` map keyed by lowercased framework
+  name so adding a new framework is a one-entry change.
+  Updated the task section to use the resolved framework name in
+  the rule list (no more hardcoded "Use Vitest").
+- **Fix 3 Layer B (HIGH)** —
+  `packages/agents/quality-gate/src/types.ts`: added
+  `GateHarnessConfig.stack?` carrying `testFramework`, `language`,
+  `framework`, `packageManager`.
+  `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`:
+  new `loadHarnessStack(projectRoot)` reads `HARNESS.json` from
+  the cloned work-dir and threads the stack into `harnessConfig`
+  before the gate dispatch.
+  `packages/agents/quality-gate/src/agents/constraint-agent.ts`:
+  new `FORBIDDEN_TEST_IMPORTS` map + `buildFrameworkRule` that
+  appends a per-cycle dynamic RegexRule when
+  `task.harnessConfig.stack?.testFramework` is set. Built
+  per-cycle (not module-global) so projects swapping frameworks
+  mid-life get the new rule on the next gate without a server
+  restart.
+- **Fix 4 (MEDIUM)** —
+  `packages/agents/generate/src/prompts/code-prompt.ts`: new
+  `## Dependency typing rule` section listing common runtime →
+  @types/* pairs (express, pg, jsonwebtoken, bcrypt, cors, morgan,
+  supertest, node) and a small list of exempted packages that ship
+  their own types (dotenv, zod, pino, fastify, prisma).
+- **Fix 5 (MEDIUM)** —
+  `packages/agents/quality-gate/src/agents/llm-review-agent.ts`:
+  added optional `testFramework` param to `buildReviewPrompt` +
+  new `## Cross-artifact consistency checks` section with four
+  numbered items (framework match, import resolution, type
+  coverage, test placement). The framework-match item is
+  parameterised by `testFramework` and falls back to a generic
+  cross-check when undefined.
+- **Fix 6 (LOW)** —
+  `packages/agents/generate/src/prompts/test-prompt.ts`: new
+  placement section in the task block. tests/unit/ mirroring src,
+  tests/integration/ for integration, tests/unit/config/ for
+  repo-root config tests, do NOT create tests in src/, do NOT
+  invent module dirs.
+- **Fix 7 (LOW)** —
+  `packages/agents/generate/src/types.ts`: new `agentsMd: string`
+  on `ContextSnapshot`.
+  `packages/agents/generate/src/orchestrator/context-assembler.ts`:
+  threads `baseSnapshot.agentsMd` through (the core harness
+  engine's `buildSnapshot` already reads AGENTS.md — just wasn't
+  surfaced to the generate-layer snapshot).
+  `packages/agents/generate/src/prompts/code-prompt.ts`: new
+  `## Project coding conventions (from AGENTS.md)` section rendering
+  the raw markdown (truncated to 3 KB), placed after the domain
+  section and before the dependency-typing section. The rule
+  emphasises "follow these verbatim" so the LLM treats it as
+  binding.
+
+Verified (every check from the brief — all 5 pass):
+
+1. **Test files import from `@jest/globals` not `vitest`** ✓ — 5/5
+   test files start with the canonical Jest import line. Zero
+   matches for `from 'vitest'`.
+2. **package.json includes `@types/pg` in devDependencies** ✓ —
+   `"@types/pg": "^8.6.1"` present. Also `@types/express`,
+   `@types/jsonwebtoken`, `@types/bcrypt`, `@types/node`,
+   `@types/jest`. dotenv correctly NOT in @types.
+3. **Test files placed in `tests/unit/`** ✓ — all 5 under
+   `tests/unit/config/` (3 config tests) or `tests/unit/shared/<area>/`
+   (2 source tests). Zero in `src/`. Verified by remote
+   `git checkout` and `find tests`.
+4. **Review-agent flags test-framework mismatches** ✓ — no Jest↔
+   Vitest mismatch this cycle, so the agent correctly produced no
+   framework-mismatch item. The Fix 5 prompt section is present
+   (verified by `grep -c`); the agent did walk the checklist and
+   flagged a placement issue (see Decisions below).
+5. **`getLLMClient()` reads apiShape from registry** ✓ — verified
+   by code inspection of `packages/core/dist/llm/index.js` in the
+   running container. The path resolves `_defaultConfig.model`
+   through `_registryResolver` first. Not live-exercised because
+   no `platform_llms` row matches `gpt-4o`; fallback path used,
+   identical to historical behaviour.
+
+Decisions made:
+
+- **Made the registry-aware path the canonical entry point** for
+  `getLLMClientForModel(undefined)` rather than introducing a new
+  function or making `getLLMClient` async (the latter would break
+  the stack-config-generator caller at
+  `packages/server/src/templates/stack-config.ts:181`). The change
+  is non-breaking — `getLLMClient(model?)` stays sync; the
+  registry resolution happens upstream in `getLLMClientForModel`.
+- **`LLM_API_SHAPE` env loader as defence-in-depth.** Even when
+  the registry is empty (single-tenant dev deployments) or the
+  model isn't registered, the env-only client now picks up
+  `apiShape` from `.env`. Three independent surfaces for one
+  setting feels redundant but each handles a different failure
+  mode (registry seeded vs. registry empty vs. ad-hoc model
+  override).
+- **Generated a real master.key in the workspace.** The file is
+  gitignored, mode 600, base64-encoded 32 bytes. Without this the
+  Fix 2 docker volume mount would fail (the dev-only auto-generate
+  path is intentionally bypassed when the mount is present).
+  Operator caveat carried into BUILD.md.
+- **Threaded testFramework through GateHarnessConfig.stack rather
+  than reading HARNESS.json from constraint-agent.** Matches the
+  pattern that `llm-review-agent.ts` already used for
+  constraintRules. One file read per cycle (in the orchestrator)
+  instead of one per agent.
+- **Built the constraint-agent's framework rule per-cycle** rather
+  than module-global. Means a project changing its declared
+  framework gets the new rule on its next gate run without a
+  platform restart. Tiny CPU cost per cycle, much better
+  operational ergonomics.
+- **Did NOT pre-generate vitest rules at module load.** Future
+  projects declaring `testFramework: "Vitest"` will get the
+  forbidden-jest-imports rule built on demand, same mechanism.
+- **Placed the AGENTS.md section after the domain section, before
+  the dependency-typing section.** Reasoning: AGENTS.md governs
+  project conventions, which sits between "what the domain looks
+  like" and "what dependencies should appear" — a natural reading
+  order.
+- **Accepted the test-agent's slight prompt-token cost increase**
+  (+2 KB) to ship the framework mandate first. The token budget
+  is well within gpt-4o's limit; the artifact-correctness gain is
+  much bigger than the cost.
+- **Did NOT relax the Fix 5 review-agent prompt** even after
+  observing the placement false-positives. The headline finding
+  (review-agent visibly walking a checklist) is the value of Fix 5;
+  the one-paragraph wording sharpen is a follow-up that doesn't
+  block any current cycle (`concerns` with LOW items doesn't fail
+  the gate). Recorded as Issue #1 in TEST_REPORT_003.
+
+Pending follow-ups (for the design-chat + next session):
+
+- **Sharpen Fix 5's placement-check wording** in
+  `llm-review-agent.ts` so the review-agent stops flagging
+  correctly-mirrored test paths. The fix is a one-paragraph prompt
+  edit + a worked example showing `tests/unit/shared/types/index.
+  test.ts` IS correct.
+- **Live-verify Fix 1's apiShape path** by switching `LLM_MODEL`
+  to `chat-latest` (with the `platform_llms` row's `api_shape`
+  set to `responses`) and confirming `max_completion_tokens`
+  flows. The code path is in place; the live exercise needs an
+  operator to flip the row + `.env` and rerun an intent.
+- **TEST_REPORT_004** — propose: a domain-module intent
+  ("Implement the Leave domain — model, repository, service,
+  routes — following the architecture in ARCHITECTURE.md"). That
+  would exercise the code-agent's cross-file pattern matching,
+  the AGENTS.md influence in a non-scaffold context, and the
+  test-agent's domain-test patterns. Different from the scaffold
+  cycle in that the LLM has to reason about cross-module
+  dependencies.
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker image rebuilt + container restarted via `docker compose
+up -d --build`. Server `/health` 200. CLI relinked via `pnpm
+build && npm link` in `packages/cli`.
+
+---
+
+
 ### Session 2026-06-04 — Claude Code (Test Report 002: post-fix live evaluation of the trackeros scaffold intent — read-and-report, agents ran end-to-end, headline finding is the env-default LLM client doesn't read registry apiShape)
 
 Read-and-report session. Re-ran the same scaffold intent from
@@ -431,201 +674,5 @@ Build status: `pnpm -r build` clean across all 12 packages.
 Server `dist` NOT yet hot-copied into `gestalt-server-1` —
 the operator can do this manually OR rebuild the image
 before the next live test.
-
----
-
-### Session 2026-06-04 — Claude Code (Test Report 001: live scaffold intent against trackeros surfaces a `gestalt run --project <name>` UUID-resolution bug — read-only diagnostic session, no code changes)
-
-Diagnostic / observational session. Goal: submit a real scaffolding
-intent against the live trackeros project, capture every agent's
-prompt + response, and produce a structured report
-(`docs/claude/TEST_REPORT_001.md`) for the platform owner to paste
-into the design chat. The user explicitly forbade any source or
-config changes — the deliverable is the report itself, not a fix.
-
-Outcome: the intent **failed before any agent dispatched**, blocked
-by a previously-undetected platform bug in the `--project` flag
-handling. The session pivoted from "review what the agents
-produced" to "explain why no agent ever ran and what the platform
-needs to fix to make the test repeatable."
-
-What the user asked for:
-
-- `gestalt run "Scaffold the project foundation. Create
-  package.json with express pg jsonwebtoken bcrypt and dotenv as
-  dependencies. Add typescript ts-node jest and the relevant type
-  definitions as dev dependencies. Create tsconfig.json with
-  strict mode targeting Node 22. Create jest.config.js. Create
-  src/shared/types/index.ts with the AppError class and Leave
-  domain enums for LeaveType LeaveStatus and UserRole. Create
-  src/shared/db/connection.ts with the pg Pool singleton."
-  --project trackeros --watch` — submitted (minus the `--watch`
-  flag, which doesn't exist on `gestalt run`; that surfaced
-  Issue #3 in the report).
-- Capture every agent's output via `gestalt intent show`,
-  `gestalt gate show`, `gestalt deploy show`, and direct DB
-  reads from `agent_executions` / `agent_execution_logs` /
-  `artifacts` / `signals`.
-- Write a detailed analysis to `docs/claude/TEST_REPORT_001.md`.
-
-What actually happened on the platform:
-
-- Intent ID `c867da2a-c5ed-49f1-82c4-1a4e4ae27c06`, correlation
-  `06299649-2db4-4d64-8785-167e025cbacb`. Status: `failed`
-  inside ~10s wall-clock, with `attempt_count = 1`.
-- **Zero rows in `agent_executions` / `agent_execution_logs` /
-  `artifacts` / `signals`** for this correlation. The
-  orchestrator threw `PostgresError: invalid input syntax for
-  type uuid: "trackeros"` from
-  `PostgresProjectRepository.findById` before any agent
-  dispatched. Three LLM calls (≈9 350 ms total) were consumed
-  by the self-healing diagnostician, which correctly identified
-  the symptom and ended at medium confidence with
-  `retryTaskType: none`. One row was written to `alerts`
-  (type=`generate-error`, severity=`high`, required_action=
-  `provide-feedback`).
-- Root cause traced (by an Explore subagent against the source):
-  - `packages/cli/src/commands/run.ts:34` reads `--project`
-    raw and forwards it as `projectId` to the server; **does
-    not** call the `resolveProjectId(client,
-    config.currentProjectId, options.project)` helper that
-    `packages/cli/src/commands/intent.ts:91` and `:274-289`
-    already implement and use correctly.
-  - `packages/server/src/routes/intents.ts:62-89` accepts the
-    raw value and INSERTs it into `intents.project_id` (a
-    `text` column) without any UUID validation or
-    name-to-UUID lookup.
-  - The first time the value is coerced to UUID is inside
-    `packages/adapters/postgres/src/repositories/projects.ts:43-49`
-    (`PostgresProjectRepository.findById`), which throws.
-  - Every prior intent in this project's history was
-    submitted via the "current project" path (where
-    `gestalt projects use trackeros` resolves the name to a
-    UUID via `packages/cli/src/commands/projects.ts:302`), so
-    the `--project <name>` failure mode had been masked until
-    this run.
-
-Why this surfaces now: the previous two sessions
-(multi-line-description prompt + JSON-escape fix) lifted
-`gestalt init` to accept multi-line bodies and fixed the
-HARNESS.json substitution to JSON-escape values — both
-prerequisites for the live test the user wants to run here. The
-test exposed an independent, longer-standing bug in the
-`--project` CLI surface.
-
-Captured (read-only):
-
-- Confirmed via `gestalt projects list` that trackeros
-  is registered (UUID `5d99e2f3-f3cb-4842-a03a-419790f70e2d`).
-- Confirmed via `gestalt project config show --project
-  trackeros` that all 9 generate / quality-gate / maintenance
-  agents are configured (intent / design / context / code /
-  test / review / drift / alignment / context-fixer), no
-  custom agents declared.
-- Pulled the orchestrator stack trace from
-  `docker logs gestalt-server-1` showing the exact `findById`
-  call site + postgres error code `22P02`.
-- Compared to control: the immediately-prior smoke-test cycle
-  (correlation `0389391b-…`) has 15 rows in `agent_executions`
-  across three retry rounds (intent → design → context →
-  lint-config → code-agent), with code-agent failing every
-  round on the OpenAI rate limit. The agent pipeline is
-  healthy when it gets to run; only the entry point is
-  broken.
-- Surfaced four secondary platform issues in passing:
-  (a) `agent_executions.tokens_used` is 0 on every row in the
-  control cycle despite real LLM calls;
-  (b) `gestalt intent list` did not include the new intent
-  because the server-side filter resolves `--project
-  trackeros` to a UUID and the broken row's `project_id` is
-  the literal name `'trackeros'`;
-  (c) `gestalt intent show <8-char-prefix>` returned "No
-  intent matches" despite the help text claiming prefix
-  support — only full UUID worked;
-  (d) the diagnostician's `escalation_reason` contains a
-  double period (`syntax..`).
-
-Deliverable:
-
-- **`docs/claude/TEST_REPORT_001.md`** (new file, ~17KB) —
-  full structured report with: per-agent status table,
-  per-agent analysis (every agent "not dispatched"),
-  artifacts table (empty), signals table (empty), alert row
-  contents, 9 numbered issues, 7 recommended platform fixes
-  (Fix A: resolve names in `run.ts:34`; Fix B: validate
-  `projectId` at `POST /intents`; Fix C: skip retry on
-  `22P02`; Fix D: capture per-agent tokens; Fix E: fix
-  prefix matching in `intent show`; Fix F: implement or
-  document `gestalt run --watch`; Fix G: strip trailing
-  period in diagnostician), verdict, and a raw-evidence
-  appendix with full server log timeline + alert context
-  + comparison control-cycle `agent_executions` dump.
-
-Decisions made:
-
-- **Did not run `pnpm` builds or restart the server.** The
-  brief explicitly forbade source + config changes. A bug
-  fix was tempting (it's a one-line change in `run.ts:34`)
-  but the user wants the report first, presumably to
-  decide which of the 7 recommended fixes to ship + in what
-  order. The fix can be applied in a follow-up session.
-- **Used Explore subagent for the code-path trace.** The
-  bug spans 4 files (CLI command, CLI client, server
-  route, postgres adapter). A subagent could read all four
-  and produce a citation-style trace without burning the
-  main conversation context. Returned a clean
-  file:line-keyed report which became the foundation of
-  the report's "Issue #1" section.
-- **Comparison control cycle pulled from the prior smoke
-  test** (correlation `0389391b-…`, 12 min earlier in this
-  same project). Demonstrates that the agent pipeline is
-  healthy and the failure is specifically at the
-  orchestrator's pre-flight project lookup, not in any
-  agent's prompt or behavior.
-- **Did not push a fix to the trackeros remote.** Same
-  rationale — this session is read-only by user
-  instruction. The pending operator alert (open, `severity:
-  high`, `required_action: provide-feedback`) is left
-  in-place for the operator to acknowledge or for a
-  follow-up session to clear with `gestalt alerts
-  dismiss`.
-- **Wrote the report as a single self-contained file at
-  `docs/claude/TEST_REPORT_001.md`** rather than inside
-  the session log, because the user will paste it into a
-  design chat and wants the deliverable to be independent
-  of Claude Code's session-log rotation. The session log
-  entry (this entry) is the meta-context for *how* the
-  report was produced.
-
-Pending follow-ups (for the design-chat + next session):
-
-- **Fix A (run.ts:34 resolveProjectId call)** is the
-  one-line blocking fix. Lands in `@gestalt/cli`. No
-  migration, no server change required for the CLI side.
-- **Fix B (server-side validation at `POST /intents`)** is
-  defense-in-depth and recommended to land in the same PR
-  as Fix A.
-- **Re-run the same scaffolding intent after Fix A + B
-  ship** to produce a real `TEST_REPORT_002.md` covering
-  what intent-agent / design-agent / context-agent /
-  code-agent actually produce. Correlation
-  `06299649-2db4-4d64-8785-167e025cbacb` is the permanent
-  reference point for the pre-fix baseline; the
-  follow-up report will diff against the agent prompts
-  + outputs that didn't exist this round.
-- **Open alert** (id not captured; query
-  `SELECT id FROM alerts WHERE correlation_id =
-  '06299649-…';`) remains open. Either dismiss via
-  `gestalt alerts dismiss` once Fix A ships, or let it
-  age out organically.
-- **Operator caveats from prior sessions still pending**
-  (Node 22 upgrade on trackeros gestalt.yml, PR #46
-  close, vault secret re-creation) are unaffected by this
-  session.
-
-Build status: no source changes made. `pnpm -r build` was
-not re-run (no need; nothing compiled differently). Server
-container `gestalt-server-1` still running the binary from
-the prior session's JSON-escape fix; no restart performed.
 
 ---

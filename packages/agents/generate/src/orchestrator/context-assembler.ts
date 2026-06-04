@@ -105,6 +105,10 @@ export async function assembleContext(
     harness: baseSnapshot.harness as ContextSnapshot['harness'],
     architectureMd: baseSnapshot.architectureMd,
     domainMd: baseSnapshot.domainMd,
+    // TEST_REPORT_002 Fix 7 — surface AGENTS.md so the code-agent
+    // (and any future agent that wants project conventions) can
+    // render it into its prompt without an extra readFile tool call.
+    agentsMd: baseSnapshot.agentsMd,
     architecture: parseArchitecture(baseSnapshot.architectureMd),
     domain: parseDomain(baseSnapshot.domainMd),
     goldenPrinciples: parseGoldenPrinciples(baseSnapshot.goldenPrinciplesMd),

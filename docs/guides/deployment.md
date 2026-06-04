@@ -161,15 +161,25 @@ checks them in this order):
 2. `/etc/gestalt/master.key` mounted into the container
 3. `./master.key` in the cwd (dev-only auto-generation if missing)
 
-The recommended production setup mounts the host-side file:
+The recommended production setup mounts the host-side file. As of
+the 2026-06-05 TEST_REPORT_002 Fix 2, this mount is wired by default
+in `docker-compose.yml`:
 
 ```yaml
-# docker-compose.yml — uncomment the volume and the env-var stays unused
+# docker-compose.yml — mounted by default; remove if you prefer
+# the GESTALT_MASTER_KEY env-var path
 services:
   server:
     volumes:
       - ./master.key:/etc/gestalt/master.key:ro
 ```
+
+**You must generate `master.key` BEFORE the first `docker compose up`.**
+A missing host-side `master.key` makes the mount fail on container
+start. The dev-only auto-generation path (`./master.key` inside the
+container) is intentionally bypassed when the mount is present — that
+way `docker compose up -d --build` cannot accidentally regenerate the
+key and invalidate every vault-encrypted secret.
 
 **Operational warnings:**
 

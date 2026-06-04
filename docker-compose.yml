@@ -13,6 +13,11 @@ services:
       - LLM_API_KEY=${LLM_API_KEY}
       - LLM_MODEL=${LLM_MODEL}
       - LLM_TIMEOUT_MS=${LLM_TIMEOUT_MS:-120000}
+      # TEST_REPORT_002 Fix 1 — explicit override for the wire shape
+      # the env-default LLM client sends. Set to `responses` for OpenAI
+      # reasoning models (gpt-5*, o1, o3, `chat-latest` which now
+      # requires `max_completion_tokens`). Unset → `chat-completions`.
+      - LLM_API_SHAPE=${LLM_API_SHAPE:-}
       - JWT_SECRET=${JWT_SECRET}
       - SERVER_BASE_URL=${SERVER_BASE_URL:-http://localhost:3000}
       - SESSION_TTL_MINUTES=${SESSION_TTL_MINUTES:-480}
@@ -39,11 +44,16 @@ services:
       # Uncomment the lines below after creating the host-side files.
       # - ./auth.config.json:/etc/gestalt/auth.config.json:ro
       # - ./krb5.keytab:/etc/gestalt/krb5.keytab:ro
-      # Session 4 — master key for the encrypted secrets vault.
-      # Generate once with: openssl rand -base64 32 > master.key
+      # Session 4 + TEST_REPORT_002 Fix 2 — master key for the
+      # encrypted secrets vault. The file is mounted read-only so
+      # `docker compose up -d --build` doesn't regenerate it (which
+      # would invalidate every vault-encrypted project Git PAT +
+      # platform secret on every rebuild). Generate once with:
+      #   openssl rand -base64 32 > master.key
       # Then chmod 600 master.key and back it up out of band — if this
-      # key is lost, every encrypted secret becomes unreadable.
-      # - ./master.key:/etc/gestalt/master.key:ro
+      # key is lost, every encrypted secret becomes unreadable. The
+      # file is .gitignored.
+      - ./master.key:/etc/gestalt/master.key:ro
 
   postgres:
     image: postgres:15-alpine

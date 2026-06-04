@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-04
+**Last updated:** 2026-06-05
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -195,32 +195,34 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
-- **Env-default LLM client doesn't read `apiShape` from the
-  platform LLM registry** (TEST_REPORT_002 #1, HIGH).
-  `getLLMClient()` at `packages/core/src/llm/index.ts:420`
-  builds from `_defaultConfig` (env-only, no apiShape) →
-  always sends `max_tokens`. Every agent without a per-agent
-  model override hits this path. Blocked the 2026-06-04 live
-  test with `chat-latest` until `.env` was switched to
-  `LLM_MODEL=gpt-4o`. Fix: make `getLLMClient()` consult the
-  registry, or wire an `LLM_API_SHAPE` env var.
-- **Mount `master.key` as a docker volume** in
-  `docker-compose.yml` so rebuilds don't regenerate it
-  (TEST_REPORT_002 #2, MEDIUM). One-line compose edit.
-- **test-agent generates Vitest, not Jest** despite a Jest-
-  centric prompt (TEST_REPORT_002 #5, HIGH code quality).
-  Fix: pin import line + reject `from 'vitest'` in
-  constraint-agent for Jest projects.
-- **code-agent skips `@types/<dep>` for runtime deps with
-  typings on npm** (TEST_REPORT_002 #8, MEDIUM — `@types/pg`
-  missing). Generalise dependency-completion logic.
-- **review-agent doesn't cross-check artifacts**
-  (TEST_REPORT_002 #7, MEDIUM). Passed even though tests
-  won't execute. Add cross-artifact consistency section to
-  the prompt.
+- **Review-agent placement check over-fires** (TEST_REPORT_003
+  Issue #1, LOW). Fix 5's review-agent now visibly walks the
+  cross-artifact checklist, but its "test file placement"
+  rule wording is too tight — flags correctly-mirrored paths
+  (`tests/unit/shared/types/index.test.ts`) as "should be at
+  `tests/unit/` directly." Verdict drops to `concerns` (LOW
+  severity, doesn't block cycle). Fix: add a worked example
+  in `llm-review-agent.ts` showing the deeper structure IS
+  correct.
+- **Fix 1 (env-default apiShape) not yet live-verified.**
+  Code path is in place — `getLLMClientForModel(undefined)`
+  now resolves through the registry, and `LLM_API_SHAPE`
+  env override is wired. Needs a follow-up test: set
+  `LLM_MODEL=chat-latest` + `platform_llms.chat-latest.
+  api_shape='responses'` and confirm `max_completion_tokens`
+  flows.
+- **test-agent: untyped `let packageJson;` in generated
+  tests** (TEST_REPORT_003 Issue #2, very low). Compiles
+  under inferred-from-usage but trips full `noImplicitAny`.
+  One-line prompt addendum.
+- **code-agent still uses `export default` on
+  connection.ts** (TEST_REPORT_003 Issue #3, project-
+  dependent). trackeros's AGENTS.md doesn't ban default
+  exports; if a project genuinely wants named-only it
+  should restate the rule in its own AGENTS.md.
 - **context-agent has 4 tools configured but never uses
-  them** (TEST_REPORT_002 #4, very low). Drop unused tool
-  config OR extend prompt to read ARCHITECTURE.md /
+  them** (TEST_REPORT_002 #4, still outstanding). Drop unused
+  tool config OR extend prompt to read ARCHITECTURE.md /
   GOLDEN_PRINCIPLES.md.
 - **Dashboard bundle is 1010 KB raw / 319 KB gzipped** after the
   CodeMirror addition (2026-06-04). Above Vite's 500 KB warning.
@@ -271,22 +273,26 @@ the `sessions/archive/` files (everything older)._
   during ADR-023 (apiShape) verification regenerated
   `master.key`, breaking the prior vault secret. Both LLMs are
   currently in env-var mode and working.
-- **Two stale alerts** from the 2026-06-04 pre-fix runs
-  (correlations `06299649-…` Report-001 baseline and
-  `ed5c9a47-…` Report-002 LLM apiShape blocker) — dismissable
-  via `gestalt alerts dismiss`. The Report-001 baseline alert
-  was dismissed at the start of the Report-002 session.
-- **TEST_REPORT_002 successful run** correlation
-  `1e316bbf-…` — deployed to production via noop adapter,
-  branch `gestalt/1e316bbf-scaffold-the-project-foundation-create`
-  on trackeros (commit `05fbebd`). Operator may close /
-  delete that branch when ready.
-- **.env was changed** (`LLM_MODEL=chat-latest` → `gpt-4o`)
-  to unblock TEST_REPORT_002. The `platform_llms` row still
-  carries `model_string='chat-latest'` (mismatched with env).
-  Either update the row's `model_string` to `gpt-4o`, OR
-  restore `LLM_MODEL=chat-latest` after the registry-aware
-  env-default fix (active follow-up above) lands.
+- **Two synthetic test branches on trackeros** from the live
+  evaluation cycles:
+  - `gestalt/1e316bbf-…` (commit `05fbebd`) from
+    TEST_REPORT_002, PR-less (noop).
+  - `gestalt/57759963-…` (commit `2a3d00d`) from
+    TEST_REPORT_003, PR #4706 (noop). Operator may close /
+    delete these when ready.
+- **`.env`**: `LLM_MODEL=gpt-4o` (was changed from
+  `chat-latest` to unblock TEST_REPORT_002). The
+  `platform_llms` row still carries `model_string='chat-latest'`
+  and is unmatched at lookup time. After Fix 1 from
+  TEST_REPORT_003 ships, an operator can either:
+  (a) keep `gpt-4o` in `.env` + add a matching row to
+  `platform_llms`, or (b) restore `LLM_MODEL=chat-latest` and
+  rely on the registry's `api_shape='responses'` row to flow
+  `max_completion_tokens`.
+- **`master.key`**: now generated in the workspace root
+  (gitignored, mode 600), mounted into the container by
+  default via `docker-compose.yml` (TEST_REPORT_003 Fix 2).
+  Survives `docker compose up -d --build`.
 
 ---
 

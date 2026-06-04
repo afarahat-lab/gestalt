@@ -26,7 +26,7 @@
  * The temp clone is removed in a `finally` block on every code path.
  */
 
-import { mkdtemp, rm } from 'fs/promises';
+import { mkdtemp, rm, readFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { simpleGit } from 'simple-git';
@@ -182,6 +182,30 @@ function defaultGateHarnessConfig(projectRoot: string): GateHarnessConfig {
 }
 
 /**
+ * Reads `HARNESS.json` from the cloned project root and returns its
+ * `stack` block (TEST_REPORT_002 Fix 3b). Returns `undefined` for any
+ * failure (missing file, bad JSON, no stack key) so the caller can
+ * fall through to the default. Used to thread `stack.testFramework`
+ * into the constraint-agent's dynamic rule set without each agent
+ * having to re-implement the file read.
+ */
+async function loadHarnessStack(projectRoot: string): Promise<GateHarnessConfig['stack'] | undefined> {
+  try {
+    const raw = await readFile(join(projectRoot, 'HARNESS.json'), 'utf8');
+    const parsed = JSON.parse(raw) as { stack?: Record<string, string> };
+    if (!parsed.stack || typeof parsed.stack !== 'object') return undefined;
+    return {
+      testFramework: typeof parsed.stack['testFramework'] === 'string' ? parsed.stack['testFramework'] : undefined,
+      language: typeof parsed.stack['language'] === 'string' ? parsed.stack['language'] : undefined,
+      framework: typeof parsed.stack['framework'] === 'string' ? parsed.stack['framework'] : undefined,
+      packageManager: typeof parsed.stack['packageManager'] === 'string' ? parsed.stack['packageManager'] : undefined,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Quality-gate orchestrator (Amendment 2026-06 — `extends
  * BaseOrchestrator` for the structural goal of every orchestrator
  * sharing one base. The review-agent now uses `callLLMWithTools`
@@ -236,6 +260,16 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
       intentText = intentRow?.text ?? undefined;
     }
 
+    // TEST_REPORT_002 Fix 3b — load the project's stack from
+    // HARNESS.json so the constraint-agent can enforce the declared
+    // test framework (and future rules can key off language /
+    // packageManager). Best-effort; absent file falls through to
+    // the framework-agnostic default.
+    const stack = await loadHarnessStack(workDir);
+    const harnessConfig: GateHarnessConfig = {
+      ...defaultGateHarnessConfig(workDir),
+      ...(stack ? { stack } : {}),
+    };
     const gateTask: GateTask = {
       taskId: message.id,
       correlationId,
@@ -245,7 +279,7 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
         path: a.path,
         content: a.content,
       })) as ArtifactRef[],
-      harnessConfig: defaultGateHarnessConfig(workDir),
+      harnessConfig,
       intentText,
     };
 

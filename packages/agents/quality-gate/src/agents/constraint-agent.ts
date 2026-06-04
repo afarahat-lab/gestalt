@@ -35,6 +35,47 @@ const CODE_FILE = (path: string): boolean =>
 const NON_TEST_CODE = (path: string): boolean =>
   CODE_FILE(path) && !/__tests__|\.test\.|\.spec\./.test(path);
 
+const TEST_FILE = (path: string): boolean =>
+  CODE_FILE(path) && /__tests__|\.test\.|\.spec\./.test(path);
+
+/**
+ * TEST_REPORT_002 Fix 3b — declared-framework → forbidden-import
+ * mapping. When the project's `HARNESS.json.stack.testFramework`
+ * names one framework, importing from a different framework in any
+ * test file is a CONSTRAINT_VIOLATION. Per the previous live cycle
+ * the test-agent generated Vitest tests against a Jest project; this
+ * rule catches that class of mismatch deterministically before the
+ * cycle reaches the LLM review-agent.
+ *
+ * Keys are lowercased canonical framework names. Values are the
+ * forbidden `from '<name>'` import substrings.
+ */
+const FORBIDDEN_TEST_IMPORTS: Record<string, ReadonlyArray<string>> = {
+  jest: ['vitest', 'mocha', 'chai', 'bun:test', 'node:test', 'tap'],
+  vitest: ['@jest/globals', 'jest', 'mocha', 'chai', 'bun:test', 'node:test', 'tap'],
+  mocha: ['vitest', '@jest/globals', 'jest', 'bun:test'],
+};
+
+function buildFrameworkRule(testFramework: string): RegexRule | null {
+  const key = testFramework.trim().toLowerCase();
+  const forbidden = FORBIDDEN_TEST_IMPORTS[key];
+  if (!forbidden || forbidden.length === 0) return null;
+  // Match `from 'forbidden'` or `from "forbidden"` (single quote and
+  // double quote). The alternation is built once per cycle.
+  const alternation = forbidden
+    .map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('|');
+  return {
+    id: `test-framework-mismatch-${key}`,
+    description: `Project declares testFramework: ${testFramework}. Tests must not import from another framework.`,
+    pattern: new RegExp(`from\\s+['"](${alternation})['"]`, 'g'),
+    appliesTo: TEST_FILE,
+    signalType: 'CONSTRAINT_VIOLATION',
+    severity: 'high',
+    autoResolvable: true,
+  };
+}
+
 const RULES: RegexRule[] = [
   // ─── CONSTRAINT_VIOLATION (auto-resolvable) ────────────────────────────────
   {
@@ -107,10 +148,22 @@ export async function runConstraintAgent(task: GateTask): Promise<GateAgentResul
   const startedAt = Date.now();
   const signals: GateSignal[] = [];
 
+  // TEST_REPORT_002 Fix 3b — append a dynamic test-framework rule
+  // when HARNESS.json declares one. Built per-cycle (NOT module-
+  // global) so a project that swaps frameworks mid-life gets the
+  // new rule on its next gate run without a server restart.
+  const declaredFramework = task.harnessConfig.stack?.testFramework;
+  const dynamicRules: RegexRule[] = [];
+  if (declaredFramework) {
+    const frameworkRule = buildFrameworkRule(declaredFramework);
+    if (frameworkRule) dynamicRules.push(frameworkRule);
+  }
+  const rulesForCycle: RegexRule[] = [...RULES, ...dynamicRules];
+
   for (const artifact of task.artifacts) {
     if (typeof artifact.content !== 'string') continue;
 
-    for (const rule of RULES) {
+    for (const rule of rulesForCycle) {
       if (!rule.appliesTo(artifact.path)) continue;
 
       const violations = findViolations(rule, artifact.path, artifact.content);

@@ -34,6 +34,7 @@ import { buildSignalFeedback } from './signal-formatter';
 const ARCHITECTURE_TRUNCATE_CHARS = 2000;
 const DOMAIN_TRUNCATE_CHARS = 2000;
 const DESIGN_TRUNCATE_CHARS = 3000;
+const AGENTS_MD_TRUNCATE_CHARS = 3000;
 
 function truncate(text: string, limit: number): string {
   if (text.length <= limit) return text;
@@ -230,6 +231,50 @@ export function buildCodePrompt(
     ? `## Domain model\n\n${truncate(ctx.domainMd, DOMAIN_TRUNCATE_CHARS)}`
     : '';
 
+  // ── 6b. Project coding conventions (TEST_REPORT_002 Fix 7) ─────────
+  //
+  // Render AGENTS.md verbatim so the code-agent picks up the
+  // project's documented conventions (named-vs-default exports,
+  // module layout, "must never" lists, dependency rules) without an
+  // explicit readFile tool call. Truncated for prompt-budget safety;
+  // the most important rules in a Gestalt AGENTS.md sit at the top
+  // (in the architecture-rules + coding-conventions sections).
+  const agentsConventionsSection = ctx.agentsMd
+    ? `## Project coding conventions (from AGENTS.md)\n\n${truncate(ctx.agentsMd, AGENTS_MD_TRUNCATE_CHARS)}\n\n` +
+      `**You MUST follow these conventions verbatim.** They override any ` +
+      `defaults you would otherwise apply (e.g. default-vs-named exports, ` +
+      `error-handling pattern, lint rules).`
+    : '';
+
+  // ── 6c. Dependency typing rule (TEST_REPORT_002 Fix 4) ─────────────
+  //
+  // Generated `package.json` files routinely shipped runtime deps
+  // without their `@types/*` counterparts (concrete miss in the
+  // 2026-06-04 scaffold cycle: `pg` without `@types/pg`). Strict
+  // TypeScript compilation then errors out at first import. Pin the
+  // rule here so the LLM emits the types alongside every typed
+  // runtime dep.
+  const depsTypingSection =
+    `## Dependency typing rule\n\n` +
+    `When you generate \`package.json\`, for every runtime dependency ` +
+    `that has a well-known \`@types/*\` package on npm, add the ` +
+    `corresponding \`@types/*\` to \`devDependencies\`.\n\n` +
+    `Common pairs (NOT exhaustive — apply the rule to ANY typed dep):\n` +
+    `- \`express\` → \`@types/express\`\n` +
+    `- \`pg\` → \`@types/pg\`\n` +
+    `- \`jsonwebtoken\` → \`@types/jsonwebtoken\`\n` +
+    `- \`bcrypt\` → \`@types/bcrypt\`\n` +
+    `- \`cors\` → \`@types/cors\`\n` +
+    `- \`morgan\` → \`@types/morgan\`\n` +
+    `- \`supertest\` → \`@types/supertest\`\n` +
+    `- Node itself → \`@types/node\`\n\n` +
+    `Packages that ship their OWN type definitions (TypeScript-native ` +
+    `like \`dotenv\`, \`zod\`, \`pino\`, \`fastify\`, \`prisma\`) do NOT ` +
+    `need a separate \`@types/*\` entry.\n\n` +
+    `**TypeScript strict mode requires type definitions.** Omitting a ` +
+    `\`@types/*\` for a typed dependency will trip \`no-any\` on the ` +
+    `consuming import and fail the quality gate.`;
+
   // ── 7. Signal feedback (retry cycles only) ─────────────────────────
   const signalsSection = buildSignalFeedback(priorSignals);
 
@@ -272,7 +317,7 @@ export function buildCodePrompt(
     `- Error handling: return typed Result<T,E> or throw with structured context`;
 
   const body = [
-    toolsSection,          // ← NEW (ADR-038) — top of prompt when tools configured
+    toolsSection,              // ← NEW (ADR-038) — top of prompt when tools configured
     architectureSection,
     scopeSection,
     constraintsSection,
@@ -280,8 +325,10 @@ export function buildCodePrompt(
     intentSection,
     principlesSection,
     domainSection,
+    agentsConventionsSection,  // ← NEW (TEST_REPORT_002 Fix 7) — AGENTS.md
+    depsTypingSection,         // ← NEW (TEST_REPORT_002 Fix 4) — @types/* coverage
     signalsSection,
-    resumeSection,         // ← NEW (migration 020) — self-healing / operator-feedback resume
+    resumeSection,             // ← NEW (migration 020) — self-healing / operator-feedback resume
     taskSection,
   ]
     .filter(Boolean)

@@ -163,4 +163,17 @@ export interface GateHarnessConfig {
     maxRetries: number;
     blockingSignals: SignalType[];
   };
+  /**
+   * Project's declared stack (TEST_REPORT_002 Fix 3b). Sourced from
+   * `HARNESS.json.stack` in the cloned project root. Optional because
+   * legacy gate tasks predate the field; the constraint-agent treats
+   * absence as "no framework constraints to enforce" and falls
+   * through.
+   */
+  stack?: {
+    testFramework?: string;
+    language?: string;
+    framework?: string;
+    packageManager?: string;
+  };
 }

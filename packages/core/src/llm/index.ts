@@ -482,31 +482,40 @@ function registryCacheKey(model: string, baseUrl: string): string {
  * just passes its own resolver).
  */
 export async function getLLMClientForModel(modelString?: string): Promise<LLMClient> {
-  if (!modelString) return getLLMClient();
+  if (!_defaultConfig) {
+    throw new Error('LLM client not initialised. Call createLLMClient(config) first.');
+  }
+  // TEST_REPORT_002 Fix 1 — when no per-agent override is supplied,
+  // resolve to the env-default model AND let it flow through the
+  // registry path below. The previous short-circuit
+  // (`if (!modelString) return getLLMClient();`) skipped the
+  // registry for the default model, so the operator's
+  // `platform_llms` row's `apiShape` was silently ignored. Now the
+  // env-default's model name is looked up just like any other,
+  // picking up the registered apiShape when present and falling
+  // through to the env-default client when no row matches.
+  const targetModel = modelString ?? _defaultConfig.model;
   if (!_registryResolver) {
     // The resolver is wired at server boot. Tests that don't wire
     // it can still use `getLLMClient(model)` directly.
-    return getLLMClient(modelString);
-  }
-  if (!_defaultConfig) {
-    throw new Error('LLM client not initialised. Call createLLMClient(config) first.');
+    return getLLMClient(targetModel);
   }
 
   let registered: RegistryEntry | null;
   try {
-    registered = await _registryResolver(modelString);
+    registered = await _registryResolver(targetModel);
   } catch (err) {
     log.warn(
-      { err: err instanceof Error ? err.message : String(err), modelString },
+      { err: err instanceof Error ? err.message : String(err), modelString: targetModel },
       'LLM registry lookup failed — falling back to default endpoint',
     );
-    return getLLMClient(modelString);
+    return getLLMClient(targetModel);
   }
 
   if (!registered) {
     // Model not in the registry → operator wants an ad-hoc override
     // against the platform-default endpoint. Same as before.
-    return getLLMClient(modelString);
+    return getLLMClient(targetModel);
   }
 
   const cacheKey = registryCacheKey(registered.modelString, registered.baseUrl);

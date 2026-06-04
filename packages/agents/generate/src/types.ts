@@ -195,6 +195,17 @@ export interface ContextSnapshot {
   harness: HarnessConfig;
   architectureMd: string;          // raw markdown — used by prompts
   domainMd: string;                // raw markdown — used by prompts
+  /**
+   * Raw `AGENTS.md` from the project root (TEST_REPORT_002 Fix 7).
+   * Carries project-specific coding conventions, module patterns,
+   * dependency rules, and "must never" lists. The code-agent
+   * renders this directly into its prompt so generated code
+   * reflects the project's documented conventions without an
+   * explicit `readFile` tool call. Empty string when AGENTS.md
+   * is absent (older projects) — the prompt section is omitted in
+   * that case.
+   */
+  agentsMd: string;
   architecture: ArchitectureSpec;  // parsed — used by agents
   domain: DomainModel;             // parsed — used by agents
   goldenPrinciples: Principle[];

@@ -89,6 +89,18 @@ export function loadConfig(): GestaltConfig {
       model: require('LLM_MODEL'),
       timeoutMs: parseInt(optional('LLM_TIMEOUT_MS', '120000'), 10),
       maxRetries: parseInt(optional('LLM_MAX_RETRIES', '3'), 10),
+      // TEST_REPORT_002 Fix 1 — explicit env override for apiShape so
+      // operators using OpenAI reasoning models (gpt-5*, o1, o3, the
+      // `chat-latest` alias which now requires `max_completion_tokens`)
+      // can pin the wire shape from `.env` without going through the
+      // registry. Defaults to `chat-completions` when unset (the
+      // historical behaviour). Unknown values are normalised away.
+      ...((): { apiShape?: 'chat-completions' | 'responses' } => {
+        const raw = process.env['LLM_API_SHAPE']?.trim().toLowerCase();
+        if (raw === 'responses') return { apiShape: 'responses' };
+        if (raw === 'chat-completions') return { apiShape: 'chat-completions' };
+        return {};
+      })(),
     },
     auth: {
       jwtSecret: require('JWT_SECRET'),
