@@ -14,6 +14,8 @@ import {
   c, blank, divider, createSpinner,
   statusBadge,
 } from '../ui/prompts';
+import { resolveProjectId } from '../ui/resolve';
+import { renderExecutionGraph, clearScreen, isTerminalIntentStatus } from '../ui/execution-graph';
 import type { RunOptions } from '../types';
 
 export async function runCommand(intentText: string, options: RunOptions): Promise<void> {
@@ -31,13 +33,21 @@ export async function runCommand(intentText: string, options: RunOptions): Promi
     process.exit(1);
   }
 
-  const projectId = options.projectId ?? config.currentProjectId;
+  const client = new GestaltApiClient({ serverUrl, token: config.token });
+
+  // Fix A — translate `--project <name>` to UUID before the server
+  // sees it. Without this the server stores the literal name in
+  // `intents.project_id` and the orchestrator's first lookup throws
+  // `22P02 invalid input syntax for type uuid`.
+  const projectId = await resolveProjectId(
+    client, config.currentProjectId, options.projectId,
+  );
   if (!projectId) {
     console.log(c.error('No project set. Run: gestalt init'));
     process.exit(1);
   }
 
-  const client = new GestaltApiClient({ serverUrl, token: config.token });
+  const watchMode = options.watch === true;
 
   // ─── Submit ────────────────────────────────────────────────────────────────
 
@@ -76,6 +86,15 @@ export async function runCommand(intentText: string, options: RunOptions): Promi
   blank();
 
   // ─── Stream live updates ───────────────────────────────────────────────────
+  //
+  // Fix F — `--watch` swaps the live SSE event ticker for the same
+  // periodic full-graph re-render that `gestalt intent show --watch`
+  // produces, so the operator stays inside `gestalt run` for the
+  // whole cycle instead of submitting + chaining a second command.
+  if (watchMode) {
+    await watchUntilTerminal(client, intentId, projectId);
+    return;
+  }
 
   console.log(c.dim('Watching agent activity (Ctrl+C to detach)...'));
   blank();
@@ -159,5 +178,53 @@ export async function runCommand(intentText: string, options: RunOptions): Promi
     blank();
     console.log(c.warn('Connection to server lost. Run `gestalt status` to check progress.'));
     process.exit(0);
+  }
+}
+
+const WATCH_INTERVAL_MS = 3_000;
+
+async function watchUntilTerminal(
+  client: GestaltApiClient,
+  intentId: string,
+  projectId: string,
+): Promise<void> {
+  process.on('SIGINT', () => {
+    blank();
+    console.log(c.dim('Detached.'));
+    process.exit(0);
+  });
+
+  while (true) {
+    let intent;
+    try {
+      intent = (await client.getIntent(intentId)).data;
+    } catch (err) {
+      blank();
+      console.log(c.warn(`Failed to fetch intent state: ${err instanceof Error ? err.message : String(err)}`));
+      console.log(c.dim(`Try: gestalt intent show ${intentId.slice(0, 8)} --watch`));
+      process.exit(1);
+    }
+
+    let events: import('../api/client').DeploymentEvent[] = [];
+    try {
+      const res = await client.listDeployments({
+        projectId, correlationId: intent.correlationId,
+      });
+      events = res.data[0]?.events ?? [];
+    } catch {
+      // Best-effort — pre-deploy cycles have no deployment row yet.
+    }
+
+    clearScreen();
+    console.log(renderExecutionGraph({ intent, deploymentEvents: events }));
+
+    if (isTerminalIntentStatus(intent.status)) {
+      blank();
+      console.log(c.success(`Reached terminal status: ${intent.status}`));
+      return;
+    }
+
+    console.log(c.dim('Press Ctrl+C to detach. Re-rendering every 3s...'));
+    await new Promise((r) => setTimeout(r, WATCH_INTERVAL_MS));
   }
 }

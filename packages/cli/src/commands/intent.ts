@@ -31,6 +31,7 @@ import {
   renderExecutionGraph, clearScreen, isTerminalIntentStatus,
 } from '../ui/execution-graph';
 import { resolveIntentId } from '../ui/intent-resolver';
+import { resolveProjectId } from '../ui/resolve';
 import { runCommand } from './run';
 import type { RunOptions } from '../types';
 
@@ -270,23 +271,6 @@ export async function intentSubmitCommand(text: string, options: RunOptions): Pr
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
-
-async function resolveProjectId(
-  client: GestaltApiClient,
-  currentProjectId: string | null,
-  projectName?: string,
-): Promise<string | null> {
-  if (projectName) {
-    const { data: projects } = await client.listProjects();
-    const match = projects.find((p) => p.name === projectName);
-    if (!match) {
-      console.log(c.error(`No project named '${projectName}'. Run \`gestalt projects list\`.`));
-      process.exit(1);
-    }
-    return match.id;
-  }
-  return currentProjectId;
-}
 
 function formatAge(updated: Date): string {
   const seconds = Math.floor((Date.now() - updated.getTime()) / 1000);

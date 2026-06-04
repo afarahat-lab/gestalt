@@ -32,6 +32,7 @@ import {
 import {
   c, blank, divider, printTable, statusBadge,
 } from '../ui/prompts';
+import { resolveProjectId } from '../ui/resolve';
 
 export interface DeployListOptions {
   server?: string;
@@ -211,23 +212,6 @@ function formatEventRow(ev: DeploymentEvent): string {
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
-
-async function resolveProjectId(
-  client: GestaltApiClient,
-  currentProjectId: string | null,
-  projectName?: string,
-): Promise<string | null> {
-  if (projectName) {
-    const { data: projects } = await client.listProjects();
-    const match = projects.find((p) => p.name === projectName);
-    if (!match) {
-      console.log(c.error(`No project named '${projectName}'. Run \`gestalt projects list\`.`));
-      process.exit(1);
-    }
-    return match.id;
-  }
-  return currentProjectId;
-}
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 

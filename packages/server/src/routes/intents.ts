@@ -17,6 +17,17 @@ import {
 
 const log = createContextLogger({ module: 'routes:intents' });
 
+/**
+ * Defensive validator for `body.projectId` at `POST /intents`. The
+ * column type is `text` so a stray non-UUID round-trips cleanly
+ * through INSERT and only blows up later in
+ * `PostgresProjectRepository.findById` with `22P02 invalid input
+ * syntax for type uuid`. Catching it here returns a clean 400 to
+ * the operator + keeps the `intents` table free of unactionable
+ * rows. See `docs/claude/TEST_REPORT_001.md` (Fix B).
+ */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 type IntentPriority = 'critical' | 'high' | 'normal' | 'low';
 
 function toTaskPriority(priority: IntentPriority): TaskPriority {
@@ -74,11 +85,36 @@ export async function registerIntentRoutes(app: FastifyInstance): Promise<void> 
         return reply.code(400).send({ error: 'projectId is required' });
       }
 
+      // Fix B — reject non-UUID projectId values up front. Without
+      // this guard, a CLI bug or hand-rolled API client could write
+      // a literal project NAME into `intents.project_id` (text
+      // column) and only fail on the orchestrator's first lookup.
+      const trimmedProjectId = projectId.trim();
+      if (!UUID_RE.test(trimmedProjectId)) {
+        return reply.code(400).send({
+          error: 'INVALID_PROJECT_ID',
+          message: 'projectId must be a UUID. Run `gestalt projects list` to find your project ID.',
+        });
+      }
+
+      // Verify the project actually exists before any further work.
+      // Distinct 404 (vs. 403 from `checkProjectMembership`) is fine
+      // here because a malformed-but-valid-UUID that doesn't exist
+      // isn't a privacy leak — there's no row to enumerate.
+      const { projects: projectRepo } = getRepositories();
+      const project = await projectRepo.findById(trimmedProjectId);
+      if (!project) {
+        return reply.code(404).send({
+          error: 'PROJECT_NOT_FOUND',
+          message: `No project found with id ${trimmedProjectId}`,
+        });
+      }
+
       // Handler-level membership guard — `requireRole('operator')` only
       // resolves projectId from URL params/query, never from the body,
       // so a regular user could otherwise submit intents against any
       // project they knew the ID of.
-      if (!await checkProjectMembership(reply, request.user.id, request.user.role, projectId, 'editor')) return;
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, trimmedProjectId, 'editor')) return;
 
       const { intents } = getRepositories();
       const correlationId = crypto.randomUUID();
@@ -86,7 +122,7 @@ export async function registerIntentRoutes(app: FastifyInstance): Promise<void> 
       const intent = await intents.create({
         id: crypto.randomUUID(),
         correlationId,
-        projectId,
+        projectId: trimmedProjectId,
         text: text.trim(),
         status: 'pending',
         source: 'human',
@@ -103,7 +139,7 @@ export async function registerIntentRoutes(app: FastifyInstance): Promise<void> 
         sourceAgent: 'orchestrator',
         targetAgent: 'intent-agent',
         priority: toTaskPriority(priority),
-        payload: { intentId: intent.id, text: intent.text, projectId },
+        payload: { intentId: intent.id, text: intent.text, projectId: trimmedProjectId },
         createdAt: new Date(),
         expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
       };

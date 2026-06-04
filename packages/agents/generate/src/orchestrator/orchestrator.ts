@@ -783,8 +783,20 @@ async function drivePlan(
           }
 
           const completedAt = new Date();
+          // Fix D — `BaseLLMAgent` accumulates `lastTokensUsed`
+          // across every LLM call the agent makes during `run()`.
+          // Agents currently return `tokensUsed: 0` in their
+          // AgentResult; prefer the instance counter so
+          // `agent_executions.tokens_used` and the per-cycle rollup
+          // (`buildResult`'s `plan.steps.reduce(... tokensUsed)`)
+          // both reflect real usage.
+          const effectiveTokensUsed =
+            (agentInstance?.lastTokensUsed ?? 0) > 0
+              ? agentInstance!.lastTokensUsed
+              : result.tokensUsed;
+          if (step.result) step.result.tokensUsed = effectiveTokensUsed;
           await executions.updateStatus(executionId, stepStatus, {
-            tokensUsed: result.tokensUsed,
+            tokensUsed: effectiveTokensUsed,
             durationMs: completedAt.getTime() - startedAt.getTime(),
             startedAt,
             completedAt,
@@ -829,7 +841,7 @@ async function drivePlan(
             executionId,
             agentRole,
             status: stepStatus,
-            tokensUsed: result.tokensUsed,
+            tokensUsed: effectiveTokensUsed,
             durationMs: completedAt.getTime() - startedAt.getTime(),
             artifactCount: result.artifacts?.length ?? 0,
             signalCount: result.signals?.length ?? 0,

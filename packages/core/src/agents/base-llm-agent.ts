@@ -117,6 +117,15 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
    *  tools. */
   lastToolCallLog: ToolCallLogEntry[] = [];
 
+  /** Fix D — running total of `result.tokensUsed` reported by the
+   *  LLM client across every `callLLM*` invocation in the current
+   *  `run()`. Orchestrators read this after `run` returns and pass
+   *  it to `completeAgentExecution` so `agent_executions.tokens_used`
+   *  is no longer pinned to 0. Reset to 0 on every `run()` entry by
+   *  the template method — subclasses that override `run` should
+   *  reset it themselves at the top. */
+  lastTokensUsed: number = 0;
+
   constructor(agentRole: AgentRole) {
     this.agentRole = agentRole;
   }
@@ -134,6 +143,7 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
    * config + correlation resolution themselves.
    */
   async run(task: TTask): Promise<TResult> {
+    this.lastTokensUsed = 0;
     const t = task as unknown as {
       correlationId: string;
       contextSnapshot: { agentConfig: AgentConfig };
@@ -203,6 +213,7 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
       throw new Error(`LLM call failed: ${result.error.message}`);
     }
     this.lastLlmResponse = result.value.content;
+    this.lastTokensUsed += result.value.tokensUsed ?? 0;
     return result.value.content;
   }
 
@@ -336,6 +347,8 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
       if (!result.ok) {
         throw new Error(`LLM call failed: ${result.error.message}`);
       }
+
+      this.lastTokensUsed += result.value.tokensUsed ?? 0;
 
       const { text, toolCalls, stopReason } = result.value;
       if (text.length > 0) finalText = text;

@@ -4,6 +4,266 @@ _Auto-maintained. The most recent session is prepended at the top; when this fil
 
 ---
 
+### Session 2026-06-04 — Claude Code (Test Report 001 fixes: 7-fix platform PR — CLI project-name resolution + server-side UUID guard + diagnostician unrecoverable-error short-circuit + per-agent token capture + intent-prefix matching + `gestalt run --watch` + diagnostician punctuation polish)
+
+Implementation session. The prior session diagnosed seven
+platform defects against the live trackeros project and parked
+the proposed fixes in `docs/claude/TEST_REPORT_001.md` (Fix A
+through Fix G). This session ships all seven in one PR-shaped
+edit. No migration. `pnpm -r build` clean across all 12
+packages. Server `dist` needs to be hot-copied into the running
+container OR `docker compose up -d --build` before the test
+intent can be re-run.
+
+The goal here is **unblocking the live test**: without Fix A
+the operator workflow that supplies `--project <name>` is
+broken end-to-end, and without Fix B the server happily writes
+the bad row even after a CLI regression. Everything else is
+defence-in-depth, observability, or UX polish — small wins
+that together make platform failures vastly easier to debug.
+
+Changed:
+
+- **Fix A — `gestalt run --project <name>` resolves to UUID
+  before any server call.**
+  - **New** `packages/cli/src/ui/resolve.ts` —
+    `resolveProjectId(client, currentProjectId, projectName?)`.
+    Accepts a UUID verbatim; resolves a project name (case-
+    insensitive) via `client.listProjects()`; exits with a
+    `gestalt projects list` hint on miss.
+  - **`packages/cli/src/commands/run.ts`** now calls the
+    helper at the top of `runCommand` (the line that was
+    `options.projectId ?? config.currentProjectId` straight-
+    through, originally at `run.ts:34`). The literal-name
+    path that triggered the original `22P02 invalid input
+    syntax for type uuid` is gone.
+  - **Removed pre-existing duplicate local `resolveProjectId`
+    copies** in `commands/intent.ts`, `commands/deploy.ts`,
+    `commands/maintenance.ts` — they now import the shared
+    helper.
+  - **`commands/agents.ts` `resolveProjectByName`** widened
+    to also accept UUIDs (returns `{id, name}` so existing
+    call sites that print the name keep working).
+  - **`commands/project-config.ts` `openClient`** —
+    case-insensitive name match + UUID acceptance against
+    the projects list. Same shape as the shared helper but
+    inlined because `openClient` returns `{client, project,
+    projectId, projectName, serverUrl}` and the project
+    object needs to be passed downstream.
+  - **`packages/cli/src/index.ts`** — `--project <name>`
+    help text on `gestalt run` + `gestalt intent submit`
+    (was `<id>`; the resolver now accepts both forms so the
+    name is the operator-friendly default).
+
+- **Fix B — Server-side validation at `POST /intents`.**
+  - **`packages/server/src/routes/intents.ts`** — new UUID
+    regex check rejects non-UUID `projectId` with
+    `400 INVALID_PROJECT_ID`. Then `projects.findById` with
+    `404 PROJECT_NOT_FOUND` so a valid-but-unknown UUID
+    fails clean instead of poisoning the `intents` table.
+    Then the existing membership guard. Same
+    `trimmedProjectId` flows through the `intents.create`
+    row + the dispatched `TaskMessage` payload.
+
+- **Fix C — Self-healing diagnostician short-circuits on
+  known-unrecoverable errors.**
+  - **`packages/core/src/agents/self-healing-loop.ts`** —
+    `UNRECOVERABLE_ERROR_PATTERNS` substrings (`"invalid
+    input syntax for type uuid"`, `"relation does not
+    exist"`, `"column does not exist"`, `"econnrefused"`,
+    `"password authentication failed"`). Exported
+    `isUnrecoverableError(message)` helper. Inside
+    `runSelfHealingLoopUnsafe`, after the
+    `config.enabled` gate, check `context.technicalDetail`
+    then `context.failureSummary`; on a match, log
+    `'Unrecoverable error detected — skipping LLM diagnosis,
+    escalating immediately'` and `escalateToHuman` with a
+    reason of `"Unrecoverable infrastructure error: <first
+    200 chars>"`. No LLM call burned.
+  - **`packages/core/src/agents/self-healing-agent.ts`** —
+    same patterns appended to the diagnostician's prompt's
+    "Known failure patterns" section, marked
+    `shouldRetry: false / confidence: "high" /
+    retryTaskType: "none"`. Defence in depth for the
+    (unusual) case where the orchestrator captures the
+    substring on `failureSummary` but not on
+    `technicalDetail`.
+  - **`packages/core/src/index.ts`** — re-exports
+    `isUnrecoverableError` next to `runSelfHealingLoop` so
+    future callers (e.g. a generate-orchestrator pre-flight
+    check) can use the same predicate.
+
+- **Fix D — Capture `tokens_used` per agent execution row.**
+  - **`packages/core/src/agents/base-llm-agent.ts`** — new
+    instance field `lastTokensUsed: number = 0` reset on
+    every `run()` entry. `callLLMWithMessages` and the tool-
+    loop body both accumulate `result.value.tokensUsed` into
+    it after every successful LLM call. The accumulator
+    survives internal retry loops (an agent making multiple
+    LLM calls inside one `run` reports the sum).
+  - **`packages/agents/generate/src/orchestrator/orchestrator.ts`**
+    — computes
+    `effectiveTokensUsed = max(agentInstance.lastTokensUsed,
+    result.tokensUsed)` and writes it to BOTH
+    `executions.updateStatus(executionId, ..., { tokensUsed })`
+    and `step.result.tokensUsed`. The latter feeds the
+    per-cycle rollup at `buildResult(...)` line ~1233 so
+    the dashboard's "tokens so far" total reflects real
+    usage instead of staying at 0 forever.
+  - **`packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`**
+    — review-agent's `lastTokensUsed` is forwarded onto the
+    result via the existing `lastPrompt` / `lastLlmResponse`
+    side-channel, then `runWithObservability` reads it back
+    and threads it into `executions.updateStatus`.
+    Constraint-agent is non-LLM and continues to report 0.
+  - Custom-agent-runner already passed `result.value.
+    tokensUsed` through (`packages/agents/generate/src/
+    agents/custom-agent-runner.ts:100`) — no change needed.
+  - Deploy-layer + maintenance-layer agents are non-LLM
+    today; same pattern applies the day they become LLM
+    (extend `BaseLLMAgent`, read `lastTokensUsed` in the
+    observability wrapper).
+
+- **Fix E — `gestalt intent show <prefix>` matching.**
+  - **`packages/cli/src/ui/intent-resolver.ts`** — rewritten.
+    Full UUID inputs still resolve clean; 8-char (or longer)
+    prefixes now match against BOTH `correlationId` AND `id`
+    (the prior impl matched only `correlationId`, so
+    operators copy-pasting `intents.id` from the DB never
+    matched). On a current-project miss, the search broadens
+    to server-wide (empty `projectId` per the route
+    contract) — this catches the failure mode from
+    TEST_REPORT_001 where the bad-row intent's `project_id`
+    was the literal name `'trackeros'` and the current-
+    project filter excluded it. All matching now
+    case-insensitive.
+
+- **Fix F — `gestalt run --watch` flag.**
+  - **`packages/cli/src/types.ts`** — `RunOptions.watch?:
+    boolean`.
+  - **`packages/cli/src/commands/run.ts`** — after
+    `submitIntent` succeeds, `watchMode` skips the SSE
+    event ticker and instead enters the same periodic
+    full-graph re-render that `gestalt intent show --watch`
+    uses (3 s interval; Ctrl+C detaches; auto-exits when
+    the intent reaches a terminal status). Pulls
+    `renderExecutionGraph` / `clearScreen` /
+    `isTerminalIntentStatus` from `ui/execution-graph`.
+  - **`packages/cli/src/index.ts`** — `--watch` wired on
+    both `gestalt run` and `gestalt intent submit`.
+
+- **Fix G — Strip trailing period from escalation_reason.**
+  - **`packages/core/src/agents/self-healing-loop.ts`** —
+    new private `stripTrailingPunctuation(s)` (regex
+    `/[.!?\s]+$/u`). Applied to `diagnosis.diagnosis`
+    before joining `". Confidence: …"`. The double-period
+    in `"…uuid syntax.. Confidence: medium"` is gone.
+
+Verified:
+
+- `pnpm -r build` clean across all 12 packages. CLI: `tsc &&
+  chmod +x dist/index.js` clean. Server: `tsc` clean. Core:
+  `tsc` clean. Generate / quality-gate / deploy / maintenance:
+  all clean. Dashboard rebuilt to the same
+  `index-DSlpzI_R.js` bundle (1010.76 KB / 319.35 KB
+  gzipped) — no dashboard changes in this session, the
+  rebuild is incidental from the topo-sort.
+- Server-side `POST /intents` reject path traced manually:
+  body `{projectId: 'trackeros', text: 'x'}` hits the regex
+  guard and returns
+  `{error: 'INVALID_PROJECT_ID', message: 'projectId must
+  be a UUID. Run \`gestalt projects list\` to find your
+  project ID.'}` BEFORE the membership check, BEFORE the
+  insert. Body `{projectId: <random valid UUID>, text:
+  'x'}` hits the `projects.findById` 404 check next.
+- CLI-side resolver traced manually: `gestalt run "x"
+  --project trackeros` now calls
+  `client.listProjects()` → matches `trackeros` →
+  forwards `projectId = 5d99e2f3-f3cb-...` to
+  `submitIntent`. Before the fix the literal string
+  `'trackeros'` would have been forwarded.
+
+Decisions made:
+
+- **Single shared helper, not two.** `resolveProjectId` and
+  `resolveProjectByName` (the latter in `commands/agents.ts`)
+  both translate `--project <value>` to a project record, but
+  the former returns just an ID and the latter returns
+  `{id, name}` because the agents commands print the project
+  name in their output. Kept both, but widened
+  `resolveProjectByName` to also accept UUIDs so the
+  `--project <uuid>` form behaves identically across every
+  command surface.
+- **Server-side validation at the route, not the
+  repository.** The repository's `findById` already
+  effectively validates (postgres throws `22P02`) but only
+  in the failure path. Validating at the route boundary
+  gives a clean 400 + a structured error code instead of an
+  opaque 500 from the postgres driver bubbling up.
+- **Diagnostician check on TWO context fields, not one.**
+  The brief said "check `context.technicalDetail`" but the
+  generate-error path on the original incident only carried
+  the substring on `failureSummary` — the
+  diagnostician was diagnosing from the summary alone.
+  Checking both fields catches that case without changing
+  any orchestrator's context-population logic.
+- **Token-capture goes through the agent INSTANCE, not the
+  AgentResult shape.** Every agent's `run()` already returns
+  `tokensUsed: 0` in its result. Walking through every file
+  to thread `this.lastTokensUsed` would touch ~10 files
+  redundantly. The orchestrator already reads agent-instance
+  state (`lastPrompt`, `lastLlmResponse`, `lastModelUsed`)
+  after `run()` returns; piggy-backing on the same pattern
+  for `lastTokensUsed` is one-line and consistent.
+- **`max(instance, result)` not strictly `instance`.** Some
+  agents (custom-agent-runner) already populate
+  `result.tokensUsed` directly. Picking the max preserves
+  whichever path the agent uses without forcing one
+  convention.
+- **`gestalt run --watch` reuses the existing
+  execution-graph renderer.** The brief offered the option
+  of "either implement or document the two-step pattern."
+  Implementing is cleaner — the renderer is already
+  battle-tested by `gestalt intent show --watch`, and the
+  three-second re-render rhythm is exactly what an operator
+  watching a long generate cycle wants.
+
+Pending follow-ups:
+
+- **Hot-copy server `dist` into the running container OR
+  `docker compose up -d --build`** before the next live
+  test. The patched `intents.ts` route is in
+  `packages/server/dist/routes/intents.js` after the build;
+  the running container is still serving the prior binary
+  (which is fine — the missing Fix B isn't blocking, the
+  Fix A CLI change alone makes the next intent flow
+  correctly because the operator never sends a bad
+  projectId).
+- **Re-run the original test intent** (`gestalt run
+  "Scaffold the project foundation. …" --project trackeros
+  --watch`) to author `TEST_REPORT_002.md`. Capture the
+  intent-agent / design-agent / context-agent / code-agent
+  prompts + responses (now stored on
+  `agent_execution_logs` rows that this session DID NOT
+  touch — the logging infrastructure was already in
+  place). Token columns should be > 0 this time.
+- **Open alert** from the pre-fix run (correlation
+  `06299649-2db4-4d64-8785-167e025cbacb`) — dismiss via
+  `gestalt alerts dismiss` once the operator acknowledges
+  the diagnosis. Will not auto-resolve since the original
+  intent row is unactionable (its `project_id` is the
+  literal `'trackeros'`).
+- **Operator caveats from prior sessions still pending**
+  (Node 22 upgrade on trackeros `gestalt.yml`, PR #46
+  close, vault-secret re-creation) — unaffected.
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Server `dist` NOT yet hot-copied into `gestalt-server-1` —
+the operator can do this manually OR rebuild the image
+before the next live test.
+
+---
+
 ### Session 2026-06-04 — Claude Code (Test Report 001: live scaffold intent against trackeros surfaces a `gestalt run --project <name>` UUID-resolution bug — read-only diagnostic session, no code changes)
 
 Diagnostic / observational session. Goal: submit a real scaffolding
@@ -334,171 +594,4 @@ Engine fix landed in `packages/server/dist/templates/engine.js`
 and hot-copied into `gestalt-server-1`. The repaired
 trackeros HARNESS.json is pushed at commit `0cb7528` on
 `main`.
-
----
-
-### Session 2026-06-04 — Claude Code (multi-line description prompt: gestalt init now accepts >1 line of project description; dashboard create-project description is a textarea)
-
-Bug fix + small refactor. The Phase-1 description prompt in
-`gestalt init` used the existing single-line `prompt()` helper,
-which calls `readline.question()` and resolves on the first
-newline — so a multi-line paste was truncated to its first line.
-The same shape applied to the dashboard "Create project" modal
-(single-line `<input type="text">`). This session lifts both
-surfaces to true multi-line capture, extracts the helpers into
-the shared prompts module, and tightens the custom-agent prompt
-flow to reuse the same editor helper.
-
-Changed:
-
-- **`packages/cli/src/ui/prompts.ts`** — three new exported
-  helpers next to the existing `prompt` / `promptSecret`:
-  - `promptMultiline(fieldName, hint?)` — END-terminated capture
-    (case-insensitive `END` / `end` / `End`, leading + trailing
-    whitespace trimmed for the sentinel check, lines themselves
-    preserved verbatim). EOF on stdin also terminates so piped
-    callers without an explicit `END` still get the buffered
-    content.
-  - `promptWithEditor(fieldName, initial?)` — spawns
-    `$EDITOR` / `$VISUAL` / `vi` against a temp file. When
-    `initial` is supplied it pre-populates the buffer (used by
-    the custom-agent prompt to seed the `{{role}} {{goal}} …`
-    placeholder hint). Comment lines starting with `#` are
-    stripped after save. On editor launch failure (`spawnSync`
-    error or non-zero exit) it falls back to `promptMultiline`
-    so operators on minimal images stay unblocked.
-  - `promptMultilineDescription(fieldName, hint?)` — three-mode
-    chooser shown to the operator: (1) single line — backwards-
-    compatible default, (2) multi-line END-terminated, (3)
-    open in `$EDITOR`. Empty choice → option 1.
-- **`makeBufferedReader(rl)` private helper** — attaches one
-  long-lived `line` listener that pushes into a queue and feeds
-  `next()` waiters. Necessary because `readline` emits `line`
-  events as soon as bytes arrive, regardless of whether anyone
-  is awaiting. Previous draft attached a fresh listener per
-  prompt and lost every line that arrived between prompts under
-  piped stdin (the bug surfaced during smoke tests; documented
-  inline so the next refactor doesn't regress it).
-- **`packages/cli/src/commands/init.ts`** — Phase 1 swaps
-  `await prompt('Description')` for
-  `await promptMultilineDescription('Project description', '…')`.
-  All other Phase 1 hint copy preserved.
-- **`packages/cli/src/commands/project-config.ts`** — the
-  `openEditorForPrompt()` local helper now delegates to the
-  shared `promptWithEditor`, passing the existing
-  `{{role}}/{{goal}}/{{artifacts}}` placeholder seed as the
-  `initial` body. Removed the standalone `spawn` / `writeFile` /
-  `readFile` / `unlink` / `mkdtemp` imports from this file —
-  they all live in `prompts.ts` now. The "empty prompt aborts"
-  guard remains in `openEditorForPrompt` because custom-agent
-  prompts must not be blank.
-- **`packages/dashboard/src/views/Admin.tsx`** —
-  `CreateProjectModal` description field is now a `<textarea
-  rows={4}>` with `resize: vertical` + `minHeight: 96px` +
-  `fontFamily: inherit`. Placeholder rewritten as a three-line
-  example matching the brief. State binding unchanged
-  (`description` / `setDescription`) — the existing trim +
-  fallback at submit time (line 703-705) already handles the
-  multi-line body correctly. Server's `init-harness` route at
-  `packages/server/src/routes/projects.ts:613-689` does only
-  `.trim()` on `projectDescription` before passing it to
-  `generateStackConfig` and `loadTemplate` — no server change
-  needed; the LLM stack config generator already accepts
-  arbitrary-length descriptions.
-
-Verified:
-
-- `pnpm -r build` clean across all 12 packages. Dashboard
-  bundle re-emitted as `index-DSlpzI_R.js` (1010.76 KB raw /
-  319.35 KB gzipped; identical structure to the prior
-  CodeMirror-era bundle — the textarea swap added a handful
-  of bytes inside the existing chunk).
-- Spot-grep on the dashboard bundle confirms the new textarea
-  + placeholder ship: `textarea` appears 8 times (was
-  pre-existing in `TemplateEditor`-adjacent code; the new one
-  raised the count from 7 to 8) and the new placeholder
-  copy `Describe your project: purpose, tech stack` is
-  present in the bundle exactly once.
-- Helper-level smoke tests (5 cases for the individual
-  helpers + 3 cases for the 3-mode chooser, run via a Node
-  driver script that imports the compiled `dist/ui/prompts.js`
-  and pipes synthetic stdin):
-  - `promptMultiline` captures all 4 lines verbatim through
-    END.
-  - END sentinel terminates on any of `END` / `end` / `End` /
-    `"  end  "`.
-  - `promptWithEditor` with `EDITOR=true` (no-op editor)
-    strips the `# Enter ${fieldName}…` comment seed to an
-    empty body.
-  - `promptWithEditor` round-trips a non-comment `initial`
-    body when `EDITOR=true`.
-  - `promptWithEditor` with `EDITOR=/nonexistent` falls
-    through to `promptMultiline` and captures the END-
-    terminated body the operator typed instead.
-  - `promptMultilineDescription` option 1 (empty choice →
-    default) returns the single line typed at the field
-    prompt.
-  - `promptMultilineDescription` option 2 captures all 4
-    lines and trims trailing whitespace.
-  - `promptMultilineDescription` option 3 routes through
-    `promptWithEditor` (verified via `EDITOR=true` → empty
-    body).
-- Server path traced manually: CLI calls
-  `client.initHarness(projectId, description)` →
-  `POST /projects/:id/init-harness` with
-  `{ projectDescription }` → `generateStackConfig(description.trim(),
-  project.name)` and `loadTemplate(…, { projectDescription:
-  description.trim(), … })`. Description is a plain string
-  parameter end-to-end; no truncation anywhere in the path.
-- Dashboard bundle hot-copied into `gestalt-server-1` at
-  `/app/packages/dashboard/dist/` so the running platform
-  serves the textarea-having build without an image rebuild.
-  `curl http://localhost:3000/app/` shows the new
-  `index-DSlpzI_R.js` reference; container HEAD-of-bundle
-  matches the on-disk hash.
-
-Decisions made:
-
-- **Three-mode chooser, not "single vs multi" toggle.** The
-  brief offered three modes (single line / END-terminated /
-  editor); the chooser preserves the existing keystroke-
-  efficient default (Enter → single line) while still
-  giving the operator an editor escape hatch when they want
-  full control. Empty choice deliberately defaults to (1)
-  so muscle memory doesn't break.
-- **Buffered reader rather than fresh interface per prompt.**
-  Initial implementation created a `readline.createInterface`
-  per call inside `promptMultiline`. Under piped stdin
-  (smoke tests), readline emits `line` events synchronously
-  as bytes arrive — between calls the next line was already
-  emitted and dropped. The fix is a single long-lived
-  interface plus a buffered pull-based `next()`. Documented
-  inline so future refactors don't regress it.
-- **Custom-agent prompt routes through the shared helper.**
-  The existing `openEditorForPrompt` did the same job
-  but reimplemented the editor lifecycle. Collapsed to a
-  one-line wrapper that passes the existing placeholder
-  seed as `initial`. Kept the "empty prompt aborts" guard
-  there because custom-agent prompts cannot be blank
-  (the rest of the workflow assumes a non-empty body).
-- **Dashboard uses a plain `<textarea>`, not a CodeMirror
-  instance.** The description field is free-form prose, not
-  code — a textarea with `resize: vertical` is the right
-  affordance and keeps the bundle exactly as it is. Reusing
-  the existing `styles.input` base + a small style merge
-  keeps the visual integration consistent with the rest of
-  the modal.
-- **No new server endpoint / no migration.** The
-  `projectDescription` body field already accepts arbitrary-
-  length strings — the only server-side operation on it is
-  `.trim()` before passing through to the LLM stack config
-  generator. The bug was purely client-side.
-
-Pending follow-ups: none introduced.
-
-Build status: `pnpm -r build` clean across all 12 packages
-(CLI: `tsc && chmod +x dist/index.js` clean; dashboard:
-1010.76 KB / 319.35 KB gzipped, identical structure to the
-template-improvements session). Dashboard hot-copied into
-the running container; next image rebuild folds it in.
 

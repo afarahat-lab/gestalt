@@ -49,6 +49,43 @@ import { createContextLogger } from '../logger/index';
 const log = createContextLogger({ module: 'self-healing-loop' });
 
 /**
+ * Substrings that mark a failure as fundamentally not fixable by a
+ * retry. Fix C — `docs/claude/TEST_REPORT_001.md`. When the
+ * orchestrator's `failureSummary` (or any captured `technicalDetail`)
+ * contains one of these patterns, the loop short-circuits straight
+ * to escalation without burning an LLM call on a diagnosis that can
+ * only conclude "retry won't help."
+ *
+ * Treat the list as conservative — only patterns whose recovery
+ * strictly requires operator action (schema migration, credential
+ * fix, infrastructure repair). Don't include transient errors here.
+ */
+const UNRECOVERABLE_ERROR_PATTERNS: readonly string[] = [
+  'invalid input syntax for type uuid',  // postgres 22P02
+  'relation does not exist',             // missing table / view
+  'column does not exist',               // schema drift
+  'econnrefused',                        // DB / Redis / upstream down
+  'password authentication failed',      // bad DB credentials
+];
+
+export function isUnrecoverableError(message: string | undefined | null): boolean {
+  if (!message) return false;
+  const lower = message.toLowerCase();
+  return UNRECOVERABLE_ERROR_PATTERNS.some((pattern) => lower.includes(pattern));
+}
+
+/**
+ * Fix G — strip trailing punctuation (period, exclamation, question
+ * mark) + whitespace from the diagnosis before concatenating with
+ * `Confidence:`. The LLM frequently terminates with a period, and
+ * the template then adds its own — producing `…syntax.. Confidence`.
+ */
+function stripTrailingPunctuation(s: string | undefined | null): string {
+  if (!s) return '';
+  return s.replace(/[.!?\s]+$/u, '');
+}
+
+/**
  * The seven failure types the platform recognises. Wired to
  * `platform_self_healing_config.failure_type` (migration 020).
  */
@@ -179,6 +216,30 @@ async function runSelfHealingLoopUnsafe(
     return { shouldRetry: false, diagnosis: null, escalated: true, autoResolved };
   }
 
+  // Fix C — short-circuit on known-unrecoverable errors before any
+  // LLM call. The diagnostician cannot pick a retry path that fixes
+  // a missing table, a bad UUID, or a refused connection; calling
+  // the LLM only burns latency + tokens.
+  const unrecoverableSource =
+    (context.technicalDetail && isUnrecoverableError(context.technicalDetail))
+      ? context.technicalDetail
+      : (context.failureSummary && isUnrecoverableError(context.failureSummary))
+        ? context.failureSummary
+        : null;
+  if (unrecoverableSource) {
+    log.info(
+      { failureType: payload.failureType, correlationId: payload.correlationId },
+      'Unrecoverable error detected — skipping LLM diagnosis, escalating immediately',
+    );
+    const autoResolved = await escalateToHuman(
+      payload,
+      context,
+      signals,
+      `Unrecoverable infrastructure error: ${unrecoverableSource.slice(0, 200)}`,
+    );
+    return { shouldRetry: false, diagnosis: null, escalated: true, autoResolved };
+  }
+
   const intent = await repos.intents.findById(payload.intentId);
   // `attemptCount` post-migration-020 starts at 0 for fresh intents.
   // The first call to runSelfHealingLoop is therefore "attempt 1"
@@ -212,11 +273,16 @@ async function runSelfHealingLoopUnsafe(
   // them (e.g. shouldRetry: true with retryTaskType: 'none' meaning
   // "I think this is fixable but I don't know which queue").
   if (!diagnosis.shouldRetry || diagnosis.retryTaskType === 'none') {
+    // Fix G — strip trailing punctuation from the LLM's diagnosis
+    // before joining with "Confidence: …", otherwise the alert's
+    // escalation_reason renders with a double period
+    // ("…uuid syntax.. Confidence: medium").
+    const cleanDiagnosis = stripTrailingPunctuation(diagnosis.diagnosis);
     const autoResolved = await escalateToHuman(
       payload,
       context,
       signals,
-      `Diagnosis: ${diagnosis.diagnosis}. Confidence: ${diagnosis.confidence}. retryTaskType: ${diagnosis.retryTaskType}`,
+      `Diagnosis: ${cleanDiagnosis}. Confidence: ${diagnosis.confidence}. retryTaskType: ${diagnosis.retryTaskType}`,
     );
     return { shouldRetry: false, diagnosis, escalated: true, autoResolved };
   }

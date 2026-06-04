@@ -694,9 +694,13 @@ async function openClient(options: BaseOptions): Promise<CommandContext | null> 
     const { data: projects } = await client.listProjects();
     let project = projects[0];
     if (options.project) {
-      const match = projects.find((p) => p.name === options.project);
+      const target = options.project.trim();
+      const lookupByUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(target);
+      const match = lookupByUuid
+        ? projects.find((p) => p.id === target)
+        : projects.find((p) => p.name.toLowerCase() === target.toLowerCase());
       if (!match) {
-        console.log(c.error(`No project named '${options.project}'. Run \`gestalt projects list\`.`));
+        console.log(c.error(`No project named '${target}'. Run \`gestalt projects list\`.`));
         process.exit(1);
       }
       project = match;

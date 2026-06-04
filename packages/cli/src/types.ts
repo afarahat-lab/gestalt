@@ -44,6 +44,10 @@ export interface RunOptions {
   server?: string;             // one-shot --server override (not persisted)
   projectId?: string;
   priority?: 'critical' | 'high' | 'normal' | 'low';
+  /** Fix F — after submitting, switch to the same periodic graph
+   *  re-render that `gestalt intent show --watch` uses, until the
+   *  intent reaches a terminal status. */
+  watch?: boolean;
 }
 
 export interface StatusOptions {

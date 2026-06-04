@@ -58,11 +58,20 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
-- **`gestalt run --project <name>` bug** (BLOCKING the operator
-  workflow that uses an explicit project flag). One-line CLI fix
-  + server defense-in-depth — see `docs/claude/TEST_REPORT_001.md`.
-  Workaround: use `gestalt projects use trackeros` first, then
-  `gestalt run "…"` without `--project`. Discovered 2026-06-04.
+- **Re-link CLI + hot-copy server `dist`** (or `docker compose
+  up -d --build`) so the 2026-06-04 follow-up session's seven
+  Test-Report-001 fixes are live in the running container.
+  ```bash
+  pnpm --filter @gestalt/cli build && cd packages/cli && npm link
+  # then either:
+  docker compose up -d --build
+  # OR hot-copy:
+  docker cp packages/server/dist gestalt-server-1:/app/packages/server/dist \
+    && docker restart gestalt-server-1
+  ```
+- **Re-run the `TEST_REPORT_001` scaffold intent** against the
+  patched build to author `TEST_REPORT_002.md`. Server `dist`
+  must be live first.
 - **trackeros `.github/workflows/gestalt.yml`** still pins Node 20
   (project was bootstrapped before the 2026-06-04 Node 22 LTS
   template change). Edit `node-version: '20'` → `'22'` + commit.

@@ -1135,13 +1135,15 @@ program
   .command('run <intent>')
   .description('Submit an intent to the generate layer')
   .option('--server <url>', 'Server URL (one-shot override for this invocation)')
-  .option('--project <id>', 'Project ID (overrides current project)')
+  .option('--project <name>', 'Project name or UUID (overrides current project)')
   .option('--priority <level>', 'Task priority: critical|high|normal|low', 'normal')
-  .action(async (intent: string, opts: { server?: string; project?: string; priority?: string }) => {
+  .option('--watch', 'After submission, re-render the execution graph every 3s until the intent reaches a terminal status (same renderer as `gestalt intent show --watch`)')
+  .action(async (intent: string, opts: { server?: string; project?: string; priority?: string; watch?: boolean }) => {
     await runCommand(intent, {
       server: opts.server,
       projectId: opts.project,
       priority: opts.priority as never,
+      watch: opts.watch,
     }).catch(fatalError);
   });
 
@@ -1193,13 +1195,15 @@ intent
   .command('submit <text>')
   .description('Submit a new intent (alias of `gestalt run` — same implementation)')
   .option('--server <url>', 'Server URL (one-shot override for this invocation)')
-  .option('--project <id>', 'Project ID (overrides current project)')
+  .option('--project <name>', 'Project name or UUID (overrides current project)')
   .option('--priority <level>', 'Task priority: critical|high|normal|low', 'normal')
-  .action(async (text: string, opts: { server?: string; project?: string; priority?: string }) => {
+  .option('--watch', 'After submission, re-render the execution graph every 3s until the intent reaches a terminal status')
+  .action(async (text: string, opts: { server?: string; project?: string; priority?: string; watch?: boolean }) => {
     await intentSubmitCommand(text, {
       server: opts.server,
       projectId: opts.project,
       priority: opts.priority as never,
+      watch: opts.watch,
     }).catch(fatalError);
   });
 

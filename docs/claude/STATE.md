@@ -101,7 +101,8 @@ the `sessions/archive/` files (everything older)._
 
 - `BaseLLMAgent` in `@gestalt/core/agents` — every LLM-using agent
   in every layer extends it. Captures `lastPrompt` /
-  `lastLlmResponse` / `lastModelUsed`.
+  `lastLlmResponse` / `lastModelUsed` / `lastTokensUsed`
+  (accumulated across every LLM call inside one `run()`).
 - Built-in file tools (ADR-038, migration 012): `readFile`,
   `listDirectory`, `searchFiles`, `getFileTree`. Read-only,
   path-traversal-guarded.
@@ -119,7 +120,9 @@ the `sessions/archive/` files (everything older)._
 
 - Per-agent `agent_executions` + `agent_execution_logs` rows
   (migration 007 + 009 + 012) with prompt / response / model /
-  tool calls.
+  tool calls / **tokens used** (BaseLLMAgent's `lastTokensUsed`
+  accumulator wired through the generate + gate orchestrators
+  on 2026-06-04; deploy + maintenance are non-LLM today).
 - Live event bus (`@gestalt/core/events`) → SSE at
   `/events`. Dashboard subscribes for instant updates.
 - IntentDetail accordion with prompt + LLM response + tool calls
@@ -131,8 +134,9 @@ the `sessions/archive/` files (everything older)._
 - Alerts: per-type bodies + interventions (ADR-021).
 - Pipeline failure alerts with operator feedback → resume on the
   same branch (migration 019).
-- Operator-driven CLI parity: `gestalt intent / gate / deploy /
-  agents active / maintenance / status --graph --watch`.
+- Operator-driven CLI parity: `gestalt run --watch` /
+  `gestalt intent / gate / deploy / agents active /
+  maintenance / status --graph --watch`.
 
 ### CLI
 
@@ -191,29 +195,20 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
-- **`gestalt run --project <name>` stores the literal NAME in
-  `intents.project_id`** instead of resolving to UUID. Orchestrator
-  then errors `invalid input syntax for type uuid` from
-  `PostgresProjectRepository.findById`. One-line fix: call the
-  existing `resolveProjectId` helper at
-  `packages/cli/src/commands/run.ts:34`. Server defense-in-depth:
-  validate `projectId` at `POST /intents`. Tracked in
-  `docs/claude/TEST_REPORT_001.md` (Fix A + Fix B). Discovered
-  2026-06-04 during live test against trackeros.
-- **`agent_executions.tokens_used` is always 0** even for cycles
-  where the `llm` module logs report real token usage. Per-agent
-  token rollups in `gestalt intent show` are wrong as a result.
-  Fix D in TEST_REPORT_001.
-- **`gestalt intent show <8-char-prefix>` no longer matches**
-  despite the help text claiming prefix support. Only full UUID
-  works. Fix E in TEST_REPORT_001.
-- **`gestalt run --watch` is undocumented / missing.** Operators
-  expect submit-and-tail in one step; today they must
-  `gestalt run … && gestalt intent show <id> --watch`. Fix F in
-  TEST_REPORT_001.
-- **Self-healing diagnostician retries on `22P02 invalid input
-  syntax for type uuid`** — wasted LLM call for an unrecoverable
-  error. Fix C in TEST_REPORT_001.
+- **Re-run `TEST_REPORT_001`'s scaffold intent** after the
+  2026-06-04 follow-up session's seven fixes ship into the
+  running container. Goal: capture real intent-agent /
+  design-agent / context-agent / code-agent prompts +
+  responses for `TEST_REPORT_002.md`, with
+  `agent_executions.tokens_used` now non-zero (Fix D wired
+  the per-agent capture in
+  `packages/agents/generate/src/orchestrator/orchestrator.ts`).
+  Server `dist` needs to be hot-copied into
+  `gestalt-server-1` (or `docker compose up -d --build`) so
+  Fix B's UUID validator at `POST /intents` is live. The
+  CLI-side Fix A (`packages/cli/src/ui/resolve.ts` shared
+  helper) is enough on its own for the next intent to flow
+  correctly; Fix B is defence-in-depth.
 - **Dashboard bundle is 1010 KB raw / 319 KB gzipped** after the
   CodeMirror addition (2026-06-04). Above Vite's 500 KB warning.
   Future code-split via dynamic `import()` would restore the
@@ -265,9 +260,12 @@ the `sessions/archive/` files (everything older)._
   currently in env-var mode and working.
 - **Open alert** (type `generate-error`, severity `high`,
   correlation `06299649-2db4-4d64-8785-167e025cbacb`) from the
-  2026-06-04 test-report cycle. Will auto-resolve once Fix A
-  lands and the same intent is re-run, or dismiss explicitly
-  with `gestalt alerts dismiss`.
+  2026-06-04 test-report cycle. Fix A + Fix B now landed in
+  the build, so a fresh re-run of the same scaffold intent
+  will succeed; the original alert row references an
+  unactionable intent (its `project_id` is the literal name
+  `'trackeros'`) and won't auto-resolve. Dismiss explicitly
+  with `gestalt alerts dismiss` once acknowledged.
 
 ---
 

@@ -267,6 +267,14 @@ INFRASTRUCTURE FAILURES → shouldRetry: false
   "ECONNREFUSED" | "ETIMEDOUT" | "pnpm: command not found":
     shouldRetry: false, confidence: "low", retryTaskType: "none"
 
+UNRECOVERABLE PLATFORM ERRORS → shouldRetry: false IMMEDIATELY (no retry)
+  "invalid input syntax for type uuid"   (postgres 22P02 — bad UUID in DB call)
+  "relation does not exist"              (schema migration not applied)
+  "column does not exist"                (schema drift)
+  "password authentication failed"       (DB credentials wrong)
+    shouldRetry: false, confidence: "high", retryTaskType: "none"
+    These are operator-only fixes — never burn a retry on them.
+
 ## Your task
 Return ONLY a JSON object — no preamble, no markdown fences:
 {

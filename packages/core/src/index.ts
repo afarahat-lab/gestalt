@@ -41,7 +41,7 @@ export type {
   SelfHealingContext, SelfHealingDiagnosis,
 } from './agents/self-healing-agent';
 export {
-  runSelfHealingLoop, shouldSkipAgent,
+  runSelfHealingLoop, shouldSkipAgent, isUnrecoverableError,
 } from './agents/self-healing-loop';
 export type {
   FailureType, SelfHealingLoopPayload, SelfHealingResult, ResumeSource,

@@ -184,10 +184,17 @@ async function resolveProjectByName(
   client: GestaltApiClient,
   projectName: string,
 ): Promise<{ id: string; name: string }> {
+  const trimmed = projectName.trim();
   const { data: projects } = await client.listProjects();
-  const match = projects.find((p) => p.name === projectName);
+  // Accept either a name (case-insensitive) or a UUID — same shape as
+  // the shared resolver in ../ui/resolve.ts so every `--project`
+  // surface behaves identically.
+  const lookupByUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed);
+  const match = lookupByUuid
+    ? projects.find((p) => p.id === trimmed)
+    : projects.find((p) => p.name.toLowerCase() === trimmed.toLowerCase());
   if (!match) {
-    console.log(c.error(`No project named '${projectName}'. Run \`gestalt projects list\` to see what is registered.`));
+    console.log(c.error(`No project named '${trimmed}'. Run \`gestalt projects list\` to see what is registered.`));
     process.exit(1);
   }
   return match;

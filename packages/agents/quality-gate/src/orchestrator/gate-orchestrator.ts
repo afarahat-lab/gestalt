@@ -288,6 +288,12 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
           if (reviewAgent.lastPrompt) r.lastPrompt = reviewAgent.lastPrompt;
           if (reviewAgent.lastLlmResponse) r.llmResponse = reviewAgent.lastLlmResponse;
           if (reviewAgent.lastModelUsed) r.modelUsed = reviewAgent.lastModelUsed;
+          // Fix D — surface the BaseLLMAgent's accumulated token
+          // count so `agent_executions.tokens_used` is non-zero for
+          // the review-agent row.
+          if (reviewAgent.lastTokensUsed > 0) {
+            (r as unknown as { tokensUsed?: number }).tokensUsed = reviewAgent.lastTokensUsed;
+          }
           return r;
         },
         childLog,
@@ -493,7 +499,12 @@ async function runWithObservability<T extends GateAgentResult>(
   const completedAt = new Date();
   const stepStatus: ExecutionStatus = result.status === 'errored'
     ? 'failed' : result.status === 'failed' ? 'failed' : 'completed';
+  // Fix D — review-agent now reports its accumulated token count
+  // through the `tokensUsed` field; constraint-agent is non-LLM and
+  // leaves it undefined → falls back to 0.
+  const tokensUsed = ((result as unknown as { tokensUsed?: number }).tokensUsed) ?? 0;
   await executions.updateStatus(executionId, stepStatus, {
+    tokensUsed,
     durationMs: completedAt.getTime() - startedAt.getTime(),
     startedAt,
     completedAt,

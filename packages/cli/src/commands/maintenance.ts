@@ -34,6 +34,7 @@ import {
   printConnectionError, isConnectivityError, handleMembershipForbidden,
 } from '../ui/server-errors';
 import { c, blank, divider, printTable } from '../ui/prompts';
+import { resolveProjectId } from '../ui/resolve';
 
 const VALID_AGENT_ROLES = new Set([
   'drift-agent', 'alignment-agent', 'gc-agent', 'evaluation-agent',
@@ -155,7 +156,7 @@ export async function maintenanceListCommand(
 
   const client = new GestaltApiClient({ serverUrl, token: config.token });
   try {
-    const projectId = await resolveProjectIdFor(client, config.currentProjectId, options.project);
+    const projectId = await resolveProjectId(client, config.currentProjectId, options.project);
     const limit = Math.min(Math.max(parseInt(options.limit ?? '20', 10) || 20, 1), 200);
     const params: Parameters<GestaltApiClient['listMaintenanceRuns']>[0] = { limit };
     if (projectId) params.projectId = projectId;
@@ -310,23 +311,6 @@ function formatAge(d: Date): string {
   if (hours < 24) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
-}
-
-async function resolveProjectIdFor(
-  client: GestaltApiClient,
-  currentProjectId: string | null,
-  projectName?: string,
-): Promise<string | null> {
-  if (projectName) {
-    const { data: projects } = await client.listProjects();
-    const match = projects.find((p) => p.name === projectName);
-    if (!match) {
-      console.log(c.error(`No project named '${projectName}'. Run \`gestalt projects list\`.`));
-      process.exit(1);
-    }
-    return match.id;
-  }
-  return currentProjectId;
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

@@ -548,3 +548,150 @@ code-agent         failed      8495 ms   0 tokens    ← OpenAI rate-limit
 
 `06299649-2db4-4d64-8785-167e025cbacb` — this report is the
 permanent record of the pre-fix state.
+
+---
+
+## Fixes applied (2026-06-04, follow-up session)
+
+All seven recommended fixes shipped in a single follow-up session.
+`pnpm -r build` clean across all 12 packages. No migration. The
+patched server `dist` needs to be re-loaded into the running
+container (hot-copy or `docker compose up -d --build`) before the
+test intent can be re-run.
+
+### Fix A — `gestalt run --project <name>` resolves to UUID ✓
+
+- **New** `packages/cli/src/ui/resolve.ts` — shared
+  `resolveProjectId(client, currentProjectId, projectName?)`
+  helper. Accepts a UUID verbatim OR resolves a project NAME
+  (case-insensitive) via `/projects`. Single source of truth so
+  every `--project` surface behaves identically.
+- **`packages/cli/src/commands/run.ts`** now calls the helper
+  before any server-side dispatch (prior code at line 34 forwarded
+  `options.projectId` raw). The literal name path that triggered
+  the original `22P02` error is gone.
+- **Also applied to** `intent.ts`, `deploy.ts`, `maintenance.ts`,
+  `agents.ts` (`resolveProjectByName` widened to accept UUIDs),
+  and `project-config.ts` (case-insensitive name + UUID matching
+  inside `openClient`). Pre-existing duplicate `resolveProjectId`
+  copies in `intent.ts` / `deploy.ts` / `maintenance.ts` removed.
+- **`packages/cli/src/index.ts`** — `--project` option help text
+  updated from `<id>` to `<name>` for `gestalt run` and
+  `gestalt intent submit`.
+
+### Fix B — Server-side validation at `POST /intents` ✓
+
+- **`packages/server/src/routes/intents.ts`** — new UUID regex
+  reject (400 `INVALID_PROJECT_ID`) + project-existence preflight
+  (404 `PROJECT_NOT_FOUND`) before the membership guard. Defence
+  in depth: even if a CLI regression or third-party caller sends
+  a non-UUID `projectId`, the row never lands in
+  `intents.project_id` and the orchestrator never sees a
+  malformed value.
+
+### Fix C — Diagnostician skips known-unrecoverable errors ✓
+
+- **`packages/core/src/agents/self-healing-loop.ts`** —
+  `UNRECOVERABLE_ERROR_PATTERNS` substrings (`"invalid input
+  syntax for type uuid"`, `"relation does not exist"`, `"column
+  does not exist"`, `"econnrefused"`, `"password authentication
+  failed"`). New exported `isUnrecoverableError(message)` helper.
+  `runSelfHealingLoopUnsafe` checks `technicalDetail` then
+  `failureSummary`; on a match it skips the LLM diagnosis and
+  goes straight to `escalateToHuman` with reason `"Unrecoverable
+  infrastructure error: …"`.
+- **`packages/core/src/agents/self-healing-agent.ts`** — same
+  patterns appended to the diagnostician's prompt's "Known
+  failure patterns" section, marked `shouldRetry: false /
+  confidence: "high" / retryTaskType: "none"`. Defence in depth
+  for the case where the orchestrator captures the substring on
+  `failureSummary` but not on `technicalDetail`.
+- **`packages/core/src/index.ts`** — re-exports
+  `isUnrecoverableError` alongside `runSelfHealingLoop`.
+
+### Fix D — Capture `tokens_used` per agent execution ✓
+
+- **`packages/core/src/agents/base-llm-agent.ts`** — new
+  instance field `lastTokensUsed` reset to 0 on the template
+  `run()` entry. Both `callLLMWithMessages` and the tool-loop
+  body now accumulate `result.value.tokensUsed` into it. Agents
+  that override `run` (every generate agent) should reset
+  `lastTokensUsed` themselves at the top — they're freshly
+  constructed per task (`newAgentForRole` in the generate
+  orchestrator) so the initial value is 0 regardless, and the
+  per-call accumulator is the only writer.
+- **`packages/agents/generate/src/orchestrator/orchestrator.ts`**
+  — computes `effectiveTokensUsed = max(agentInstance.lastTokensUsed,
+  result.tokensUsed)` and writes it to both
+  `executions.updateStatus(..., { tokensUsed })` AND
+  `step.result.tokensUsed`. The latter feeds the per-cycle
+  rollup at `buildResult(...)` line ~1233 so the dashboard's
+  "tokens so far" total reflects real usage.
+- **`packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`**
+  — review-agent's `lastTokensUsed` is now forwarded onto the
+  result via the existing `lastPrompt` / `lastLlmResponse`
+  side-channel. `runWithObservability` reads it back and threads
+  it into `executions.updateStatus`. Constraint-agent is non-LLM
+  and stays at 0.
+- Custom-agent-runner already passed `result.value.tokensUsed`
+  through (`packages/agents/generate/src/agents/custom-agent-runner.ts:100`)
+  — no change.
+- Deploy-layer agents are non-LLM today, so no change. The
+  pattern is identical when a deploy agent is upgraded to LLM
+  in a future cycle (extend BaseLLMAgent, read `lastTokensUsed`
+  in the observability wrapper).
+
+### Fix E — `gestalt intent show <prefix>` matching ✓
+
+- **`packages/cli/src/ui/intent-resolver.ts`** — rewritten:
+  - Full-UUID input first tries a correlationId-prefix lookup
+    against the current project, then falls back to the input
+    itself (in case it's the internal `intent.id`).
+  - Prefix lookup matches BOTH `correlationId` AND `id` (older
+    impl matched only `correlationId`, so an operator copy-
+    pasting `intents.id` from the DB never matched).
+  - When the current-project scope misses, broadens to
+    server-wide (empty `projectId` filter per the
+    `/intents` route contract). Catches the case where the
+    failing intent's stored project doesn't match the
+    operator's `gestalt projects use` selection.
+  - All matching now case-insensitive.
+
+### Fix F — `gestalt run --watch` ✓
+
+- **`packages/cli/src/types.ts`** — `RunOptions.watch?: boolean`.
+- **`packages/cli/src/commands/run.ts`** — after `submitIntent`
+  succeeds, `watchMode` swaps the live SSE event ticker for the
+  same periodic full-graph re-render that `gestalt intent show
+  --watch` uses (3 s interval; Ctrl+C detaches; auto-exit on
+  terminal status).
+- **`packages/cli/src/index.ts`** — `--watch` flag wired on
+  both `gestalt run` and `gestalt intent submit`.
+
+### Fix G — Strip trailing period from escalation_reason ✓
+
+- **`packages/core/src/agents/self-healing-loop.ts`** —
+  new private `stripTrailingPunctuation(s)` (regex
+  `/[.!?\s]+$/u`). Applied to `diagnosis.diagnosis` before
+  joining `"Confidence: …"`. The double-period in
+  `"…uuid syntax.. Confidence: medium"` is gone.
+
+### Open follow-ups carried forward to the re-run
+
+- **Re-run the test intent against the fixed platform.** The
+  next session should:
+  1. Hot-copy `packages/server/dist/` into the running
+     container OR `docker compose up -d --build`.
+  2. `gestalt run "<same scaffold prompt>" --project trackeros
+     --watch`.
+  3. Capture `agent_executions` + `agent_execution_logs` for
+     the new correlationId (tokens column should be > 0 now).
+  4. Author TEST_REPORT_002.md with real per-agent prompt /
+     response analysis — the agent pipeline IS expected to
+     reach intent / design / context / code now.
+- **Open alert** (correlation
+  `06299649-2db4-4d64-8785-167e025cbacb`) from this report's
+  pre-fix run can be cleared with `gestalt alerts dismiss`
+  once the operator has acked the diagnosis.
+- **trackeros `.github/workflows/gestalt.yml`** Node-20-pin and
+  **PR #46** cleanup remain (carried in BUILD.md).
