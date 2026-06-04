@@ -17,7 +17,8 @@ export type {
 export { ok, err } from './types';
 
 // Tools (ADR-038)
-export { FILE_TOOL_DEFINITIONS, executeFileTool } from './tools/file-tools';
+export { FILE_TOOL_DEFINITIONS, executeFileTool, executeScript } from './tools/file-tools';
+export type { ExecuteScriptResult } from './tools/file-tools';
 
 // Platform secrets vault (Session 4 — migration 015)
 export {
@@ -135,7 +136,7 @@ export type {
 export { getRepositories, setRepositories } from './repository/index';
 
 // Harness
-export type { HarnessConfig, ConstraintRule, ContextSnapshot, HarnessValidationResult } from './harness/index';
+export type { HarnessConfig, HarnessAgentConfig, ConstraintRule, ContextSnapshot, HarnessValidationResult } from './harness/index';
 export { HarnessEngine, createHarnessEngine, REQUIRED_CONTEXT_FILES } from './harness/index';
 
 // Events

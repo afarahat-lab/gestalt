@@ -319,6 +319,14 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
           if (constraintAgent.lastLlmResponse) decorated.llmResponse = constraintAgent.lastLlmResponse;
           if (constraintAgent.lastModelUsed) decorated.modelUsed = constraintAgent.lastModelUsed;
           if (constraintAgent.lastTokensUsed > 0) decorated.tokensUsed = constraintAgent.lastTokensUsed;
+          // TEST_REPORT_005 evolution — constraint-agent now drives a
+          // tool-use loop (executeScript / readFile / searchFiles).
+          // Forward the call log so the dashboard's tool-call panel
+          // shows what the LLM actually ran.
+          if (constraintAgent.lastToolCallLog.length > 0) {
+            (decorated as unknown as { toolCalls?: typeof constraintAgent.lastToolCallLog }).toolCalls =
+              constraintAgent.lastToolCallLog;
+          }
           return r;
         },
         childLog,
@@ -576,6 +584,7 @@ async function runWithObservability<T extends GateAgentResult>(
     lastPrompt?: string;
     llmResponse?: string;
     modelUsed?: string;
+    toolCalls?: Array<{ toolName: string; input: Record<string, unknown>; output: string; isError: boolean; calledAt: Date; toolSource?: string }>;
   };
   await executionLogs.save({
     executionId,
@@ -590,7 +599,11 @@ async function runWithObservability<T extends GateAgentResult>(
     errorMessage: result.status === 'errored'
       ? 'Gate agent threw before producing a structured response'
       : null,
-    toolCalls: [],
+    // TEST_REPORT_005 evolution — constraint-agent's executeScript /
+    // readFile / searchFiles calls are persisted onto
+    // `agent_execution_logs.tool_calls`. Empty for non-tool-using
+    // gate agents.
+    toolCalls: resultWithPrompt.toolCalls ?? [],
   }).catch((err) => {
     childLog.warn({ err, executionId, agentRole }, 'executionLogs.save failed');
   });

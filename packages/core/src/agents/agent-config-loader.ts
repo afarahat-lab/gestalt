@@ -53,6 +53,24 @@ const ALL_FILE_TOOLS: AgentToolConfig = {
   builtin: ['readFile', 'listDirectory', 'searchFiles', 'getFileTree'],
 };
 
+/**
+ * TEST_REPORT_005 evolution — code-agent + test-runner-agent +
+ * constraint-agent gain `executeScript`. Each agent decides which
+ * commands to run based on the project's stack — no hardcoded
+ * shell strings in the platform.
+ */
+const ALL_FILE_TOOLS_WITH_SCRIPT: AgentToolConfig = {
+  builtin: ['readFile', 'listDirectory', 'searchFiles', 'getFileTree', 'executeScript'],
+};
+
+const CONSTRAINT_AGENT_TOOLS: AgentToolConfig = {
+  builtin: ['executeScript', 'readFile', 'searchFiles'],
+};
+
+const TEST_RUNNER_AGENT_TOOLS: AgentToolConfig = {
+  builtin: ['executeScript', 'readFile'],
+};
+
 /** review-agent + context-fixer get a narrower subset because they
  *  work primarily off the artifact set in the LLM message — they
  *  use `readFile` for spot-checks but don't need to enumerate the
@@ -104,7 +122,10 @@ export const PER_ROLE_DEFAULTS: Record<string, AgentConfig> = {
     goal: 'Generate production-quality TypeScript code that follows the project harness',
     llm: { temperature: 0.2, maxTokens: 8000 },
     promptExtensions: [],
-    tools: { ...ALL_FILE_TOOLS },
+    // TEST_REPORT_005 evolution — code-agent gains `executeScript`
+    // so it can verify (e.g. `tsc --noEmit`) the code it just
+    // generated and self-correct on failure before the gate.
+    tools: { ...ALL_FILE_TOOLS_WITH_SCRIPT },
   },
   'test-agent': {
     role: 'Senior QA engineer',
@@ -114,6 +135,27 @@ export const PER_ROLE_DEFAULTS: Record<string, AgentConfig> = {
     tools: { builtin: [] },
   },
   // ─── Gate layer (Amendment 2026-06: tools enabled) ────────────
+  'constraint-agent': {
+    role: 'Architectural constraint evaluator',
+    goal: 'Verify generated code satisfies all project architectural rules using executeScript + read-only file tools',
+    llm: { temperature: 0.0, maxTokens: 4000 },
+    promptExtensions: [],
+    // TEST_REPORT_005 evolution — constraint-agent is now an LLM
+    // agent. It reads HARNESS.json's per-agent rules + uses
+    // `executeScript` (e.g. `tsc --noEmit`, `grep -r "console\\." src/`)
+    // to verify them.
+    tools: { ...CONSTRAINT_AGENT_TOOLS },
+  },
+  'test-runner-agent': {
+    role: 'Test execution specialist',
+    goal: 'Run the project test suite and report failures with context',
+    llm: { temperature: 0.0, maxTokens: 4000 },
+    promptExtensions: [],
+    // TEST_REPORT_005 evolution — test-runner-agent picks the
+    // right runner (jest / vitest / pytest / …) based on the
+    // project's stack and executes it.
+    tools: { ...TEST_RUNNER_AGENT_TOOLS },
+  },
   'review-agent': {
     role: 'Senior engineer and code reviewer',
     goal: 'Assess generated code quality and architectural correctness',

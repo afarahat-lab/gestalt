@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-05 (after TEST_REPORT_005)
+**Last updated:** 2026-06-05 (after TEST_REPORT_006 — executeScript evolution)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -195,26 +195,34 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
-- **constraint-agent type-only pg import false-positive —
-  FIXED (TEST_REPORT_005 Fix 1).** Two-stage flow: scripted
-  detection → CandidateViolations; LLM judgment dismisses
-  type-only imports + context-dependent false positives;
-  only confirmed → signals. Live-verified — the
-  TEST_REPORT_004 blocking candidate now DISMISSED.
-  Code-prompt also gained an `import type` hygiene section.
-- **review-agent over-fires on out-of-scope rules**
-  (TEST_REPORT_005, HIGH — blocking). Fix 2 + Fix 3 wired
-  (sections render; package.json with `@types/jest` is in
-  the prompt) but the LLM still flags "Missing audit" +
-  "Missing @types/jest". Prompt-prominence issue —
-  re-order outOfScope + project-state above the
-  file-under-review block + add a closing checklist, OR
-  apply constraint-agent's two-stage pattern to review-agent.
+- **constraint-agent: pure LLM with `executeScript`**
+  (TEST_REPORT_006, REPLACES TEST_REPORT_005's two-stage
+  flow). Reads plain-English rules from
+  `HARNESS.json.agentConfig['constraint-agent'].rules` and
+  uses `executeScript` / `readFile` / `searchFiles` to
+  verify each rule. Live-verified — the LLM picked
+  `npm run lint`, `npm run test`, and `searchFiles "new
+  Pool"` (instantiation, not the type import) without any
+  platform-side carve-out. 0 violations on the Leave
+  module cycle; reached `deployed`.
+- **review-agent still over-fires** (carried from
+  TEST_REPORT_005). Today's TEST_REPORT_006 cycle had 4
+  false-positive "Import for X cannot be resolved" items
+  from review-agent on imports that DO resolve. The cycle
+  still progressed to deploy. Recommended: apply the
+  rules-only + executeScript pattern to review-agent
+  too. A review-agent that runs `tsc --noEmit` itself would
+  close this class.
+- **code-agent has executeScript but doesn't use it yet.**
+  `PER_ROLE_DEFAULTS` grants the tool but `code-prompt.ts`
+  doesn't yet inline `buildScriptToolInstruction()`. The
+  LLM didn't reach for the tool unprompted on the live
+  cycle. One-section prompt addition would unlock
+  self-verifying code generation.
 - **Self-healing escape hatch wired (Fix 4) but not yet
   exercised live.** When `attemptNumber > 1` AND current
   signals contain fingerprints not in `priorSignals`,
-  escalate. Test cycle hit rate-limits before the trigger
-  condition could fire.
+  escalate. Cycle didn't trigger the condition.
 - **Fix 1 (env-default apiShape) not yet live-verified.**
   Code path in place; needs `LLM_MODEL=chat-latest` +
   `platform_llms.chat-latest.api_shape='responses'` and a

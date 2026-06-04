@@ -49,6 +49,35 @@
       }
     ]
   },
+  "agentConfig": {
+    "constraint-agent": {
+      "rules": [
+        "All database connections must be created in src/shared/db/ only. Importing a database type for use in a type signature is NOT a violation — only instantiating a connection is.",
+        "No SQL queries outside repository classes. Services, routes, and controllers must not contain SQL.",
+        "No console.log/warn/error in production source files.",
+        "All async functions must handle errors — no unhandled promise rejections.",
+        "No hardcoded credentials or connection strings in source files."
+      ]
+    },
+    "code-agent": {
+      "rules": [
+        "Generated code must compile without errors.",
+        "All imports must resolve to files that exist in the project or are declared in package.json."
+      ]
+    },
+    "test-runner-agent": {
+      "rules": [
+        "All generated tests must pass.",
+        "Tests must cover every success criterion from the IntentSpec."
+      ]
+    },
+    "review-agent": {
+      "rules": [
+        "Only flag violations for layers and concerns included in the intent scope.",
+        "Do not flag items as missing if they already exist in the project's main branch."
+      ]
+    }
+  },
   "pipeline": {
     "adapter": "noop",
     "autoMerge": false,

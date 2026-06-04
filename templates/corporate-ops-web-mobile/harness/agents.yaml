@@ -4,9 +4,16 @@
 # change LLM parameters, and add prompt extensions per project without
 # touching framework code.
 #
-# Infrastructure agents (constraint-agent, test-runner-agent,
-# pipeline-agent, promotion-agent, gc-agent) do deterministic work and
-# are NOT configurable here.
+# Infrastructure agents (pipeline-agent, promotion-agent, gc-agent)
+# do deterministic work and are NOT configurable here.
+#
+# constraint-agent and test-runner-agent ARE LLM-driven as of
+# TEST_REPORT_005 (executeScript evolution) — their behaviour is
+# controlled by HARNESS.json's `agentConfig.<agent-name>.rules`
+# (plain-English rules) plus the executeScript tool. They appear
+# in the agents list at the bottom for reference but do not need
+# to be customised here unless an operator wants to override the
+# default tool set or LLM parameters.
 #
 # Key conventions:
 #   role  — short professional title (becomes "You are <role> working on
@@ -70,6 +77,11 @@ agents:
         - listDirectory     # explore the project structure
         - searchFiles       # find where things are defined
         - getFileTree       # understand project layout
+        - executeScript     # verify generated code (compile / lint / etc.)
+                            # The agent picks the command — there are NO
+                            # hardcoded shell strings on the platform.
+                            # Hard blocklist: rm -rf, git push/commit/reset/rebase,
+                            # curl|sh, wget|sh, > /etc/, sudo (never overridable).
       # ADR-039 — MCP (Model Context Protocol) servers extend the
       # agent with external tools (issue trackers, dashboards, docs).
       # Tool names are auto-namespaced as `<serverName>__<toolName>`

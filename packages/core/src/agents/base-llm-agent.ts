@@ -418,6 +418,48 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
   }
 
   /**
+   * TEST_REPORT_005 evolution — render the per-agent rules section
+   * for this agent role from `HARNESS.json.agentConfig`. Returns an
+   * empty string when the project hasn't declared rules for this
+   * role; subclasses concat the result unconditionally so the
+   * prompt is well-formed either way.
+   *
+   * Rules are plain English. The agent is expected to use its
+   * available tools (`executeScript` + the read-only file tools)
+   * to verify each rule.
+   */
+  protected buildHarnessAgentSection(
+    harnessConfig: { agentConfig?: Record<string, { rules?: string[] }> } | null | undefined,
+  ): string {
+    const cfg = harnessConfig?.agentConfig?.[this.agentRole];
+    if (!cfg?.rules || cfg.rules.length === 0) return '';
+    return [
+      '## Rules you must enforce (from HARNESS.json)',
+      '',
+      ...cfg.rules.map((r) => `- ${r}`),
+      '',
+    ].join('\n');
+  }
+
+  /**
+   * TEST_REPORT_005 evolution — one-sentence direction for agents
+   * that have `executeScript` available. The brief is intentionally
+   * terse: the LLM decides which commands fit the project's
+   * language + stack. No hardcoded commands anywhere in the
+   * platform or HARNESS.json.
+   */
+  protected buildScriptToolInstruction(): string {
+    return [
+      '## Script execution',
+      'You have access to the `executeScript` tool.',
+      "Use it to verify the rules above by running whatever commands",
+      "are appropriate for this project's language and stack. Decide",
+      'what to run — do not wait to be told.',
+      '',
+    ].join('\n');
+  }
+
+  /**
    * Helper for subclasses: build a `CONTEXT_GAP` feedback signal
    * tagged with this agent's role.
    */

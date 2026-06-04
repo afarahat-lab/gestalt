@@ -57,6 +57,15 @@ export interface ConstraintRule {
   severity: 'critical' | 'high' | 'medium' | 'low';
 }
 
+/**
+ * TEST_REPORT_005 (executeScript-evolution) — per-agent rules section
+ * on HARNESS.json. Plain-English only; the LLM decides what scripts
+ * to run / files to read to verify each rule.
+ */
+export interface HarnessAgentConfig {
+  rules?: string[];
+}
+
 export interface HarnessConfig {
   name: string;
   version: string;
@@ -83,6 +92,29 @@ export interface HarnessConfig {
   constraints?: {
     rules: ConstraintRule[];
   };
+  /**
+   * Per-agent rules section (TEST_REPORT_005 evolution). Each entry
+   * carries plain-English rules the agent must enforce / consider.
+   * WHAT the agent enforces is declarative project intent; HOW it
+   * verifies is the LLM's decision (it has `executeScript` + the
+   * existing read-only file tools to choose from).
+   *
+   * Example:
+   *   {
+   *     "constraint-agent": {
+   *       "rules": [
+   *         "No SQL queries outside repository classes",
+   *         "All async functions must handle errors"
+   *       ]
+   *     }
+   *   }
+   *
+   * Absent agents simply receive the empty section; rule injection
+   * is opt-in per agent. There are NO hardcoded script commands
+   * anywhere — adding `executeScript` to the agent's tool list +
+   * listing rules here is the entire configuration surface.
+   */
+  agentConfig?: Record<string, HarnessAgentConfig>;
   identity?: Record<string, unknown>;
   /**
    * Pipeline config (ADR-033). Reads as the typed

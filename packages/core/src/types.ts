@@ -249,7 +249,8 @@ export type BuiltInToolName =
   | 'readFile'
   | 'listDirectory'
   | 'searchFiles'
-  | 'getFileTree';
+  | 'getFileTree'
+  | 'executeScript';
 
 /**
  * Persisted history of one tool call. `output` is truncated to 500
