@@ -269,8 +269,16 @@ export async function loadAgentConfig(
   };
 }
 
+// TEST_REPORT_010 — `executeScript` was missing from this set. The
+// BuiltInToolName type already includes it (ADR-038 evolution); the
+// filter in `extractTools` then silently dropped it when a project's
+// agents.yaml listed it under `tools.builtin`. Symptom: code-agent /
+// review-agent / constraint-agent prompts told the LLM to use
+// `executeScript` but the orchestrator never registered the tool, so
+// the LLM had no way to call it (rounds of TEST_REPORT_007-009 never
+// observed an `executeScript` invocation).
 const VALID_BUILTIN_TOOLS = new Set<BuiltInToolName>([
-  'readFile', 'listDirectory', 'searchFiles', 'getFileTree',
+  'readFile', 'listDirectory', 'searchFiles', 'getFileTree', 'executeScript',
 ]);
 
 function extractTools(entry: AgentConfig, baseline: AgentToolConfig): AgentToolConfig {

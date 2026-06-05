@@ -67,18 +67,31 @@ None blocking the build. Areas to keep in mind:
 - **Two trackeros branches from live test cycles** —
   `gestalt/1e316bbf-…` (Report 002) and `gestalt/57759963-…`
   (Report 003, PR #4706). Close or delete when done.
-- **MAX_TOOL_CALLS cap-inside-batch bug** uncovered by
-  TEST_REPORT_009 (`packages/core/src/agents/base-llm-agent.ts`
-  inner `for (const call of toolCalls)` loop). Blocks code-agent
-  cycles on gpt-4o-mini. Fix priority: HIGH. See
-  TEST_REPORT_009.md root-cause analysis.
-- **Trackeros code-agent on gpt-4o-mini** (commit `9c41633` on
-  trackeros `main`). No platform-side action — this is a
-  per-project override in `agents.yaml`.
-- **One open `generate-error` alert** for correlation
-  `522e1edc-…` (TEST_REPORT_009's three-round failure). Will
-  auto-resolve on next successful Leave-module attempt, or
-  dismiss via `gestalt alerts dismiss`.
+- **MAX_TOOL_CALLS cap-inside-batch bug fixed** in
+  TEST_REPORT_010 — cap check moved to batch-level + synthesis
+  turn with `tools: []`. Cap raised 10 → 20. Code-agent now
+  finishes cleanly on gpt-4o-mini.
+- **VALID_BUILTIN_TOOLS now includes `executeScript`**
+  (TEST_REPORT_010 Fix 4 — latent bug that silently dropped
+  `executeScript` from any `agents.yaml` declaration).
+- **Trackeros code-agent on gpt-4o-mini + executeScript tool**
+  (commits `9c41633` + `6b7e42e` on trackeros `main`). No
+  platform-side action — per-project `agents.yaml`.
+- **One open `GP_BREACH` alert** for correlation
+  `7afa0886-…` (TEST_REPORT_010's escalated Leave cycle —
+  real review-agent finding on DB-pattern violation). Will
+  auto-resolve once the architectural findings are addressed
+  in a follow-up intent, or dismiss with
+  `gestalt alerts dismiss`. (TR_009's alert may still be
+  open too — same command.)
+- **Review-agent `result_status='failed'` with successful
+  JSON output** (TR_010). Cosmetic — verdict is correct,
+  row label is wrong. Trace gate-orchestrator failure-path
+  vs signal emit. Fix priority: HIGH.
+- **Constraint-agent 387s / 50k-token / 19-executeScript
+  budget** on the Leave intent (TR_010). Now the slowest
+  agent in the cycle. Restructure prompt or add per-role
+  MAX_TOOL_CALLS override.
 - **Review-agent placement-check wording fix** is a small
   follow-up (TEST_REPORT_003 Issue #1) — one paragraph in
   `llm-review-agent.ts` to stop false-positive

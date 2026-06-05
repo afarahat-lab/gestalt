@@ -289,11 +289,16 @@ export class LLMClient {
 
     const messages = request.messages.map(toolLoopMessageToOpenAI);
 
+    // TEST_REPORT_010 — when callers pass an empty tools array
+    // (cap-rejection synthesis turn), omit both `tools` and
+    // `tool_choice` from the body so OpenAI returns a plain text
+    // completion. Sending `tools: []` + `tool_choice: 'auto'`
+    // returns HTTP 400 on chat-completions: *"tool_choice cannot
+    // be specified without 'tools' parameter"*.
     const body = {
       model: this.config.model,
       messages,
-      tools,
-      tool_choice: 'auto',
+      ...(tools.length > 0 ? { tools, tool_choice: 'auto' as const } : {}),
       ...tokenLimitField(this.config.apiShape, request.maxTokens ?? 4096),
       ...temperatureField(this.config.apiShape, request.temperature ?? 0.2),
     };

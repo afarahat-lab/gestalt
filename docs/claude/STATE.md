@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-05 (after TEST_REPORT_009 — incremental tool-call log persistence + code-agent gpt-4o-mini)
+**Last updated:** 2026-06-06 (after TEST_REPORT_010 — batch-level MAX_TOOL_CALLS cap + pre-generation prompt + executeScript availability)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -197,28 +197,60 @@ the `sessions/archive/` files (everything older)._
 
 - **constraint-agent + review-agent + code-agent all have
   `executeScript` + HARNESS.json `agentConfig.<role>.rules`
-  rendering** (TR_005/006/007/008). Code-agent invocation is
-  MANDATORY per TR_008 (prompt block + `verificationNote`
-  schema + HARNESS rule). **TR_009 disproved live invocation
-  on near-empty scaffolds**: code-agent spends its
-  `MAX_TOOL_CALLS=10` budget on directory exploration and
-  never reaches `executeScript`. Prompt restructure +
-  deterministic post-LLM verify needed.
+  rendering** (TR_005/006/007/008). **TR_010 proved live
+  invocation:** code-agent ran 5× `executeScript` (mkdir
+  scaffold ×2, `npm run lint`, `npm run typecheck`,
+  `npx tsc --noEmit`) and emitted a `verificationNote`
+  that became a low-severity `LINT_FAILURE` signal — the
+  first end-to-end evidence the TR_008 schema works in
+  production.
 - **Tool-call persistence is now incremental** in
   `BaseLLMAgent.runToolLoop()` (TR_009 Fix 1). Mid-loop
   throws leave full `agent_execution_logs.tool_calls`
-  arrays. Proven by 3× 10-entry arrays in TR_009.
+  arrays. Proven again in TR_010 (every failed-and-completed
+  row carries its full tool-call log).
 - **Trackeros code-agent runs on gpt-4o-mini** (TR_009
   Fix 2, trackeros `9c41633`). Zero rate-limit errors;
-  ~3× cheaper per cycle.
-- **HIGH bug uncovered by TR_009: `MAX_TOOL_CALLS`
-  cap-inside-batch in `runToolLoop`'s inner loop.** When the
-  cap hits mid-batch, the assistant message has N
-  `tool_call_ids` but only M<N `tool` responses → next
-  OpenAI call returns HTTP 400. Was masked by gpt-4o
-  rate-limits in TR_008; gpt-4o-mini's TPM headroom exposes
-  it. Fix: finish the batch before the cap check (option
-  a in TEST_REPORT_009).
+  ~3× cheaper per cycle. TR_010's full cycle: ~240k
+  tokens / ~$0.14 USD.
+- **`MAX_TOOL_CALLS` cap-inside-batch is fixed** (TR_010
+  Fix 1). Cap check moved BEFORE the per-call dispatch loop;
+  over-cap batches get synthesised rejection responses for
+  every `tool_call_id`, then a synthesis turn with
+  `tools: []` is fired so the LLM produces final text
+  (`stopReason === 'stop'`). HTTP 400
+  *"tool_call_ids did not have response messages"* is gone.
+- **`MAX_TOOL_CALLS` raised from 10 → 20** (TR_010 Fix 2).
+  Headroom for ~1 getFileTree + ~3 readFile + ~2 executeScript
+  + retries. Code-agent now finishes in 33s with 21 tool
+  calls (5× executeScript).
+- **Code-agent prompt has a `## Before generating code`
+  section** (TR_010 Fix 2). Tells the LLM to read existing
+  deps first, NOT explore output paths, NOT listDirectory
+  on paths it's about to create. Reduced `listDirectory`
+  spend from 14× (TR_009) to 8× (TR_010); still room to
+  trim further.
+- **`VALID_BUILTIN_TOOLS` now includes `executeScript`**
+  (TR_010 Fix 4 — latent bug). Loader was silently dropping
+  `executeScript` when a project's `agents.yaml` listed it.
+  Root cause of TR_007/008/009 never observing the call.
+- **trackeros `agents.yaml` code-agent lists `executeScript`**
+  (TR_010 operator change, commit `6b7e42e`).
+- **Empty-tools wire path is safe** (TR_010 Fix 3). When
+  `tools: []` is sent to OpenAI we now also drop
+  `tool_choice` — sending the pair returns HTTP 400.
+- **Review-agent `result_status = 'failed'` with successful
+  JSON output** (TR_010 finding). `agent_execution_logs` row
+  marked failed (empty `error_message`) but `llm_response` is
+  well-formed JSON AND four `signals` rows were emitted with
+  `source_agent='review-agent'`. Cosmetic — verdict is
+  correct, just the row label is wrong. Likely a race in the
+  gate-orchestrator's failure-path. Fix priority: HIGH.
+- **Constraint-agent 387-second / 50k-token / 19-executeScript
+  budget on TR_010's Leave intent.** Hit the new cap of 20.
+  Now the slowest agent in the cycle by 5×. Either restructure
+  the prompt to batch verifications or introduce a per-role
+  MAX_TOOL_CALLS override.
 - **Self-healing escape hatch wired (Fix 4) but not yet
   exercised live.** When `attemptNumber > 1` AND current
   signals contain fingerprints not in `priorSignals`,
@@ -227,14 +259,12 @@ the `sessions/archive/` files (everything older)._
   Code path in place; needs `LLM_MODEL=chat-latest` +
   `platform_llms.chat-latest.api_shape='responses'` and a
   test cycle to confirm `max_completion_tokens` flows.
-- **Older test-report follow-ups** (all LOW unless noted):
-  test-agent untyped `let packageJson;` (TR_003 #2);
-  test-agent punts on method coverage with
+- **Older test-report follow-ups** (all LOW): test-agent
+  punts on method coverage with
   "// Additional tests can be added similarly" (TR_004);
   IntentSpec lacks a `dependencies` block (TR_004, MEDIUM);
-  code-agent default export on connection.ts (TR_003 #3,
-  project-dependent); context-agent has 4 tools but never
-  uses them (TR_002 #4). Full detail in `TEST_REPORT_*.md`.
+  context-agent has 4 tools but never uses them (TR_002 #4).
+  Full detail in `TEST_REPORT_*.md`.
 - **Dashboard bundle is 1010 KB raw / 319 KB gzipped** after the
   CodeMirror addition (2026-06-04). Above Vite's 500 KB warning.
   Future code-split via dynamic `import()` would restore the
@@ -284,30 +314,18 @@ the `sessions/archive/` files (everything older)._
   during ADR-023 (apiShape) verification regenerated
   `master.key`, breaking the prior vault secret. Both LLMs are
   currently in env-var mode and working.
-- **Synthetic trackeros branches from live test cycles**:
-  - `gestalt/1e316bbf-…` (commit `05fbebd`) from
-    TEST_REPORT_002, PR-less (noop).
-  - `gestalt/57759963-…` (commit `2a3d00d`) from
-    TEST_REPORT_003, **merged via PR #47** — scaffold is on
-    `origin/main` and the foundation for TEST_REPORT_004.
-  - `gestalt/3af30e7d-…` + `gestalt/a829c77b-…` (TEST_REPORT_004)
-    — cycles failed at gate verdict, never pushed to remote.
-    Nothing to clean.
-- **Two open alerts** from the TEST_REPORT_004 attempts
-  (correlations `3af30e7d-…` and `a829c77b-…`, type
-  `generate-error`, severity `high`). Both will auto-resolve
-  once the three TEST_REPORT_004 fixes ship and the Leave
-  module intent succeeds — OR dismiss with
-  `gestalt alerts dismiss`.
-- **`.env`**: `LLM_MODEL=gpt-4o` (was changed from
-  `chat-latest` to unblock TEST_REPORT_002). The
-  `platform_llms` row still carries `model_string='chat-latest'`
-  and is unmatched at lookup time. After Fix 1 from
-  TEST_REPORT_003 ships, an operator can either:
-  (a) keep `gpt-4o` in `.env` + add a matching row to
-  `platform_llms`, or (b) restore `LLM_MODEL=chat-latest` and
-  rely on the registry's `api_shape='responses'` row to flow
-  `max_completion_tokens`.
+- **Synthetic trackeros branches** from live test cycles
+  (TR_002 / 003 merged; TR_004+ cycles failed at gate and
+  never pushed). Branch-name pattern: `gestalt/<correlation>-`.
+- **One open alert** from TR_010's escalated Leave cycle
+  (correlation `7afa0886-…`, type `GP_BREACH`, severity
+  `critical`). Dismiss with `gestalt alerts dismiss` after
+  the architectural findings are addressed in a follow-up
+  intent. (TR_009's alert may also still be open; same
+  command.)
+- **`.env`**: `LLM_MODEL=gpt-4o` (operator default). For
+  `chat-latest` routing through the registry's responses
+  api_shape, see TR_003 Fix 1 follow-up.
 - **`master.key`**: now generated in the workspace root
   (gitignored, mode 600), mounted into the container by
   default via `docker-compose.yml` (TEST_REPORT_003 Fix 2).

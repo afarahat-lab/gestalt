@@ -4,6 +4,244 @@ _Auto-maintained. The most recent session is prepended at the top; when this fil
 
 ---
 
+### Session 2026-06-06 — Claude Code (TEST_REPORT_010: MAX_TOOL_CALLS cap-inside-batch + pre-generation prompt + executeScript availability — code-agent invokes executeScript 5× in a single run, the first end-to-end since TR_007; cycle escalates on legitimate review-agent findings, not platform bugs)
+
+Implementation + live verification session against
+TEST_REPORT_009's two-bug landing pad. The brief: refactor the
+`MAX_TOOL_CALLS` enforcement so the cap is checked
+**before** the per-call dispatch loop (TR_009's HTTP 400 root
+cause), add a pre-generation prompt block telling the code-agent
+to read existing deps first and skip listDirectory on output
+paths it's about to create, raise the cap from 10 to 20. Then
+re-run the Leave-module intent and answer **"does the
+tool_calls log show an executeScript call?"** — the question
+TR_009 left open.
+
+Outcome: ✓ **decisive yes.** Code-agent ran 5× `executeScript`
+in a single completed round (`mkdir` scaffold ×2, `npm run lint`,
+`npm run typecheck`, `npx tsc --noEmit`), emitted a structured
+JSON response with a `verificationNote` field, and the parser
+converted that note into a low-severity `LINT_FAILURE` signal —
+the first end-to-end production observation of the TR_008
+`verificationNote` schema. Cycle escalated to `escalate` on
+real review-agent findings (DB access outside repository pattern
++ missing audit logging), not platform bugs.
+
+| Phase | TR_007 | TR_008 | TR_009 | **TR_010** |
+|---|---|---|---|---|
+| Code-agent result | completed | failed (rate-limit) | failed (HTTP 400) | **completed** |
+| `executeScript` calls in log | 0 | 0 (logged) | 0 | **5** |
+| Code-agent tokens | ~25.9k | ~34.2k avg | ~137k avg | 68.5k |
+| Cycle deploys | yes | no | no | no (real review findings) |
+
+What the user asked for:
+
+- **Fix 1 (HIGH)** — Move the `MAX_TOOL_CALLS` cap check to
+  batch-level. Previous code checked the cap inside the per-call
+  dispatch loop; when the cap struck mid-batch, the assistant
+  message in history carried N `tool_call_ids` but only M < N
+  `tool` response messages, and the next OpenAI call failed
+  with HTTP 400 *"tool_call_ids did not have response
+  messages"*. Synthesise rejection responses for every call in
+  an over-cap batch so history stays consistent. Pseudo-code
+  in the brief used `break` after rejection.
+- **Fix 2 (HIGH)** — Add a `## Before generating code` block
+  at the start of `code-prompt.ts`'s task section telling the
+  LLM to read existing files first, not explore non-existent
+  directories, not `listDirectory` on output paths it's about
+  to create. Raise `MAX_TOOL_CALLS` from 10 → 20.
+- Re-run the same Leave-module intent. Verify no HTTP 400,
+  at least one `executeScript`, cycle deploys on first round,
+  ≤ 15 code-agent tool calls.
+
+What changed (per fix):
+
+- **Fix 1** — `packages/core/src/agents/base-llm-agent.ts`
+  `runToolLoop`. New batch-level check before the per-call
+  loop: `if (totalToolCalls + toolCalls.length > MAX_TOOL_CALLS)`
+  → push a synthesised `tool` response for every call in the
+  batch with content *"Tool call limit reached — no further
+  tool calls permitted. Return your best answer now based on
+  what you have already gathered."* Each rejection is logged
+  into `toolCallLog` with `toolSource: 'cap-rejected'`. Inner
+  per-call cap check removed; the dispatch loop now always
+  processes the entire batch.
+- **Fix 1 refinement** — initial implementation followed the
+  brief's `break;` literally. Live verification (correlation
+  `9cafadd5-…` round 1) failed with *"Code agent failed:
+  Unexpected end of JSON input"* because `finalText` stayed
+  empty after the rejection (`stopReason` was `tool_calls`,
+  LLM never produced text). Changed to `capStruck = true;
+  continue;` so the outer loop fires once more with
+  `tools: capStruck ? [] : tools` — the LLM is forced to
+  produce final text (`stopReason === 'stop'`).
+- **Fix 1 wire fix** — `packages/core/src/llm/index.ts`
+  `callProviderWithTools`. Spreading `tools` + `tool_choice`
+  into the OpenAI body is now conditional on
+  `tools.length > 0` — sending `tools: []` +
+  `tool_choice: 'auto'` returns HTTP 400 *"tool_choice cannot
+  be specified without 'tools' parameter"*.
+- **Fix 2 — prompt** — `code-prompt.ts` task section gets a
+  new `preGenerationSection` prepended:
+  > 1. Read existing files your generated code will import
+  >    from (use readFile on each). These are listed in the
+  >    IntentSpec and design spec.
+  > 2. Do NOT explore directories that don't exist yet — you
+  >    are about to CREATE them. Call getFileTree ONCE,
+  >    then proceed directly to generation.
+  > 3. Do NOT listDirectory on paths listed as OUTPUT paths.
+  > 4. After emitting, verify with executeScript.
+  >
+  > Budget guidance: ~1 getFileTree + ~3 readFile + ~2
+  > executeScript = ~6 purposeful tool calls.
+- **Fix 2 — cap raised** — `MAX_TOOL_CALLS` 10 → 20 in
+  `base-llm-agent.ts`. Comment explains the verification-aware
+  budget: ~1 getFileTree + ~3 readFile + ~2 executeScript =
+  ~6 purposeful + retries.
+- **Fix 4 (latent bug uncovered during verification)** —
+  `packages/core/src/agents/agent-config-loader.ts`
+  `VALID_BUILTIN_TOOLS` was missing `'executeScript'`. The
+  `BuiltInToolName` type already included it, but
+  `extractTools()` filters `agents.yaml`-declared tools
+  through this Set, so any project listing `executeScript`
+  had it silently dropped. **This is why TR_007–009's
+  code-agent never invoked `executeScript`:** trackeros's
+  `agents.yaml` overrode `PER_ROLE_DEFAULTS` with a 4-tool
+  list (no executeScript), and even if an operator had added
+  it, this filter would have stripped it. Added
+  `'executeScript'` with a comment pointing at TR_007–010.
+- **Operator-side** — trackeros `agents.yaml` code-agent
+  `tools.builtin` gains `executeScript` (commit `6b7e42e`
+  on trackeros `main`).
+
+Live verification (correlation
+`7afa0886-dfef-43e4-8731-af1b48aadbd0`):
+
+| Agent | Status | Tokens | Tool calls | Duration |
+|---|---|---|---|---|
+| intent-agent | completed | 1,235 | 0 | 8s |
+| design-agent | completed | 1,034 | 0 | 7s |
+| lint-config-agent | completed | 0 | 0 | 25ms |
+| context-agent | completed | 2,773 | 1 | 11s |
+| **code-agent** | **completed** | **68,527** | **21** (5× executeScript, 8× listDirectory, 7× readFile, 1× getFileTree) | **33s** |
+| test-agent | completed | 3,035 | 0 | 16s |
+| review-agent | failed | 111,719 | 0 | 30s |
+| constraint-agent | failed | 50,748 | 21 (19× executeScript, 2× searchFiles) | 387s |
+
+Total: **~240k tokens / ~$0.14 USD** at gpt-4o-mini pricing —
+within the brief's $0.10–0.15 target.
+
+The five `executeScript` commands the code-agent ran:
+```
+1-2. mkdir -p src/modules/leave && touch leave.{model,repository,service,routes,index,test}.ts
+3.   npm run lint
+4.   npm run typecheck
+5.   npx tsc --noEmit
+```
+
+Lint + typecheck failed because trackeros's `package.json`
+doesn't declare those scripts. The LLM correctly surfaced that
+via a `verificationNote` field, which `parseCodeResponse`
+converted into a `LINT_FAILURE` signal:
+> *"Code-agent pre-emit verification did not pass: The module
+> structure was created successfully, but I was unable to run
+> lint and typecheck scripts as they are missing from
+> package.json."*
+
+**First observed end-to-end use of the TR_008 verificationNote
+schema in production data.**
+
+Generated artifacts: 5 source files + 5 test files for the
+Leave module (model / repository / service / routes / index +
+4 unit tests + 1 module test). **First time the trackeros
+scaffolding has progressed past the code-agent step since
+TEST_REPORT_007.**
+
+Gate verdict: `escalate` — 1 `GOLDEN_PRINCIPLE_BREACH` (DB
+access outside repository pattern) + 3 review-agent
+`CONSTRAINT_VIOLATION` (missing audit logging, test framework
+mismatch, unresolved import) + 2 constraint-agent
+`CONSTRAINT_VIOLATION` (error shape, unhandled promise). These
+are **real architectural findings** on the generated code, not
+platform failures.
+
+Brief's verification matrix:
+
+| Check | Result |
+|---|---|
+| No HTTP 400 *"tool_call_ids did not have response messages"* | ✓ pass |
+| Code-agent reads existing deps | ✓ pass (7× readFile) |
+| At least one executeScript call | ✓ **pass (5×)** |
+| No listDirectory on non-existent paths | ⚠ partial (8× — down from 14× in TR_009) |
+| Cycle deploys on first round | ✗ escalated on real findings |
+| Total code-agent tool calls ≤ 15 | ⚠ 21 (hit the new cap of 20 + 1 rejection batch entry) |
+
+Decisions made:
+
+- **Departed from the brief's literal `break` after cap
+  rejection.** Live verification showed the LLM produced no
+  text on the rejected turn, leaving `finalText` empty. The
+  brief's intent ("LLM is explicitly told to stop requesting
+  tools and return its answer") required a synthesis turn —
+  changed to `continue` + empty-`tools` next call so the model
+  is forced to produce text.
+- **Fixed `VALID_BUILTIN_TOOLS` even though it wasn't in the
+  brief.** Without it, the verification matrix mechanically
+  could not pass — the LLM couldn't invoke `executeScript`
+  because the loader silently stripped it. Documented as a
+  scope expansion in the report.
+- **Updated trackeros `agents.yaml` for the same reason.** Even
+  with the loader fix, trackeros's existing 4-tool declaration
+  needed `executeScript` appended to expose it.
+- **Wrote the report against the escalated cycle rather than
+  re-running.** The escalation is on legitimate findings; the
+  fixes work. Re-running to chase deploy success would
+  conflate platform observation with content-quality
+  iteration.
+
+Pending follow-ups:
+
+- **(HIGH) Review-agent `result_status = 'failed'` with
+  successful JSON output.** `agent_execution_logs` row marked
+  failed (empty `error_message`) but `llm_response` is
+  well-formed JSON AND 4 `signals` rows were emitted with
+  `source_agent='review-agent'`. Cosmetic — verdict is correct,
+  row label is wrong. Likely a race in the gate-orchestrator
+  failure-path.
+- **(MEDIUM) Constraint-agent 387s / 50k-token /
+  19-executeScript budget** on the Leave intent. Now the
+  slowest agent in the cycle by 5×. Restructure the prompt
+  to batch verifications or introduce a per-role
+  `MAX_TOOL_CALLS` override.
+- **(MEDIUM) Code-agent still emits 8× listDirectory** despite
+  the new pre-generation block. Down from 14× in TR_009,
+  still significant. Options: drop `listDirectory` from
+  code-agent's `tools.builtin` (lean on `getFileTree`); or
+  strengthen the prompt with hard examples of unhelpful
+  exploration.
+- **(MEDIUM) Add `n_turns` + `final_stop_reason` columns** to
+  `agent_execution_logs` (carried over from TR_008/009) — would
+  make "agent hit the cap" detectable without grepping server
+  logs.
+- **(LOW) Update the corporate-ops-web-mobile template
+  `agents.yaml`** to include `executeScript` for code-agent /
+  review-agent / constraint-agent so newly-bootstrapped
+  projects don't repeat this issue.
+- **(LOW) trackeros `package.json`** doesn't expose `lint` or
+  `typecheck` scripts. The code-agent caught it via
+  `verificationNote`. Either add scripts or drive a follow-up
+  intent.
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker image rebuilt + container restarted via
+`docker compose up -d --build`. Server `/health` 200 throughout.
+Trackeros `main` updated to `6b7e42e`. New file
+`docs/claude/TEST_REPORT_010.md`.
+
+---
+
+
+
 ### Session 2026-06-05 — Claude Code (TEST_REPORT_009: incremental tool-call log persistence + code-agent → gpt-4o-mini — Fix 1 unambiguously proven via data; Fix 2 swaps the rate-limit ceiling for a separate cap-inside-batch bug)
 
 Two small surgical fixes from TEST_REPORT_008's "definitive
@@ -369,191 +607,3 @@ throughout. Trackeros `main` updated (`44403f0`) with the
 ---
 
 
-### Session 2026-06-05 — Claude Code (TEST_REPORT_007: review-agent + code-agent gain executeScript / HARNESS.json rules / verification guidance — Leave module deploys on a SINGLE round, 35% cheaper)
-
-Implementation + live test session. Goal: extend the
-TEST_REPORT_006 executeScript pattern to two more agents
-(review-agent + code-agent), following the same recipe — render
-`agentConfig.<role>.rules` from HARNESS.json + add the
-`executeScript` one-sentence direction + give the agent the tool
-in PER_ROLE_DEFAULTS. Specifically targeted at TEST_REPORT_006's
-"Import cannot be resolved" review-agent false positives + the
-fact that code-agent had executeScript but no prompt section
-telling it about the tool.
-
-Outcome: **Leave module deployed on a SINGLE round, zero retries.**
-Cost ≈ $0.27 USD (down 35 % from TEST_REPORT_006's $0.40 across
-two rounds). The brief's two targeted fixes both ship correctly
-and visibly render in the live prompts (verified by `grep`).
-Open caveat: neither agent actually invokes `executeScript` from
-the new prompt sections this cycle — code-agent reads files but
-doesn't compile-check, and review-agent errored out partway
-through its LLM call on an OpenAI rate limit. The wiring is in
-place; "you have this tool" reads as advisory rather than
-mandatory and the next iteration should make it imperative.
-
-What the user asked for:
-
-- **Fix 1 (HIGH)**: Give the review-agent `executeScript` so it
-  can run `tsc --noEmit` to verify "Import cannot be resolved"
-  findings before flagging them. Render the
-  `agentConfig['review-agent'].rules` + executeScript direction
-  + a new "Verification guidance" block BEFORE the golden
-  principles section. Update PER_ROLE_DEFAULTS. Update HARNESS.json
-  templates + push to trackeros/main.
-- **Fix 2 (HIGH)**: Add `buildHarnessAgentSection` +
-  `buildScriptToolInstruction` calls to `code-prompt.ts` so the
-  code-agent knows it has executeScript. (The tool was already in
-  the code-agent's `tools.builtin` per TEST_REPORT_006; the
-  prompt section was missing.)
-- Re-run the same Leave module intent. Verify single round, no
-  retries, gate clean pass, cost target ≈ $0.10-0.15.
-
-What changed (per fix):
-
-- **Supporting refactor — BaseLLMAgent helpers exported as
-  standalone**. The class methods `buildHarnessAgentSection` and
-  `buildScriptToolInstruction` are now thin wrappers around
-  top-level exported `renderHarnessAgentRules(agentRole,
-  harnessConfig)` and `renderScriptToolInstruction()` functions.
-  Necessary because `code-prompt.ts` is a function (not a class
-  method) and can't call `this.buildHarnessAgentSection`.
-  Backward-compatible — existing class-based callers (constraint-
-  agent) keep working.
-  `packages/core/src/index.ts` exports both standalone helpers
-  next to `BaseLLMAgent`.
-- **Fix 1 — review-agent**. `llm-review-agent.ts` gets new
-  imports of the standalone helpers, a new `loadFullHarness`
-  helper that reads the full HARNESS.json (not just constraints
-  subset), and three new prompt sections rendered at the TOP of
-  the body (after persona) before everything else:
-  - `## Rules you must enforce (from HARNESS.json)` via
-    `renderHarnessAgentRules('review-agent', fullHarness)`
-  - `## Script execution` via `renderScriptToolInstruction()`
-  - `## Verification guidance` (a fresh block) — four
-    verify-before-flagging directives: import-resolution → tsc
-    --noEmit, missing-dep → readFile package.json,
-    framework-mismatch → searchFiles/grep, missing-audit/RBAC
-    /validation → check IntentSpec.outOfScope.
-  `agent-config-loader.ts`: new `REVIEW_AGENT_TOOLS = ['executeScript',
-  'readFile', 'searchFiles']`; `PER_ROLE_DEFAULTS['review-agent']`
-  switched to it; removed the now-orphaned `READ_ONLY_TOOLS`
-  constant.
-  Templates: `templates/.../HARNESS.json` review-agent rules
-  expanded from 2 → 4 per brief; `templates/.../agents.yaml`
-  review-agent's `tools.builtin` now lists `[executeScript,
-  readFile, searchFiles]`.
-  Operator-side: `trackeros/HARNESS.json` updated to match;
-  pushed as commit `79e9190` to trackeros/main.
-- **Fix 2 — code-agent**. `code-prompt.ts` imports
-  `renderHarnessAgentRules` and `renderScriptToolInstruction`
-  from `@gestalt/core` and renders two new sections between
-  the architecture section and the scope section:
-  - `harnessAgentRulesSection` — calls
-    `renderHarnessAgentRules('code-agent', ctx.harness)`
-  - `scriptToolSection` — calls `renderScriptToolInstruction()`
-  `packages/agents/generate/src/types.ts`: local mirror
-  `HarnessConfig` interface gains `agentConfig?: Record<string,
-  { rules?: string[] }>` so `ctx.harness.agentConfig` is typed.
-
-Live verification:
-
-- Correlation `a41959f9-5338-484e-ab00-ad6b0f5a74cc`. PR #2801 on
-  trackeros at branch `gestalt/a41959f9-create-the-leave-module-foundation`,
-  commit `9b1db0f`.
-- **Single generate round → gate clean pass → deploy**. No retry.
-- Total ≈ 53,500 tokens / ≈ $0.27 USD vs TEST_REPORT_006's
-  81,500 / $0.40. **-35 % cost on the same intent.**
-- Review-agent prompt confirmed to contain ALL FOUR new sections
-  by `grep` against the persisted prompt text:
-  `Rules you must enforce` (1×), `Script execution` (1×),
-  `Verification guidance` (1×), plus the existing
-  `Out of scope` (1×), `Project state` (2×).
-- Code-agent prompt confirmed to contain BOTH new sections
-  by `grep`: `Rules you must enforce` (1×), `Script execution`
-  (1×).
-- Constraint-agent: still works perfectly. 5 tool calls including
-  1 executeScript (`npm run lint`). Verdict
-  `{"violations": [], "summary": "0 violations"}`.
-- Review-agent: this cycle hit an OpenAI `rate-limit` mid-call.
-  The orchestrator's "errored → absence of signals" fallback
-  treated this as clean. So we have evidence of the PROMPT
-  being constructed correctly but no live evidence of the
-  review-agent actually invoking executeScript from it.
-- Code-agent: 7 tool calls (up from 5 in TEST_REPORT_006) — more
-  thorough scaffolding discovery, but still 0 executeScript
-  invocations. The new prompt section reads as advisory; the LLM
-  doesn't reach for the tool unprompted.
-
-Brief's verification matrix:
-
-| Check | Result |
-|---|---|
-| Review-agent tool calls include executeScript("tsc --noEmit") | ✗ not exercised (LLM errored on rate-limit before reaching tools) |
-| No "Import cannot be resolved" false positives | ✓ pass (0 signals) |
-| Gate verdict: clean pass | ✓ pass (server log: `Gate passed — all 2 checks clean. verdict: pass. signalCount: 0`) |
-| Code-agent tool calls include executeScript | ✗ partial — prompt has the section; LLM didn't reach for it |
-| Token cost ~$0.10-0.15 | ⚠ $0.27 (single round ✓; raw cost above target) |
-
-Decisions made:
-
-- **Standalone exports rather than passing `this` around.**
-  Tempted to add a static method on BaseLLMAgent that
-  `code-prompt.ts` could call as `BaseLLMAgent.renderRules(...)`,
-  but free functions read more naturally for prompt assembly +
-  match the existing pattern in `code-prompt.ts` (where every
-  other section is a free helper). Class wrappers preserved
-  for the constraint-agent's existing call sites.
-- **Verification guidance is a NEW prompt block, not a tweak
-  to an existing one.** The brief calls it out explicitly with
-  four verify-before-flagging items. Inserting it adjacent to
-  the (existing) Script execution section reinforces "you have
-  a tool — here are the four cases to use it for".
-- **Placed Fix 1's new sections at the TOP of the body**
-  (right after persona). The brief says "BEFORE the golden
-  principles section so rules take precedence" — putting them
-  before everything else also puts them BEFORE the existing
-  outOfScope + project-state sections from TEST_REPORT_004.
-  The full body order is now harnessRules → script →
-  verification → outOfScope → projectState → scaffolding →
-  constraints → principles → consistency → files-under-review.
-- **Placed Fix 2's new sections after architectureSection,
-  before scopeSection.** Earlier than constraints/design/intent
-  so the LLM reads "these are the rules + a way to verify
-  them" first.
-- **Did not adjust the code-prompt's task section to make
-  executeScript mandatory.** The brief's pseudo-code is a
-  passive instruction ("You have access to … Decide what to
-  run"). After confirming the prompt section renders correctly
-  but the LLM doesn't actually invoke the tool, a forceful
-  pre-emit verification rule is the next iteration —
-  recorded as TEST_REPORT_008's top recommended fix.
-- **Removed the unused `READ_ONLY_TOOLS` constant** rather than
-  silencing the TS6133 with a noUnusedLocals carve-out. It was
-  only referenced by review-agent before this session;
-  TEST_REPORT_007 migrates review-agent to `REVIEW_AGENT_TOOLS`
-  so the orphan can go.
-
-Pending follow-ups:
-
-- **(HIGH) Make code-agent self-verify before emitting files.**
-  Convert the script section from advisory to mandatory in the
-  task section: "Before returning the final JSON, you MUST call
-  executeScript with a compile/test command and fix any
-  errors before re-emitting." Single-paragraph addition to
-  code-prompt.ts.
-- **(MEDIUM) Review-agent rate-limit sensitivity.** The 11,854-
-  token prompt may be tickling per-minute output-rate limits on
-  gpt-4o. Measure prompt-size delta vs TEST_REPORT_006.
-- **(LOW) Document `tests/integration/` placement formally** in
-  the test-prompt — the test-agent has been using it for two
-  cycles but it's not documented.
-- **(LOW) BLOCKED_PATTERNS end-to-end test** (still pending from
-  TEST_REPORT_006).
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Docker image rebuilt + container restarted. Server `/health` 200
-throughout. Trackeros `main` updated (`79e9190`) with the
-review-agent rules expansion.
-
----

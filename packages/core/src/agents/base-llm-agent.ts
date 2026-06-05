@@ -91,8 +91,15 @@ import { applyAgentConfig } from './agent-config-helpers';
 /**
  * Safety cap on tool calls per agent run (ADR-038). Prevents an
  * agent from chewing through provider quota on a runaway plan.
+ *
+ * TEST_REPORT_010 Fix 2 — raised from 10 → 20. The code-agent's new
+ * mandatory-pre-emit-verification block (TEST_REPORT_008) wants
+ * headroom for ~1 getFileTree + ~3 readFile (existing deps) + 1
+ * executeScript + 1 fix + 1 re-verify = ~7 purposeful calls. The old
+ * cap of 10 sat right on top of that and ran out before the LLM
+ * could reach `executeScript`.
  */
-const MAX_TOOL_CALLS = 10;
+const MAX_TOOL_CALLS = 20;
 
 /** Tool-call output truncated to this many chars before storage in
  *  `agent_execution_logs.tool_calls`. Full results still go to the
@@ -379,11 +386,16 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
     const toolCallLog: ToolCallLogEntry[] = [];
     let totalToolCalls = 0;
     let finalText = '';
+    // TEST_REPORT_010 Fix 1 — set when the cap is struck on the
+    // current turn. The next `completeWithTools` call is made with
+    // an empty tools list so the LLM physically cannot request more
+    // tool calls; it is forced to produce its final text answer.
+    let capStruck = false;
 
     for (let turn = 0; turn < MAX_TOOL_CALLS + 1; turn++) {
       const result = await client.completeWithTools({
         messages: history,
-        tools,
+        tools: capStruck ? [] : tools,
         ...(agentConfig.llm.temperature !== undefined ? { temperature: agentConfig.llm.temperature } : {}),
         ...(agentConfig.llm.maxTokens !== undefined ? { maxTokens: agentConfig.llm.maxTokens } : {}),
         correlationId,
@@ -407,8 +419,53 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
         toolCalls,
       });
 
+      // TEST_REPORT_010 Fix 1 — cap check is now BATCH-LEVEL, not
+      // per-call. The previous per-call `if (totalToolCalls >=
+      // MAX_TOOL_CALLS) break;` inside the loop could end the
+      // batch mid-way, leaving an assistant message with N
+      // tool_calls but only M < N tool responses. OpenAI's strict
+      // validation then returns HTTP 400 *"tool_call_ids did not
+      // have response messages"* on the next iteration
+      // (TEST_REPORT_009 root cause).
+      //
+      // The fix preserves history consistency by synthesising a
+      // rejection `tool` message for EVERY call in an over-cap
+      // batch, marking the cap as struck, and continuing the outer
+      // loop ONE more time so the LLM can produce its final answer
+      // (stopReason === 'stop'). Without that synthesis turn,
+      // `finalText` stays empty and the orchestrator fails on
+      // "Unexpected end of JSON input".
+      if (totalToolCalls + toolCalls.length > MAX_TOOL_CALLS) {
+        for (const call of toolCalls) {
+          const rejection =
+            'Tool call limit reached — no further tool calls ' +
+            'permitted. Return your best answer now based on what ' +
+            'you have already gathered.';
+          history.push({
+            role: 'tool',
+            toolCallId: call.id,
+            content: rejection,
+          });
+          toolCallLog.push({
+            toolName: call.name,
+            input: call.input,
+            output: rejection,
+            isError: true,
+            calledAt: new Date(),
+            toolSource: 'cap-rejected',
+          });
+          this.lastToolCallLog = toolCallLog.slice();
+        }
+        // Drop the tools array for the synthesis turn so the LLM
+        // physically cannot request more — it MUST produce text.
+        // If it nevertheless requests tools again, the next pass
+        // through this block will reject + the for-loop bound
+        // (`MAX_TOOL_CALLS + 1` iterations) bails us out.
+        capStruck = true;
+        continue;
+      }
+
       for (const call of toolCalls) {
-        if (totalToolCalls >= MAX_TOOL_CALLS) break;
         totalToolCalls++;
 
         const mcpClient = findMcpForCall(call.name, mcpByPrefix);
@@ -449,10 +506,6 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
         // this, the final assignment below was the only writer and
         // a mid-loop throw left the field empty.
         this.lastToolCallLog = toolCallLog.slice();
-      }
-
-      if (totalToolCalls >= MAX_TOOL_CALLS) {
-        // Safety cap hit — let the model do one more synthesis turn.
       }
     }
 

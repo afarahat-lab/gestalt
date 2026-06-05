@@ -339,6 +339,37 @@ export function buildCodePrompt(
     attempt > 0
       ? `\n\nIMPORTANT: Retry attempt ${attempt}. Return pure JSON only — no commentary, no markdown fences.`
       : '';
+  // TEST_REPORT_010 Fix 2 — explicit exploration-budget guidance.
+  // TEST_REPORT_009 disproved live invocation of executeScript on a
+  // near-empty scaffold: the LLM spent its entire MAX_TOOL_CALLS
+  // budget calling `listDirectory` on directories it was about to
+  // CREATE (src/modules/leave/repository, etc.) before reaching the
+  // verification step. This block tells the LLM what to read and —
+  // more importantly — what NOT to explore.
+  //
+  // Order matters: this is the FIRST thing in the task section so the
+  // LLM reads "don't waste calls on output paths" before any of the
+  // file-organisation / code-rules / verification / schema sections.
+  const preGenerationSection =
+    `## Before generating code\n\n` +
+    `1. **Read existing files your generated code will import from.** ` +
+    `Use \`readFile\` on each — they're listed in the IntentSpec and ` +
+    `the design-spec above (typical examples: \`src/shared/types/index.ts\`, ` +
+    `\`src/shared/db/connection.ts\`, \`src/index.ts\`).\n` +
+    `2. **Do NOT explore directories that don't exist yet.** You are ` +
+    `about to CREATE them. Call \`getFileTree\` ONCE to understand the ` +
+    `current shape of the project, then proceed directly to generation. ` +
+    `Repeated \`listDirectory\` calls on missing paths burn your budget.\n` +
+    `3. **Do NOT call \`listDirectory\` on the OUTPUT paths** listed in ` +
+    `the design spec / file-organisation rules below — those paths are ` +
+    `the destinations for the files you are about to emit; they will ` +
+    `not exist yet.\n` +
+    `4. **After emitting, verify with \`executeScript\`** (see the ` +
+    `mandatory pre-emit verification section at the end).\n\n` +
+    `Budget guidance: ~1 \`getFileTree\` + ~3 \`readFile\` on existing ` +
+    `deps + ~2 \`executeScript\` (verify + re-verify) = ~6 purposeful ` +
+    `tool calls. Anything more is exploration overhead.\n`;
+
   // TEST_REPORT_008 Fix 1 — restructured. The JSON-return instruction
   // is now LAST in the prompt; the new `## Mandatory pre-emit
   // verification` block sits immediately above it. Code rules + file
@@ -348,6 +379,7 @@ export function buildCodePrompt(
   // converts "you have a tool" (TEST_REPORT_007 advisory tone) into
   // "you MUST call it before emitting" (mandatory).
   const taskSection =
+    preGenerationSection + `\n` +
     `## Generate code now\n\n` +
     `Generate the TypeScript code files needed to implement the intent above. ` +
     `Follow the architecture, respect all constraints, implement the design ` +
