@@ -11,7 +11,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-06 (after TEST_REPORT_010 — batch-level MAX_TOOL_CALLS cap + pre-generation prompt + executeScript availability)
+**Last updated:** 2026-06-06 (after TEST_REPORT_011 — TR_010 escalation analysis + 8-round scoped-intent failure exposes review-agent hallucination + retry-budget overshoot)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -202,24 +202,17 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
-- **constraint-agent + review-agent + code-agent all have
-  `executeScript` + HARNESS.json `agentConfig.<role>.rules`
-  rendering** (TR_005/006/007/008). **TR_010 proved live
-  invocation:** code-agent ran 5× `executeScript` (mkdir
-  scaffold ×2, `npm run lint`, `npm run typecheck`,
-  `npx tsc --noEmit`) and emitted a `verificationNote`
-  that became a low-severity `LINT_FAILURE` signal — the
-  first end-to-end evidence the TR_008 schema works in
-  production.
-- **Tool-call persistence is now incremental** in
+- **executeScript invocation is consistent for code-agent and
+  constraint-agent** (TR_010/011). TR_010: 5× per round;
+  TR_011: 125× across 8 rounds. Review-agent NEVER reaches
+  for it (0 tool calls in every TR_011 round) — see CRITICAL
+  follow-up above.
+- **Tool-call persistence is incremental** in
   `BaseLLMAgent.runToolLoop()` (TR_009 Fix 1). Mid-loop
-  throws leave full `agent_execution_logs.tool_calls`
-  arrays. Proven again in TR_010 (every failed-and-completed
-  row carries its full tool-call log).
-- **Trackeros code-agent runs on gpt-4o-mini** (TR_009
-  Fix 2, trackeros `9c41633`). Zero rate-limit errors;
-  ~3× cheaper per cycle. TR_010's full cycle: ~240k
-  tokens / ~$0.14 USD.
+  throws preserve full tool-call logs in
+  `agent_execution_logs`.
+- **Trackeros code-agent runs on gpt-4o-mini** (trackeros
+  `9c41633`). Zero rate-limit errors; ~3× cheaper.
 - **`MAX_TOOL_CALLS` cap-inside-batch is fixed** (TR_010
   Fix 1). Cap check moved BEFORE the per-call dispatch loop;
   over-cap batches get synthesised rejection responses for
@@ -227,37 +220,55 @@ the `sessions/archive/` files (everything older)._
   `tools: []` is fired so the LLM produces final text
   (`stopReason === 'stop'`). HTTP 400
   *"tool_call_ids did not have response messages"* is gone.
-- **`MAX_TOOL_CALLS` raised from 10 → 20** (TR_010 Fix 2).
-  Headroom for ~1 getFileTree + ~3 readFile + ~2 executeScript
-  + retries. Code-agent now finishes in 33s with 21 tool
-  calls (5× executeScript).
-- **Code-agent prompt has a `## Before generating code`
-  section** (TR_010 Fix 2). Tells the LLM to read existing
-  deps first, NOT explore output paths, NOT listDirectory
-  on paths it's about to create. Reduced `listDirectory`
-  spend from 14× (TR_009) to 8× (TR_010); still room to
-  trim further.
-- **`VALID_BUILTIN_TOOLS` now includes `executeScript`**
-  (TR_010 Fix 4 — latent bug). Loader was silently dropping
-  `executeScript` when a project's `agents.yaml` listed it.
-  Root cause of TR_007/008/009 never observing the call.
-- **trackeros `agents.yaml` code-agent lists `executeScript`**
-  (TR_010 operator change, commit `6b7e42e`).
+- **`MAX_TOOL_CALLS` raised from 10 → 20 + pre-generation
+  prompt block in code-prompt.ts** (TR_010 Fix 2). Tells the
+  LLM to read existing deps first, not explore non-existent
+  paths. TR_011 VALIDATED this: `listDirectory` count is 0
+  across all 8 TR_011 rounds (down from 14× in TR_009).
+- **`VALID_BUILTIN_TOOLS` includes `executeScript`** (TR_010
+  Fix 4 — latent bug; loader was silently dropping it).
 - **Empty-tools wire path is safe** (TR_010 Fix 3). When
-  `tools: []` is sent to OpenAI we now also drop
-  `tool_choice` — sending the pair returns HTTP 400.
+  `tools: []`, also drop `tool_choice` from OpenAI body.
+- **CRITICAL: Review-agent hallucinates findings every round
+  on correctly-structured code** (TR_011 — proven across
+  64 agent executions / 8 rounds). Persistent false positives:
+  audit-logging finding when not in IntentSpec, "DB-pattern
+  violation" against code that correctly delegates,
+  "Import cannot be resolved" against imports that resolve.
+  Despite TR_007's verification-guidance block + executeScript
+  availability, review-agent `tool_calls` is 0 in every TR_011
+  round — the LLM never reaches for the verification tool.
+  Two fixes recommended: prompt-tighten (cheap, may not be
+  enough) OR deterministic post-LLM grep filter on findings.
 - **Review-agent `result_status = 'failed'` with successful
-  JSON output** (TR_010 finding). `agent_execution_logs` row
-  marked failed (empty `error_message`) but `llm_response` is
-  well-formed JSON AND four `signals` rows were emitted with
-  `source_agent='review-agent'`. Cosmetic — verdict is
-  correct, just the row label is wrong. Likely a race in the
-  gate-orchestrator's failure-path. Fix priority: HIGH.
+  JSON output** (TR_010 finding, TR_011 reconfirms across 8
+  rounds). `agent_execution_logs` row marked failed (empty
+  `error_message`) but `llm_response` is well-formed JSON
+  AND signals rows are emitted with `source_agent='review-
+  agent'`. Cosmetic but blocks operator triage —
+  can't distinguish "review-agent crashed" from "review-agent
+  emitted false positives". Fix priority: HIGH.
+- **HIGH: Retry-budget overshoot** (TR_011 finding). `qualityGate.maxRetries: 3` + `selfHealing.maxAttempts: 2`
+  should cap at 6 rounds. TR_011's cycle ran 8. Suspected
+  cause: constraint-agent verdict-passed in round 4 resets
+  the gate retry counter. Audit `gate-orchestrator.ts`
+  retryCount increment logic.
+- **TR_010 GP_BREACH was a FALSE POSITIVE** (TR_011 analysis).
+  Review-agent's "Direct DB access in service" finding
+  fired against code that correctly imports + delegates to
+  `LeaveRepository`. No `pool.query` in the service.
+  Three of TR_010's five review-agent findings were false
+  positives or mistargeted.
 - **Constraint-agent 387-second / 50k-token / 19-executeScript
-  budget on TR_010's Leave intent.** Hit the new cap of 20.
-  Now the slowest agent in the cycle by 5×. Either restructure
-  the prompt to batch verifications or introduce a per-role
-  MAX_TOOL_CALLS override.
+  budget on TR_010's Leave intent.** TR_011 confirms similar
+  pattern (8-21 tool calls / round). Restructure prompt to
+  batch verifications or per-role MAX_TOOL_CALLS override.
+- **Constraint-agent reviews files outside the cycle's
+  artifact set** (TR_011 finding). Flagged
+  `src/shared/db/connection.ts` (pre-existing infrastructure
+  on main, not generated this cycle) for "hardcoded
+  credentials" on its `process.env.DATABASE_URL` line.
+  Constraint-agent should scope to the cycle's diff.
 - **Self-healing escape hatch wired (Fix 4) but not yet
   exercised live.** When `attemptNumber > 1` AND current
   signals contain fingerprints not in `priorSignals`,
@@ -441,21 +452,39 @@ None blocking the build. Areas to keep in mind:
 - **Trackeros code-agent on gpt-4o-mini + executeScript tool**
   (commits `9c41633` + `6b7e42e` on trackeros `main`). No
   platform-side action — per-project `agents.yaml`.
-- **One open `GP_BREACH` alert** for correlation
-  `7afa0886-…` (TEST_REPORT_010's escalated Leave cycle —
-  real review-agent finding on DB-pattern violation). Will
-  auto-resolve once the architectural findings are addressed
-  in a follow-up intent, or dismiss with
-  `gestalt alerts dismiss`. (TR_009's alert may still be
-  open too — same command.)
+- **TR_010 GP_BREACH was a FALSE POSITIVE** (TR_011 analysis).
+  Review-agent flagged `leave.service.ts` for direct DB
+  access against code that correctly delegates to
+  `LeaveRepository`. No `pool.query` in service. Critical
+  driver for the review-agent fix below.
+- **CRITICAL — Review-agent hallucinates findings every
+  round on correctly-structured code** (TR_011, proven across
+  64 agent executions / 8 rounds). 8-round cycle burned
+  ~2.47M tokens chasing phantom complaints. Two recommended
+  fixes: (a) prompt-tighten — explicit "don't emit when
+  file structurally satisfies the rule"; (b) deterministic
+  post-LLM grep filter on review-agent's findings.
+- **HIGH — Retry-budget overshoot** (TR_011). 8 rounds
+  ran despite `qualityGate.maxRetries: 3` + `selfHealing.
+  maxAttempts: 2` = 6 max. Constraint-agent verdict-passed
+  in round 4 may reset the gate retry counter. Audit
+  `gate-orchestrator.ts`.
+- **One open `failed` alert** for correlation
+  `11a08e08-…` (TR_011's 8-round Leave-service cycle). Plus
+  TR_010's open `GP_BREACH` for `7afa0886-…` and possibly
+  TR_009's. All dismissable with `gestalt alerts dismiss`.
 - **Review-agent `result_status='failed'` with successful
-  JSON output** (TR_010). Cosmetic — verdict is correct,
+  JSON output** (TR_010/011). Cosmetic — verdict is correct,
   row label is wrong. Trace gate-orchestrator failure-path
   vs signal emit. Fix priority: HIGH.
+- **Constraint-agent reviews files outside the diff** (TR_011).
+  Flagged pre-existing `src/shared/db/connection.ts` for
+  "hardcoded credentials" on its `process.env.DATABASE_URL`
+  line. Constraint-agent should scope to the cycle's
+  artifact set.
 - **Constraint-agent 387s / 50k-token / 19-executeScript
-  budget** on the Leave intent (TR_010). Now the slowest
-  agent in the cycle. Restructure prompt or add per-role
-  MAX_TOOL_CALLS override.
+  budget** on TR_010's Leave intent (TR_011 similar pattern).
+  Restructure prompt or add per-role MAX_TOOL_CALLS override.
 - **Review-agent placement-check wording fix** is a small
   follow-up (TEST_REPORT_003 Issue #1) — one paragraph in
   `llm-review-agent.ts` to stop false-positive
@@ -489,6 +518,213 @@ Moved to [@docs/claude/ARCHITECTURE.md](./ARCHITECTURE.md#key-type-alignment-rul
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+
+### Session 2026-06-06 — Claude Code (TEST_REPORT_011: TR_010 escalation analysis + 8-round scoped service intent — review-agent persistently hallucinates findings across rounds, retry budget overshoots by 2, ~$0.74 USD burned chasing phantom complaints; pre-generation prompt VALIDATED (listDirectory = 0))
+
+Two-part diagnostic session against TEST_REPORT_010's escalated cycle.
+**Step 1**: analyse whether TR_010's `GP_BREACH` was a real architectural
+violation or a review-agent false positive. **Step 2**: run a tightly
+scoped intent (single service file + single test, against an existing
+repository) and answer whether narrow scoping avoids the false-positive
+pile-up. No platform code changed this session — pure observation.
+
+Outcome: **Step 1 confirms TR_010's GP_BREACH was a FALSE POSITIVE**,
+and three of TR_010's five review-agent findings were either false
+positives or mistargeted. **Step 2 confirms the false-positive
+pattern is structural, not scope-driven**: the scoped intent ran
+**8 rounds** before failing (above the configured 6-round cap),
+burning ~2.47M tokens / ~$0.74 USD chasing the same review-agent
+hallucinations every round. Quality-gate's review-agent is now the
+single biggest blocker to a working end-to-end cycle.
+
+What the user asked for:
+
+- **Step 1 — TR_010 escalation analysis.** Read the generated
+  `leave.service.ts` from correlation `7afa0886-…`. Decide whether
+  the review-agent's "Direct DB access in service" GP_BREACH was
+  genuine (service calling `pool.query` directly) or a false
+  positive (service correctly delegating to repository). Same for
+  the audit-logging CV and the "Import cannot be resolved" CV.
+- **Step 2 — Scoped intent.** Cherry-pick `leave.model.ts` +
+  `leave.repository.ts` from `gestalt/a41959f9-...` (TR_007's
+  branch) to trackeros `main` so a real dependency exists, then
+  run a narrow intent for just `leave.service.ts` + its unit
+  test. Verify: executeScript fires consistently, code-agent
+  imports correctly from the existing repository, service uses
+  the repository interface (not `pool.query`), gate passes
+  cleanly, scope avoids GP_BREACH.
+
+What changed:
+
+- **No platform code.** Entirely diagnostic.
+- **Operator setup commit on trackeros `main`** (`5e619a9`):
+  cherry-picked `leave.model.ts` + `leave.repository.ts` from
+  `gestalt/a41959f9-create-the-leave-module-foundation`. TR_007
+  reported these were merged via PR #2801 — but the actual
+  trackeros PR list shows #39–#48 with no leave-module PR
+  among them. The TR_007 PR was never opened against main. This
+  commit closes that gap.
+
+Step 1 — TR_010 escalation analysis (verbatim from artifact):
+
+```ts
+// leave.service.ts (TR_010 correlation 7afa0886-…)
+import { LeaveRepository } from './leave.repository';
+
+export class LeaveService {
+  constructor(private readonly leaveRepository: LeaveRepository) {}
+
+  async submitLeaveRequest(req: LeaveRequest): Promise<LeaveRequest> {
+    return this.leaveRepository.createLeaveRequest(req);
+  }
+}
+```
+
+No `pool.query`. No `db.query`. The service imports + delegates to
+`LeaveRepository` — exactly the pattern the rule requires. **The
+GP_BREACH was a false positive.**
+
+TR_010 finding-by-finding:
+
+| TR_010 finding | Genuine? | In scope? | Should have been |
+|---|---|---|---|
+| GP_BREACH "Direct DB access in service" | **No** — service delegates correctly | n/a | Not emitted |
+| CV "Missing audit logging" | Yes | **Out of scope** | Suppressed per the review-agent's own outOfScope rule |
+| CV "Test framework mismatch" | Mixed — `src/modules/leave/leave.test.ts` lacks the imports; the `tests/unit/*` files have them | Yes | File-scoped |
+| CV "Import cannot be resolved for `LeaveRequest`" | **Wrong target** — `LeaveRequest` IS imported; the actual missing import is `LeaveRepository` in routes.ts | Yes | Right finding, wrong symbol |
+| CV "Unhandled promise rejection" (constraint-agent) | **No** — routes DO have try/catch | Yes | False positive |
+
+**Three of TR_010's five gate findings were false positives or
+mistargeted.** The single critical-severity escalation was on the
+single finding the review-agent should not have raised.
+
+Step 2 — Scoped intent execution (correlation
+`11a08e08-b191-48ba-b7b9-2c213123d350`):
+
+**8 rounds** before terminal `failed` status. Total cost:
+2,472,848 tokens / ~$0.74 USD.
+
+| Round | Code-agent (tok / tc) | Constraint-agent | Review-agent |
+|---|---|---|---|
+| 1 | 139,587 / 21 | failed (15) | failed (0) |
+| 2 | 139,808 / 21 | failed (10) | failed (0) |
+| 3 | 289,228 / 21 | failed (21) | failed (0) |
+| 4 | 145,138 / 21 | **passed** (5) | failed (0) |
+| 5 | 379,701 / 21 | failed (8) | failed (0) |
+| 6 | 159,994 / 21 | failed (13) | failed (0) |
+| 7 | 106,453 / 14 | failed (9) | failed (0) |
+| 8 | 115,504 / 16 | failed (9) | failed (0) |
+
+Code-agent total tool calls across 8 rounds: 125× `executeScript`,
+23× `readFile`, 8× `getFileTree`, **0× `listDirectory`**.
+
+What worked:
+
+- **TR_010 pre-generation prompt VALIDATED.** `listDirectory`
+  dropped from 8× in TR_010 to **0× across all 8 TR_011 rounds.**
+  The "do NOT explore directories that don't exist yet" instruction
+  is being respected. Permanent simplification candidate: drop
+  `listDirectory` from code-agent's `tools.builtin` entirely.
+- **`readFile` correctly hit the existing dependency files** —
+  distinct paths read across the cycle: `leave.repository.ts`,
+  `leave.model.ts`, `src/shared/types/index.ts`,
+  `src/shared/db/connection.ts`. The setup commit's seeded files
+  were used as designed.
+- **`executeScript` consistent.** 125 invocations across 8 rounds.
+  The mandatory pre-emit verification block is wired and active.
+- **Round 1's service.ts correctly imports `ILeaveRepository`**
+  from the seeded `leave.repository.ts` and delegates correctly.
+  Brief's verification questions 1–3 all pass.
+
+What didn't work:
+
+- **Review-agent hallucinated the SAME false positives every
+  round** for 8 straight rounds:
+  - "Missing audit logging" — 8/8 (out of scope per intent)
+  - "DB-pattern violation" against code that correctly delegates —
+    6/8 (false positive, same as TR_010)
+  - "Import cannot be resolved" against resolvable imports — 5/8
+  - "Missing RBAC enforcement" — 5/8 (out of scope)
+- **Review-agent's `tool_calls` is 0 in every TR_011 round.**
+  Despite TR_007's verification-guidance block telling it to run
+  `tsc --noEmit` before flagging unresolved imports, the LLM
+  never reaches for the tool. The instruction is advisory; it
+  needs to be mandatory + structural.
+- **Constraint-agent reviews files outside the cycle's
+  diff.** Flagged pre-existing `src/shared/db/connection.ts`
+  (on main since project bootstrap, not generated this cycle) for
+  "hardcoded credentials" on its `process.env.DATABASE_URL`
+  reference. Constraint-agent should scope to the cycle's
+  artifact set.
+- **Positive feedback loop induced scope creep.** By round 8 the
+  service had added `updateLeaveRequest` + `deleteLeaveRequest`
+  (not requested), dropped `getEmployeeLeave` (in the intent),
+  added `console.log("…")` as a "fix" for the phantom
+  audit-logging finding (which constraint-agent then correctly
+  flagged), and referenced `LeaveStatus.Deleted` (which doesn't
+  exist in shared/types).
+- **Retry budget overshot by 2 rounds.** `qualityGate.maxRetries: 3`
+  + `selfHealing.maxAttempts: 2` = 6 max. Cycle ran 8. Suspected
+  cause: constraint-agent verdict-passed in round 4 reset the
+  gate retry counter.
+
+Brief's verification matrix:
+
+| Question | Result |
+|---|---|
+| Did `executeScript` fire again? | ✓ Yes, 125× across 8 rounds |
+| Did code-agent correctly import from existing `leave.repository.ts`? | ✓ Yes — readFile on it every round |
+| Did the service correctly use the repository (no `pool.query`)? | ✓ Yes — delegated via repository in every round |
+| Did the gate pass cleanly with no false positives? | ✗ No — same false positives every round |
+| Was the intent scope narrow enough to avoid GP_BREACH? | ⚠ Mixed — no GP_BREACH escalation, but `failed` after budget exhaustion |
+
+Decisions made:
+
+- **Did NOT touch platform code this session.** The brief was
+  diagnostic + scoped re-run; widening scope to fix the
+  review-agent bug would have conflated measurement with
+  iteration. Recorded as the top recommended fix in the report.
+- **Did NOT abort the cycle mid-flight when it became clear the
+  loop was unproductive.** User chose "let it finish naturally"
+  via AskUserQuestion at round 5 → cleanest data for the report,
+  even at the cost of ~$0.40 in extra spend.
+- **Asked the user before pushing the setup commit to trackeros
+  main.** Auto-mode classifier blocked the first attempt as
+  out-of-brief; user approved via AskUserQuestion (selected
+  "Push setup commit"). Documented as deliberate setup, not
+  test artifact.
+
+Recommended fixes (carried into TR_011 report):
+
+- **(CRITICAL)** Tighten review-agent prompt: explicit "do NOT
+  emit when file structurally satisfies the rule"; "if concern
+  is not in IntentSpec.successCriteria AND not in
+  HARNESS.json.constraints.rules, treat as out-of-scope".
+- **(HIGH)** Add deterministic post-LLM grep filter on
+  review-agent findings — "Import cannot be resolved for X" →
+  `grep "^import.*X" <file>`; drop finding if hit. "Direct DB
+  access" → `grep "pool\.query\|db\.query" <file>`; drop if
+  no hits.
+- **(HIGH)** Investigate the 8-round overshoot. Audit
+  `gate-orchestrator.ts` retryCount increment logic.
+- **(HIGH)** Fix the review-agent `result_status='failed'` bug
+  (TR_010 / TR_011 reconfirmed across 64 executions).
+- **(MEDIUM)** Intent-agent should populate `outOfScope` more
+  generously based on the brief's narrowness.
+- **(MEDIUM)** Constraint-agent should scope to the cycle's diff,
+  not the whole project tree.
+- **(LOW)** Drop `listDirectory` from code-agent's `tools.builtin` —
+  TR_011 proves the pre-generation prompt has driven it to zero.
+
+Build status: `pnpm -r build` clean (no platform code changed).
+Docker server still on TR_010's `30b5d0b` image, healthy throughout.
+Trackeros `main`: `5e619a9` (setup commit). New file
+`docs/claude/TEST_REPORT_011.md`. No new commits on the gestalt repo
+yet — TR_011 commit is the next step.
+
+---
+
+
 
 ### Session 2026-06-06 — Claude Code (TEST_REPORT_010: MAX_TOOL_CALLS cap-inside-batch + pre-generation prompt + executeScript availability — code-agent invokes executeScript 5× in a single run, the first end-to-end since TR_007; cycle escalates on legitimate review-agent findings, not platform bugs)
 
@@ -923,172 +1159,6 @@ image rebuilt + container restarted via `docker compose up -d
 --build`. Server `/health` 200 throughout. Trackeros `main`
 updated to `9c41633`. New file `docs/claude/TEST_REPORT_009.md`.
 Branch protection still off on both repos.
-
----
-
-
-### Session 2026-06-05 — Claude Code (TEST_REPORT_008: code-agent mandatory pre-emit verification — three fixes shipped + verified in prompts; live cycles rate-limit mid-tool-loop because the new behaviour spikes token usage past gpt-4o's TPM ceiling)
-
-Implementation session with a partial live verification. Goal:
-convert the code-agent's executeScript usage from advisory (added
-in TEST_REPORT_007) to MANDATORY by restructuring the code-prompt's
-task section + adding a `verificationNote` JSON field + expanding
-HARNESS.json's `agentConfig.code-agent.rules` to state the mandate
-explicitly.
-
-Outcome: **all three platform fixes shipped and are verified to
-render in the live prompts.** The behavioural change is also
-clearly visible in the data — round-1 code-agent token usage
-jumped from TEST_REPORT_007's 25,912 to TEST_REPORT_008's avg
-34,225 (+32 %) across three independent attempts; server logs
-show 9+ tool-loop turns per attempt vs TEST_REPORT_007's typical
-5-7. Both consistent with the LLM now invoking executeScript per
-the mandate.
-
-**Definitive verification blocked by two adjacent platform
-limitations**:
-1. `agent_execution_logs.tool_calls` persistence is end-of-loop —
-   on a rate-limit throw, the orchestrator never writes the
-   tool-call log. All 6 code-agent execution rows across the 3
-   cycles wrote empty arrays.
-2. gpt-4o's standard 30K TPM ceiling sits right at the new
-   per-cycle floor. Round-1 burns 35 k tokens in ~15s, round-2
-   immediately rate-limits in 2-3s on its first call.
-
-Three live submission attempts all failed with the same pattern.
-The fixes work; what's blocking is observability + LLM ceiling,
-not the implementation.
-
-What the user asked for:
-
-- **Fix 1 (HIGH)** — In `code-prompt.ts`, add a `## Mandatory
-  pre-emit verification` section at the end of the task block
-  (just before the JSON return instruction) with three numbered
-  steps: call `executeScript` with stack-appropriate command;
-  fix errors and retry; only return when exit 0 OR after 2
-  attempts include `verificationNote` field.
-- **Fix 2 (HIGH)** — Update the response JSON schema example to
-  include the optional `verificationNote`. In the agent's parser,
-  if `verificationNote` is present emit a `LINT_FAILURE` signal
-  (low severity) carrying the note text so the gate sees the
-  warning.
-- **Fix 3 (HIGH)** — Update `agentConfig.code-agent.rules` in
-  both the template HARNESS.json and trackeros's HARNESS.json
-  from 2 → 3 rules, with the third stating "You MUST run a
-  compile/lint check via executeScript before emitting the
-  final files. This is not optional."
-
-What changed:
-
-- **Fix 1**:
-  `packages/agents/generate/src/prompts/code-prompt.ts` —
-  restructured `taskSection`. File organisation rules + code
-  rules moved earlier (they used to come after the JSON-return
-  instruction). New `## Mandatory pre-emit verification` block
-  with 3 numbered steps (call executeScript with stack-appropriate
-  command — listing tsc / mypy / go build / cargo check / mvn /
-  npm run lint as examples; iterate up to two attempts on
-  errors; emit verificationNote on failure). New `## Return
-  format` block placed LAST, with the updated JSON schema
-  example including the optional `verificationNote` field. Final
-  sentence: "This is not optional. A finding from the gate that
-  'you didn't compile-check before emitting' is a strict failure
-  mode the platform now enforces."
-- **Fix 2**:
-  `packages/agents/generate/src/agents/code-agent.ts` —
-  `parseCodeFiles` renamed to `parseCodeResponse`. New
-  `CodeAgentParseResult { files; verificationNote? }` interface.
-  The optional `verificationNote` is extracted, trimmed; empty
-  strings normalised to undefined. When non-empty, the agent
-  emits a `LINT_FAILURE` signal (low severity, auto-resolvable)
-  with the note as the message. Imports `FeedbackSignal` from
-  `../types`.
-- **Fix 3**:
-  `templates/corporate-ops-web-mobile/harness/HARNESS.json` —
-  `agentConfig.code-agent.rules` grew from 2 → 3.
-  `trackeros/HARNESS.json` updated via direct push to main
-  (commit `44403f0`).
-
-Live verification:
-
-Three submission attempts, all failed with the same pattern:
-
-| # | Correlation | R1 code-agent tokens | Outcome |
-|---|---|---|---|
-| 1 | `860df22d-…` | 34,695 | rate-limit mid tool-loop |
-| 2 | `f7e1d840-…` | 32,203 | rate-limit; round-3 intent-agent retried so many times it produced a `waiting-for-clarification` |
-| 3 | `9cfd74fb-…` | 35,777 | rate-limit mid tool-loop |
-
-Indirect evidence the code-agent IS invoking executeScript:
-
-- **Token usage +32 % vs TEST_REPORT_007** (25,912 → 34,225 avg).
-- **9+ tool-loop turns per attempt vs TEST_REPORT_007's 5-7.**
-  Server logs show `LLM tool-loop turn completed` with
-  `stopReason: "tool_calls"` for each turn.
-- **Per-turn token escalation matches executeScript-stderr
-  pattern**: counts climb 1,478 → 2,908 → 5,099 → 5,229 → 5,564
-  → 6,472 → 6,647 → 6,766 within one loop. The 4× jump at
-  turn 4 is consistent with `tsc --noEmit` stderr (multi-KB
-  compile-error output on the clone tree that doesn't have
-  `node_modules` installed at this point) being inserted into
-  the LLM context.
-
-Direct evidence missing:
-
-- `agent_execution_logs.tool_calls`: all 6 code-agent rows have
-  empty `tool_calls` arrays. The orchestrator's persistence
-  layer only writes the log on successful tool-loop completion;
-  rate-limit throws abort before the save.
-
-Prompt sections rendered correctly (grep against persisted prompt):
-
-- `## Mandatory pre-emit verification`: 1 hit
-- `verificationNote`: 2 hits (one in instruction, one in schema)
-- `tsc --noEmit`: 1 hit (example in step 1)
-
-Decisions made:
-
-- **Wrote the report against indirect evidence rather than waiting
-  for a successful direct verification.** Three independent
-  attempts showed the same pattern — token usage and tool-loop
-  turn count are consistent with executeScript being called. The
-  observability layer's mid-loop-throw blind spot is itself a
-  finding (recommended fix #1 in the report).
-- **Used direct API login (curl /auth/login + write JWT into
-  ~/.gestalt/config.json) when CLI's promptSecret raw-mode prompt
-  couldn't be driven via expect.** Same issue as prior sessions
-  with `gestalt projects update-token`; documented as an
-  operator-flow pain point but not blocking.
-- **Did not introduce a model-override or MAX_TOOL_CALLS reduction
-  this session.** The brief was specifically about prompt + schema
-  + rules. Rate-limit mitigation is the next session's work —
-  recorded as recommended fix #2.
-- **Did not modify `BaseLLMAgent.runToolLoop` to do incremental
-  persistence**, even though that would have unblocked the
-  direct verification. Out of scope for the brief; recorded as
-  recommended fix #1.
-
-Pending follow-ups:
-
-- **(HIGH)** Incremental tool-call persistence in
-  `BaseLLMAgent.runToolLoop()`. Set `this.lastToolCallLog =
-  [...toolCallLog]` at the start of each loop iteration so a
-  rate-limit throw still leaves the orchestrator with a full
-  record of the calls that completed. Five-line change.
-- **(HIGH)** Code-agent rate-limit mitigation. Either operator-
-  side switch to `gpt-4o-mini` (set in trackeros's
-  `agents.yaml`), or lower `MAX_TOOL_CALLS` from 10 to 5 in
-  `base-llm-agent.ts`, or bump OpenAI tier.
-- **(MEDIUM)** Capture `n_turns` and `final_stop_reason` on
-  agent_execution_logs so the dashboard can show "agent needed
-  N tool-loop turns" without grepping server logs.
-- **(LOW)** Document the verificationNote → LINT_FAILURE signal
-  pathway in GENERATE-LAYER.md.
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Docker image rebuilt + container restarted. Server `/health` 200
-throughout. Trackeros `main` updated (`44403f0`) with the
-3-rule code-agent expansion.
 
 ---
 

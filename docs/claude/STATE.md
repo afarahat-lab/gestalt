@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-06 (after TEST_REPORT_010 — batch-level MAX_TOOL_CALLS cap + pre-generation prompt + executeScript availability)
+**Last updated:** 2026-06-06 (after TEST_REPORT_011 — TR_010 escalation analysis + 8-round scoped-intent failure exposes review-agent hallucination + retry-budget overshoot)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -195,24 +195,17 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
-- **constraint-agent + review-agent + code-agent all have
-  `executeScript` + HARNESS.json `agentConfig.<role>.rules`
-  rendering** (TR_005/006/007/008). **TR_010 proved live
-  invocation:** code-agent ran 5× `executeScript` (mkdir
-  scaffold ×2, `npm run lint`, `npm run typecheck`,
-  `npx tsc --noEmit`) and emitted a `verificationNote`
-  that became a low-severity `LINT_FAILURE` signal — the
-  first end-to-end evidence the TR_008 schema works in
-  production.
-- **Tool-call persistence is now incremental** in
+- **executeScript invocation is consistent for code-agent and
+  constraint-agent** (TR_010/011). TR_010: 5× per round;
+  TR_011: 125× across 8 rounds. Review-agent NEVER reaches
+  for it (0 tool calls in every TR_011 round) — see CRITICAL
+  follow-up above.
+- **Tool-call persistence is incremental** in
   `BaseLLMAgent.runToolLoop()` (TR_009 Fix 1). Mid-loop
-  throws leave full `agent_execution_logs.tool_calls`
-  arrays. Proven again in TR_010 (every failed-and-completed
-  row carries its full tool-call log).
-- **Trackeros code-agent runs on gpt-4o-mini** (TR_009
-  Fix 2, trackeros `9c41633`). Zero rate-limit errors;
-  ~3× cheaper per cycle. TR_010's full cycle: ~240k
-  tokens / ~$0.14 USD.
+  throws preserve full tool-call logs in
+  `agent_execution_logs`.
+- **Trackeros code-agent runs on gpt-4o-mini** (trackeros
+  `9c41633`). Zero rate-limit errors; ~3× cheaper.
 - **`MAX_TOOL_CALLS` cap-inside-batch is fixed** (TR_010
   Fix 1). Cap check moved BEFORE the per-call dispatch loop;
   over-cap batches get synthesised rejection responses for
@@ -220,37 +213,55 @@ the `sessions/archive/` files (everything older)._
   `tools: []` is fired so the LLM produces final text
   (`stopReason === 'stop'`). HTTP 400
   *"tool_call_ids did not have response messages"* is gone.
-- **`MAX_TOOL_CALLS` raised from 10 → 20** (TR_010 Fix 2).
-  Headroom for ~1 getFileTree + ~3 readFile + ~2 executeScript
-  + retries. Code-agent now finishes in 33s with 21 tool
-  calls (5× executeScript).
-- **Code-agent prompt has a `## Before generating code`
-  section** (TR_010 Fix 2). Tells the LLM to read existing
-  deps first, NOT explore output paths, NOT listDirectory
-  on paths it's about to create. Reduced `listDirectory`
-  spend from 14× (TR_009) to 8× (TR_010); still room to
-  trim further.
-- **`VALID_BUILTIN_TOOLS` now includes `executeScript`**
-  (TR_010 Fix 4 — latent bug). Loader was silently dropping
-  `executeScript` when a project's `agents.yaml` listed it.
-  Root cause of TR_007/008/009 never observing the call.
-- **trackeros `agents.yaml` code-agent lists `executeScript`**
-  (TR_010 operator change, commit `6b7e42e`).
+- **`MAX_TOOL_CALLS` raised from 10 → 20 + pre-generation
+  prompt block in code-prompt.ts** (TR_010 Fix 2). Tells the
+  LLM to read existing deps first, not explore non-existent
+  paths. TR_011 VALIDATED this: `listDirectory` count is 0
+  across all 8 TR_011 rounds (down from 14× in TR_009).
+- **`VALID_BUILTIN_TOOLS` includes `executeScript`** (TR_010
+  Fix 4 — latent bug; loader was silently dropping it).
 - **Empty-tools wire path is safe** (TR_010 Fix 3). When
-  `tools: []` is sent to OpenAI we now also drop
-  `tool_choice` — sending the pair returns HTTP 400.
+  `tools: []`, also drop `tool_choice` from OpenAI body.
+- **CRITICAL: Review-agent hallucinates findings every round
+  on correctly-structured code** (TR_011 — proven across
+  64 agent executions / 8 rounds). Persistent false positives:
+  audit-logging finding when not in IntentSpec, "DB-pattern
+  violation" against code that correctly delegates,
+  "Import cannot be resolved" against imports that resolve.
+  Despite TR_007's verification-guidance block + executeScript
+  availability, review-agent `tool_calls` is 0 in every TR_011
+  round — the LLM never reaches for the verification tool.
+  Two fixes recommended: prompt-tighten (cheap, may not be
+  enough) OR deterministic post-LLM grep filter on findings.
 - **Review-agent `result_status = 'failed'` with successful
-  JSON output** (TR_010 finding). `agent_execution_logs` row
-  marked failed (empty `error_message`) but `llm_response` is
-  well-formed JSON AND four `signals` rows were emitted with
-  `source_agent='review-agent'`. Cosmetic — verdict is
-  correct, just the row label is wrong. Likely a race in the
-  gate-orchestrator's failure-path. Fix priority: HIGH.
+  JSON output** (TR_010 finding, TR_011 reconfirms across 8
+  rounds). `agent_execution_logs` row marked failed (empty
+  `error_message`) but `llm_response` is well-formed JSON
+  AND signals rows are emitted with `source_agent='review-
+  agent'`. Cosmetic but blocks operator triage —
+  can't distinguish "review-agent crashed" from "review-agent
+  emitted false positives". Fix priority: HIGH.
+- **HIGH: Retry-budget overshoot** (TR_011 finding). `qualityGate.maxRetries: 3` + `selfHealing.maxAttempts: 2`
+  should cap at 6 rounds. TR_011's cycle ran 8. Suspected
+  cause: constraint-agent verdict-passed in round 4 resets
+  the gate retry counter. Audit `gate-orchestrator.ts`
+  retryCount increment logic.
+- **TR_010 GP_BREACH was a FALSE POSITIVE** (TR_011 analysis).
+  Review-agent's "Direct DB access in service" finding
+  fired against code that correctly imports + delegates to
+  `LeaveRepository`. No `pool.query` in the service.
+  Three of TR_010's five review-agent findings were false
+  positives or mistargeted.
 - **Constraint-agent 387-second / 50k-token / 19-executeScript
-  budget on TR_010's Leave intent.** Hit the new cap of 20.
-  Now the slowest agent in the cycle by 5×. Either restructure
-  the prompt to batch verifications or introduce a per-role
-  MAX_TOOL_CALLS override.
+  budget on TR_010's Leave intent.** TR_011 confirms similar
+  pattern (8-21 tool calls / round). Restructure prompt to
+  batch verifications or per-role MAX_TOOL_CALLS override.
+- **Constraint-agent reviews files outside the cycle's
+  artifact set** (TR_011 finding). Flagged
+  `src/shared/db/connection.ts` (pre-existing infrastructure
+  on main, not generated this cycle) for "hardcoded
+  credentials" on its `process.env.DATABASE_URL` line.
+  Constraint-agent should scope to the cycle's diff.
 - **Self-healing escape hatch wired (Fix 4) but not yet
   exercised live.** When `attemptNumber > 1` AND current
   signals contain fingerprints not in `priorSignals`,

@@ -77,21 +77,39 @@ None blocking the build. Areas to keep in mind:
 - **Trackeros code-agent on gpt-4o-mini + executeScript tool**
   (commits `9c41633` + `6b7e42e` on trackeros `main`). No
   platform-side action — per-project `agents.yaml`.
-- **One open `GP_BREACH` alert** for correlation
-  `7afa0886-…` (TEST_REPORT_010's escalated Leave cycle —
-  real review-agent finding on DB-pattern violation). Will
-  auto-resolve once the architectural findings are addressed
-  in a follow-up intent, or dismiss with
-  `gestalt alerts dismiss`. (TR_009's alert may still be
-  open too — same command.)
+- **TR_010 GP_BREACH was a FALSE POSITIVE** (TR_011 analysis).
+  Review-agent flagged `leave.service.ts` for direct DB
+  access against code that correctly delegates to
+  `LeaveRepository`. No `pool.query` in service. Critical
+  driver for the review-agent fix below.
+- **CRITICAL — Review-agent hallucinates findings every
+  round on correctly-structured code** (TR_011, proven across
+  64 agent executions / 8 rounds). 8-round cycle burned
+  ~2.47M tokens chasing phantom complaints. Two recommended
+  fixes: (a) prompt-tighten — explicit "don't emit when
+  file structurally satisfies the rule"; (b) deterministic
+  post-LLM grep filter on review-agent's findings.
+- **HIGH — Retry-budget overshoot** (TR_011). 8 rounds
+  ran despite `qualityGate.maxRetries: 3` + `selfHealing.
+  maxAttempts: 2` = 6 max. Constraint-agent verdict-passed
+  in round 4 may reset the gate retry counter. Audit
+  `gate-orchestrator.ts`.
+- **One open `failed` alert** for correlation
+  `11a08e08-…` (TR_011's 8-round Leave-service cycle). Plus
+  TR_010's open `GP_BREACH` for `7afa0886-…` and possibly
+  TR_009's. All dismissable with `gestalt alerts dismiss`.
 - **Review-agent `result_status='failed'` with successful
-  JSON output** (TR_010). Cosmetic — verdict is correct,
+  JSON output** (TR_010/011). Cosmetic — verdict is correct,
   row label is wrong. Trace gate-orchestrator failure-path
   vs signal emit. Fix priority: HIGH.
+- **Constraint-agent reviews files outside the diff** (TR_011).
+  Flagged pre-existing `src/shared/db/connection.ts` for
+  "hardcoded credentials" on its `process.env.DATABASE_URL`
+  line. Constraint-agent should scope to the cycle's
+  artifact set.
 - **Constraint-agent 387s / 50k-token / 19-executeScript
-  budget** on the Leave intent (TR_010). Now the slowest
-  agent in the cycle. Restructure prompt or add per-role
-  MAX_TOOL_CALLS override.
+  budget** on TR_010's Leave intent (TR_011 similar pattern).
+  Restructure prompt or add per-role MAX_TOOL_CALLS override.
 - **Review-agent placement-check wording fix** is a small
   follow-up (TEST_REPORT_003 Issue #1) — one paragraph in
   `llm-review-agent.ts` to stop false-positive
