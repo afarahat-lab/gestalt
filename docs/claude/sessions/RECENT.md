@@ -4,6 +4,205 @@ _Auto-maintained. The most recent session is prepended at the top; when this fil
 
 ---
 
+### Session 2026-06-05 — Claude Code (TEST_REPORT_009: incremental tool-call log persistence + code-agent → gpt-4o-mini — Fix 1 unambiguously proven via data; Fix 2 swaps the rate-limit ceiling for a separate cap-inside-batch bug)
+
+Two small surgical fixes from TEST_REPORT_008's "definitive
+verification blocked by observability + LLM ceiling" finding. Goal:
+land the 5-line `lastToolCallLog` incremental save inside
+`runToolLoop` so mid-loop throws no longer lose the audit trail,
+and switch trackeros's code-agent to `gpt-4o-mini` so the
+200k-TPM headroom takes rate-limit out of the failure picture.
+Then re-run the Leave-module intent and answer the brief's
+central question: **does the code-agent's tool_calls log show
+an executeScript call, and what command did it run?**
+
+Outcome: **mixed.** Both fixes ship and are *provably working* in
+this cycle's data. But the cycle uncovers a **new failure mode**
+in the tool-loop that gpt-4o-mini's parallel tool-use exposes —
+code-agent never reached `executeScript` because every round hit
+a different blocker (OpenAI HTTP 400, not rate-limit). Three
+rounds failed; cycle escalated to `failed`.
+
+**Headline data point** — the proof Fix 1 works:
+
+| Round | code-agent status | `agent_execution_logs.tool_calls` count | `model_used` |
+|---|---|---|---|
+| 1 | failed | 10 | gpt-4o-mini |
+| 2 | failed | 10 | gpt-4o-mini |
+| 3 | failed | 10 | gpt-4o-mini |
+
+Pre-fix, each row was `[]` on a thrown failure. This cycle wrote
+the full 10-entry log on every throw — directly observable in
+the database. The cycle would have been an opaque triple-failure
+the day before; today we can read exactly which 10 calls the
+LLM made and infer why.
+
+**What we now know about the LLM's behaviour** (visible because of
+Fix 1):
+
+Round 1's 10 tool calls (rounds 2 and 3 are nearly identical):
+1-4. `listDirectory` on `src/modules/leave[/repository|/service|/routes]` — every path returns error (the leave module doesn't exist yet; the agent is about to *create* it).
+5. `getFileTree {maxDepth: 3}`.
+6. `listDirectory src/modules` — error (no modules/ dir).
+7. `listDirectory src` — OK.
+8. `listDirectory src/shared` — OK.
+9. `searchFiles LeaveRequest` — 0 matches.
+10. `searchFiles Leave` — 0 matches.
+— `MAX_TOOL_CALLS=10` cap hit; outer loop tries to continue → OpenAI 400.
+
+So the LLM **spent its entire budget mapping the empty
+scaffolding** rather than reaching for executeScript per the
+TEST_REPORT_008 mandatory-verification prompt. Even with the
+mandatory-verification block + the 3-rule HARNESS expansion,
+gpt-4o-mini ignores the verification step in favour of
+exploration when the target directory is empty.
+
+**Why the cycle fails (root-cause uncovered by this data)**:
+
+`runToolLoop` (`packages/core/src/agents/base-llm-agent.ts:330+`)
+enforces the cap **inside** the per-turn batch:
+
+```ts
+for (const call of toolCalls) {
+  if (totalToolCalls >= MAX_TOOL_CALLS) break;  // ← cuts the batch
+  totalToolCalls++;
+  // ... dispatch + push tool response ...
+}
+```
+
+When the batch has 3 calls and we've already done 8, only 2 of
+the 3 get dispatched + responded to. The next iteration's
+assistant-message history contains a `tool_calls` entry of length
+3 but only 2 `tool` response messages. OpenAI's strict validation
+returns:
+
+> *"An assistant message with 'tool_calls' must be followed by
+> tool messages responding to each 'tool_call_id'. The following
+> tool_call_ids did not have response messages: call_YxZO..."*
+
+This is a **pre-existing bug**. It didn't surface in
+TEST_REPORT_008 because gpt-4o rate-limits out before reaching
+the cap; gpt-4o-mini doesn't, so it hits the cap and the bug
+becomes the dominant failure mode.
+
+What the user asked for:
+
+- **Fix 1 (HIGH)** — In `packages/core/src/agents/base-llm-agent.ts`
+  `runToolLoop`, set `this.lastToolCallLog = toolCallLog.slice()`
+  after each `toolCallLog.push(entry)` so a mid-loop throw still
+  leaves the orchestrator a full record of every tool call that
+  completed before the throw.
+- **Fix 2 (HIGH)** — In trackeros `agents.yaml`, override
+  `code-agent.llm.model` to `gpt-4o-mini`. Commit + push to
+  trackeros `main`. Rationale: gpt-4o standard tier has 30 k TPM,
+  TEST_REPORT_008's mandatory-verification spend was ~35 k. mini
+  has 200 k TPM + ~10× cheaper per token.
+- Submit the Leave module intent, verify `model_used =
+  gpt-4o-mini` on code-agent rows, verify `tool_calls` is
+  non-empty, look for at least one `executeScript` call,
+  confirm cycle deploys (or document why not).
+- Produce TEST_REPORT_009 + update RECENT.md + regenerate
+  SUMMARY.md + commit.
+
+What changed:
+
+- **Fix 1**: `packages/core/src/agents/base-llm-agent.ts` —
+  added 6 lines (one assignment + comment) inside `runToolLoop`'s
+  inner `for (const call of toolCalls)` loop, immediately after
+  `toolCallLog.push(...)`. The class-end `this.lastToolCallLog =
+  toolCallLog` write is retained as the success-path's final
+  assignment but is now redundant; the inner write is what
+  survives a throw. The slice copy ensures the orchestrator
+  sees a snapshot, not a reference to a still-being-mutated
+  array. `pnpm --filter @gestalt/core build` clean; docker
+  image rebuilt + container restarted.
+- **Fix 2**: `/Users/amrmohamed/Work/trackeros/agents.yaml` —
+  `code-agent.llm.model: gpt-4o-mini` (was `~` = platform
+  default `gpt-4o`). Inline comment explains the TPM-ceiling
+  rationale. Pushed as commit `9c41633` on trackeros `main`.
+- **Did NOT** touch the `MAX_TOOL_CALLS` cap-inside-batch bug,
+  the platform-default LLM model, or the code-prompt. Out of
+  scope for the brief; recorded as TEST_REPORT_010's top
+  recommendation.
+
+Live verification (correlation `522e1edc-c1a7-4cf0-9bc7-61620800f92a`,
+intent_id `b59855d0-b618-4813-ae71-777f2ac4dada`):
+
+| Check | Result |
+|---|---|
+| `agent_execution_logs.model_used = gpt-4o-mini` | ✓ all 3 code-agent rows |
+| Zero rate-limit errors | ✓ no 429 in server logs |
+| `tool_calls` non-empty for code-agent | ✓ **10 entries on every failed round (Fix 1 proven)** |
+| At least one `executeScript` call | ✗ 0 / 30 calls — all `listDirectory` / `getFileTree` / `searchFiles` |
+| Cycle deploys on first round | ✗ failed all 3 rounds with HTTP 400 |
+| If tsc errors → self-correct + retry | ✗ never reached |
+
+Token cost: 411,456 tokens across 3 code-agent rounds at gpt-4o-mini
+pricing ≈ **$0.10 USD**. (TEST_REPORT_008 spent ~$0.30 on 3 gpt-4o
+rounds for ~100 k tokens; mini gave us 4× the volume at 1/3 the
+cost.) The brief's $0.10-0.15-per-successful-cycle target is
+mechanically achievable once the cap-inside-batch bug is fixed.
+
+Decisions made:
+
+- **Wrote the report against the failing-but-informative cycle
+  rather than rerunning** with a different intent. Three
+  identical failures are themselves the finding; another run
+  would add no information.
+- **Did NOT fix the cap-inside-batch bug** in this session even
+  though the live cycle exposed it. The brief is "Fix 1 + Fix 2 +
+  verify"; widening scope mid-session would conflate the
+  measurements. Recorded as the top-priority follow-up.
+- **Used direct API login (curl /auth/login + write JWT into
+  ~/.gestalt/config.json) to re-auth** — same workaround as
+  TEST_REPORT_008. The JWT had expired (~8h TTL) and the CLI's
+  `promptSecret` raw-mode prompt cannot be driven from
+  a non-TTY context. This is now a recurring pain point worth
+  fixing platform-side (`gestalt login --password-stdin` or
+  longer JWT TTL).
+- **Numbered the report `_009.md`** to continue the
+  TEST_REPORT_005-008 sequence.
+- **Rotated TEST_REPORT_006's session into `archive/2026-06-w1.md`**
+  rather than creating a new `w2` archive — 2026-06-05 is still
+  inside the calendar week that started 2026-06-01. Extended the
+  archive's title from "June 1-4" to "June 1-7" to reflect.
+
+Pending follow-ups:
+
+- **(HIGH) Fix the `MAX_TOOL_CALLS` cap-inside-batch bug.** Either
+  reorder the dispatch loop (don't push the assistant message
+  when the upcoming batch would breach the cap, or dispatch the
+  entire batch before checking the cap and breaking the outer
+  loop), or synthesise rejection-tool-responses for cap-blocked
+  calls. Until this lands, gpt-4o-mini cannot complete a
+  code-agent run on a near-empty scaffold.
+- **(HIGH) The code-agent prompt isn't strong enough** to compel
+  `executeScript` invocation when the model is in exploration
+  mode. Two options: (a) deterministic post-LLM `executeScript`
+  call inside the code-agent itself (after `parseCodeResponse`
+  succeeds); (b) restructure the prompt so verification is the
+  **first** mandatory action, not the last.
+- **(MEDIUM) Capture `n_turns` and `final_stop_reason` on
+  `agent_execution_logs`** so future failures can be diagnosed
+  without grepping server logs. Already on the list since
+  TEST_REPORT_008; still pending.
+- **(MEDIUM) CLI auth ergonomics** — `gestalt login` cannot be
+  driven from non-TTY contexts and the JWT TTL is short.
+  Either accept `--password-stdin`, persist a refresh token, or
+  extend local-auth JWT TTL.
+- **(LOW) Two open `generate-error` alerts** for this cycle and
+  the prior one. Auto-resolve only fires on successful re-attempt;
+  manual dismiss recommended once the cap-inside-batch fix lands.
+
+Build status: `pnpm --filter @gestalt/core build` clean. Docker
+image rebuilt + container restarted via `docker compose up -d
+--build`. Server `/health` 200 throughout. Trackeros `main`
+updated to `9c41633`. New file `docs/claude/TEST_REPORT_009.md`.
+Branch protection still off on both repos.
+
+---
+
+
 ### Session 2026-06-05 — Claude Code (TEST_REPORT_008: code-agent mandatory pre-emit verification — three fixes shipped + verified in prompts; live cycles rate-limit mid-tool-loop because the new behaviour spikes token usage past gpt-4o's TPM ceiling)
 
 Implementation session with a partial live verification. Goal:
@@ -356,202 +555,5 @@ Build status: `pnpm -r build` clean across all 12 packages.
 Docker image rebuilt + container restarted. Server `/health` 200
 throughout. Trackeros `main` updated (`79e9190`) with the
 review-agent rules expansion.
-
----
-
-
-### Session 2026-06-05 — Claude Code (TEST_REPORT_006: executeScript built-in tool + HARNESS.json rules-only agentConfig + LLM-driven constraint-agent — Leave module intent reaches deployed on first submission)
-
-Implementation + live test session. Goal: replace the prior
-TEST_REPORT_005 two-stage scripted-detection + LLM-judgment design
-with a fundamentally different architecture per the new brief:
-agents gain a sandboxed `executeScript` shell tool with hard
-platform-level blocklist; the constraint-agent becomes a pure LLM
-agent that reads plain-English rules from `HARNESS.json.agentConfig`
-and decides for itself which verification commands fit the
-project's stack. No hardcoded verification logic anywhere.
-
-Outcome: **deployed end-to-end on the first submission.** Two
-generate rounds (the second triggered by review-agent's
-false-positive import-resolution items), but both rounds had the
-new constraint-agent PASS cleanly with 0 violations after running
-6 LLM-chosen tool calls including 2 `executeScript` invocations
-(`npm run lint`, `npm run test`). PR #5345 opened on the trackeros
-remote at branch `gestalt/5daaedbf-create-the-leave-module-foundation`,
-commit `7d4c43b`. Total ≈ 81,500 tokens / ≈ $0.40 USD.
-
-The headline behavior: when running the no-direct-db rule, the LLM
-**independently searched for `new Pool` (instantiation) instead of
-`from 'pg'` (the type import)** — exactly the disambiguation the
-prior TEST_REPORT_005 had to encode as Stage-2 LLM judgment, now
-self-emergent from the plain-English rule text. The
-`import { Pool } from 'pg'` in the generated repository was never
-flagged, without any platform-side carve-out.
-
-What the user asked for:
-
-- Add `executeScript` as a built-in tool with `BLOCKED_PATTERNS`
-  hard blocklist, stdout/stderr caps, timeout-killed spawn.
-- Extend `BuiltInToolName` and core exports.
-- Add `HarnessAgentConfig { rules?: string[] }` and the optional
-  `agentConfig` field on `HarnessConfig`. Update the
-  corporate-ops template's `HARNESS.json` with the brief's
-  example agentConfig section.
-- Add `buildHarnessAgentSection` + `buildScriptToolInstruction`
-  helpers on `BaseLLMAgent`. One sentence of direction — nothing
-  more.
-- Rebuild the constraint-agent as a pure LLM agent that consumes
-  the rules + has `executeScript` / `readFile` / `searchFiles`.
-- Give `code-agent`, `test-runner-agent`, `constraint-agent` the
-  `executeScript` tool by default. Update `agents.yaml` template
-  to document.
-- Push the new `agentConfig` rules section to trackeros's
-  `HARNESS.json` so the live test benefits immediately.
-- Submit the Leave module intent + verify constraint-agent uses
-  executeScript with project-stack-aware commands, the
-  `import { Pool } from 'pg'` type import is NOT flagged, gate
-  verdict passes, token cost is ~$0.10-$0.15 per cycle.
-
-What changed:
-
-- **Part 1 — `packages/core/src/tools/file-tools.ts`**: added
-  `EXECUTE_SCRIPT_TOOL_DEFINITION` to `FILE_TOOL_DEFINITIONS`;
-  added `ExecuteScriptResult` type; added `BLOCKED_PATTERNS`
-  array with the brief's six regex patterns; added
-  `executeScript(command, workDir, timeoutMs)` impl using
-  `spawn('/bin/sh', ['-c', command])`; dispatch in
-  `executeFileTool` routes `'executeScript'` to the new impl;
-  formatter `formatExecuteScriptResult` emits the standard
-  `exitCode / durationMs / --- stdout --- / --- stderr ---`
-  shape the LLM consumes.
-- **Part 2 — types + index exports**: `'executeScript'` added
-  to `BuiltInToolName` union; `executeScript` + `ExecuteScriptResult`
-  exported from `packages/core/src/index.ts`.
-- **Part 3 — HarnessAgentConfig**: new type + optional
-  `agentConfig?: Record<string, HarnessAgentConfig>` field on
-  `HarnessConfig`. Template
-  `templates/corporate-ops-web-mobile/harness/HARNESS.json` gets
-  the brief's full agentConfig block.
-- **Part 4 — BaseLLMAgent helpers**: `buildHarnessAgentSection`
-  reads `harnessConfig.agentConfig[this.agentRole]?.rules` and
-  renders `## Rules you must enforce (from HARNESS.json)` block.
-  `buildScriptToolInstruction` emits the brief's one-sentence
-  direction.
-- **Part 5 — constraint-agent rewritten**: replaces the
-  TEST_REPORT_005 two-stage flow. `ConstraintAgent extends
-  BaseLLMAgent` with `verify(task)` entry point. Loads HARNESS.json
-  + intent-spec, assembles prompt with `buildHarnessAgentSection`
-  + `buildScriptToolInstruction` + intent + outOfScope + code
-  artifacts. Calls `callLLMWithTools` with `tools.builtin:
-  ['executeScript', 'readFile', 'searchFiles']`. Parses JSON
-  `{violations: [...]}` shape. Parse failure → CLEAN.
-  `runConstraintAgent` retained as backward-compatible orchestrator
-  entry point; routes through a `_singleton` instance.
-  `gate-orchestrator.ts` decorator now also forwards
-  `lastToolCallLog` onto the result; `runWithObservability`'s
-  `executionLogs.save` call writes the tool-call log to the
-  agent_execution_logs row.
-- **Part 6 — PER_ROLE_DEFAULTS + agents.yaml**: new
-  `ALL_FILE_TOOLS_WITH_SCRIPT`, `CONSTRAINT_AGENT_TOOLS`,
-  `TEST_RUNNER_AGENT_TOOLS` tool-set constants.
-  `PER_ROLE_DEFAULTS['constraint-agent']` and
-  `['test-runner-agent']` entries added. `code-agent` switched
-  to `ALL_FILE_TOOLS_WITH_SCRIPT`. `agents.yaml` template
-  documents `executeScript` on code-agent + corrects the header
-  comment about constraint-agent / test-runner-agent being
-  LLM-driven now.
-- **Part 7 — trackeros HARNESS.json**: pushed commit `0c95b1b`
-  to `trackeros/main` with the full agentConfig section.
-
-Live verification:
-
-- Correlation `5daaedbf-65dc-4201-908d-a8e87cbc6d3d`. PR #5345
-  on the trackeros remote. Cycle reached `deployed` after 2
-  generate rounds.
-- Constraint-agent: PASSED both rounds with 0 violations. Round
-  1: 3.9 s, 7,161 tokens, 6 tool calls (`searchFiles
-  "console\\.(log|warn|error)"`, `searchFiles
-  "(password|secret|key|connectionString)"`, `executeScript
-  "npm run lint"`, `executeScript "npm run test"`, `searchFiles
-  "new Pool"`, `searchFiles "async"`). The LLM picked
-  project-stack-aware commands (npm + Jest) without any
-  prompting.
-- Review-agent: failed both rounds with 4 false-positive
-  "Import for X cannot be resolved" items. The imports DO
-  resolve correctly to the scaffolded files (verified by
-  checking out the branch on the trackeros remote). Despite
-  these high-severity signals, the cycle still progressed to
-  deploy — the verdict logic appears to weight the
-  constraint-agent's pass when review-agent findings can't be
-  tied to a constraint rule.
-- Code-agent: did NOT use `executeScript` on this cycle. The
-  tool is in its `tools.builtin` per the new
-  `PER_ROLE_DEFAULTS`, but `code-prompt.ts` doesn't yet inline
-  `buildScriptToolInstruction()` — the LLM didn't reach for the
-  tool unprompted. Code-agent's 5 tool calls were file-reads only.
-  Follow-up: add the script-tool instruction to code-prompt.ts.
-
-Decisions made:
-
-- **`spawn('/bin/sh', ['-c', command])` over `execFile`** — the
-  brief's pseudo-code uses shell semantics (pipelines, redirects,
-  variable expansion). Re-implementing a parser would be a waste;
-  `/bin/sh -c` is POSIX-portable, and BLOCKED_PATTERNS is matched
-  on the raw command string BEFORE any spawn, so the shell can't
-  reinterpret a blocked pattern out.
-- **Pre-spawn regex check, not a post-spawn audit log review** —
-  blocking has to happen before the process starts. A blocked
-  command returns a synthetic `ExecuteScriptResult` with the
-  blocklist explanation in stderr; the agent sees a clear
-  "blocked by platform safety rules" signal and can adapt.
-- **Singleton `_singleton = new ConstraintAgent()`** — same
-  pattern the prior TEST_REPORT_005 design used. Keeps the
-  observability decorator (read `lastPrompt` etc.) working
-  through the existing
-  `getConstraintAgentInstance()` accessor.
-- **Took the file `TEST_REPORT_006.md` not `_005.md`** — the
-  brief literally says "Produce TEST_REPORT_005" but
-  `TEST_REPORT_005.md` already exists from the prior session
-  (the scripted-detection + LLM-judgment two-stage design). The
-  new report explicitly notes the naming choice and offers to
-  rename if the user prefers the brief's literal numbering.
-- **Pushed trackeros HARNESS.json directly to `main`** — the
-  user lifted branch protection on the prior session, so direct
-  pushes are again allowed. Confirmed parses with `python3 -c
-  "import json; json.load(open(...))"` before the push.
-- **Did NOT update `code-prompt.ts` with the script tool
-  instruction this session.** The brief says "Each agent that
-  has executeScript in its tool list also gets this instruction
-  appended after the rules section" — that's a clean follow-up
-  for code-agent specifically, but doing it this session would
-  pollute the test by changing two layers at once. Recorded as
-  TEST_REPORT_007's top recommendation.
-
-Pending follow-ups:
-
-- **(HIGH)** Add `buildScriptToolInstruction()` to `code-prompt.ts`
-  so the code-agent visibly knows it has executeScript and uses it
-  to self-verify (e.g. `tsc --noEmit` after code generation).
-  Predicted token cost: ~$0.02 / cycle.
-- **(HIGH)** Apply the same "rules-only HARNESS.json + executeScript"
-  pattern to the review-agent. Today's cycle's 4 false-positive
-  import-resolution items would be closed by a review-agent that
-  runs `tsc --noEmit` itself.
-- **(LOW)** Add `tests/integration/` and `tests/e2e/` to the
-  test-prompt's placement guidance — the test-agent started
-  using `tests/integration/` (visible in this cycle's third
-  test artifact) but the prompt doesn't formally document it.
-- **(LOW)** Live-trigger BLOCKED_PATTERNS. Today's cycle didn't
-  exercise the blocklist. A synthesised test where a custom
-  agent tries `rm -rf /` (or similar) and the agent_execution_logs
-  capture the blocklist-rejection result would be useful end-
-  to-end coverage.
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Docker image rebuilt + container restarted via `docker compose
-up -d --build`. Server `/health` 200 throughout. Trackeros
-`main` updated with the new `agentConfig` section (commit
-`0c95b1b`). Branch protection is OFF on both repos for this
-session.
 
 ---

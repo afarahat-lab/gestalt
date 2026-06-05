@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-05 (after TEST_REPORT_008 — code-agent mandatory pre-emit verification)
+**Last updated:** 2026-06-05 (after TEST_REPORT_009 — incremental tool-call log persistence + code-agent gpt-4o-mini)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -197,28 +197,28 @@ the `sessions/archive/` files (everything older)._
 
 - **constraint-agent + review-agent + code-agent all have
   `executeScript` + HARNESS.json `agentConfig.<role>.rules`
-  rendering** (TEST_REPORT_005/006/007/008). Code-agent's
-  invocation is now MANDATORY per TEST_REPORT_008's
-  prompt-restructure + verificationNote schema field +
-  third HARNESS rule. The behaviour change is visible in
-  the data (round-1 code-agent token usage +32 % vs
-  TEST_REPORT_007; 9+ tool-loop turns per attempt) but
-  rate-limit aborts have been blocking direct evidence in
-  `agent_execution_logs.tool_calls`.
-- **Tool-call persistence is end-of-loop** in
-  `BaseLLMAgent.runToolLoop()` — on a rate-limit / timeout
-  throw the orchestrator loses the in-flight tool-call
-  record. Recommended next: incremental persistence
-  (`this.lastToolCallLog = [...toolCallLog]` at the top of
-  each iteration). 5-line change; unblocks direct
-  TEST_REPORT_008 verification on the next run.
-- **Code-agent rate-limit ceiling.** With executeScript
-  now mandatory the per-cycle token spend on gpt-4o
-  averages 35 k — tight against gpt-4o's 30 k TPM at
-  standard tier. Operator mitigation: switch code-agent's
-  model to `gpt-4o-mini` (per-agent override in
-  agents.yaml), lower `MAX_TOOL_CALLS` from 10 → 5, or
-  bump OpenAI tier.
+  rendering** (TR_005/006/007/008). Code-agent invocation is
+  MANDATORY per TR_008 (prompt block + `verificationNote`
+  schema + HARNESS rule). **TR_009 disproved live invocation
+  on near-empty scaffolds**: code-agent spends its
+  `MAX_TOOL_CALLS=10` budget on directory exploration and
+  never reaches `executeScript`. Prompt restructure +
+  deterministic post-LLM verify needed.
+- **Tool-call persistence is now incremental** in
+  `BaseLLMAgent.runToolLoop()` (TR_009 Fix 1). Mid-loop
+  throws leave full `agent_execution_logs.tool_calls`
+  arrays. Proven by 3× 10-entry arrays in TR_009.
+- **Trackeros code-agent runs on gpt-4o-mini** (TR_009
+  Fix 2, trackeros `9c41633`). Zero rate-limit errors;
+  ~3× cheaper per cycle.
+- **HIGH bug uncovered by TR_009: `MAX_TOOL_CALLS`
+  cap-inside-batch in `runToolLoop`'s inner loop.** When the
+  cap hits mid-batch, the assistant message has N
+  `tool_call_ids` but only M<N `tool` responses → next
+  OpenAI call returns HTTP 400. Was masked by gpt-4o
+  rate-limits in TR_008; gpt-4o-mini's TPM headroom exposes
+  it. Fix: finish the batch before the cap check (option
+  a in TEST_REPORT_009).
 - **Self-healing escape hatch wired (Fix 4) but not yet
   exercised live.** When `attemptNumber > 1` AND current
   signals contain fingerprints not in `priorSignals`,
@@ -227,25 +227,14 @@ the `sessions/archive/` files (everything older)._
   Code path in place; needs `LLM_MODEL=chat-latest` +
   `platform_llms.chat-latest.api_shape='responses'` and a
   test cycle to confirm `max_completion_tokens` flows.
-- **test-agent: untyped `let packageJson;`** (TEST_REPORT_003
-  #2, very low). One-line prompt addendum.
-- **test-agent punts on method coverage** (TEST_REPORT_004,
-  LOW). Test files end with `// Additional tests for X can
-  be added similarly` instead of emitting them. Prompt could
-  pin: "one test file per method named in success criteria."
-- **IntentSpec lacks a `dependencies` block**
-  (TEST_REPORT_004, MEDIUM). Intent-agent doesn't enumerate
-  upstream files the intent reads from; design-agent could
-  verify deps exist on `main` if it did.
-- **code-agent still uses `export default` on
-  connection.ts** (TEST_REPORT_003 Issue #3, project-
-  dependent). trackeros's AGENTS.md doesn't ban default
-  exports; if a project genuinely wants named-only it
-  should restate the rule in its own AGENTS.md.
-- **context-agent has 4 tools configured but never uses
-  them** (TEST_REPORT_002 #4, still outstanding). Drop unused
-  tool config OR extend prompt to read ARCHITECTURE.md /
-  GOLDEN_PRINCIPLES.md.
+- **Older test-report follow-ups** (all LOW unless noted):
+  test-agent untyped `let packageJson;` (TR_003 #2);
+  test-agent punts on method coverage with
+  "// Additional tests can be added similarly" (TR_004);
+  IntentSpec lacks a `dependencies` block (TR_004, MEDIUM);
+  code-agent default export on connection.ts (TR_003 #3,
+  project-dependent); context-agent has 4 tools but never
+  uses them (TR_002 #4). Full detail in `TEST_REPORT_*.md`.
 - **Dashboard bundle is 1010 KB raw / 319 KB gzipped** after the
   CodeMirror addition (2026-06-04). Above Vite's 500 KB warning.
   Future code-split via dynamic `import()` would restore the

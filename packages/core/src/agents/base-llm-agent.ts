@@ -442,6 +442,13 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
           calledAt: new Date(),
           toolSource,
         });
+        // TEST_REPORT_009 Fix 1 — incremental persistence. If the
+        // next `completeWithTools` call throws (e.g. rate-limit),
+        // the orchestrator can still read every tool call that
+        // completed before the throw via `lastToolCallLog`. Without
+        // this, the final assignment below was the only writer and
+        // a mid-loop throw left the field empty.
+        this.lastToolCallLog = toolCallLog.slice();
       }
 
       if (totalToolCalls >= MAX_TOOL_CALLS) {
