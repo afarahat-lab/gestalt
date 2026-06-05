@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-05 (after TEST_REPORT_007 — review-agent + code-agent gain executeScript)
+**Last updated:** 2026-06-05 (after TEST_REPORT_008 — code-agent mandatory pre-emit verification)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -197,18 +197,28 @@ the `sessions/archive/` files (everything older)._
 
 - **constraint-agent + review-agent + code-agent all have
   `executeScript` + HARNESS.json `agentConfig.<role>.rules`
-  rendering** (TEST_REPORT_005/006/007). The Leave module
-  intent deploys cleanly on a single round at ≈$0.27 USD.
-  Constraint-agent verifies via `npm run lint` + targeted
-  searchFiles. Review-agent's prompt has Verification
-  guidance ("before flagging X, run command Y") — wired
-  but the LLM tends to follow the advisory tone and not
-  actually invoke executeScript yet. Code-agent has the
-  prompt section but doesn't reach for the tool either.
-  Recommended next: convert code-prompt's script section
-  from advisory to mandatory ("before returning the JSON,
-  you MUST executeScript a compile command and fix any
-  errors").
+  rendering** (TEST_REPORT_005/006/007/008). Code-agent's
+  invocation is now MANDATORY per TEST_REPORT_008's
+  prompt-restructure + verificationNote schema field +
+  third HARNESS rule. The behaviour change is visible in
+  the data (round-1 code-agent token usage +32 % vs
+  TEST_REPORT_007; 9+ tool-loop turns per attempt) but
+  rate-limit aborts have been blocking direct evidence in
+  `agent_execution_logs.tool_calls`.
+- **Tool-call persistence is end-of-loop** in
+  `BaseLLMAgent.runToolLoop()` — on a rate-limit / timeout
+  throw the orchestrator loses the in-flight tool-call
+  record. Recommended next: incremental persistence
+  (`this.lastToolCallLog = [...toolCallLog]` at the top of
+  each iteration). 5-line change; unblocks direct
+  TEST_REPORT_008 verification on the next run.
+- **Code-agent rate-limit ceiling.** With executeScript
+  now mandatory the per-cycle token spend on gpt-4o
+  averages 35 k — tight against gpt-4o's 30 k TPM at
+  standard tier. Operator mitigation: switch code-agent's
+  model to `gpt-4o-mini` (per-agent override in
+  agents.yaml), lower `MAX_TOOL_CALLS` from 10 → 5, or
+  bump OpenAI tier.
 - **Self-healing escape hatch wired (Fix 4) but not yet
   exercised live.** When `attemptNumber > 1` AND current
   signals contain fingerprints not in `priorSignals`,

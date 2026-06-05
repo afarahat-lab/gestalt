@@ -339,16 +339,20 @@ export function buildCodePrompt(
     attempt > 0
       ? `\n\nIMPORTANT: Retry attempt ${attempt}. Return pure JSON only — no commentary, no markdown fences.`
       : '';
+  // TEST_REPORT_008 Fix 1 — restructured. The JSON-return instruction
+  // is now LAST in the prompt; the new `## Mandatory pre-emit
+  // verification` block sits immediately above it. Code rules + file
+  // organisation rules move up so the LLM reads them first, then
+  // commits to the verification step, then commits to the JSON
+  // schema. Putting verification + schema together at the end
+  // converts "you have a tool" (TEST_REPORT_007 advisory tone) into
+  // "you MUST call it before emitting" (mandatory).
   const taskSection =
     `## Generate code now\n\n` +
     `Generate the TypeScript code files needed to implement the intent above. ` +
     `Follow the architecture, respect all constraints, implement the design ` +
     `spec faithfully, and stay within the Scope section's rules — include ` +
     `ONLY files within the scope defined above.${retryHint}\n\n` +
-    `Return a JSON object with this structure:\n\n` +
-    '```json\n' +
-    `{\n  "files": [\n    { "path": "src/...", "content": "..." }\n  ]\n}\n` +
-    '```\n\n' +
     `File organisation rules:\n` +
     `- src/modules/<domain>/domain/<entity>.ts — entity types and interfaces\n` +
     `- src/modules/<domain>/repository/<entity>-repository.ts — data access\n` +
@@ -360,7 +364,39 @@ export function buildCodePrompt(
     `- Named exports only — no default exports except React components\n` +
     `- All repository methods parameterised — no string concatenation in SQL\n` +
     `- Every exported function has a JSDoc comment\n` +
-    `- Error handling: return typed Result<T,E> or throw with structured context`;
+    `- Error handling: return typed Result<T,E> or throw with structured context\n\n` +
+    `## Mandatory pre-emit verification\n\n` +
+    `Before returning the final files JSON you MUST:\n\n` +
+    `1. Call \`executeScript\` with the appropriate compile/lint command ` +
+    `for this project's stack. Use your knowledge of the stack to pick:\n` +
+    `   - TypeScript / Node: \`tsc --noEmit\` (or \`npx tsc --noEmit\`)\n` +
+    `   - Python: \`python -m mypy src\` or \`python -m py_compile <files>\`\n` +
+    `   - Go: \`go build ./...\`\n` +
+    `   - Rust: \`cargo check\`\n` +
+    `   - Java: \`mvn compile\` or the project's gradle equivalent\n` +
+    `   You can also run \`npm run lint\` / \`npm run typecheck\` / project-specific scripts.\n\n` +
+    `2. If the command reports errors: **fix the errors in your ` +
+    `generated files and call \`executeScript\` again.** Iterate until ` +
+    `the command exits with code 0 OR you've made two attempts.\n\n` +
+    `3. Only return the files JSON when the verification command ` +
+    `exits with code 0. **If you cannot get it to exit 0 after two ` +
+    `attempts, return the best version you have AND include a ` +
+    `\`verificationNote\` field** in your JSON describing what failed ` +
+    `and what you tried. The downstream gate will see the note and ` +
+    `route appropriately.\n\n` +
+    `This is not optional. A finding from the gate that "you didn't ` +
+    `compile-check before emitting" is a strict failure mode the ` +
+    `platform now enforces.\n\n` +
+    `## Return format\n\n` +
+    `Return ONLY valid JSON — no preamble, no markdown fences:\n\n` +
+    '```json\n' +
+    `{\n` +
+    `  "files": [\n` +
+    `    { "path": "src/...", "content": "..." }\n` +
+    `  ],\n` +
+    `  "verificationNote": "optional — only include if verification did not pass. Describe what failed."\n` +
+    `}\n` +
+    '```';
 
   // TEST_REPORT_007 Fix 2 — render `agentConfig['code-agent'].rules`
   // from HARNESS.json + the `executeScript` direction. Placed

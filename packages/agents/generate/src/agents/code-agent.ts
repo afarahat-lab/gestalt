@@ -9,7 +9,7 @@
  * are about quality failure (lint, test, constraint).
  */
 
-import type { AgentTask, AgentResult, GeneratedArtifact } from '../types';
+import type { AgentTask, AgentResult, GeneratedArtifact, FeedbackSignal } from '../types';
 import { buildCodePrompt } from '../prompts/code-prompt';
 import { applyAgentConfig } from '../prompts/agent-config-helpers';
 import { BaseLLMAgent } from './base-llm-agent';
@@ -49,14 +49,37 @@ export class CodeAgent extends BaseLLMAgent {
         const raw = useTools
           ? (await this.callLLMWithTools(prompt, agentConfig, projectRoot, task.correlationId, task.mcpClients)).response
           : await this.callLLM(prompt, agentConfig, task.correlationId);
-        const codeFiles = parseCodeFiles(raw, task.correlationId);
-        if (codeFiles.length === 0) throw new Error('LLM returned no code files');
+        const parseResult = parseCodeResponse(raw, task.correlationId);
+        if (parseResult.files.length === 0) throw new Error('LLM returned no code files');
+
+        // TEST_REPORT_008 Fix 2 — emit a LINT_FAILURE signal when the
+        // LLM explicitly tells us the pre-emit verification didn't
+        // pass. Low severity because the gate's own constraint /
+        // review agents will still get a pass at the artifact. The
+        // signal exists so the gate has a heads-up that the
+        // generated code may not compile cleanly — useful for the
+        // feedback-router's signal-to-agent mapping (TEST_REPORT_005
+        // Fix 4 honours `priorSignals` on retry, so a downstream
+        // retry will see the verification failure as context).
+        const signals: FeedbackSignal[] = [];
+        if (parseResult.verificationNote) {
+          signals.push({
+            id: crypto.randomUUID(),
+            correlationId: task.correlationId,
+            type: 'LINT_FAILURE',
+            severity: 'low',
+            sourceAgent: 'code-agent',
+            message: `Code-agent pre-emit verification did not pass: ${parseResult.verificationNote}`,
+            autoResolvable: true,
+            createdAt: new Date(),
+          });
+        }
 
         return {
           agentRole: 'code-agent',
           status: 'completed',
-          artifacts: codeFiles,
-          signals: [],
+          artifacts: parseResult.files,
+          signals,
           tokensUsed: 0,
           durationMs: Date.now() - startedAt,
         };
@@ -89,9 +112,24 @@ export class CodeAgent extends BaseLLMAgent {
   }
 }
 
-function parseCodeFiles(raw: string, correlationId: string): GeneratedArtifact[] {
-  const parsed = JSON.parse(extractJsonObject(raw)) as { files?: Array<{ path: string; content: string }> };
-  return (parsed.files ?? []).map((f) => ({
+/**
+ * TEST_REPORT_008 Fix 2 — extended parse result. `verificationNote`
+ * is optional; the code-agent's prompt asks the LLM to include it
+ * ONLY when the pre-emit `executeScript` verification didn't pass
+ * after two attempts. Present → the orchestrator emits a low-
+ * severity `LINT_FAILURE` signal so the gate sees the warning.
+ */
+interface CodeAgentParseResult {
+  files: GeneratedArtifact[];
+  verificationNote?: string;
+}
+
+function parseCodeResponse(raw: string, correlationId: string): CodeAgentParseResult {
+  const parsed = JSON.parse(extractJsonObject(raw)) as {
+    files?: Array<{ path: string; content: string }>;
+    verificationNote?: unknown;
+  };
+  const files = (parsed.files ?? []).map((f) => ({
     id: crypto.randomUUID(),
     correlationId,
     type: 'code' as const,
@@ -100,4 +138,9 @@ function parseCodeFiles(raw: string, correlationId: string): GeneratedArtifact[]
     producedBy: 'code-agent' as const,
     createdAt: new Date(),
   }));
+  const verificationNote =
+    typeof parsed.verificationNote === 'string' && parsed.verificationNote.trim().length > 0
+      ? parsed.verificationNote.trim()
+      : undefined;
+  return verificationNote ? { files, verificationNote } : { files };
 }
