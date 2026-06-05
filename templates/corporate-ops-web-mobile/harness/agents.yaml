@@ -120,16 +120,18 @@ agents:
   # ── Gate layer (Amendment 2026-06: tools enabled by default) ──
   review-agent:
     role: "Senior engineer and code reviewer"
-    goal: "Assess generated code quality and architectural correctness"
+    goal: "Assess generated code quality and architectural correctness — verify findings with executeScript before flagging"
     llm:
       model: ~
       temperature: 0.1
       max_tokens: 4000
     tools:
-      # Narrower than code-agent — review-agent operates primarily
-      # off the artifact set already in its prompt; the tools are for
-      # spot-checking referenced files before flagging issues.
-      builtin: [readFile, searchFiles]
+      # TEST_REPORT_007 — gains executeScript so it can `tsc --noEmit`
+      # to verify import resolution before flagging "Import cannot be
+      # resolved" findings. searchFiles + readFile are the legacy
+      # spot-check toolset. Same hard blocklist as code-agent (no rm
+      # -rf / no git push / no sudo / no curl|bash / etc.) applies.
+      builtin: [executeScript, readFile, searchFiles]
     prompt_extensions: []
 
   # ── Maintenance layer (Amendment 2026-06: tools enabled) ──────

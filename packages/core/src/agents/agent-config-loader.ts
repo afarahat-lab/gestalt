@@ -71,12 +71,16 @@ const TEST_RUNNER_AGENT_TOOLS: AgentToolConfig = {
   builtin: ['executeScript', 'readFile'],
 };
 
-/** review-agent + context-fixer get a narrower subset because they
- *  work primarily off the artifact set in the LLM message — they
- *  use `readFile` for spot-checks but don't need to enumerate the
- *  tree. */
-const READ_ONLY_TOOLS: AgentToolConfig = {
-  builtin: ['readFile', 'searchFiles'],
+/**
+ * TEST_REPORT_007 Fix 1 — review-agent now ALSO gets executeScript so
+ * it can run `tsc --noEmit` to verify import resolution before
+ * flagging "Import cannot be resolved" findings. The cycle's
+ * cloned tree under `/tmp/gestalt-gate-<corr>-<rand>/` has
+ * `node_modules/` installed by the orchestrator, so the compiler
+ * sees the same view the deployed branch will.
+ */
+const REVIEW_AGENT_TOOLS: AgentToolConfig = {
+  builtin: ['executeScript', 'readFile', 'searchFiles'],
 };
 
 /** context-fixer's pared-down set — just enough to verify the
@@ -158,10 +162,12 @@ export const PER_ROLE_DEFAULTS: Record<string, AgentConfig> = {
   },
   'review-agent': {
     role: 'Senior engineer and code reviewer',
-    goal: 'Assess generated code quality and architectural correctness',
+    goal: 'Assess generated code quality and architectural correctness — verify findings with executeScript before flagging',
     llm: { temperature: 0.1, maxTokens: 4000 },
     promptExtensions: [],
-    tools: { ...READ_ONLY_TOOLS },
+    // TEST_REPORT_007 Fix 1 — gains `executeScript`. See
+    // `REVIEW_AGENT_TOOLS` doc-comment.
+    tools: { ...REVIEW_AGENT_TOOLS },
   },
   // ─── Maintenance layer (Amendment 2026-06: tools enabled) ─────
   'drift-agent': {

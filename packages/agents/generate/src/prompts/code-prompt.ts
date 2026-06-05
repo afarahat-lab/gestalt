@@ -30,6 +30,7 @@
 import type { ContextSnapshot, FeedbackSignal } from '../types';
 import { applyAgentConfig } from './agent-config-helpers';
 import { buildSignalFeedback } from './signal-formatter';
+import { renderHarnessAgentRules, renderScriptToolInstruction } from '@gestalt/core';
 
 const ARCHITECTURE_TRUNCATE_CHARS = 2000;
 const DOMAIN_TRUNCATE_CHARS = 2000;
@@ -361,20 +362,36 @@ export function buildCodePrompt(
     `- Every exported function has a JSDoc comment\n` +
     `- Error handling: return typed Result<T,E> or throw with structured context`;
 
+  // TEST_REPORT_007 Fix 2 — render `agentConfig['code-agent'].rules`
+  // from HARNESS.json + the `executeScript` direction. Placed
+  // right after the architecture section so the LLM reads "these
+  // are the rules; here's a tool to verify them" before any of
+  // the more specific scope / constraint / intent sections. The
+  // tool is already in the code-agent's `tools.builtin` per
+  // PER_ROLE_DEFAULTS — until this prompt section, the LLM didn't
+  // know to reach for it (TEST_REPORT_006 §code-agent).
+  //
+  // `ctx.harness` is the parsed HarnessConfig the orchestrator
+  // already attaches to the snapshot via `assembleContext`.
+  const harnessAgentRulesSection = renderHarnessAgentRules('code-agent', ctx.harness);
+  const scriptToolSection = renderScriptToolInstruction();
+
   const body = [
-    toolsSection,              // ← NEW (ADR-038) — top of prompt when tools configured
+    toolsSection,                  // ← NEW (ADR-038) — top of prompt when tools configured
     architectureSection,
+    harnessAgentRulesSection,      // ← NEW (TEST_REPORT_007 Fix 2) — HARNESS.json code-agent.rules
+    scriptToolSection,             // ← NEW (TEST_REPORT_007 Fix 2) — executeScript direction
     scopeSection,
     constraintsSection,
     designSection,
     intentSection,
     principlesSection,
     domainSection,
-    agentsConventionsSection,  // ← NEW (TEST_REPORT_002 Fix 7) — AGENTS.md
-    depsTypingSection,         // ← NEW (TEST_REPORT_002 Fix 4) — @types/* coverage
-    typeImportSection,         // ← NEW (TEST_REPORT_004 Fix 1) — `import type` for db drivers
+    agentsConventionsSection,      // ← NEW (TEST_REPORT_002 Fix 7) — AGENTS.md
+    depsTypingSection,             // ← NEW (TEST_REPORT_002 Fix 4) — @types/* coverage
+    typeImportSection,             // ← NEW (TEST_REPORT_004 Fix 1) — `import type` for db drivers
     signalsSection,
-    resumeSection,             // ← NEW (migration 020) — self-healing / operator-feedback resume
+    resumeSection,                 // ← NEW (migration 020) — self-healing / operator-feedback resume
     taskSection,
   ]
     .filter(Boolean)

@@ -99,6 +99,50 @@ const MAX_TOOL_CALLS = 10;
  *  LLM via the live loop. */
 const TOOL_OUTPUT_LOG_TRUNCATE = 500;
 
+/**
+ * TEST_REPORT_005 / TEST_REPORT_007 evolution — render the per-agent
+ * rules section from `HARNESS.json.agentConfig[role].rules` as a
+ * plain-text markdown block.
+ *
+ * Standalone (not on the class) because function-based prompt
+ * builders (`code-prompt.ts`, etc.) need to call it without a
+ * `this` context. The class wrapper `buildHarnessAgentSection`
+ * delegates here.
+ *
+ * Returns the empty string when the project hasn't declared rules
+ * for the given role — callers concatenate unconditionally.
+ */
+export function renderHarnessAgentRules(
+  agentRole: string,
+  harnessConfig: { agentConfig?: Record<string, { rules?: string[] }> } | null | undefined,
+): string {
+  const cfg = harnessConfig?.agentConfig?.[agentRole];
+  if (!cfg?.rules || cfg.rules.length === 0) return '';
+  return [
+    '## Rules you must enforce (from HARNESS.json)',
+    '',
+    ...cfg.rules.map((r) => `- ${r}`),
+    '',
+  ].join('\n');
+}
+
+/**
+ * TEST_REPORT_005 / TEST_REPORT_007 evolution — one-sentence
+ * direction telling an LLM agent that it has `executeScript` and
+ * should decide which commands fit the project's stack. Same text
+ * for every agent.
+ */
+export function renderScriptToolInstruction(): string {
+  return [
+    '## Script execution',
+    'You have access to the `executeScript` tool.',
+    "Use it to verify the rules above by running whatever commands",
+    "are appropriate for this project's language and stack. Decide",
+    'what to run — do not wait to be told.',
+    '',
+  ].join('\n');
+}
+
 export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
   protected readonly agentRole: AgentRole;
 
@@ -418,45 +462,27 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
   }
 
   /**
-   * TEST_REPORT_005 evolution — render the per-agent rules section
-   * for this agent role from `HARNESS.json.agentConfig`. Returns an
-   * empty string when the project hasn't declared rules for this
-   * role; subclasses concat the result unconditionally so the
-   * prompt is well-formed either way.
-   *
-   * Rules are plain English. The agent is expected to use its
-   * available tools (`executeScript` + the read-only file tools)
-   * to verify each rule.
+   * TEST_REPORT_005 evolution — class wrapper for the standalone
+   * `renderHarnessAgentRules` function. Subclasses call
+   * `this.buildHarnessAgentSection(harnessConfig)`. Function-based
+   * prompt builders (`code-prompt.ts`, etc.) call
+   * `renderHarnessAgentRules(roleName, harnessConfig)` directly.
    */
   protected buildHarnessAgentSection(
     harnessConfig: { agentConfig?: Record<string, { rules?: string[] }> } | null | undefined,
   ): string {
-    const cfg = harnessConfig?.agentConfig?.[this.agentRole];
-    if (!cfg?.rules || cfg.rules.length === 0) return '';
-    return [
-      '## Rules you must enforce (from HARNESS.json)',
-      '',
-      ...cfg.rules.map((r) => `- ${r}`),
-      '',
-    ].join('\n');
+    return renderHarnessAgentRules(this.agentRole, harnessConfig);
   }
 
   /**
-   * TEST_REPORT_005 evolution — one-sentence direction for agents
-   * that have `executeScript` available. The brief is intentionally
-   * terse: the LLM decides which commands fit the project's
-   * language + stack. No hardcoded commands anywhere in the
-   * platform or HARNESS.json.
+   * TEST_REPORT_005 evolution — class wrapper for
+   * `renderScriptToolInstruction()`. The text is identical for
+   * every agent; the wrapper exists so subclasses can chain
+   * `this.buildScriptToolInstruction()` next to
+   * `this.buildHarnessAgentSection(...)`.
    */
   protected buildScriptToolInstruction(): string {
-    return [
-      '## Script execution',
-      'You have access to the `executeScript` tool.',
-      "Use it to verify the rules above by running whatever commands",
-      "are appropriate for this project's language and stack. Decide",
-      'what to run — do not wait to be told.',
-      '',
-    ].join('\n');
+    return renderScriptToolInstruction();
   }
 
   /**

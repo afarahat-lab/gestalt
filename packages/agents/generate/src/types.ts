@@ -144,6 +144,14 @@ export interface HarnessConfig {
     rules: ConstraintRule[];
   };
   /**
+   * Per-agent rules section (TEST_REPORT_005 / TEST_REPORT_007 — the
+   * executeScript evolution). Mirrors `HarnessConfig.agentConfig` in
+   * `@gestalt/core`. Plain-English rules; the LLM agents decide which
+   * commands to run via `executeScript` to verify them. Read by the
+   * code-prompt's `renderHarnessAgentRules('code-agent', …)` call.
+   */
+  agentConfig?: Record<string, { rules?: string[] }>;
+  /**
    * Project-level MCP server credentials (ADR-039). Mirrors
    * `HarnessConfig.mcp` in `@gestalt/core`. Read by the MCP token
    * resolver when an agent's `tools.mcp[].token_from` is `'harness'`.

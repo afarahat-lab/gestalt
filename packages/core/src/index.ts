@@ -34,7 +34,11 @@ export type { McpServerConfig } from './tools/mcp-resolver';
 // Agent base + configuration + orchestrator base (Amendment 2026-06
 // — moved to core from agents-generate so every layer shares one
 // implementation).
-export { BaseLLMAgent } from './agents/base-llm-agent';
+export {
+  BaseLLMAgent,
+  renderHarnessAgentRules,
+  renderScriptToolInstruction,
+} from './agents/base-llm-agent';
 export {
   SelfHealingAgent,
 } from './agents/self-healing-agent';

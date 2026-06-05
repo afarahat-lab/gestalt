@@ -28,7 +28,13 @@ import { readFile } from 'fs/promises';
 import { join } from 'path';
 import type { ArtifactRef, GateAgentResult, GateSignal, GateTask } from '../types';
 import type { Artifact, ConstraintRule, SignalSeverity } from '@gestalt/core';
-import { loadAgentConfig, BaseLLMAgent, extractJsonObject } from '@gestalt/core';
+import {
+  loadAgentConfig,
+  BaseLLMAgent,
+  extractJsonObject,
+  renderHarnessAgentRules,
+  renderScriptToolInstruction,
+} from '@gestalt/core';
 import type { AgentConfig } from '@gestalt/core';
 import type { AgentResult } from '@gestalt/agents-generate';
 
@@ -126,6 +132,14 @@ export class ReviewAgent extends BaseLLMAgent {
     // review-agent only saw the artifact set.
     const projectStateFiles = await loadProjectStateFiles(task.harnessConfig.projectRoot);
 
+    // TEST_REPORT_007 Fix 1 — load the full HARNESS.json so the
+    // review-agent can render the same `agentConfig['review-agent'].rules`
+    // section the constraint-agent renders for its own role. The
+    // rules + the `executeScript` direction + a "verify before
+    // flagging" guidance block sit ABOVE the golden-principles
+    // section so they take precedence in the LLM's reading order.
+    const fullHarness = await loadFullHarness(task.harnessConfig.projectRoot);
+
     const prompt = buildReviewPrompt(
       codeArtifacts,
       task.harnessConfig.goldenPrinciples,
@@ -135,6 +149,7 @@ export class ReviewAgent extends BaseLLMAgent {
       task.harnessConfig.stack?.testFramework,
       intentSpecOutOfScope,
       projectStateFiles,
+      fullHarness,
     );
 
     let review: LLMReview;
@@ -292,6 +307,24 @@ async function loadProjectStateFiles(
   return files;
 }
 
+/**
+ * TEST_REPORT_007 Fix 1 — read the full HARNESS.json so the
+ * review-agent can render its own `agentConfig['review-agent'].rules`
+ * section via the shared `renderHarnessAgentRules` helper. Returns
+ * null on any read/parse failure; the rules-rendering helper then
+ * emits the empty string and the prompt remains well-formed.
+ */
+async function loadFullHarness(
+  projectRoot: string,
+): Promise<{ agentConfig?: Record<string, { rules?: string[] }> } | null> {
+  try {
+    const raw = await readFile(join(projectRoot, 'HARNESS.json'), 'utf8');
+    return JSON.parse(raw) as { agentConfig?: Record<string, { rules?: string[] }> };
+  } catch {
+    return null;
+  }
+}
+
 function buildReviewPrompt(
   artifacts: ArtifactRef[],
   goldenPrinciples: string[],
@@ -301,6 +334,7 @@ function buildReviewPrompt(
   testFramework?: string,
   intentSpecOutOfScope?: string[],
   projectStateFiles?: Record<string, string>,
+  fullHarness?: { agentConfig?: Record<string, { rules?: string[] }> } | null,
 ): string {
   let used = 0;
   const files: string[] = [];
@@ -316,6 +350,39 @@ function buildReviewPrompt(
   const persona =
     `You are ${agentConfig.role} working on the Gestalt platform.\n` +
     `Your goal: ${agentConfig.goal}\n`;
+
+  // TEST_REPORT_007 Fix 1 — render the review-agent's own rules from
+  // HARNESS.json's `agentConfig['review-agent'].rules`, the
+  // `executeScript` direction, and an explicit "verify before
+  // flagging" guidance block. These sit at the TOP of the prompt
+  // body (right after persona) so they take precedence over the
+  // golden-principles and cross-artifact checks below.
+  //
+  // The verification guidance is the targeted fix from
+  // TEST_REPORT_006: the review-agent was flagging "Import cannot
+  // be resolved" findings without actually running tsc to verify.
+  // Telling it to verify before flagging — and naming the specific
+  // commands for the three common cases — reduces that class of
+  // false positive.
+  const harnessRulesSection = renderHarnessAgentRules('review-agent', fullHarness ?? null);
+  const scriptInstruction = renderScriptToolInstruction();
+  const verificationGuidance =
+    `## Verification guidance\n\n` +
+    `Before flagging any finding, verify it with a tool call when ` +
+    `possible:\n\n` +
+    `- "Import cannot be resolved" → run \`tsc --noEmit\` and check ` +
+    `the output. The cycle's branch has \`node_modules/\` installed; ` +
+    `the import IS reachable to the compiler at this point.\n` +
+    `- "Missing dependency" → \`readFile\` package.json (also visible ` +
+    `in the Project state section below) before flagging.\n` +
+    `- "Test framework mismatch" → run \`grep\` via \`searchFiles\` ` +
+    `to confirm the import line actually appears, then verify the ` +
+    `test framework via the project's package.json.\n` +
+    `- "Missing audit / RBAC / input validation" → check the ` +
+    `IntentSpec's outOfScope first; if the layer is excluded, skip.\n\n` +
+    `Do NOT flag a finding based on inference alone when a script ` +
+    `can verify it. A finding that turns out to be false-positive ` +
+    `wastes a retry round and burns the operator's trust.\n`;
 
   // Project constraint rules from HARNESS.json — checked verbatim by
   // the constraint-agent after generation; flagging them here lets
@@ -483,7 +550,7 @@ You are reviewing code generated by upstream agents. Your job is to
 identify concerns the generate layer missed. Be specific and concrete —
 no generic advice. Only flag concerns that are actually present in the
 code below.
-${outOfScopeSection}${projectStateSection}${scaffoldingSection}${constraintsSection}${principlesSection}${consistencySection}
+${harnessRulesSection}${scriptInstruction}${verificationGuidance}${outOfScopeSection}${projectStateSection}${scaffoldingSection}${constraintsSection}${principlesSection}${consistencySection}
 ## Files under review
 
 ${files.join('\n\n')}

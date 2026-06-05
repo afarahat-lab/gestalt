@@ -73,8 +73,10 @@
     },
     "review-agent": {
       "rules": [
-        "Only flag violations for layers and concerns included in the intent scope.",
-        "Do not flag items as missing if they already exist in the project's main branch."
+        "Only flag violations for layers explicitly in scope for this intent.",
+        "Do not flag items as missing if they already exist on the project's main branch.",
+        "Verify import resolution by running tsc --noEmit before flagging unresolved imports.",
+        "Do not flag golden principle violations for concerns excluded by IntentSpec.outOfScope."
       ]
     }
   },

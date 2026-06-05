@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-05 (after TEST_REPORT_006 — executeScript evolution)
+**Last updated:** 2026-06-05 (after TEST_REPORT_007 — review-agent + code-agent gain executeScript)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -195,30 +195,20 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
-- **constraint-agent: pure LLM with `executeScript`**
-  (TEST_REPORT_006, REPLACES TEST_REPORT_005's two-stage
-  flow). Reads plain-English rules from
-  `HARNESS.json.agentConfig['constraint-agent'].rules` and
-  uses `executeScript` / `readFile` / `searchFiles` to
-  verify each rule. Live-verified — the LLM picked
-  `npm run lint`, `npm run test`, and `searchFiles "new
-  Pool"` (instantiation, not the type import) without any
-  platform-side carve-out. 0 violations on the Leave
-  module cycle; reached `deployed`.
-- **review-agent still over-fires** (carried from
-  TEST_REPORT_005). Today's TEST_REPORT_006 cycle had 4
-  false-positive "Import for X cannot be resolved" items
-  from review-agent on imports that DO resolve. The cycle
-  still progressed to deploy. Recommended: apply the
-  rules-only + executeScript pattern to review-agent
-  too. A review-agent that runs `tsc --noEmit` itself would
-  close this class.
-- **code-agent has executeScript but doesn't use it yet.**
-  `PER_ROLE_DEFAULTS` grants the tool but `code-prompt.ts`
-  doesn't yet inline `buildScriptToolInstruction()`. The
-  LLM didn't reach for the tool unprompted on the live
-  cycle. One-section prompt addition would unlock
-  self-verifying code generation.
+- **constraint-agent + review-agent + code-agent all have
+  `executeScript` + HARNESS.json `agentConfig.<role>.rules`
+  rendering** (TEST_REPORT_005/006/007). The Leave module
+  intent deploys cleanly on a single round at ≈$0.27 USD.
+  Constraint-agent verifies via `npm run lint` + targeted
+  searchFiles. Review-agent's prompt has Verification
+  guidance ("before flagging X, run command Y") — wired
+  but the LLM tends to follow the advisory tone and not
+  actually invoke executeScript yet. Code-agent has the
+  prompt section but doesn't reach for the tool either.
+  Recommended next: convert code-prompt's script section
+  from advisory to mandatory ("before returning the JSON,
+  you MUST executeScript a compile command and fix any
+  errors").
 - **Self-healing escape hatch wired (Fix 4) but not yet
   exercised live.** When `attemptNumber > 1` AND current
   signals contain fingerprints not in `priorSignals`,
