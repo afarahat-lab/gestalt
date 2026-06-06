@@ -82,6 +82,26 @@ None blocking the build. Areas to keep in mind:
   access against code that correctly delegates to
   `LeaveRepository`. No `pool.query` in service. Critical
   driver for the review-agent fix below.
+- **TR_015 Approach A — explicit repository-pattern rule
+  wording applied** (no platform code change). trackeros
+  HARNESS.json (commit `ce0c01e` on `main`) and the
+  `corporate-ops-web-mobile` template (version `0.3.1` →
+  `0.4.0`) carry the new wording. Server boot log confirms
+  template refresh: *"Refreshed built-in template (version
+  bump) — previousVersion 0.3.1, version 0.4.0"*. Live
+  verification: gpt-4o-mini reads the rule (title prefix in
+  26/28 signals) but emits findings that directly
+  contradict the rule body. The categorical confusion is
+  isolated to the LLM-reasoning layer.
+- **HIGHEST follow-up — TR_015:** Switch gate-agent model
+  to gpt-4o via trackeros `agents.yaml` per-agent override.
+- **HIGH follow-up — TR_015:** Deterministic post-LLM
+  filter for the specific
+  pool.query-in-*.repository.ts-flagged-as-violation case
+  (re-promoted from TR_012).
+- **MEDIUM follow-up — TR_015:** Restore the TR_010
+  mandatory executeScript code-agent rule (TR_015's
+  trackeros HARNESS.json dropped it per the brief).
 - **TR_014 Aider as a swappable code-generation backend.**
   Per-project opt-in via
   `HARNESS.json.codeGeneration.backend: 'aider' | 'gestalt'`

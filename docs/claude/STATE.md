@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-06 (after TEST_REPORT_014 — Aider shipped as a swappable code-generation backend; trackeros opted in; code-agent wall-clock drops 10–80× per round; same gate-side hallucination as TR_013 — proves the failure mode is backend-independent)
+**Last updated:** 2026-06-06 (after TEST_REPORT_015 — Approach A applied to trackeros + template v0.4.0; rule wording is correct but gpt-4o-mini READS the rule then REASONS the opposite — categorical confusion isolated to the LLM-reasoning layer; gate-agent model swap promoted to HIGHEST follow-up)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -195,6 +195,39 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
+- **TR_015 Approach A — explicit repository-pattern rule
+  wording applied.** trackeros HARNESS.json (commit
+  `ce0c01e` on `main`) and the
+  `corporate-ops-web-mobile` template (version bumped
+  `0.3.1` → `0.4.0`; refresh confirmed in server boot log)
+  both carry the new constraint-agent + review-agent rules
+  with explicit positive AND negative examples and
+  file-name patterns. Aider produced the cleanest
+  `leave.service.ts` of any cycle (proper DI). But
+  gpt-4o-mini READS the rule (its title prefix appears in
+  26/28 constraint-agent signals) and REASONS the opposite
+  (15 signals explicitly assert "pool.query in a
+  repository file is not allowed" — direct contradiction of
+  the rule's body). Cycle terminated via TR_012 Fix 3 loop
+  detector at 74% repeat rate. ~$0.087 USD.
+- **(HIGHEST follow-up — TR_015 promotes from LOW)** Switch
+  gate-agent model gpt-4o-mini → gpt-4o. Five cycles
+  (TR_011/012/013/014/015) of reading-rules-then-emitting-
+  the-opposite are sufficient evidence. Configure in
+  trackeros `agents.yaml` per-agent override: `constraint-
+  agent: { llm: { model: gpt-4o } }`, `review-agent: { llm:
+  { model: gpt-4o } }`. No platform code change needed.
+- **(HIGH follow-up — re-promoted from TR_012 by TR_015)**
+  Deterministic post-LLM filter for "pool.query in
+  *.repository.ts flagged as violation". TR_013 evidence
+  requirement gives the parser `location.file` +
+  `quotedLine` — one-line exemption catches this category.
+  Approach A alone is insufficient; this is the structural
+  belt to the gpt-4o braces.
+- **(MEDIUM follow-up — new from TR_015)** Restore the
+  TR_010 mandatory executeScript code-agent rule. The brief
+  dropped it; Aider's test file regressed the
+  `beforeEach`-import miss as a result.
 - **TR_014 Aider as a swappable code-generation backend landed.**
   New `packages/agents/generate/src/adapters/aider-adapter.ts`
   + `aider-message-builder.ts` + `agents/aider-code-agent.ts`.
@@ -380,7 +413,8 @@ the `sessions/archive/` files (everything older)._
   `7afa0886-…`, TR_011's `failed` for `11a08e08-…`, TR_012's
   `gate-max-retries` for `aac73745-…`, TR_013's
   `generate-error` for `59900af8-…`, TR_014's
-  `gate-max-retries` for `3a114a1d-…`. All dismissable with
+  `gate-max-retries` for `3a114a1d-…`, TR_015's
+  `gate-max-retries` for `d7d9f66f-…`. All dismissable with
   `gestalt alerts dismiss`.
 - **`.env`**: `LLM_MODEL=gpt-4o` (operator default). For
   `chat-latest` routing through the registry's responses
