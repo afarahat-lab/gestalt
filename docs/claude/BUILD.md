@@ -82,22 +82,38 @@ None blocking the build. Areas to keep in mind:
   access against code that correctly delegates to
   `LeaveRepository`. No `pool.query` in service. Critical
   driver for the review-agent fix below.
-- **CRITICAL — Review-agent hallucinates findings every
-  round on correctly-structured code** (TR_011, proven across
-  64 agent executions / 8 rounds). 8-round cycle burned
-  ~2.47M tokens chasing phantom complaints. Two recommended
-  fixes: (a) prompt-tighten — explicit "don't emit when
-  file structurally satisfies the rule"; (b) deterministic
-  post-LLM grep filter on review-agent's findings.
-- **HIGH — Retry-budget overshoot** (TR_011). 8 rounds
-  ran despite `qualityGate.maxRetries: 3` + `selfHealing.
-  maxAttempts: 2` = 6 max. Constraint-agent verdict-passed
-  in round 4 may reset the gate retry counter. Audit
-  `gate-orchestrator.ts`.
-- **One open `failed` alert** for correlation
-  `11a08e08-…` (TR_011's 8-round Leave-service cycle). Plus
-  TR_010's open `GP_BREACH` for `7afa0886-…` and possibly
-  TR_009's. All dismissable with `gestalt alerts dismiss`.
+- **TR_012 review-agent reliability fixes landed.** Three
+  platform changes (Fix 1 — `mapItemsToSignals` hard-codes
+  `CONSTRAINT_VIOLATION` so review-agent can never emit
+  GP_BREACH; Fix 2 — mandatory 5-step tool-first review
+  protocol in the prompt; Fix 3 — `detectRepeatedSignalLoop`
+  escape hatch in `self-healing-loop.ts` for >50% signal
+  fingerprint overlap across attempts). Live-proven: Fix 1 ✓
+  (0/30 review signals are GP_BREACH); Fix 3 ✓ (fired at 72%
+  repeat rate on attempt 2 with a specific
+  "Review-agent loop detected" alert); Fix 2's STEP 5 scope
+  filter ✓ (audit-logging false positive eliminated). Fix 2's
+  tool-call mandate ✗ — ignored by gpt-4o-mini (0/64
+  review-agent tool calls). Operator-side: trackeros
+  `agents.yaml` review-agent gains `executeScript`
+  (`3500a46`).
+- **HIGHEST follow-up — TR_012:** Deterministic post-LLM grep
+  filter on review-agent findings to drop the residual
+  "Direct DB access" hallucinations (28/30 of TR_012's
+  review-agent signals). Single grep + package.json
+  cross-check; cheapest high-leverage fix in the queue.
+- **HIGH follow-up — TR_012:** Try switching review-agent's
+  model to gpt-4o. gpt-4o-mini's tool-refusal pattern is
+  reconfirmed across TR_011 + TR_012; gpt-4o follows
+  imperative instructions more reliably.
+- **~~Retry-budget overshoot~~ DROPPED** (TR_012 analysis).
+  Actual budget is `gateRetries × (selfHealing + 1) = 9`
+  max, not 6. TR_011's 8 and TR_012's 8 sit within budget.
+  No bug.
+- **Open alerts to dismiss**: TR_010's `GP_BREACH` for
+  `7afa0886-…`, TR_011's `failed` for `11a08e08-…`, TR_012's
+  `gate-max-retries` for `aac73745-…`. All dismissable with
+  `gestalt alerts dismiss`.
 - **Review-agent `result_status='failed'` with successful
   JSON output** (TR_010/011). Cosmetic — verdict is correct,
   row label is wrong. Trace gate-orchestrator failure-path

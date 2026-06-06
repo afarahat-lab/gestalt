@@ -353,36 +353,92 @@ function buildReviewPrompt(
 
   // TEST_REPORT_007 Fix 1 — render the review-agent's own rules from
   // HARNESS.json's `agentConfig['review-agent'].rules`, the
-  // `executeScript` direction, and an explicit "verify before
-  // flagging" guidance block. These sit at the TOP of the prompt
-  // body (right after persona) so they take precedence over the
-  // golden-principles and cross-artifact checks below.
+  // `executeScript` direction, and a mandatory tool-first protocol
+  // block. These sit at the TOP of the prompt body (right after
+  // persona) so they take precedence over the golden-principles
+  // and cross-artifact checks below.
   //
-  // The verification guidance is the targeted fix from
-  // TEST_REPORT_006: the review-agent was flagging "Import cannot
-  // be resolved" findings without actually running tsc to verify.
-  // Telling it to verify before flagging — and naming the specific
-  // commands for the three common cases — reduces that class of
-  // false positive.
+  // TEST_REPORT_012 — review-agent fixes from TR_011's 8-round
+  // hallucination cycle. TR_011 proved that TR_007's advisory
+  // "verify before flagging" block was being ignored — review-agent
+  // made 0 tool calls across 64 executions / 8 rounds. The fix:
+  //
+  //   1. (this prompt) Replace the advisory verificationGuidance
+  //      with a strict numbered protocol the model MUST follow
+  //      before reasoning about findings, plus an explicit
+  //      severity ceiling so review-agent can never claim
+  //      GP_BREACH (which by-design requires tool-verified
+  //      evidence — only the constraint-agent can produce that).
+  //   2. (mapItemsToSignals) Belt-and-braces — downgrade any
+  //      `critical` item the LLM emits anyway to `high`
+  //      (CONSTRAINT_VIOLATION), never GP_BREACH.
   const harnessRulesSection = renderHarnessAgentRules('review-agent', fullHarness ?? null);
   const scriptInstruction = renderScriptToolInstruction();
+
+  // TR_012 Fix 1 — explicit severity ceiling. Review-agent reasons
+  // off a prompt + artifact set; it cannot achieve the certainty
+  // that warrants a GP_BREACH escalation (which is reserved for
+  // tool-verified findings the constraint-agent produces). The
+  // post-LLM mapping in mapItemsToSignals enforces this even if
+  // the model ignores the instruction.
+  const severityLimitsSection =
+    `## Signal severity limits — MANDATORY\n\n` +
+    `You MAY emit: \`CONSTRAINT_VIOLATION\` (high/medium) and ` +
+    `\`CONCERN\` (low). In schema terms that maps to severity values ` +
+    `\`high\`, \`medium\`, \`low\`, and \`info\`.\n\n` +
+    `You MAY NOT emit anything that would map to ` +
+    `\`GOLDEN_PRINCIPLE_BREACH\` — that means do NOT use severity ` +
+    `\`critical\`. GP_BREACH requires tool-verified evidence; only ` +
+    `the constraint-agent (which runs executeScript deterministically ` +
+    `against the artifact set) is authorised to produce that level ` +
+    `of certainty. When in doubt, downgrade to \`high\` ` +
+    `(CONSTRAINT_VIOLATION) — the gate-orchestrator's retry loop ` +
+    `will still surface the finding to the code-agent.\n`;
+
+  // TR_012 Fix 2 — strict tool-first protocol replaces the advisory
+  // verification guidance. The model is told to call specific tools
+  // before reasoning; findings without tool evidence must be
+  // downgraded to severity "low" (the gate-orchestrator drops
+  // low/info from the signal stream so they don't drive retries).
   const verificationGuidance =
-    `## Verification guidance\n\n` +
-    `Before flagging any finding, verify it with a tool call when ` +
-    `possible:\n\n` +
-    `- "Import cannot be resolved" → run \`tsc --noEmit\` and check ` +
-    `the output. The cycle's branch has \`node_modules/\` installed; ` +
-    `the import IS reachable to the compiler at this point.\n` +
-    `- "Missing dependency" → \`readFile\` package.json (also visible ` +
-    `in the Project state section below) before flagging.\n` +
-    `- "Test framework mismatch" → run \`grep\` via \`searchFiles\` ` +
-    `to confirm the import line actually appears, then verify the ` +
-    `test framework via the project's package.json.\n` +
-    `- "Missing audit / RBAC / input validation" → check the ` +
-    `IntentSpec's outOfScope first; if the layer is excluded, skip.\n\n` +
-    `Do NOT flag a finding based on inference alone when a script ` +
-    `can verify it. A finding that turns out to be false-positive ` +
-    `wastes a retry round and burns the operator's trust.\n`;
+    `## Review protocol — MANDATORY SEQUENCE\n\n` +
+    `You MUST follow this sequence. Do not skip steps.\n\n` +
+    `STEP 1 — Run \`tsc --noEmit\`.\n` +
+    `Call \`executeScript({ command: "npx tsc --noEmit" })\`. Record ` +
+    `the exit code and any errors. This is your primary evidence ` +
+    `for import-resolution and type-shape findings. If tsc passes, ` +
+    `do NOT emit "Import cannot be resolved" or "Type mismatch" ` +
+    `findings — the compiler disagrees and you have less evidence ` +
+    `than it does.\n\n` +
+    `STEP 2 — Check for genuine direct-DB-access violations.\n` +
+    `Call \`searchFiles({ pattern: "pool\\\\.query|db\\\\.query|new Pool" })\` ` +
+    `and \`searchFiles({ pattern: "require\\\\(.*(pg|mysql|postgres)" })\`. ` +
+    `Only flag a DB-access violation if these searches return matches ` +
+    `OUTSIDE \`src/shared/db/\` (which is the project's sanctioned ` +
+    `connection module). If the searches return zero matches in the ` +
+    `cycle's artifact set, do NOT emit a "Direct DB access in service" ` +
+    `finding.\n\n` +
+    `STEP 3 — Read \`package.json\`.\n` +
+    `Call \`readFile({ path: "package.json" })\`. Do NOT flag a ` +
+    `dependency as missing if it already appears in \`dependencies\`, ` +
+    `\`devDependencies\`, or \`peerDependencies\`. The Project state ` +
+    `section below also includes this content — cross-check both.\n\n` +
+    `STEP 4 — Only then reason about findings.\n` +
+    `Using the tool outputs from steps 1–3 as evidence, identify ` +
+    `genuine violations. A finding WITHOUT tool evidence must be ` +
+    `recorded as severity \`low\` and category \`style\` — never ` +
+    `\`high\`, never \`medium\`, never \`critical\`. The gate-orchestrator ` +
+    `drops \`low\`/\`info\` from the signal stream, so untestable ` +
+    `concerns go into the review artifact for the operator's eye ` +
+    `instead of driving a retry.\n\n` +
+    `STEP 5 — Apply the scope filter.\n` +
+    `Remove any finding whose subject matter appears in ` +
+    `IntentSpec.outOfScope (see the "Out of scope" section below). ` +
+    `If the intent excludes "API layer", do NOT flag missing audit ` +
+    `logging on a service file. If the intent excludes "RBAC", do ` +
+    `NOT flag missing role checks. Audit logging / RBAC / error ` +
+    `middleware / input validation belong to a FUTURE intent that ` +
+    `includes the relevant layer, not this one.\n`;
 
   // Project constraint rules from HARNESS.json — checked verbatim by
   // the constraint-agent after generation; flagging them here lets
@@ -550,7 +606,8 @@ You are reviewing code generated by upstream agents. Your job is to
 identify concerns the generate layer missed. Be specific and concrete —
 no generic advice. Only flag concerns that are actually present in the
 code below.
-${harnessRulesSection}${scriptInstruction}${verificationGuidance}${outOfScopeSection}${projectStateSection}${scaffoldingSection}${constraintsSection}${principlesSection}${consistencySection}
+${harnessRulesSection}${scriptInstruction}${severityLimitsSection}
+${verificationGuidance}${outOfScopeSection}${projectStateSection}${scaffoldingSection}${constraintsSection}${principlesSection}${consistencySection}
 ## Files under review
 
 ${files.join('\n\n')}
@@ -612,28 +669,46 @@ function mapItemsToSignals(
     // stay in the artifact only.
     if (item.severity === 'low' || item.severity === 'info') continue;
 
-    // GOLDEN_PRINCIPLE_BREACH triggers `escalate` (human review, never
-    // auto-resolved). Reserve it for `critical` severity only.
-    const isBreach = item.severity === 'critical';
-
+    // TR_012 Fix 1 — the review-agent reasons off a prompt + artifact
+    // set; it CANNOT achieve the certainty that warrants escalation
+    // to GOLDEN_PRINCIPLE_BREACH. GP_BREACH triggers human review
+    // (never auto-resolved) and is reserved for the constraint-agent,
+    // which produces tool-verified evidence via executeScript.
+    //
+    // TR_011 proved review-agent emits false-positive GP_BREACH on
+    // correctly-structured code (e.g. "Direct DB access in service"
+    // against a service that delegates to the repository). The
+    // prompt's `severityLimitsSection` tells the LLM not to use
+    // severity "critical"; this is the belt-and-braces enforcement
+    // for when the LLM ignores the instruction. Downgrade to
+    // CONSTRAINT_VIOLATION/high so the finding still drives a retry
+    // round but never escalates the cycle to human review.
     out.push({
       id: crypto.randomUUID(),
       correlationId,
-      type: isBreach ? 'GOLDEN_PRINCIPLE_BREACH' : 'CONSTRAINT_VIOLATION',
+      type: 'CONSTRAINT_VIOLATION',
       severity: mapSeverity(item.severity),
       agentRole: 'review-agent',
       message: `[review/${item.category}] ${item.message}${item.fixHint ? ` Hint: ${item.fixHint}` : ''}`,
       location: item.file
         ? { file: item.file, line: item.line, rule: `review/${item.category}` }
         : null,
-      autoResolvable: !isBreach,
+      autoResolvable: true,
     });
   }
   return out;
 }
 
+/**
+ * TR_012 Fix 1 — review-agent items at severity `critical` are
+ * downgraded to `high` on the signal because the type is forced to
+ * CONSTRAINT_VIOLATION (never GP_BREACH). Without this downgrade the
+ * gate-orchestrator's verdict logic would still see a critical
+ * severity and route the cycle to `fail` rather than the standard
+ * retry path.
+ */
 function mapSeverity(s: LLMReviewItem['severity']): SignalSeverity {
-  if (s === 'critical') return 'critical';
+  if (s === 'critical') return 'high';
   if (s === 'high') return 'high';
   if (s === 'medium') return 'medium';
   return 'low';

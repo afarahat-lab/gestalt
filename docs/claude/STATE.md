@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-06 (after TEST_REPORT_011 — TR_010 escalation analysis + 8-round scoped-intent failure exposes review-agent hallucination + retry-budget overshoot)
+**Last updated:** 2026-06-06 (after TEST_REPORT_012 — review-agent reliability fixes shipped; severity cap + self-healing loop detection working in live data; mandatory tool-first protocol delivered but ignored by gpt-4o-mini)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -195,11 +195,42 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
+- **TR_012 review-agent reliability fixes landed.** Three
+  platform changes (severity cap in `llm-review-agent.ts`
+  `mapItemsToSignals` so review-agent can never emit
+  `GOLDEN_PRINCIPLE_BREACH`; mandatory tool-first review
+  protocol in the same file's prompt; `detectRepeatedSignalLoop`
+  + escape hatch in `self-healing-loop.ts` so the cycle
+  escalates when >50% of a self-healing-retry's signals
+  fingerprint-match the prior attempt) + one trackeros
+  operator change (`executeScript` added to
+  `review-agent.tools.builtin`, commit `3500a46`). TR_012
+  proved Fix 1 ✓ (0/30 review signals are GP_BREACH) and
+  Fix 3 ✓ (fired at 72% repeat rate on attempt 2 with a
+  specific "Review-agent loop detected" alert). Fix 2's
+  STEP 5 scope-filter ✓ (audit-logging false positive
+  gone — TR_011 had 8/8 rounds, TR_012 has 0/30); Fix 2's
+  STEPS 1–3 tool-call mandate ✗ (gpt-4o-mini's tool-refusal
+  pattern from TR_011 reconfirmed; 0/64 review-agent tool
+  calls). Cycle cost -45% vs TR_011.
+- **(HIGHEST follow-up — TR_012)** Deterministic post-LLM
+  grep filter on review-agent findings. 28/30 of TR_012's
+  review-agent signals are "Direct DB access" hallucinations
+  against the repository file (which is correctly using
+  pool.query — that IS the pattern). A `grep -E
+  "pool\.query|db\.query|new Pool"` check on the artifact set
+  excluding `shared/db/` drops the finding if no matches.
+  Same treatment for "Missing dependency X" → drop if X is
+  in package.json.
+- **(HIGH follow-up — TR_012)** Try switching review-agent's
+  model to gpt-4o. gpt-4o-mini's tool-refusal pattern is now
+  well-documented across TR_011 + TR_012. ~$0.04/round still
+  in budget if it converges in 1–2 rounds.
 - **executeScript invocation is consistent for code-agent and
-  constraint-agent** (TR_010/011). TR_010: 5× per round;
-  TR_011: 125× across 8 rounds. Review-agent NEVER reaches
-  for it (0 tool calls in every TR_011 round) — see CRITICAL
-  follow-up above.
+  constraint-agent** (TR_010/011/012). Code-agent ~21×/round;
+  constraint-agent 5–25×/round. Review-agent: **0× in every
+  round across TR_011 + TR_012** even with the new mandatory
+  protocol — see TR_012 HIGHEST follow-up.
 - **Tool-call persistence is incremental** in
   `BaseLLMAgent.runToolLoop()` (TR_009 Fix 1). Mid-loop
   throws preserve full tool-call logs in
@@ -222,17 +253,19 @@ the `sessions/archive/` files (everything older)._
   Fix 4 — latent bug; loader was silently dropping it).
 - **Empty-tools wire path is safe** (TR_010 Fix 3). When
   `tools: []`, also drop `tool_choice` from OpenAI body.
-- **CRITICAL: Review-agent hallucinates findings every round
-  on correctly-structured code** (TR_011 — proven across
-  64 agent executions / 8 rounds). Persistent false positives:
-  audit-logging finding when not in IntentSpec, "DB-pattern
-  violation" against code that correctly delegates,
-  "Import cannot be resolved" against imports that resolve.
-  Despite TR_007's verification-guidance block + executeScript
-  availability, review-agent `tool_calls` is 0 in every TR_011
-  round — the LLM never reaches for the verification tool.
-  Two fixes recommended: prompt-tighten (cheap, may not be
-  enough) OR deterministic post-LLM grep filter on findings.
+- **Review-agent hallucination addressed by TR_012's three
+  fixes, with the worst symptoms eliminated:**
+  - GP_BREACH from review-agent — **eliminated** (Fix 1).
+  - Audit-logging / RBAC / input-validation false
+    positives — **eliminated** (Fix 2's STEP 5 scope filter).
+  - Persistent round-over-round loops on residual
+    hallucinations — **capped** (Fix 3 escape hatch).
+  - **Remaining gap**: 28/30 of TR_012's review-agent
+    signals are "Direct DB access" hallucinations against the
+    repository file. Fix 2's mandatory tool-call instruction
+    is ignored by gpt-4o-mini (0/64 review-agent tool calls
+    across TR_011 + TR_012). Next step (HIGHEST follow-up)
+    is the deterministic grep filter.
 - **Review-agent `result_status = 'failed'` with successful
   JSON output** (TR_010 finding, TR_011 reconfirms across 8
   rounds). `agent_execution_logs` row marked failed (empty
@@ -241,11 +274,12 @@ the `sessions/archive/` files (everything older)._
   agent'`. Cosmetic but blocks operator triage —
   can't distinguish "review-agent crashed" from "review-agent
   emitted false positives". Fix priority: HIGH.
-- **HIGH: Retry-budget overshoot** (TR_011 finding). `qualityGate.maxRetries: 3` + `selfHealing.maxAttempts: 2`
-  should cap at 6 rounds. TR_011's cycle ran 8. Suspected
-  cause: constraint-agent verdict-passed in round 4 resets
-  the gate retry counter. Audit `gate-orchestrator.ts`
-  retryCount increment logic.
+- **~~HIGH~~ DROPPED: Retry-budget overshoot.** TR_011
+  thought 6 rounds was the budget; TR_012 proves the actual
+  budget is `gateRetries × (selfHealing + 1) = 3 × 3 = 9`
+  max. TR_011's 8 and TR_012's 8 both sit one round under
+  that. No bug, no fix needed. Gate-orchestrator retryCount
+  increment logic is correct.
 - **TR_010 GP_BREACH was a FALSE POSITIVE** (TR_011 analysis).
   Review-agent's "Direct DB access in service" finding
   fired against code that correctly imports + delegates to
@@ -262,10 +296,14 @@ the `sessions/archive/` files (everything older)._
   on main, not generated this cycle) for "hardcoded
   credentials" on its `process.env.DATABASE_URL` line.
   Constraint-agent should scope to the cycle's diff.
-- **Self-healing escape hatch wired (Fix 4) but not yet
-  exercised live.** When `attemptNumber > 1` AND current
-  signals contain fingerprints not in `priorSignals`,
-  escalate. Cycle didn't trigger the condition.
+- **TR_004 Fix 4 self-healing escape hatch (new-violations
+  detection)** still not exercised live. TR_012's new
+  `detectRepeatedSignalLoop` escape hatch (repeated-signals
+  detection) IS proven live (fired at 72% repeat rate on
+  attempt 2). Both hatches sit in the same code path; the
+  new-violations one would fire if a code-agent amendment
+  introduced novel violations the diagnostician couldn't
+  reason through.
 - **Fix 1 (env-default apiShape) not yet live-verified.**
   Code path in place; needs `LLM_MODEL=chat-latest` +
   `platform_llms.chat-latest.api_shape='responses'` and a

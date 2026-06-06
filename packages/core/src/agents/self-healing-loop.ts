@@ -116,6 +116,38 @@ function detectRetryIntroducedViolations(
 }
 
 /**
+ * TEST_REPORT_012 Fix 3 — detect review-agent hallucination loops.
+ *
+ * TR_011's 8-round cycle proved the gate's failure mode is structural:
+ * review-agent emits the same false-positive findings every round
+ * regardless of whether the code-agent's amendment addressed them, the
+ * code-agent re-emits valid code, and the cycle still fails the gate.
+ * Each round burns ~300k tokens chasing phantom complaints.
+ *
+ * This check is the brake. When >50% of the current attempt's signals
+ * (by fingerprint) match the prior attempt's signals AND we're past the
+ * first attempt, the loop is non-productive: the code hasn't changed
+ * meaningfully but the gate keeps failing on the same things. Escalate
+ * to human review rather than burning another retry round.
+ *
+ * The 50% threshold is conservative — a single repeated finding amongst
+ * many new ones doesn't trip the brake (the amendment is making
+ * progress, just slowly). Use the higher-precision fingerprint
+ * (`type | first-N-chars-of-message`) so a finding re-rendered with a
+ * different line number still matches.
+ */
+const REPEATED_SIGNAL_THRESHOLD = 0.5;
+
+function detectRepeatedSignalLoop(
+  currentSignals: PlatformSignal[],
+  priorSignals: ReadonlyArray<{ type: string; message: string; sourceAgent: string; severity: string }>,
+): PlatformSignal[] {
+  if (priorSignals.length === 0 || currentSignals.length === 0) return [];
+  const priorFingerprints = new Set(priorSignals.map(signalFingerprint));
+  return currentSignals.filter((s) => priorFingerprints.has(signalFingerprint(s)));
+}
+
+/**
  * The seven failure types the platform recognises. Wired to
  * `platform_self_healing_config.failure_type` (migration 020).
  */
@@ -312,6 +344,56 @@ async function runSelfHealingLoopUnsafe(
   //   - the operator can review + decide whether to back out the
   //     amendment or accept the new findings.
   const priorResume = (intent?.lastResumeContext ?? null) as ResumeContext | null;
+
+  // TEST_REPORT_012 Fix 3 — review-agent hallucination-loop escape
+  // hatch. Fires BEFORE the retry-introduced-violations check
+  // because the symptoms partially overlap: both manifest as a
+  // multi-round cycle the diagnostician can't break out of, but
+  // the repeated-signal pattern is the more common one (TR_011
+  // burned 8 rounds on it). When >50% of the current attempt's
+  // signals fingerprint-match the prior attempt's signals AND we're
+  // past attempt 1, the gate is stuck on the same findings round
+  // after round — the diagnostician can't reason its way past
+  // false-positive review findings, so escalating to a human is
+  // the only productive next step.
+  if (priorResume?.autoHealed && currentAttempt > 1) {
+    const repeatedSignals = detectRepeatedSignalLoop(
+      signals,
+      priorResume.priorSignals ?? [],
+    );
+    const repeatRatio = signals.length > 0
+      ? repeatedSignals.length / signals.length
+      : 0;
+    if (
+      repeatedSignals.length > 0
+      && repeatRatio > REPEATED_SIGNAL_THRESHOLD
+    ) {
+      log.info(
+        {
+          correlationId: payload.correlationId,
+          attempt: currentAttempt,
+          repeatedCount: repeatedSignals.length,
+          totalCurrent: signals.length,
+          repeatRatio: Math.round(repeatRatio * 100) / 100,
+        },
+        'Review-agent hallucination loop detected — escalating instead of amending again',
+      );
+      const summary = repeatedSignals
+        .slice(0, 3)
+        .map((s) => `${s.type} (${s.sourceAgent}): ${s.message.slice(0, 80)}`)
+        .join(' | ');
+      const autoResolved = await escalateToHuman(
+        payload,
+        context,
+        signals,
+        `Review-agent loop detected: ${repeatedSignals.length} of ${signals.length} ` +
+        `findings are identical to the prior attempt (${Math.round(repeatRatio * 100)}% repeat rate) ` +
+        `across ${currentAttempt} rounds. Likely hallucination — human review required. Repeated: ${summary}`,
+      );
+      return { shouldRetry: false, diagnosis: null, escalated: true, autoResolved };
+    }
+  }
+
   if (priorResume?.autoHealed && currentAttempt > 1) {
     const newViolations = detectRetryIntroducedViolations(
       signals,
