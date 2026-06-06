@@ -694,6 +694,7 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
           packageManager:            stackConfig.packageManager,
           installCmd:                stackConfig.installCmd,
           testCmd:                   stackConfig.testCmd,
+          lintCmd:                   stackConfig.lintCmd,
           buildCmd:                  stackConfig.buildCmd ?? '',
           testFramework:             stackConfig.testFramework,
           framework:                 stackConfig.framework ?? '',

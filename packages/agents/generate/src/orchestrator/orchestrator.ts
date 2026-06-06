@@ -455,30 +455,34 @@ async function handleIntentTask(
 
     childLog.info(
       { artifactCount: allArtifacts.length, retryCount },
-      'All generate steps complete, dispatching to quality gate',
+      'All generate steps complete, dispatching to deploy:pr (ADR-041 — gate runs post-CI)',
     );
-    await transitionIntent(payload.intentId, correlationId, 'in-review');
 
+    // ADR-041 — gate moved to post-CI. Generate hands off directly to
+    // pr-agent; pr-agent opens (or pushes to) the PR; CI runs; on CI
+    // success the deploy orchestrator dispatches `gate:review` with
+    // `readFromBranch: true`. pr-agent flips the intent status to
+    // `deploying` when it picks up the task, so no transition here.
     await dispatch({
       id: crypto.randomUUID(),
       correlationId,
-      type: 'gate:review',
+      type: 'deploy:pr',
       sourceAgent: 'orchestrator',
-      targetAgent: 'review-agent',
+      targetAgent: 'pr-agent',
       priority: message.priority,
       payload: {
         intentId: payload.intentId,
-        artifacts: allArtifacts,
-        // Forward retry state so the gate can enforce maxRetries across
-        // re-entries. The gate increments retryCount before dispatching
-        // its own follow-up.
-        retryCount,
         projectId,
-        text: intentText,
-        // Pipeline-feedback resume: forward to the gate so it can pass
-        // through to its `deploy:pr` dispatch on a pass verdict. pr-agent
-        // then sees `resumeOnBranch` and pushes to the existing branch
-        // instead of opening a new PR.
+        intentText,
+        artifacts: allArtifacts.map((a) => ({
+          id: a.id,
+          type: a.type,
+          path: a.path,
+          content: a.content,
+        })),
+        // Pipeline-feedback / gate-retry resume — forwarded so
+        // pr-agent pushes to the existing branch and reuses the
+        // open PR instead of opening a new one.
         resumeOnBranch: payload.resumeOnBranch,
         prNumber: payload.prNumber,
         prUrl: payload.prUrl,

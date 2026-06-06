@@ -27,9 +27,8 @@ import { c, statusBadge } from './prompts';
 export const FRAMEWORK_AGENTS: ReadonlySet<string> = new Set([
   'intent-agent', 'design-agent', 'context-agent', 'lint-config-agent',
   'code-agent', 'test-agent', 'review-agent', 'constraint-agent',
-  'lint-agent', 'security-agent', 'test-runner-agent', 'pr-agent',
-  'pipeline-agent', 'promotion-agent', 'drift-agent', 'alignment-agent',
-  'gc-agent', 'evaluation-agent', 'context-fixer',
+  'pr-agent', 'pipeline-agent', 'promotion-agent', 'drift-agent',
+  'alignment-agent', 'gc-agent', 'evaluation-agent', 'context-fixer',
 ]);
 
 const GENERATE_AGENTS = new Set([
@@ -37,10 +36,8 @@ const GENERATE_AGENTS = new Set([
   'code-agent', 'test-agent',
 ]);
 
-const GATE_AGENTS = new Set([
-  'constraint-agent', 'lint-agent', 'security-agent', 'test-runner-agent',
-  'review-agent',
-]);
+// ADR-041 — gate runs post-CI; lint / security / test-runner removed.
+const GATE_AGENTS = new Set(['constraint-agent', 'review-agent']);
 
 const DEPLOY_AGENTS = new Set([
   'pr-agent', 'pipeline-agent', 'promotion-agent',

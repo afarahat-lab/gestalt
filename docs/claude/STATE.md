@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-06 (after TEST_REPORT_017 — constraint-agent's hardcoded AGENT_CONFIG removed; now resolves via loadAgentConfig like review-agent. Second clean `Status: ✓ deployed` in a row; constraint-agent model_used = 'gpt-4o' confirmed; 9× faster + 18× cheaper than on gpt-4o-mini.)
+**Last updated:** 2026-06-06 (after TEST_REPORT_018 — gate moves to post-CI per ADR-041. `lint-agent` / `security-agent` / `test-runner-agent` deleted; CI now owns lint/tests/security via the project's own tooling. Generate dispatches `deploy:pr` directly; pipeline-agent on CI-pass dispatches `gate:review` with `readFromBranch: true`; gate clones + checks out PR branch + reads source files; on pass dispatches `deploy:promotion`; on fail forwards `resumeOnBranch` so Aider's fix lands on the same PR. End-to-end chain verified live. Template bumped to 0.5.0.)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -27,9 +27,16 @@ the `sessions/archive/` files (everything older)._
 
 - **generate** — intent → design → context → lint-config → code → test;
   custom agents in `agents.yaml` interleave via `runs_after`.
-- **quality-gate** — constraint-agent (regex) + review-agent (LLM).
-  Verdict: `pass` / `fail` (auto-retry) / `escalate` (GP_BREACH).
-  Max gate retries: 3.
+- **quality-gate** — constraint-agent + review-agent (both LLM,
+  ADR-041 — gate runs AFTER CI, not before pr-agent). Gate clones
+  the PR branch, checks it out, and reads source files directly
+  from the working tree (`readFromBranch: true`). On pass dispatches
+  `deploy:promotion` (staging); on fail forwards `resumeOnBranch`
+  so the retry leg pushes to the same PR. Verdict:
+  `pass` / `fail` (auto-retry) / `escalate` (GP_BREACH).
+  Max gate retries: 3. Pre-CI lint/security/test-runner stubs
+  deleted — CI uses the project's own ESLint / Vitest / Semgrep
+  via the comprehensive `gestalt.yml` workflow template.
 - **deploy** — pr-agent → pipeline-agent → promotion-agent
   (staging → production). `PipelineAdapter` interface;
   `GitHubActionsAdapter` + `NoOpPipelineAdapter` implemented.
@@ -161,10 +168,11 @@ the `sessions/archive/` files (everything older)._
 
 ## Implemented with caveats
 
-- **Quality-gate** — `lint-agent` / `security-agent` /
-  `test-runner-agent` are stubs (need a `pnpm install` step in the
-  cloned tree). The package works end-to-end via
-  `constraint-agent` + `llm-review-agent`.
+- **Quality-gate** — ADR-041 (TR_018): pre-CI lint / security /
+  test-runner stubs were deleted. Gate now runs `constraint-agent`
+  + `review-agent` AFTER CI passes, reading source files directly
+  from the PR branch. CI owns lint / unit-tests / security scan
+  via the project's own tooling.
 - **Deploy** — `GitHubActionsAdapter` + `NoOpPipelineAdapter` are
   the only implementations. Azure DevOps / GitLab CI / Jenkins
   are typed stubs in the `PipelineAdapterType` union.
@@ -195,6 +203,47 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
+- **TR_018 ADR-041 (gate moves to post-CI) landed.**
+  `lint-agent` / `security-agent` / `test-runner-agent` deleted.
+  Generate orchestrator dispatches `deploy:pr` directly.
+  Deploy-orchestrator on `deploy:pipeline` success dispatches
+  `gate:review` with `readFromBranch: true` / `branch` /
+  `prNumber` / `prUrl` / `ciRunId`. Gate clones, fetches +
+  checks out PR branch, walks the tree for source files
+  (`readSourceFilesFromWorkDir`, capped at 200 files / 64k
+  per file). On pass dispatches `deploy:promotion` (staging);
+  on fail forwards `resumeOnBranch` to the generate retry so
+  Aider pushes the fix commit to the same PR branch (CI
+  re-triggers automatically). New `StackConfig.lintCmd`;
+  comprehensive CI template (`Compile / Test / Lint / Semgrep`);
+  template bumped 0.4.0 → 0.5.0 + refresh confirmed at boot.
+  ADR-041 documented in `docs/DECISIONS.md`. Live verification
+  (correlation `59d81261-...`): every new dispatch transition
+  fires exactly as designed (see TEST_REPORT_018.md). Cycle
+  did NOT reach `deployed` — gate caught real bugs in Aider's
+  output (unresolved import, unknown-typed error, missing
+  `user` on Request) and exhausted the retry budget. The
+  architectural change is verified end-to-end; outcome is
+  gated on Aider's code quality on this specific intent.
+- **(HIGH — new from TR_018)** Restore the TR_010 mandatory
+  `executeScript tsc --noEmit` code-agent rule on trackeros's
+  HARNESS.json. Aider's leave.routes.ts cut had real
+  TypeScript errors the gate caught; the missing self-check
+  rule meant Aider didn't catch them itself. Same rule the
+  TR_015 brief accidentally dropped.
+- **(MEDIUM — new from TR_018)** Switch trackeros's
+  `pipeline.adapter` from `noop` to `github-actions` next
+  session to exercise the new comprehensive CI workflow
+  (Compile / Test / Lint / Semgrep) end-to-end. trackeros's
+  existing committed `gestalt.yml` predates the `lintCmd`
+  substitution + the comprehensive workflow body, so the
+  switch will require pushing the new template body to
+  trackeros's `.github/workflows/gestalt.yml`.
+- **(LOW — new from TR_018)** Clean up trackeros's stale
+  `test-runner-agent` references in HARNESS.json
+  (agentConfig + qualityGate.required) + agents.yaml
+  (per-agent block). Silently ignored today; no behaviour
+  change.
 - **TR_017 constraint-agent now respects `agents.yaml`.**
   `packages/agents/quality-gate/src/agents/constraint-
   agent.ts` — removed the module-level `AGENT_CONFIG`

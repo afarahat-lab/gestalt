@@ -37,6 +37,13 @@ export interface StackConfig {
   installCmd: string;
   /** Exact test command for both CI + local dev. */
   testCmd: string;
+  /**
+   * Lint command (ADR-041 — CI is the primary lint owner now that
+   * the Gestalt LLM gate stopped running lint pre-push). Defaults to
+   * a no-op echo when the stack has no standard linter so the workflow
+   * still compiles.
+   */
+  lintCmd: string;
   /** Build command (TypeScript compile, Go build, etc.) or null. */
   buildCmd: string | null;
   /** 'Jest' | 'Vitest' | 'pytest' | 'JUnit' | 'go test' */
@@ -147,6 +154,7 @@ export const DEFAULT_STACK_CONFIG: StackConfig = {
   packageManager: 'pnpm',
   installCmd: 'pnpm install --frozen-lockfile',
   testCmd: 'pnpm test',
+  lintCmd: 'pnpm run lint',
   buildCmd: 'pnpm run build',
   testFramework: 'Vitest',
   framework: null,
@@ -225,6 +233,7 @@ Return ONLY a JSON object — no preamble, no markdown fences:
   "packageManager": "npm|pnpm|yarn|pip|poetry|go|cargo|...",
   "installCmd": "exact CI install command",
   "testCmd": "exact CI test command",
+  "lintCmd": "exact CI lint command (or 'echo \"No lint configured\"' when the stack has no standard linter)",
   "buildCmd": "exact build command or null",
   "testFramework": "Jest|Vitest|pytest|JUnit|go test|...",
   "framework": "Express|Fastify|FastAPI|Spring|Gin|null",
@@ -247,6 +256,12 @@ Rules:
 - agentPromptExtensions should be specific coding conventions for this stack
   e.g. "Use async/await throughout, never callbacks" or
   "Follow PEP 8 — 4 space indentation, snake_case variables"
+- lintCmd examples by stack:
+  TypeScript/JavaScript with ESLint: "npx eslint src --max-warnings 0"
+  TypeScript via pnpm script: "pnpm run lint"
+  Python: "python -m flake8 src"
+  Go: "golangci-lint run"
+  Stacks with no standard linter: 'echo "No lint configured"'
 - ciSetupSteps should be valid YAML that fits inside a GitHub Actions job steps array
   For Node: setup-node + package manager setup
   For Python: setup-python + pip/poetry install
@@ -279,6 +294,7 @@ export function parseStackConfig(raw: string): StackConfig {
     const packageManager = stringOr(parsed.packageManager, DEFAULT_STACK_CONFIG.packageManager);
     const installCmd = stringOr(parsed.installCmd, DEFAULT_STACK_CONFIG.installCmd);
     const testCmd = stringOr(parsed.testCmd, DEFAULT_STACK_CONFIG.testCmd);
+    const lintCmd = stringOr(parsed.lintCmd, DEFAULT_STACK_CONFIG.lintCmd);
     const buildCmd = nullableString(parsed.buildCmd);
     const testFramework = stringOr(parsed.testFramework, DEFAULT_STACK_CONFIG.testFramework);
     const framework = nullableString(parsed.framework);
@@ -309,6 +325,7 @@ export function parseStackConfig(raw: string): StackConfig {
       packageManager,
       installCmd,
       testCmd,
+      lintCmd,
       buildCmd,
       testFramework,
       framework,

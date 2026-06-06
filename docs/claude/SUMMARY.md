@@ -11,7 +11,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-06 (after TEST_REPORT_017 — constraint-agent's hardcoded AGENT_CONFIG removed; now resolves via loadAgentConfig like review-agent. Second clean `Status: ✓ deployed` in a row; constraint-agent model_used = 'gpt-4o' confirmed; 9× faster + 18× cheaper than on gpt-4o-mini.)
+**Last updated:** 2026-06-06 (after TEST_REPORT_018 — gate moves to post-CI per ADR-041. `lint-agent` / `security-agent` / `test-runner-agent` deleted; CI now owns lint/tests/security via the project's own tooling. Generate dispatches `deploy:pr` directly; pipeline-agent on CI-pass dispatches `gate:review` with `readFromBranch: true`; gate clones + checks out PR branch + reads source files; on pass dispatches `deploy:promotion`; on fail forwards `resumeOnBranch` so Aider's fix lands on the same PR. End-to-end chain verified live. Template bumped to 0.5.0.)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -34,9 +34,16 @@ the `sessions/archive/` files (everything older)._
 
 - **generate** — intent → design → context → lint-config → code → test;
   custom agents in `agents.yaml` interleave via `runs_after`.
-- **quality-gate** — constraint-agent (regex) + review-agent (LLM).
-  Verdict: `pass` / `fail` (auto-retry) / `escalate` (GP_BREACH).
-  Max gate retries: 3.
+- **quality-gate** — constraint-agent + review-agent (both LLM,
+  ADR-041 — gate runs AFTER CI, not before pr-agent). Gate clones
+  the PR branch, checks it out, and reads source files directly
+  from the working tree (`readFromBranch: true`). On pass dispatches
+  `deploy:promotion` (staging); on fail forwards `resumeOnBranch`
+  so the retry leg pushes to the same PR. Verdict:
+  `pass` / `fail` (auto-retry) / `escalate` (GP_BREACH).
+  Max gate retries: 3. Pre-CI lint/security/test-runner stubs
+  deleted — CI uses the project's own ESLint / Vitest / Semgrep
+  via the comprehensive `gestalt.yml` workflow template.
 - **deploy** — pr-agent → pipeline-agent → promotion-agent
   (staging → production). `PipelineAdapter` interface;
   `GitHubActionsAdapter` + `NoOpPipelineAdapter` implemented.
@@ -168,10 +175,11 @@ the `sessions/archive/` files (everything older)._
 
 ## Implemented with caveats
 
-- **Quality-gate** — `lint-agent` / `security-agent` /
-  `test-runner-agent` are stubs (need a `pnpm install` step in the
-  cloned tree). The package works end-to-end via
-  `constraint-agent` + `llm-review-agent`.
+- **Quality-gate** — ADR-041 (TR_018): pre-CI lint / security /
+  test-runner stubs were deleted. Gate now runs `constraint-agent`
+  + `review-agent` AFTER CI passes, reading source files directly
+  from the PR branch. CI owns lint / unit-tests / security scan
+  via the project's own tooling.
 - **Deploy** — `GitHubActionsAdapter` + `NoOpPipelineAdapter` are
   the only implementations. Azure DevOps / GitLab CI / Jenkins
   are typed stubs in the `PipelineAdapterType` union.
@@ -202,6 +210,47 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
+- **TR_018 ADR-041 (gate moves to post-CI) landed.**
+  `lint-agent` / `security-agent` / `test-runner-agent` deleted.
+  Generate orchestrator dispatches `deploy:pr` directly.
+  Deploy-orchestrator on `deploy:pipeline` success dispatches
+  `gate:review` with `readFromBranch: true` / `branch` /
+  `prNumber` / `prUrl` / `ciRunId`. Gate clones, fetches +
+  checks out PR branch, walks the tree for source files
+  (`readSourceFilesFromWorkDir`, capped at 200 files / 64k
+  per file). On pass dispatches `deploy:promotion` (staging);
+  on fail forwards `resumeOnBranch` to the generate retry so
+  Aider pushes the fix commit to the same PR branch (CI
+  re-triggers automatically). New `StackConfig.lintCmd`;
+  comprehensive CI template (`Compile / Test / Lint / Semgrep`);
+  template bumped 0.4.0 → 0.5.0 + refresh confirmed at boot.
+  ADR-041 documented in `docs/DECISIONS.md`. Live verification
+  (correlation `59d81261-...`): every new dispatch transition
+  fires exactly as designed (see TEST_REPORT_018.md). Cycle
+  did NOT reach `deployed` — gate caught real bugs in Aider's
+  output (unresolved import, unknown-typed error, missing
+  `user` on Request) and exhausted the retry budget. The
+  architectural change is verified end-to-end; outcome is
+  gated on Aider's code quality on this specific intent.
+- **(HIGH — new from TR_018)** Restore the TR_010 mandatory
+  `executeScript tsc --noEmit` code-agent rule on trackeros's
+  HARNESS.json. Aider's leave.routes.ts cut had real
+  TypeScript errors the gate caught; the missing self-check
+  rule meant Aider didn't catch them itself. Same rule the
+  TR_015 brief accidentally dropped.
+- **(MEDIUM — new from TR_018)** Switch trackeros's
+  `pipeline.adapter` from `noop` to `github-actions` next
+  session to exercise the new comprehensive CI workflow
+  (Compile / Test / Lint / Semgrep) end-to-end. trackeros's
+  existing committed `gestalt.yml` predates the `lintCmd`
+  substitution + the comprehensive workflow body, so the
+  switch will require pushing the new template body to
+  trackeros's `.github/workflows/gestalt.yml`.
+- **(LOW — new from TR_018)** Clean up trackeros's stale
+  `test-runner-agent` references in HARNESS.json
+  (agentConfig + qualityGate.required) + agents.yaml
+  (per-agent block). Silently ignored today; no behaviour
+  change.
 - **TR_017 constraint-agent now respects `agents.yaml`.**
   `packages/agents/quality-gate/src/agents/constraint-
   agent.ts` — removed the module-level `AGENT_CONFIG`
@@ -561,6 +610,32 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+- **TR_018 ADR-041 (gate moves to post-CI) landed.** Pre-CI gate
+  stubs `lint-agent` / `security-agent` / `test-runner-agent`
+  deleted. Generate → deploy:pr → CI → gate (constraint-agent +
+  review-agent on PR branch) → promotion. New `StackConfig.lintCmd`;
+  comprehensive CI workflow template (`Compile / Test / Lint /
+  Semgrep`); `corporate-ops-web-mobile` template bumped 0.4.0 →
+  0.5.0; refresh confirmed in boot log. Live-verified end-to-end:
+  every dispatch transition in the new chain fires; gate clones +
+  fetches + checks out PR branch + reads source files from disk
+  (`mode: branch`); on fail forwards `resumeOnBranch` so retry leg
+  pushes to same PR; CI re-triggers on push. Cycle did NOT reach
+  `deployed` — gate caught real Aider bugs (unresolved import,
+  unknown error, missing `user`). Architectural change verified;
+  outcome gated on Aider's code quality. See
+  `docs/claude/TEST_REPORT_018.md`.
+- **HIGH follow-up — TR_018:** Restore TR_010 mandatory
+  `executeScript tsc --noEmit` code-agent rule on trackeros's
+  HARNESS.json (dropped per the TR_015 brief).
+- **MEDIUM follow-up — TR_018:** Switch trackeros's
+  `pipeline.adapter` from `noop` to `github-actions` to exercise
+  the comprehensive CI workflow end-to-end; will require pushing
+  the new `gestalt.yml` template body to trackeros's
+  `.github/workflows/gestalt.yml`.
+- **LOW follow-up — TR_018:** Clean up trackeros's stale
+  `test-runner-agent` references (HARNESS.json agentConfig +
+  qualityGate.required + agents.yaml). Silently ignored today.
 - **`master.key`** is generated locally (workspace root, mode
   600, gitignored) and mounted into the server container by
   default via `docker-compose.yml`. Survives `docker compose
@@ -739,6 +814,224 @@ Moved to [@docs/claude/ARCHITECTURE.md](./ARCHITECTURE.md#key-type-alignment-rul
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+### Session 2026-06-06 — Claude Code (TEST_REPORT_018: gate moves to post-CI — ADR-041; deletes lint/security/test-runner agents; new dispatch chain Aider → pr-agent → CI → gate → promotion verified end-to-end)
+
+Architectural change session. The brief: move the LLM quality
+gate from pre-push (before pr-agent opens the PR) to post-CI
+(after CI passes, before promotion-agent merges). Delete the
+three stub agents (`lint-agent`, `security-agent`,
+`test-runner-agent`) — CI now owns lint / unit-tests / security
+scan via the project's own tooling. The Gestalt LLM gate
+focuses exclusively on architectural compliance + design-spec
+adherence (constraint-agent + review-agent only). Add ADR-041
+documenting the decision.
+
+Outcome: **architectural change verified end-to-end on the
+first cycle.** Every dispatch transition in the new chain
+fires correctly. The gate-orchestrator now clones, fetches +
+checks out the PR branch, and reads source files directly from
+the working tree (`mode: branch`) rather than the artifact set
+generate carried over the queue. On a gate pass with
+`readFromBranch: true`, dispatch flips from `deploy:pr` (legacy
+path, preserved as fallback) to `deploy:promotion` (staging) —
+the rest of the deploy chain (production promotion + auto-merge)
+is unchanged. On a gate fail, `maybeDispatchRetry` now forwards
+`resumeOnBranch: payload.branch` to the generate retry leg so
+Aider's fix commit lands on the same PR branch instead of
+opening a second PR. CI re-triggers automatically on the push
+(`push: branches: ['gestalt/**']`), the gate re-runs against the
+new code.
+
+What changed (code):
+
+- **`packages/agents/quality-gate/src/agents/`** —
+  `lint-agent.ts`, `security-agent.ts`, `test-runner-agent.ts`
+  deleted. `index.ts` exports + `types.ts` `GateAgentRole`
+  union trimmed to `constraint-agent | review-agent`.
+  Unused `SecurityFinding`, `OWASPSeverity`, `TestFailure`,
+  `TestRunResult`, `runLintAgent` / `runSecurityAgent` /
+  `runTestRunnerAgent` removed.
+- **`packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`** —
+  `GateTaskPayload` gains `readFromBranch?: boolean`,
+  `branch?: string`, `prNumber?: number`, `prUrl?: string`,
+  `ciRunId?: string`. New code path between clone + GateTask
+  build: `git fetch origin <branch> && git checkout -B <branch>
+  origin/<branch>`. New `readSourceFilesFromWorkDir(projectRoot,
+  correlationId, log)` walks the tree, filters by
+  `SOURCE_FILE_EXTENSIONS` (`.ts .tsx .js .py .go .java .rs
+  .cs .rb .kt .swift` etc.), skips `node_modules` / `dist` /
+  `build` / `target` / `__pycache__` / `.venv` / etc., capped
+  at `MAX_GATE_FILES=200` / `MAX_FILE_BYTES=64k`. New
+  `dispatchPromotion(args)` helper sends `deploy:promotion`
+  (staging) with `prNumber` + `branch` + `intentText`. Pass-
+  verdict branch splits on `payload.readFromBranch` — true →
+  promotion (ADR-041), false → legacy `dispatchDeployPR` (kept
+  for in-flight pre-ADR-041 jobs). `maybeDispatchRetry`
+  forwards `resumeOnBranch` + `prNumber` + `prUrl` to the
+  generate retry leg.
+- **`packages/agents/generate/src/orchestrator/orchestrator.ts`** —
+  end of `handleIntentTask` swaps
+  `transitionIntent('in-review') + dispatch('gate:review')`
+  for a direct `dispatch('deploy:pr')`. pr-agent owns the
+  `deploying` transition. Pipeline-feedback resume context
+  (`resumeOnBranch` / `prNumber` / `prUrl`) is forwarded
+  through unchanged.
+- **`packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`** —
+  in `deploy:pipeline`'s `outcome.kind === 'passed'` branch:
+  `transitionIntent → 'in-review'` then dispatch `gate:review`
+  with `readFromBranch: true` / `branch` / `prNumber` /
+  `prUrl` / `ciRunId`. Replaces the previous direct
+  `deploy:promotion` dispatch. CI-failure self-healing branch
+  unchanged.
+- **`packages/core/src/types.ts`** — `AgentRole` loses
+  `lint-agent | security-agent | test-runner-agent`;
+  `TaskType` loses `gate:lint | gate:security |
+  gate:test-runner`.
+- **`packages/core/src/agents/agent-config-loader.ts`** —
+  `PER_ROLE_DEFAULTS['test-runner-agent']` entry +
+  `TEST_RUNNER_AGENT_TOOLS` constant removed.
+- **`packages/server/src/routes/agents.ts`** —
+  `GATE_FRAMEWORK_ROLES` becomes `{constraint-agent,
+  review-agent}`; `GATE_INFRASTRUCTURE_AGENTS` now empty.
+- **CLI + dashboard classification sets** updated
+  (`packages/cli/src/ui/execution-graph.ts`, `gate.ts`,
+  `IntentDetail.tsx`, `ProjectSettings.tsx`,
+  `ActiveAgents.tsx`).
+
+Stack config + templates:
+
+- **`packages/server/src/templates/stack-config.ts`** —
+  `StackConfig` gains `lintCmd: string`.
+  `DEFAULT_STACK_CONFIG.lintCmd = 'pnpm run lint'`. LLM
+  prompt asks for `lintCmd` with examples by stack (eslint /
+  flake8 / golangci-lint / `echo "No lint configured"`).
+- **`packages/server/src/routes/{projects,templates}.ts`** —
+  substitution + known-variable allow-list updated.
+- **`templates/corporate-ops-web-mobile/ci/gestalt.yml`** —
+  re-written comprehensively: `Compile` (`{{buildCmd}}`),
+  `Test` (`{{testCmd}}`), `Lint` (`{{lintCmd}}`),
+  `Security scan` (Semgrep auto, `continue-on-error`).
+  Triggers on `push: branches: ['gestalt/**']` +
+  `pull_request: branches: [main]` so CI runs whenever
+  pr-agent pushes.
+- **`templates/corporate-ops-web-mobile/template.json`** —
+  version `0.4.0` → `0.5.0`. Refresh confirmed in boot log
+  ("Refreshed built-in template (version bump),
+  previousVersion: 0.4.0, version: 0.5.0").
+- **`templates/corporate-ops-web-mobile/harness/HARNESS.json`**
+  — `_comment_gate` documentation field added.
+  `qualityGate.required` trimmed from
+  `[lint, typecheck, unit-tests, constraint-check,
+  security-scan]` to `[constraint-check, design-review]`.
+  `agentConfig['test-runner-agent']` block removed.
+- **`docs/DECISIONS.md`** — ADR-041 appended. Decision,
+  rationale, implementation, consequences fully documented.
+
+Live verification (correlation
+`59d81261-035b-4b6e-96d0-24a210b7fe44`, intent
+`db4810bc-...`): every dispatch transition in the new chain
+fires exactly as designed:
+
+```
+Orchestrator received intent task
+All generate steps complete, dispatching to deploy:pr (ADR-041 — gate runs post-CI)
+Deploy orchestrator received task            taskType: deploy:pr
+Pushed fix to existing branch — re-triggering pipeline
+Deploy orchestrator received task            taskType: deploy:pipeline
+Resolved pipeline adapter
+Pipeline triggered — polling for terminal status
+Pipeline status update                       (noop adapter — passed)
+Quality gate received task
+Cloning project repo for gate review
+Checked out PR branch for gate review        (NEW — ADR-041)
+Gate artifacts resolved                      mode: branch  (NEW — ADR-041)
+Gate failed — 4 CONSTRAINT_VIOLATION
+Gate fail — dispatched retry to generate queue
+Orchestrator received intent task            (retry)
+Resuming cycle on existing branch (pipeline-feedback)
+```
+
+Verification matrix:
+
+| Check | Result |
+|---|---|
+| `generate complete → deploy:pr` (NOT `gate:review`) | ✓ |
+| pipeline-agent CI-pass → `gate:review` (NOT `deploy:promotion`) | ✓ |
+| Gate clones PR branch via `git fetch + git checkout -B` | ✓ |
+| Gate loads source files from branch (`mode: branch`) | ✓ |
+| Gate-fail retry forwards `resumeOnBranch: branch` | ✓ |
+| pr-agent on retry leg pushes to existing branch | ✓ |
+| CI re-triggers automatically (noop) | ✓ |
+| `lint-agent` / `security-agent` / `test-runner-agent` no longer in agent_executions | ✓ |
+
+What didn't pass:
+
+- **Cycle did NOT reach `deployed`.** Six retry legs were
+  consumed before `gate-max-retries` fired and the intent
+  transitioned to `failed`. The new dispatch chain was the
+  whole point of the verification — it works end-to-end. The
+  gate caught **real bugs Aider's first cut left behind**
+  (unresolved `LeaveService` import, `error: unknown` not
+  narrowed, `req.user` not typed). These are accurate
+  review-agent findings, NOT the categorical hallucinations
+  TR_011-TR_015 documented — the rule-clarity + evidence-
+  requirement work from prior reports holds. The cycle
+  outcome is gated on Aider's code quality on this specific
+  intent, not on the architectural change.
+- Per-leg shape: `pr-agent (12s) → pipeline-agent (9s, noop
+  CI pass) → constraint-agent (2-4s, pass) → review-agent
+  (5-9s, fail with 3-9 real findings)`. Each leg ~30s of
+  agent time + ~10s of clone overhead.
+
+Decisions made:
+
+- **Preserved legacy pre-CI gate path
+  (`readFromBranch: false`) as a fallback.** Any in-flight
+  pre-ADR-041 BullMQ jobs queued before this deploy still
+  complete correctly via `dispatchDeployPR` on a pass.
+- **Did NOT modify trackeros's HARNESS.json or agents.yaml
+  in this session.** trackeros still carries
+  `agentConfig['test-runner-agent']` rules + an `agents.yaml`
+  `test-runner-agent` block. The platform silently ignores
+  these now (no role mapping); operators can clean up
+  opportunistically.
+- **Did NOT switch trackeros's pipeline adapter from `noop`
+  to `github-actions`.** That would have exercised the real
+  CI workflow (build + test + lint + Semgrep). Out of scope
+  for the architectural-change verification; the noop adapter
+  proves the dispatch chain end-to-end.
+
+Pending follow-ups (priority-shifted by TR_018):
+
+- **(HIGH — new)** Aider's leave.routes.ts cut has real
+  TypeScript errors (unresolved `LeaveService` import,
+  unknown-typed `error`, missing `user` on Request). The
+  TR_010 mandatory `executeScript tsc --noEmit` code-agent
+  rule (dropped in TR_015's trackeros brief) would have
+  caught these before the gate. Restore the rule on
+  trackeros's HARNESS.json next session.
+- **(MEDIUM — new)** trackeros's `pipeline.adapter` is
+  `noop`. Switch to `github-actions` next session to verify
+  the CI workflow end-to-end (Compile / Test / Lint /
+  Semgrep). Will need to push the `lintCmd` substitution
+  through too — trackeros's existing CI workflow predates
+  the lintCmd field.
+- **(LOW — new)** Clean up trackeros's stale
+  `test-runner-agent` references in HARNESS.json +
+  agents.yaml + qualityGate.required.
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker image rebuilt + container restarted; `/health` 200
+throughout. Built-in template auto-refreshed at boot
+(0.4.0 → 0.5.0). New file `docs/claude/TEST_REPORT_018.md`.
+**This is the largest architectural change since the
+self-healing loop landed in migration 020** — gate moved a
+full layer downstream + three stub agents deleted +
+end-to-end dispatch chain rewired. Zero migrations needed.
+
+---
+
+
 ### Session 2026-06-06 — Claude Code (TEST_REPORT_017: fix constraint-agent hardcoded AGENT_CONFIG — second clean deploy in a row; gate-agent model overrides finally land symmetrically; constraint-agent on gpt-4o runs 9× faster + 18× cheaper than on gpt-4o-mini)
 
 One-line fix session against TR_016's HIGHEST follow-up. The
@@ -1040,201 +1333,6 @@ Server `/health` 200 throughout. trackeros `main` updated
 to `9830241`. New file `docs/claude/TEST_REPORT_016.md`.
 **First clean `gestalt status: ✓ deployed` since
 TEST_REPORT_007.**
-
----
-
-
-
-### Session 2026-06-06 — Claude Code (TEST_REPORT_015: Approach A — explicit repository-pattern rule wording. Rule clarification applied to trackeros + template (bumped 0.4.0); gpt-4o-mini READS the rule but REASONS the opposite — categorical confusion is provably at the LLM-reasoning layer, not the rule-clarity layer.)
-
-Project-side fix session against TR_013's HIGHEST follow-up.
-The user's brief: replace constraint-agent + review-agent rules
-with explicit positive AND negative examples that name file-name
-patterns. No platform code. Apply to trackeros's HARNESS.json
-AND the built-in `corporate-ops-web-mobile` template; bump
-template version to 0.4.0 so the seed-on-restart mechanism
-propagates to new projects automatically.
-
-Outcome: **Approach A applied as briefed; data isolates the
-remaining failure mode to the LLM reasoning layer.** Rule wording
-landed in both places (trackeros commit `ce0c01e`; template
-re-seed confirmed in server boot log: "Refreshed built-in
-template" 0.3.1 → 0.4.0). gpt-4o-mini IS reading the new rule —
-the rule's title prefix `[REPOSITORY PATTERN — what is a
-VIOLATION (flag this)]` appears verbatim in 26 of 28
-constraint-agent signals. But the model REASONS the opposite of
-what the rule says: 15 signals explicitly assert "pool.query in
-a repository file is not allowed" against the rule that says the
-same thing IS the repository's job. Aider produced the cleanest
-leave.service.ts of any cycle to date (proper DI, exactly the
-intent) in 8.3 s. Cycle still fails at gate-max-retries via the
-loop detector at 74% repeat rate.
-
-What the user asked for:
-
-- **Fix 1** — trackeros HARNESS.json. Replace constraint-agent
-  + review-agent rules with the brief's explicit pos/neg
-  example wording. Push to trackeros main.
-- **Fix 2** — Same wording merged into the built-in
-  `corporate-ops-web-mobile` template. Bump
-  `template.json#version` to `0.4.0` so the
-  `seedBuiltinTemplate` boot-path picks it up and refreshes
-  the `platform_templates` row.
-- Verify with the same Leave-service intent (Aider backend
-  active). Check zero "Direct DB access" signals; gate-pass
-  round 1; cost < $0.05; Aider 6–13 s.
-
-What changed:
-
-- **trackeros `HARNESS.json`** (commit `ce0c01e` on
-  trackeros `main`): constraint-agent + review-agent rules
-  replaced with the brief's explicit `REPOSITORY PATTERN —
-  what is a VIOLATION (flag this)` / `what is CORRECT (do
-  NOT flag)` wording. File-name patterns (`*.repository.ts`,
-  `*.service.ts`) named explicitly. Concrete example
-  (`leave.service.ts containing pool.query('SELECT...')`).
-- **`templates/corporate-ops-web-mobile/harness/HARNESS.json`**:
-  same wording merged into the template's existing rules —
-  three new REPOSITORY-PATTERN rules prepended to
-  constraint-agent's list (preserving the existing
-  src/shared/db / console.log / async-error rules), three
-  new REPOSITORY-PATTERN rules merged into review-agent's
-  list (preserving the existing scope / main-branch /
-  tsc-noEmit / outOfScope rules).
-- **`templates/corporate-ops-web-mobile/template.json`**:
-  version `0.3.1` → `0.4.0`. The platform's
-  `seedBuiltinTemplate` (server.ts line 306) compares
-  on-disk vs DB version and refreshes when they differ.
-- Docker image rebuilt + container restarted. Server boot
-  log confirms refresh: `INFO: Refreshed built-in template
-  (version bump) — slug: corporate-ops-web-mobile,
-  previousVersion: 0.3.1, version: 0.4.0, fileCount: 7`.
-
-Live verification (correlation
-`d7d9f66f-c261-4e3f-b11c-0560bfd62832`, intent_id
-`27232b78-…`):
-
-8 rounds, 64 agent executions. 38 review + constraint signals.
-~291k tokens / **~$0.087 USD** at gpt-4o-mini pricing.
-
-Verification matrix vs brief:
-
-| Check | Result |
-|---|---|
-| Zero "Direct DB access" on `leave.repository.ts` | **✗** 15 signals; constraint-agent flags pool.query in the repository as a violation |
-| Zero "Direct DB access" on `leave.service.ts` | **✗** 4 signals; review-agent flags `this.leaveRepository.createLeaveRequest(req)` as DB access |
-| Gate verdict pass round 1 | **✗** same gate-max-retries termination as TR_013/014 |
-| Cost < $0.05 | **✗** $0.087 |
-| Aider 6–13 s | **✓** 8.3 s round 1 |
-
-What worked:
-
-- **Rule wording landed exactly as briefed.** Both trackeros
-  and the template carry the new rules verbatim. Template
-  re-seed mechanism worked end-to-end (version bump triggers
-  refresh on next boot).
-- **Aider produced the cleanest leave.service.ts of any
-  cycle to date.** Proper DI via constructor (`constructor(
-  private leaveRepository: LeaveRepository) {}` — TR_014's
-  `new LeaveRepository()` issue is fixed). 12 lines.
-  Imports resolve. Exactly the intent.
-- **gpt-4o-mini IS reading the new rule.** The rule's title
-  prefix `[REPOSITORY PATTERN — what is a VIOLATION (flag
-  this)]` appears verbatim in 26 of 28 constraint-agent
-  signal messages. The model is being shown the rule and is
-  including its title in its output.
-- **Loop-detector repeat rate dropped monotonically.**
-  TR_013: 84% → TR_014: 77% → TR_015: 74%. The cycle's
-  failure-mode diversity is narrowing as each round emits
-  the same concrete reasoning failure.
-- **Evidence requirement (TR_013) continues to work.** 38/38
-  emitted signals carry `Evidence: "..."`. The TR_013
-  contract is unaffected.
-
-What didn't work:
-
-- **gpt-4o-mini REASONS the opposite of what the rule
-  says.** Sample signal:
-  > `[REPOSITORY PATTERN — what is a VIOLATION] This line
-  > violates the repository pattern rule because it directly
-  > calls pool.query() in a repository file, which is not
-  > allowed according to the architectural constraints.`
-  > `Evidence: "const result = await this.pool.query<...>"`
-  The rule says (verbatim): *"A file named \*.repository.ts
-  calling pool.query() ... is correct and must never be
-  flagged."* The model emitted **the opposite**. 15 of 28
-  constraint-agent signals are this exact pattern.
-- **Even when the model REASONS correctly it emits anyway.**
-  One constraint-agent signal:
-  > `[REPOSITORY PATTERN — what is a VIOLATION] ... No
-  > violation is present in the service file.` severity:
-  > low.
-  The model correctly determined no violation is present
-  AND emitted a signal anyway. The TR_013 gate-orchestrator
-  drops low/info so this is structurally safe — but it
-  shows the LLM cannot follow even its own correct reasoning.
-- **Review-agent flags the service's repository call as DB
-  access.** Sample:
-  > `[review/architecture] The LeaveService is directly
-  > calling a repository method that may lead to direct
-  > database access ...` Evidence:
-  > `"return this.leaveRepository.createLeaveRequest(req);"`
-  Same pattern — rule reads but reasoning is inverted.
-- **Aider's pre-emit verification dropped.** The brief's
-  trackeros `code-agent.rules` no longer includes the
-  TR_010 mandatory executeScript check. Test file is
-  missing the `beforeEach` import. Low-impact for this
-  cycle but a regression vs TR_014.
-
-Decisions made:
-
-- **Did NOT touch the gate-agent model.** The brief was
-  explicitly Approach A only ("No platform code"). Promoting
-  the gate model swap to HIGHEST in pending follow-ups is
-  the report's main signal to the next session.
-- **Restated rules in the trackeros HARNESS.json's
-  code-agent section per the brief, even though it dropped
-  the TR_010 executeScript mandate.** The brief listed only
-  two code-agent rules; I followed the brief verbatim and
-  flagged the dropped rule as a Medium follow-up.
-- **Rebuilt the Docker image rather than just restarting.**
-  Templates are baked into the image at build time (`COPY
-  templates ./templates`). To get the new template content
-  into `/app/templates`, a rebuild was necessary even
-  though only the running server's seedBuiltinTemplate code
-  reads it.
-- **Wrote the report against the 8-round failing cycle.**
-  The data is now characteristic enough that another run
-  would produce the same shape — the LLM-reasoning failure
-  is reproducible.
-
-Pending follow-ups (priority-shifted by TR_015's data):
-
-- **(HIGHEST — promoted from LOW in TR_014)** Switch
-  gate-agent model gpt-4o-mini → gpt-4o. Five cycles of
-  reading-rules-then-emitting-the-opposite are sufficient
-  evidence. Per-agent override in trackeros `agents.yaml`:
-  `constraint-agent: { llm: { model: gpt-4o } }`,
-  `review-agent: { llm: { model: gpt-4o } }`.
-- **(HIGH — re-promoted from TR_012 by TR_015)**
-  Deterministic post-LLM filter for "pool.query in
-  *.repository.ts flagged as violation". The TR_013
-  evidence requirement gives the parser (`location.file` +
-  `quotedLine`) enough info to apply a one-line exemption.
-  Was superseded by Approach A; TR_015 proves Approach A
-  alone is insufficient.
-- **(MEDIUM — new from TR_015)** Restore the TR_010
-  mandatory executeScript code-agent rule. The brief
-  dropped it; Aider's test file regressed the
-  `beforeEach`-import miss as a result.
-- **(LOW — carryover from TR_014)** Aider token spend
-  visibility; finer CONTEXT_GAP taxonomy on Aider exit
-  codes; per-role MAX_TOOL_CALLS override.
-
-Build status: `pnpm -r build` clean. Docker image rebuilt;
-template refresh logged at boot. Server `/health` 200
-throughout. trackeros `main` updated to `ce0c01e`. New file
-`docs/claude/TEST_REPORT_015.md`.
 
 ---
 

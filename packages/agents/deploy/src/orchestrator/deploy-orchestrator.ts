@@ -258,23 +258,35 @@ async function handleDeployTask(
         }
         return buildTaskResult(message, healing.retryDispatched ? 'completed' : 'failed', startedAt);
       }
-      // Pass → dispatch staging promotion. prNumber + intentText are
-      // forwarded so the promotion-agent can call mergePullRequest()
-      // when HARNESS.json has pipeline.autoMerge === true.
+      // ADR-041 — CI passed; dispatch the LLM quality gate to
+      // review the code on the PR branch. Gate runs constraint-agent
+      // + review-agent against the actual committed source files
+      // (loaded via `readFromBranch: true`), not the artifact set
+      // generate produced. On pass the gate dispatches
+      // deploy:promotion (staging); on fail it triggers
+      // self-healing → Aider regenerates on the same branch → CI
+      // re-runs → gate re-runs.
+      await transitionIntent(payload.intentId, correlationId, 'in-review');
       await dispatch({
         id: crypto.randomUUID(),
         correlationId,
-        type: 'deploy:promotion',
+        type: 'gate:review',
         sourceAgent: 'pipeline-agent',
-        targetAgent: 'promotion-agent',
+        targetAgent: 'review-agent',
         priority: (message.priority ?? 'normal') as TaskPriority,
         payload: {
           intentId: payload.intentId,
           projectId: payload.projectId,
-          targetEnvironment: 'staging',
+          // Empty artifact array — gate reads source files from the
+          // branch directly under ADR-041.
+          artifacts: [],
+          readFromBranch: true,
+          branch: payload.branch,
           prNumber: payload.prNumber,
-          intentText: payload.intentText,
-        } satisfies DeployPromotionPayload,
+          prUrl: payload.prUrl,
+          ciRunId: result.outcome.runId,
+          text: payload.intentText,
+        },
         createdAt: new Date(),
         expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),
       }, queueConfigFromEnv());

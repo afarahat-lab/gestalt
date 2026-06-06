@@ -27,7 +27,7 @@ const ROLE_COLOR: Record<string, string> = {
   'test-agent':       'var(--amber)',
   'context-agent':    'var(--blue)',
   'review-agent':     'var(--amber)',
-  'security-agent':   'var(--red)',
+  'constraint-agent': 'var(--red)',
   'pipeline-agent':   'var(--blue)',
 };
 

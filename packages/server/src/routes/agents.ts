@@ -49,13 +49,11 @@ const GENERATE_FRAMEWORK_ROLES = new Set([
   'lint-config-agent', 'code-agent', 'test-agent',
 ]);
 
-/** Gate-layer framework LLM roles. constraint-agent / lint-agent /
- *  security-agent / test-runner-agent are deterministic infrastructure
- *  and surface separately as `infrastructure`. */
-const GATE_FRAMEWORK_ROLES = new Set(['review-agent']);
-const GATE_INFRASTRUCTURE_AGENTS = [
-  'constraint-agent', 'lint-agent', 'security-agent', 'test-runner-agent',
-];
+/** Gate-layer framework LLM roles (ADR-041 — gate runs post-CI;
+ *  constraint-agent + review-agent only). Both are LLM-driven; the
+ *  infrastructure list is now empty. */
+const GATE_FRAMEWORK_ROLES = new Set(['constraint-agent', 'review-agent']);
+const GATE_INFRASTRUCTURE_AGENTS: string[] = [];
 
 /** Maintenance-layer LLM roles — context-fixer is the LLM-driven path;
  *  drift-agent and alignment-agent appear here because they declare

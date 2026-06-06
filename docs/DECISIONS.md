@@ -1047,3 +1047,97 @@ Schema:
   native addon fails gracefully (provider skipped, server still
   starts) — important for macOS dev where the addon may not
   build.
+
+---
+
+## ADR-041 — Quality gate runs after CI, before merge
+
+Date: 2026-06
+Status: Accepted
+
+### Decision
+
+The LLM quality gate (constraint-agent + review-agent) runs AFTER
+CI passes, as a pre-merge step. It no longer runs before the PR is
+created.
+
+New sequence:
+
+```
+Aider generates → pr-agent creates PR →
+CI (build + tests + lint + security) → CI passes →
+gate (constraint-agent + review-agent on the PR branch) →
+gate passes → promotion-agent merges → staging → production
+```
+
+The pre-CI stubs `lint-agent`, `security-agent`, and
+`test-runner-agent` are removed from `@gestalt/agents-quality-gate`
+along with their roles in `AgentRole`, their `gate:*` task types,
+and their `PER_ROLE_DEFAULTS` entries.
+
+### Rationale
+
+- The LLM gate's value is what CI cannot do: architectural
+  compliance and design-spec adherence. Running after CI means the
+  gate reviews code that already compiles, passes tests, and
+  passes lint — no redundant checks.
+- CI uses the project's own tools (its real ESLint config, real
+  test runner, real Semgrep rules), which is more accurate than
+  the platform's pre-CI stubs ever were.
+- A single failure surface (CI) catches the broad class of
+  problems CI is good at. Aider's self-healing loop reads CI
+  failures via the existing `pipeline-failed` failure type, so
+  retries route through the same code path as before.
+- The CI provider is configured via `HARNESS.json` `pipeline.adapter`.
+  Supported today: `github-actions`, `noop`. The pipeline adapter
+  union still names `azure-pipelines`, `gitlab-ci`, `jenkins`;
+  those remain typed stubs.
+
+### Implementation
+
+- `packages/agents/quality-gate/src/agents/lint-agent.ts` /
+  `security-agent.ts` / `test-runner-agent.ts` deleted.
+- Generate orchestrator no longer dispatches `gate:review` at the
+  end of a successful cycle — it dispatches `deploy:pr` directly.
+- Deploy orchestrator's `deploy:pipeline` success branch now
+  dispatches `gate:review` (with `readFromBranch: true`,
+  `branch`, `prNumber`, `prUrl`, `ciRunId`) instead of
+  `deploy:promotion`.
+- Gate orchestrator gains a `readSourceFilesFromWorkDir` walker
+  that produces `ArtifactRef[]` from the cloned PR branch (filtered
+  by `SOURCE_FILE_EXTENSIONS`, skipping `node_modules` / `dist` /
+  `build` / `__pycache__` / etc., capped at 200 files / 64 KiB
+  per file). The constraint-agent + review-agent then see the
+  exact code CI just tested.
+- Gate orchestrator `git fetch origin <branch> && git checkout -B
+  <branch> origin/<branch>` before reading source files.
+- On gate pass with `readFromBranch: true`, gate dispatches
+  `deploy:promotion` (staging) — the rest of the deploy chain
+  (production promotion + auto-merge) is unchanged.
+- On gate fail, `maybeDispatchRetry` now forwards
+  `resumeOnBranch: payload.branch` to the generate retry, so the
+  next Aider cycle pushes its fix commit to the same PR branch
+  instead of opening a second PR. CI re-triggers automatically on
+  the push, then the gate re-runs.
+- The CI template (`templates/corporate-ops-web-mobile/ci/gestalt.yml`)
+  becomes comprehensive: `Compile`, `Test`, `Lint`, and a Semgrep
+  security scan. `StackConfig` gains `lintCmd`.
+- The legacy pre-CI gate path (`readFromBranch: false`) is
+  preserved as a fallback so in-flight jobs queued before this
+  change can still complete.
+
+### Consequences
+
+- Quicker generate cycles — no LLM gate before the PR exists.
+- More accurate quality signal — CI uses the project's real
+  tooling, not platform stubs.
+- The gate now needs the PR branch to exist, so gate cannot run
+  on an empty intent. Generate cycles that produce no artifacts
+  never reach the gate (matched the prior behaviour anyway).
+- `IntentStatus` `in-review` semantics tighten: it now means
+  "CI passed, LLM gate running" rather than "code generated,
+  gate running". Dashboards rendering the status string keep
+  working; the operator-visible meaning is more accurate.
+- Pre-existing alerts for `gate-max-retries` continue to fire
+  when retries are exhausted; the only behaviour change is that
+  the retry leg now pushes to the same PR branch.

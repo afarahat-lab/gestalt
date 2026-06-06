@@ -26,8 +26,8 @@
  * The temp clone is removed in a `finally` block on every code path.
  */
 
-import { mkdtemp, rm, readFile } from 'fs/promises';
-import { join } from 'path';
+import { mkdtemp, rm, readFile, readdir, stat } from 'fs/promises';
+import { join, relative } from 'path';
 import { tmpdir } from 'os';
 import { simpleGit } from 'simple-git';
 import {
@@ -80,13 +80,35 @@ interface GateTaskPayload {
   projectId?: string;
   text?: string;
   /**
-   * Pipeline-feedback resume — forwarded from the generate orchestrator
-   * so this gate dispatch can carry it through to `deploy:pr`. pr-agent
-   * then pushes to the same branch instead of opening a new PR.
+   * ADR-041 post-CI gate mode. When `true` the gate-orchestrator loads
+   * source files from the cloned PR branch (the exact code that just
+   * passed CI) instead of the artifacts that were carried over the
+   * queue. On `false` (or absent) the gate falls back to the legacy
+   * pre-CI artifact-based path — preserved for backward compatibility
+   * with in-flight jobs queued before this change.
    */
-  resumeOnBranch?: string;
+  readFromBranch?: boolean;
+  /**
+   * The PR branch the cycle landed on. Set whenever the gate is being
+   * dispatched after a PR has been opened — by deploy-orchestrator on
+   * CI-success (ADR-041) and by the gate's own retry path on a fail
+   * verdict (so generate's resume leg pushes back to the same branch).
+   */
+  branch?: string;
   prNumber?: number;
   prUrl?: string;
+  /**
+   * GitHub Actions run id (or whichever CI provider) for the run that
+   * just passed. Forwarded into the gate's promotion dispatch only so
+   * the deployment events table can link gate → CI run.
+   */
+  ciRunId?: string;
+  /**
+   * Legacy pre-push field — pipeline-feedback resume. Preserved for the
+   * older pre-CI artifact-based gate path. New CI-success dispatches
+   * set `branch` instead.
+   */
+  resumeOnBranch?: string;
 }
 
 /**
@@ -206,6 +228,108 @@ async function loadHarnessStack(projectRoot: string): Promise<GateHarnessConfig[
 }
 
 /**
+ * ADR-041 — file extensions the gate considers "source code" when
+ * loading the post-CI artifact set from the PR branch. Languages the
+ * platform supports today; new languages should be added here when
+ * their support lands. Test files (e.g. `*.test.ts`) are included on
+ * purpose — review-agent reviews tests too.
+ */
+const SOURCE_FILE_EXTENSIONS: ReadonlySet<string> = new Set([
+  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.py', '.go', '.java', '.rs', '.cs', '.rb', '.kt', '.swift',
+]);
+
+/**
+ * Directories that never carry source code worth reviewing. Skipped
+ * during the recursive walk to avoid pulling in dependency trees
+ * (node_modules) or build output (dist, build, target).
+ */
+const SKIP_DIRS: ReadonlySet<string> = new Set([
+  'node_modules', '.git', '.gestalt', 'dist', 'build', 'target',
+  '.next', '.nuxt', 'out', 'coverage', '__pycache__', '.venv', 'venv',
+  '.pytest_cache', '.mypy_cache',
+]);
+
+/** Cap on how many files the gate will load. */
+const MAX_GATE_FILES = 200;
+/** Per-file size cap to keep prompts bounded. */
+const MAX_FILE_BYTES = 64 * 1024;
+
+/**
+ * ADR-041 — walk the cloned PR branch and return every source file as
+ * a `GateTask` artifact. The constraint-agent + review-agent see
+ * exactly the code CI just tested.
+ *
+ * Walks depth-first, skipping `SKIP_DIRS` and files outside
+ * `SOURCE_FILE_EXTENSIONS`. Files larger than `MAX_FILE_BYTES` are
+ * skipped (review-agent would truncate them anyway). The walk stops
+ * at `MAX_GATE_FILES`; remaining files are dropped with a warning so
+ * an operator-misconfigured project can't OOM the gate.
+ */
+async function readSourceFilesFromWorkDir(
+  projectRoot: string,
+  correlationId: string,
+  childLog: ReturnType<typeof createContextLogger>,
+): Promise<ArtifactRef[]> {
+  const artifacts: ArtifactRef[] = [];
+  let truncated = false;
+
+  async function walk(dir: string): Promise<void> {
+    if (artifacts.length >= MAX_GATE_FILES) {
+      truncated = true;
+      return;
+    }
+    let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+    try {
+      entries = await readdir(dir, { withFileTypes: true, encoding: 'utf8' });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (artifacts.length >= MAX_GATE_FILES) { truncated = true; return; }
+      if (entry.name.startsWith('.') && entry.name !== '.eslintrc') continue;
+      if (entry.isDirectory()) {
+        if (SKIP_DIRS.has(entry.name)) continue;
+        await walk(join(dir, entry.name));
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const ext = extOf(entry.name);
+      if (!SOURCE_FILE_EXTENSIONS.has(ext)) continue;
+      const full = join(dir, entry.name);
+      try {
+        const st = await stat(full);
+        if (st.size > MAX_FILE_BYTES) continue;
+        const content = await readFile(full, 'utf8');
+        const relPath = relative(projectRoot, full);
+        artifacts.push({
+          id: `${correlationId}:${relPath}`,
+          type: relPath.includes('.test.') || relPath.includes('.spec.') ? 'test' : 'code',
+          path: relPath,
+          content,
+        });
+      } catch {
+        // Best-effort — a single unreadable file shouldn't break the gate.
+      }
+    }
+  }
+
+  await walk(projectRoot);
+  if (truncated) {
+    childLog.warn(
+      { fileCount: artifacts.length, max: MAX_GATE_FILES },
+      'Gate source-file walk hit MAX_GATE_FILES — remaining files dropped',
+    );
+  }
+  return artifacts;
+}
+
+function extOf(name: string): string {
+  const dot = name.lastIndexOf('.');
+  return dot >= 0 ? name.slice(dot).toLowerCase() : '';
+}
+
+/**
  * Quality-gate orchestrator (Amendment 2026-06 — `extends
  * BaseOrchestrator` for the structural goal of every orchestrator
  * sharing one base. The review-agent now uses `callLLMWithTools`
@@ -250,6 +374,24 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
     childLog.info({ workDir }, 'Cloning project repo for gate review');
     await simpleGit().clone(cloneUrl, workDir);
 
+    // ADR-041 — when the gate is reviewing the PR branch post-CI,
+    // check out that branch so the constraint-agent and review-agent
+    // see exactly the code CI just tested. Without this the gate
+    // would silently review `main` and produce misleading findings.
+    if (payload.branch) {
+      const repo = simpleGit(workDir);
+      try {
+        await repo.fetch('origin', payload.branch);
+        await repo.checkout(['-B', payload.branch, `origin/${payload.branch}`]);
+        childLog.info({ branch: payload.branch }, 'Checked out PR branch for gate review');
+      } catch (err) {
+        childLog.warn(
+          { err: err instanceof Error ? err.message : String(err), branch: payload.branch },
+          'Failed to checkout PR branch — reviewing default branch instead',
+        );
+      }
+    }
+
     // Resolve the operator's intent text. The payload usually carries
     // it on a retry leg; on a first dispatch we fall back to the
     // persisted intent row. The review-agent uses this for scaffolding
@@ -270,15 +412,26 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
       ...defaultGateHarnessConfig(workDir),
       ...(stack ? { stack } : {}),
     };
+    // ADR-041 — load source files from the cloned working tree when
+    // the gate is reviewing post-CI. The pre-CI artifact-based path
+    // is preserved as a fallback for any legacy in-flight jobs.
+    const gateArtifacts: ArtifactRef[] = payload.readFromBranch
+      ? await readSourceFilesFromWorkDir(workDir, correlationId, childLog)
+      : payload.artifacts.map((a) => ({
+          id: a.id,
+          type: a.type,
+          path: a.path,
+          content: a.content,
+        }));
+    childLog.info(
+      { artifactCount: gateArtifacts.length, mode: payload.readFromBranch ? 'branch' : 'artifacts' },
+      'Gate artifacts resolved',
+    );
+
     const gateTask: GateTask = {
       taskId: message.id,
       correlationId,
-      artifacts: payload.artifacts.map((a) => ({
-        id: a.id,
-        type: a.type,
-        path: a.path,
-        content: a.content,
-      })) as ArtifactRef[],
+      artifacts: gateArtifacts,
       harnessConfig,
       intentText,
     };
@@ -397,11 +550,25 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
     //              no signal is auto-resolvable
     if (result.verdict === 'pass') {
       await transitionIntent(payload.intentId, correlationId, 'approved');
-      await dispatchDeployPR({
-        message,
-        payload,
-        childLog,
-      });
+      if (payload.readFromBranch) {
+        // ADR-041 post-CI path — CI already validated the code on
+        // this branch; gate just confirmed architectural compliance.
+        // Hand straight off to promotion.
+        await dispatchPromotion({
+          message,
+          payload,
+          childLog,
+        });
+      } else {
+        // Legacy pre-CI path — gate ran before the PR existed, so
+        // it needs to dispatch deploy:pr to open it. Preserved for
+        // backward compatibility with in-flight pre-ADR-041 jobs.
+        await dispatchDeployPR({
+          message,
+          payload,
+          childLog,
+        });
+      }
     } else if (result.verdict === 'escalate') {
       await transitionIntent(payload.intentId, correlationId, 'escalated');
       // Surface the breach to the dashboard's Alerts view. Without
@@ -649,6 +816,51 @@ function gateSignalToPlatformSignal(s: GateSignal): PlatformSignal {
  * (older-shape gate task), the deploy step is skipped — intent stays at
  * `approved` and the operator can re-run the cycle.
  */
+/**
+ * ADR-041 — gate pass after CI: hand off to promotion-agent (staging
+ * first; promotion-agent dispatches the production leg itself).
+ */
+async function dispatchPromotion(args: {
+  message: TaskMessage<GateTaskPayload>;
+  payload: GateTaskPayload;
+  childLog: ReturnType<typeof createContextLogger>;
+}): Promise<void> {
+  const { message, payload, childLog } = args;
+  const correlationId = message.correlationId;
+  const projectId = payload.projectId
+    ?? (await getRepositories().intents.findById(payload.intentId))?.projectId;
+  const intentText = payload.text
+    ?? (await getRepositories().intents.findById(payload.intentId))?.text;
+  if (!projectId) {
+    childLog.warn('Gate pass — cannot resolve projectId; skipping deploy:promotion');
+    return;
+  }
+
+  await dispatch({
+    id: crypto.randomUUID(),
+    correlationId,
+    type: 'deploy:promotion',
+    sourceAgent: 'review-agent',
+    targetAgent: 'promotion-agent',
+    priority: (message.priority ?? 'normal') as TaskPriority,
+    payload: {
+      intentId: payload.intentId,
+      projectId,
+      targetEnvironment: 'staging',
+      prNumber: payload.prNumber,
+      branch: payload.branch,
+      intentText,
+    },
+    createdAt: new Date(),
+    expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),
+  }, queueConfigFromEnv());
+
+  childLog.info(
+    { prNumber: payload.prNumber ?? null, branch: payload.branch ?? null },
+    'Gate pass (post-CI) — dispatched deploy:promotion (staging)',
+  );
+}
+
 async function dispatchDeployPR(args: {
   message: TaskMessage<GateTaskPayload>;
   payload: GateTaskPayload;
@@ -905,7 +1117,11 @@ async function maybeDispatchRetry(args: {
   // retry leg immediately. The next generate cycle will re-set it later.
   await transitionIntent(payload.intentId, correlationId, 'generating');
 
-  const retryPayload: GenerateRetryPayload = {
+  const retryPayload: GenerateRetryPayload & {
+    resumeOnBranch?: string;
+    prNumber?: number;
+    prUrl?: string;
+  } = {
     intentId: payload.intentId,
     text: intentText,
     projectId,
@@ -921,6 +1137,17 @@ async function maybeDispatchRetry(args: {
       autoResolvable: s.autoResolvable,
       createdAt: new Date(),
     })),
+    // ADR-041 — when the gate was triggered post-CI (`readFromBranch`
+    // mode), the cycle already has an open PR on `branch`. Hand the
+    // branch back to the generate orchestrator so the regen sits on
+    // top of the existing history; pr-agent's resume leg pushes the
+    // fix commit to the same branch, CI re-triggers automatically,
+    // and the gate re-runs against the new code. Without this, the
+    // retry would open a SECOND PR on a fresh branch and the original
+    // PR would hang.
+    ...(payload.branch ? { resumeOnBranch: payload.branch } : {}),
+    ...(payload.prNumber !== undefined ? { prNumber: payload.prNumber } : {}),
+    ...(payload.prUrl ? { prUrl: payload.prUrl } : {}),
   };
 
   await dispatch({

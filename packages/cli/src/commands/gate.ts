@@ -104,10 +104,8 @@ function renderGateDetail(intent: IntentDetail): void {
   blank();
 }
 
-const GATE_SOURCE_AGENTS = new Set([
-  'constraint-agent', 'lint-agent', 'security-agent', 'test-runner-agent',
-  'review-agent',
-]);
+// ADR-041 — gate runs post-CI; constraint-agent + review-agent only.
+const GATE_SOURCE_AGENTS = new Set(['constraint-agent', 'review-agent']);
 
 function verdictFor(status: string, gateSignals: SignalSummary[]): string {
   if (status === 'escalated') return c.error('⚠ escalated');
@@ -128,31 +126,14 @@ function verdictFor(status: string, gateSignals: SignalSummary[]): string {
 
 function formatCheck(e: AgentExecution, allSignals: SignalSummary[]): string {
   // Per-agent quick summary so the row is informative beyond
-  // pass/fail. Pull from this agent's emitted signals; gate stubs
-  // (lint-agent / security-agent / test-runner-agent) typically don't
-  // emit signals so the summary is empty there — the row still
-  // surfaces the status + duration.
+  // pass/fail. ADR-041 — gate runs constraint-agent + review-agent
+  // only (lint / security / test-runner moved to CI).
   const own = allSignals.filter((s) => s.sourceAgent === e.agentRole);
   let summary = '';
   switch (e.agentRole) {
     case 'constraint-agent': {
       const count = own.length;
       summary = `${count} violation${count === 1 ? '' : 's'}`;
-      break;
-    }
-    case 'lint-agent': {
-      const count = own.filter((s) => s.type === 'LINT_FAILURE').length;
-      summary = `${count} warning${count === 1 ? '' : 's'}`;
-      break;
-    }
-    case 'security-agent': {
-      const count = own.length;
-      summary = `${count} finding${count === 1 ? '' : 's'}`;
-      break;
-    }
-    case 'test-runner-agent': {
-      const failed = own.filter((s) => s.type === 'TEST_FAILURE').length;
-      summary = failed === 0 ? 'all tests passed' : `${failed} failed`;
       break;
     }
     case 'review-agent': {

@@ -50,9 +50,11 @@ const TABS = [
 ] as const;
 type TabId = typeof TABS[number]['id'];
 
-// Read-only — surfaced in the brief's Agents-tab note.
+// Read-only — surfaced in the brief's Agents-tab note. ADR-041 —
+// gate runs constraint-agent + review-agent only; both are
+// LLM-driven (configurable in agents.yaml) so neither is
+// "infrastructure" anymore.
 const INFRASTRUCTURE_AGENTS = [
-  'constraint-agent', 'lint-agent', 'security-agent', 'test-runner-agent',
   'pr-agent', 'pipeline-agent', 'promotion-agent',
   'gc-agent', 'evaluation-agent',
 ];

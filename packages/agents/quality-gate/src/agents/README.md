@@ -1,6 +1,9 @@
 # Quality gate — Specialist agents
 
-Five agents that each validate one concern. They run in a fixed order. They never generate or fix — only validate and signal.
+Two LLM agents that validate architectural compliance and design-spec
+adherence. Per ADR-041, the gate runs AFTER CI (which owns lint /
+typecheck / unit tests / security). They never generate or fix —
+only validate and signal.
 
 ---
 
@@ -8,19 +11,16 @@ Five agents that each validate one concern. They run in a fixed order. They neve
 
 | File | Purpose |
 |---|---|
-| `lint-agent.ts` | ESLint + Prettier. Runs in parallel with security-agent. Produces LINT_FAILURE. |
-| `security-agent.ts` | OWASP ruleset scan. Runs in parallel with lint-agent. CRITICAL/HIGH → GOLDEN_PRINCIPLE_BREACH. |
-| `constraint-agent.ts` | Architectural rule enforcement. Two levels: ESLint rules + AST semantic checks. |
-| `test-runner-agent.ts` | Vitest execution. Runs last before review. Each failure → TEST_FAILURE signal. |
-| `review-agent.ts` | Synthesises all signals into GateResult. Applies verdict logic. Always runs last. |
+| `constraint-agent.ts` | Architectural rule enforcement via LLM + `executeScript` + `readFile` / `searchFiles`. Reads HARNESS.json `agentConfig['constraint-agent'].rules`. |
+| `llm-review-agent.ts` | Senior-engineer code review (LLM). Synthesises with constraint-agent's signals to produce a GateResult. |
+| `review-agent.ts` | Result-synthesis helpers (`synthesiseGateResult`, `summariseGateResult`) — pure functions, no I/O. |
 
 ## Rules for agents working here
 
-- Never use an LLM — the quality gate must be fully deterministic
 - Never modify or fix artifacts — only read and validate
 - Never downgrade GOLDEN_PRINCIPLE_BREACH severity
 - Always include file and line in signal location when available
-- review-agent must always run regardless of other agent outcomes
+- Every emitted finding must carry `quotedLine` evidence (TR_013 contract)
 
 ## Context needed
 

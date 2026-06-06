@@ -6,20 +6,19 @@
 export type {
   GateResult, GateVerdict, GateSignal, GateAgentResult,
   RetryRecommendation, GateTask, GateHarnessConfig,
-  ConstraintRule, ConstraintViolation, SecurityFinding,
-  TestRunResult, TestFailure, GateAgentRole, SignalSeverity,
+  ConstraintRule, ConstraintViolation,
+  GateAgentRole, SignalSeverity,
   ArtifactRef,
 } from './types';
 
 // Orchestrator (BullMQ worker) — call once at server startup.
 export { startGateWorker } from './orchestrator/gate-orchestrator';
 
-// Agents
+// Agents — constraint + review only since ADR-041 (gate runs post-CI).
+// Pre-CI lint/security/test-runner stubs were removed; CI now owns
+// those checks via the project's own tooling.
 export { runConstraintAgent }   from './agents/constraint-agent';
 export { ReviewAgent }          from './agents/llm-review-agent';
 export type { LLMReviewAgentResult, LLMReviewArtifact } from './agents/llm-review-agent';
-export { runSecurityAgent }     from './agents/security-agent';
-export { runLintAgent }         from './agents/lint-agent';
-export { runTestRunnerAgent }   from './agents/test-runner-agent';
 export { synthesiseGateResult, isDeployBlocked, summariseGateResult } from './agents/review-agent';
 export { validateGateResult }   from './validators/gate-result-validator';

@@ -58,6 +58,32 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+- **TR_018 ADR-041 (gate moves to post-CI) landed.** Pre-CI gate
+  stubs `lint-agent` / `security-agent` / `test-runner-agent`
+  deleted. Generate → deploy:pr → CI → gate (constraint-agent +
+  review-agent on PR branch) → promotion. New `StackConfig.lintCmd`;
+  comprehensive CI workflow template (`Compile / Test / Lint /
+  Semgrep`); `corporate-ops-web-mobile` template bumped 0.4.0 →
+  0.5.0; refresh confirmed in boot log. Live-verified end-to-end:
+  every dispatch transition in the new chain fires; gate clones +
+  fetches + checks out PR branch + reads source files from disk
+  (`mode: branch`); on fail forwards `resumeOnBranch` so retry leg
+  pushes to same PR; CI re-triggers on push. Cycle did NOT reach
+  `deployed` — gate caught real Aider bugs (unresolved import,
+  unknown error, missing `user`). Architectural change verified;
+  outcome gated on Aider's code quality. See
+  `docs/claude/TEST_REPORT_018.md`.
+- **HIGH follow-up — TR_018:** Restore TR_010 mandatory
+  `executeScript tsc --noEmit` code-agent rule on trackeros's
+  HARNESS.json (dropped per the TR_015 brief).
+- **MEDIUM follow-up — TR_018:** Switch trackeros's
+  `pipeline.adapter` from `noop` to `github-actions` to exercise
+  the comprehensive CI workflow end-to-end; will require pushing
+  the new `gestalt.yml` template body to trackeros's
+  `.github/workflows/gestalt.yml`.
+- **LOW follow-up — TR_018:** Clean up trackeros's stale
+  `test-runner-agent` references (HARNESS.json agentConfig +
+  qualityGate.required + agents.yaml). Silently ignored today.
 - **`master.key`** is generated locally (workspace root, mode
   600, gitignored) and mounted into the server container by
   default via `docker-compose.yml`. Survives `docker compose

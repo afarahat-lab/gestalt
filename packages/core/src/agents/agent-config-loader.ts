@@ -54,10 +54,10 @@ const ALL_FILE_TOOLS: AgentToolConfig = {
 };
 
 /**
- * TEST_REPORT_005 evolution — code-agent + test-runner-agent +
- * constraint-agent gain `executeScript`. Each agent decides which
- * commands to run based on the project's stack — no hardcoded
- * shell strings in the platform.
+ * TEST_REPORT_005 evolution — code-agent + constraint-agent gain
+ * `executeScript`. Each agent decides which commands to run based
+ * on the project's stack — no hardcoded shell strings in the
+ * platform.
  */
 const ALL_FILE_TOOLS_WITH_SCRIPT: AgentToolConfig = {
   builtin: ['readFile', 'listDirectory', 'searchFiles', 'getFileTree', 'executeScript'],
@@ -65,10 +65,6 @@ const ALL_FILE_TOOLS_WITH_SCRIPT: AgentToolConfig = {
 
 const CONSTRAINT_AGENT_TOOLS: AgentToolConfig = {
   builtin: ['executeScript', 'readFile', 'searchFiles'],
-};
-
-const TEST_RUNNER_AGENT_TOOLS: AgentToolConfig = {
-  builtin: ['executeScript', 'readFile'],
 };
 
 /**
@@ -149,16 +145,6 @@ export const PER_ROLE_DEFAULTS: Record<string, AgentConfig> = {
     // `executeScript` (e.g. `tsc --noEmit`, `grep -r "console\\." src/`)
     // to verify them.
     tools: { ...CONSTRAINT_AGENT_TOOLS },
-  },
-  'test-runner-agent': {
-    role: 'Test execution specialist',
-    goal: 'Run the project test suite and report failures with context',
-    llm: { temperature: 0.0, maxTokens: 4000 },
-    promptExtensions: [],
-    // TEST_REPORT_005 evolution — test-runner-agent picks the
-    // right runner (jest / vitest / pytest / …) based on the
-    // project's stack and executes it.
-    tools: { ...TEST_RUNNER_AGENT_TOOLS },
   },
   'review-agent': {
     role: 'Senior engineer and code reviewer',

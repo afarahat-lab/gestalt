@@ -19,8 +19,9 @@
     "queue":    { "type": "bullmq", "configKey": "REDIS_URL" },
     "llm":      { "type": "azure-openai", "configKey": "LLM_BASE_URL" }
   },
+  "_comment_gate": "CI (build/tests/lint/security) runs first via pipeline.adapter. The Gestalt LLM gate (constraint-agent + review-agent) runs after CI passes as a pre-merge architectural review.",
   "qualityGate": {
-    "required": ["lint", "typecheck", "unit-tests", "constraint-check", "security-scan"],
+    "required": ["constraint-check", "design-review"],
     "blockingSignals": ["GOLDEN_PRINCIPLE_BREACH", "CONSTRAINT_VIOLATION"],
     "autoResolvableSignals": ["LINT_FAILURE", "TEST_FAILURE"],
     "maxRetries": 3
@@ -67,12 +68,6 @@
         "Generated code must compile without errors. Verify with executeScript before returning.",
         "All imports must resolve to files that exist in the project or are declared in package.json.",
         "You MUST run a compile/lint check via executeScript before emitting the final files. This is not optional."
-      ]
-    },
-    "test-runner-agent": {
-      "rules": [
-        "All generated tests must pass.",
-        "Tests must cover every success criterion from the IntentSpec."
       ]
     },
     "review-agent": {

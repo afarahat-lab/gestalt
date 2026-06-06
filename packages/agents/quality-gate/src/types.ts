@@ -6,12 +6,12 @@
 import type { AgentRole, SignalType } from '@gestalt/core';
 import type { OrchestratorState } from '@gestalt/agents-generate';
 
-// Gate agent roles
+// Gate agent roles (ADR-041 — lint / security / test-runner removed;
+// CI owns those checks now). The gate runs after CI passes and
+// focuses exclusively on architectural compliance + design spec
+// adherence — constraint-agent + review-agent.
 export type GateAgentRole =
-  | 'lint-agent'
-  | 'security-agent'
   | 'constraint-agent'
-  | 'test-runner-agent'
   | 'review-agent';
 
 // Verdict
@@ -47,11 +47,9 @@ export interface GateAgentResult {
   signals: GateSignal[];
   durationMs: number;
   /**
-   * Populated by LLM-backed gate agents (review-agent today).
-   * Non-LLM agents (constraint-agent regex sweeper, future
-   * lint-agent / security-agent / test-runner-agent that shell out to
-   * project tooling) leave these undefined. Persisted into
-   * `agent_execution_logs` by the gate orchestrator.
+   * Populated by every LLM-backed gate agent (constraint-agent +
+   * review-agent today). Persisted into `agent_execution_logs` by
+   * the gate orchestrator.
    */
   lastPrompt?: string;
   llmResponse?: string;
@@ -99,36 +97,6 @@ export interface ConstraintViolation {
   ruleId: string;
   message: string;
   location: CodeLocation;
-}
-
-// Security finding
-export type OWASPSeverity = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | 'INFO';
-
-export interface SecurityFinding {
-  id: string;
-  title: string;
-  severity: OWASPSeverity;
-  description: string;
-  location: CodeLocation | null;
-  cwe?: string;
-}
-
-// Test results
-export interface TestFailure {
-  testName: string;
-  suiteName: string;
-  expected: string;
-  actual: string;
-  stackTrace: string;
-  location: CodeLocation | null;
-}
-
-export interface TestRunResult {
-  passed: number;
-  failed: number;
-  skipped: number;
-  durationMs: number;
-  failures: TestFailure[];
 }
 
 // Gate task received from queue

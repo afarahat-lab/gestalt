@@ -56,9 +56,8 @@ const PREVIEW_CHARS = 400;
 const FRAMEWORK_AGENTS = new Set<string>([
   'intent-agent', 'design-agent', 'context-agent', 'lint-config-agent',
   'code-agent', 'test-agent', 'review-agent', 'constraint-agent',
-  'lint-agent', 'security-agent', 'test-runner-agent', 'pr-agent',
-  'pipeline-agent', 'promotion-agent', 'drift-agent', 'alignment-agent',
-  'gc-agent', 'evaluation-agent', 'context-fixer',
+  'pr-agent', 'pipeline-agent', 'promotion-agent', 'drift-agent',
+  'alignment-agent', 'gc-agent', 'evaluation-agent', 'context-fixer',
 ]);
 
 export function IntentDetail() {
