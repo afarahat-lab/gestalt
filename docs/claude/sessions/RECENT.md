@@ -3,6 +3,233 @@
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+### Session 2026-06-06 — Claude Code (TEST_REPORT_014: Aider as a swappable code-generation backend — ships cleanly; code-agent wall-clock drops 10–80×; same gate-side hallucination as TR_013 — proves the issue is backend-independent)
+
+Seven-part implementation session against the user's brief: replace
+the Gestalt-native code-agent + test-agent with Aider, per project
+opt-in via HARNESS.json. Aider runs as a child process, edits files
+directly in the cycle's cloned work-dir, and the AiderCodeAgent
+re-reads them as artifacts so the rest of the platform (gate,
+deploy, observability) runs unchanged. Aider 0.86.2 installed in
+the production Docker image; trackeros opted in via
+`codeGeneration.backend: 'aider'`.
+
+Outcome: **Aider integration ships cleanly and works.** Aider ran 8
+times in the verification cycle, producing the same correct
+15-line `leave.service.ts` + a vitest test file every round in
+6–13 seconds (vs the Gestalt-native code-agent's 33–735 seconds
+in TR_013). Test-agent was skipped on all 8 rounds — Aider produced
+tests inline. But the cycle **still fails on the same review-agent /
+constraint-agent "Direct DB access" categorical hallucination as
+TR_013**, terminated by TR_012's loop detector at a 77% repeat
+rate. This is the cleanest possible isolation: switching the
+backend changes nothing about the gate's behaviour. **Approach A
+(tighter HARNESS.json rule wording) is still the next required
+fix.**
+
+What the user asked for:
+
+- **Part 1** — Install Aider in the production Docker image
+  (`packages/server/Dockerfile`).
+- **Part 2** — AiderAdapter in the generate package: `runAider`
+  + `parseAiderChangedFiles`. `--yes --no-git --message` flags
+  mandatory; credentials forwarded as env vars not CLI flags.
+- **Part 3** — Aider message builder: task + criteria + rules +
+  architecture + design. **No implementation instructions** —
+  Aider decides how.
+- **Part 4** — Orchestrator wiring. When the harness opts in,
+  swap CodeAgent for AiderCodeAgent and skip test-agent.
+- **Part 5** — HARNESS schema `codeGeneration.backend:
+  'gestalt' | 'aider'`, default `'gestalt'`.
+- **Part 6** — executeScript gains `extraEnv?` for credential
+  forwarding.
+- **Part 7** — trackeros opted in via HARNESS.json; commit
+  pushed to trackeros `main`.
+- Verify with the same Leave-service intent used in TR_011/012/013.
+  Compare code quality, wall-clock, and gate verdict against TR_013.
+
+What changed:
+
+- **`packages/server/Dockerfile`**: production stage gets
+  `python3` + `py3-pip` + `aider-chat`. Tree-sitter's C
+  extensions need build-base + python3-dev — installed as a
+  `--virtual .aider-build-deps` package and removed via
+  `apk del` in the same layer so the runtime image stays
+  lean. `docker compose exec server aider --version` →
+  `aider 0.86.2`.
+- **`packages/core/src/tools/file-tools.ts`**: `executeScript`
+  signature gains optional `extraEnv?: Record<string, string>`.
+  Tool-call callers pass undefined and behave exactly as before.
+- **`packages/core/src/llm/index.ts`**: `LLMClient.getBaseUrl()`
+  + `getApiKey()` for the Aider credential forward. Comment
+  marks `getApiKey()` callers MUST treat the return as secret.
+- **`packages/core/src/harness/index.ts`** +
+  **`packages/agents/generate/src/types.ts`**:
+  `codeGeneration?: { backend: 'gestalt' | 'aider' }` on
+  HarnessConfig (both core + generate-side mirror).
+- **`packages/agents/generate/src/adapters/aider-adapter.ts`**
+  (new). `runAider` spawns `aider --yes --no-git --model "<m>"
+  --message "<escaped>"` via `executeScript`, with
+  `OPENAI_API_KEY` / `OPENAI_API_BASE` / `AIDER_NO_AUTO_COMMITS=
+  true` in `extraEnv`. `parseAiderChangedFiles` extracts paths
+  from `Wrote|Created|Updated|Modified|Edited|Applied edit to`
+  lines.
+- **`packages/agents/generate/src/adapters/aider-message-builder
+  .ts`** (new). Concise: task + success criteria + out-of-scope
+  + project rules + architecture (truncated 2KB) + design
+  (truncated 2KB). No HOW instructions.
+- **`packages/agents/generate/src/agents/aider-code-agent.ts`**
+  (new). Extends `BaseLLMAgent`; overrides `run()` to: resolve
+  per-agent LLM client, pull design-spec artifact, build
+  message, run Aider, re-read written files as `code` artifacts,
+  persist a `design`-type narrative artifact at
+  `.gestalt/<correlationId>/aider-output.md`. Sets
+  `lastPrompt` / `lastLlmResponse` / `lastModelUsed` so the
+  dashboard accordion renders Aider's narrative like a normal
+  LLM response.
+- **`packages/agents/generate/src/orchestrator/orchestrator.ts`**:
+  `newAgentForRole(role, harnessConfig)` — new signature.
+  Returns AiderCodeAgent for code-agent when
+  `harnessConfig?.codeGeneration?.backend === 'aider'`.
+  Top-level `handleIntentTask` merges `'test-agent'` into
+  `opts.skipAgents` under Aider mode so the existing skip
+  path marks test-agent as `skipped` for the dashboard.
+- **trackeros `HARNESS.json`** (commit `ccd99d0` on `main`):
+  `"codeGeneration": { "backend": "aider" }` appended.
+
+Live verification (correlation `3a114a1d-…`, intent_id
+`c2772306-…`):
+
+Per-round code-agent wall-clock (Aider sessions):
+
+| Rd | code-agent (ms) | files | test-agent | gate verdict |
+|---|---|---|---|---|
+| 1 | 12,287 | 2 | skipped | gate-fail |
+| 2 |  7,782 | 2 | skipped | gate-fail |
+| 3 |  6,103 | 2 | skipped | gate-fail |
+| 4 |  8,590 | 2 | skipped | gate-fail |
+| 5 |  8,956 | 2 | skipped | gate-fail |
+| 6 |  8,760 | 2 | skipped | gate-fail |
+| 7 |  9 s avg | 2 | skipped | self-healing |
+| 8 | terminating | 2 | skipped | gate-max-retries |
+
+Comparison to TR_013's Gestalt-native code-agent: 6–13 s per
+round vs 48–735 s per round. **10–80× faster wall-clock per
+code-agent step.** Zero JSON parse failures (the round-7 failure
+mode that ended TR_013 doesn't exist for Aider).
+
+Verification matrix:
+
+| Check | Result |
+|---|---|
+| Server logs show "Running Aider code generation" | ✓ every round, with `module: "aider-code-agent"` |
+| `.gestalt/<correlationId>/aider-output.md` artifact saved | ✓ full prompt + narrative + exit code + file list |
+| `leave.service.ts` created in the work-dir | ✓ Aider wrote it; AiderCodeAgent re-read + persisted as `code` artifact |
+| Gate runs on Aider-generated files | ✓ both review + constraint reviewed them |
+| No tool-budget exhaustion | ✓ never hit the 120s adapter timeout |
+| Code quality vs TR_013 | ✓ Aider's 15-line file is cleaner than any of TR_013's rounds; matches intent exactly |
+| Evidence requirement intact | ✓ 31/31 review + constraint signals carry `Evidence: "..."` |
+
+What worked:
+
+- **Wall-clock collapse.** Aider's code-agent step is 6–13s,
+  vs TR_013's 33–735s. Total code-agent wall-clock dropped
+  from ~36 minutes to ~67 seconds across the cycle.
+- **Code quality is consistently good.** Aider produced the
+  same minimal 15-line `leave.service.ts` on every retry —
+  no scope creep over rounds (TR_013's round 4+ added
+  unrequested methods, `console.log` "audit" lines, and
+  dropped requested methods).
+- **No JSON parse failures.** Aider writes files directly;
+  the brittle JSON-mode response handling that bit TR_013's
+  round 7 doesn't exist here.
+- **Clean observability surface.** The aider-output.md
+  artifact carries the prompt + Aider's verbatim narrative
+  — operators see exactly what the model decided to do.
+- **Per-project opt-in works.** trackeros opted in via a
+  3-line HARNESS.json change; no platform code change to
+  enable. Other projects continue running the Gestalt-native
+  code-agent.
+- **Test-agent skip works.** All 8 test-agent rows are
+  `status='skipped'`, no execution, no LLM call, fast.
+- **TR_013 evidence requirement still holds.** 31/31
+  signals carry `Evidence: "..."` quotes.
+
+What didn't work:
+
+- **Same gate-side hallucination as TR_013.** Review-agent +
+  constraint-agent emit the same "Direct DB access in
+  repository" categorical confusion. Sample finding:
+  > *[Repository pattern VIOLATION] The LeaveService class
+  > is directly calling a method on the LeaveRepository...*
+  That IS the repository pattern. The LLM's category
+  confusion is independent of which backend wrote the code.
+- **Cycle still terminates at gate-max-retries.** 8 rounds,
+  same 77% loop-detector trigger as TR_013's 84%. The
+  failure mode is unchanged.
+- **Token tracking is invisible.** Aider spends tokens
+  out-of-band; `tokens_used` is 0 on every code-agent
+  execution row. Operators can't see the cost surface for
+  the Aider-backed step.
+- **Aider's pre-emit verification is its call.** The
+  Gestalt-native code-agent has the TR_010 mandatory
+  `executeScript` pre-emit step. Aider may or may not run a
+  compile check based on its internal heuristics. We pass
+  the project rule, but Aider doesn't necessarily honour it.
+- **Test file completeness is laxer.** Aider's test file
+  was missing the `beforeEach` import — scaffolds the call
+  but forgets the import.
+
+Decisions made:
+
+- **Used `apk add --virtual` for build-deps in the Dockerfile.**
+  Aider depends on tree-sitter which needs cc + python3-dev.
+  Installing them as a virtual package + `apk del` in the same
+  RUN layer keeps the runtime image lean.
+- **Exposed `getBaseUrl()` + `getApiKey()` on LLMClient.**
+  Cleanest path for the Aider adapter to route through the
+  same registry-resolved endpoint without re-resolving
+  env/vault. Comment marks `getApiKey()` as secret-tier.
+- **Test-agent skipping via `opts.skipAgents` merge** rather
+  than a dedicated AiderSkippedAgent class. Reuses the
+  existing self-healing skip path verbatim.
+- **Persisted Aider's stdout as a `design`-type artifact.**
+  Closest existing artifact type. Path is
+  `.gestalt/<correlationId>/aider-output.md`. Operators see
+  the narrative in the dashboard accordion via the standard
+  artifact rendering.
+- **Aider sessions bounded by 120s timeout.** Same as the
+  `executeScript` MAX_SCRIPT_TIMEOUT_MS cap. Never hit it
+  in the verification cycle (max session was 12.3s).
+
+Pending follow-ups:
+
+- **(HIGHEST — carryover from TR_013)** Approach A: tighten
+  trackeros's HARNESS.json constraint rule wording. TR_014
+  proves the issue is backend-independent.
+- **(HIGH — new from TR_014)** Capture Aider's token spend.
+  Parse the `Tokens: N sent / M received` line from Aider's
+  stdout when present.
+- **(MEDIUM — new from TR_014)** Surface Aider exit-code
+  reasons in the CONTEXT_GAP signal — finer taxonomy than
+  the current generic message.
+- **(MEDIUM — carryover from TR_010/011)** Constraint-agent
+  per-role MAX_TOOL_CALLS override. TR_014 round 2's
+  constraint-agent ran 513s / 78k tokens.
+- **(LOW — new from TR_014)** Operator-side: project rule
+  "Every test file MUST import its testing-framework symbols
+  explicitly" addresses Aider's missing `beforeEach` import.
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker image rebuilt + container restarted via `docker compose
+up -d --build`. Server `/health` 200 throughout. Aider 0.86.2
+verified inside the container. trackeros `main` updated to
+`ccd99d0`. New file `docs/claude/TEST_REPORT_014.md`.
+
+---
+
+
+
 ### Session 2026-06-06 — Claude Code (TEST_REPORT_013: evidence requirement for ALL agents — structural fix lands cleanly, 25/25 emitted signals carry verbatim quotes, 4 ungrounded findings dropped at parse, categorical hallucination still drives the cycle but now visibly so)
 
 Six-part implementation session against TEST_REPORT_012's
@@ -466,213 +693,6 @@ Docker image rebuilt + container restarted via `docker compose
 up -d --build`. Server `/health` 200 throughout. Trackeros
 `main` updated to `3500a46`. New file
 `docs/claude/TEST_REPORT_012.md`.
-
----
-
-
-
-### Session 2026-06-06 — Claude Code (TEST_REPORT_011: TR_010 escalation analysis + 8-round scoped service intent — review-agent persistently hallucinates findings across rounds, retry budget overshoots by 2, ~$0.74 USD burned chasing phantom complaints; pre-generation prompt VALIDATED (listDirectory = 0))
-
-Two-part diagnostic session against TEST_REPORT_010's escalated cycle.
-**Step 1**: analyse whether TR_010's `GP_BREACH` was a real architectural
-violation or a review-agent false positive. **Step 2**: run a tightly
-scoped intent (single service file + single test, against an existing
-repository) and answer whether narrow scoping avoids the false-positive
-pile-up. No platform code changed this session — pure observation.
-
-Outcome: **Step 1 confirms TR_010's GP_BREACH was a FALSE POSITIVE**,
-and three of TR_010's five review-agent findings were either false
-positives or mistargeted. **Step 2 confirms the false-positive
-pattern is structural, not scope-driven**: the scoped intent ran
-**8 rounds** before failing (above the configured 6-round cap),
-burning ~2.47M tokens / ~$0.74 USD chasing the same review-agent
-hallucinations every round. Quality-gate's review-agent is now the
-single biggest blocker to a working end-to-end cycle.
-
-What the user asked for:
-
-- **Step 1 — TR_010 escalation analysis.** Read the generated
-  `leave.service.ts` from correlation `7afa0886-…`. Decide whether
-  the review-agent's "Direct DB access in service" GP_BREACH was
-  genuine (service calling `pool.query` directly) or a false
-  positive (service correctly delegating to repository). Same for
-  the audit-logging CV and the "Import cannot be resolved" CV.
-- **Step 2 — Scoped intent.** Cherry-pick `leave.model.ts` +
-  `leave.repository.ts` from `gestalt/a41959f9-...` (TR_007's
-  branch) to trackeros `main` so a real dependency exists, then
-  run a narrow intent for just `leave.service.ts` + its unit
-  test. Verify: executeScript fires consistently, code-agent
-  imports correctly from the existing repository, service uses
-  the repository interface (not `pool.query`), gate passes
-  cleanly, scope avoids GP_BREACH.
-
-What changed:
-
-- **No platform code.** Entirely diagnostic.
-- **Operator setup commit on trackeros `main`** (`5e619a9`):
-  cherry-picked `leave.model.ts` + `leave.repository.ts` from
-  `gestalt/a41959f9-create-the-leave-module-foundation`. TR_007
-  reported these were merged via PR #2801 — but the actual
-  trackeros PR list shows #39–#48 with no leave-module PR
-  among them. The TR_007 PR was never opened against main. This
-  commit closes that gap.
-
-Step 1 — TR_010 escalation analysis (verbatim from artifact):
-
-```ts
-// leave.service.ts (TR_010 correlation 7afa0886-…)
-import { LeaveRepository } from './leave.repository';
-
-export class LeaveService {
-  constructor(private readonly leaveRepository: LeaveRepository) {}
-
-  async submitLeaveRequest(req: LeaveRequest): Promise<LeaveRequest> {
-    return this.leaveRepository.createLeaveRequest(req);
-  }
-}
-```
-
-No `pool.query`. No `db.query`. The service imports + delegates to
-`LeaveRepository` — exactly the pattern the rule requires. **The
-GP_BREACH was a false positive.**
-
-TR_010 finding-by-finding:
-
-| TR_010 finding | Genuine? | In scope? | Should have been |
-|---|---|---|---|
-| GP_BREACH "Direct DB access in service" | **No** — service delegates correctly | n/a | Not emitted |
-| CV "Missing audit logging" | Yes | **Out of scope** | Suppressed per the review-agent's own outOfScope rule |
-| CV "Test framework mismatch" | Mixed — `src/modules/leave/leave.test.ts` lacks the imports; the `tests/unit/*` files have them | Yes | File-scoped |
-| CV "Import cannot be resolved for `LeaveRequest`" | **Wrong target** — `LeaveRequest` IS imported; the actual missing import is `LeaveRepository` in routes.ts | Yes | Right finding, wrong symbol |
-| CV "Unhandled promise rejection" (constraint-agent) | **No** — routes DO have try/catch | Yes | False positive |
-
-**Three of TR_010's five gate findings were false positives or
-mistargeted.** The single critical-severity escalation was on the
-single finding the review-agent should not have raised.
-
-Step 2 — Scoped intent execution (correlation
-`11a08e08-b191-48ba-b7b9-2c213123d350`):
-
-**8 rounds** before terminal `failed` status. Total cost:
-2,472,848 tokens / ~$0.74 USD.
-
-| Round | Code-agent (tok / tc) | Constraint-agent | Review-agent |
-|---|---|---|---|
-| 1 | 139,587 / 21 | failed (15) | failed (0) |
-| 2 | 139,808 / 21 | failed (10) | failed (0) |
-| 3 | 289,228 / 21 | failed (21) | failed (0) |
-| 4 | 145,138 / 21 | **passed** (5) | failed (0) |
-| 5 | 379,701 / 21 | failed (8) | failed (0) |
-| 6 | 159,994 / 21 | failed (13) | failed (0) |
-| 7 | 106,453 / 14 | failed (9) | failed (0) |
-| 8 | 115,504 / 16 | failed (9) | failed (0) |
-
-Code-agent total tool calls across 8 rounds: 125× `executeScript`,
-23× `readFile`, 8× `getFileTree`, **0× `listDirectory`**.
-
-What worked:
-
-- **TR_010 pre-generation prompt VALIDATED.** `listDirectory`
-  dropped from 8× in TR_010 to **0× across all 8 TR_011 rounds.**
-  The "do NOT explore directories that don't exist yet" instruction
-  is being respected. Permanent simplification candidate: drop
-  `listDirectory` from code-agent's `tools.builtin` entirely.
-- **`readFile` correctly hit the existing dependency files** —
-  distinct paths read across the cycle: `leave.repository.ts`,
-  `leave.model.ts`, `src/shared/types/index.ts`,
-  `src/shared/db/connection.ts`. The setup commit's seeded files
-  were used as designed.
-- **`executeScript` consistent.** 125 invocations across 8 rounds.
-  The mandatory pre-emit verification block is wired and active.
-- **Round 1's service.ts correctly imports `ILeaveRepository`**
-  from the seeded `leave.repository.ts` and delegates correctly.
-  Brief's verification questions 1–3 all pass.
-
-What didn't work:
-
-- **Review-agent hallucinated the SAME false positives every
-  round** for 8 straight rounds:
-  - "Missing audit logging" — 8/8 (out of scope per intent)
-  - "DB-pattern violation" against code that correctly delegates —
-    6/8 (false positive, same as TR_010)
-  - "Import cannot be resolved" against resolvable imports — 5/8
-  - "Missing RBAC enforcement" — 5/8 (out of scope)
-- **Review-agent's `tool_calls` is 0 in every TR_011 round.**
-  Despite TR_007's verification-guidance block telling it to run
-  `tsc --noEmit` before flagging unresolved imports, the LLM
-  never reaches for the tool. The instruction is advisory; it
-  needs to be mandatory + structural.
-- **Constraint-agent reviews files outside the cycle's
-  diff.** Flagged pre-existing `src/shared/db/connection.ts`
-  (on main since project bootstrap, not generated this cycle) for
-  "hardcoded credentials" on its `process.env.DATABASE_URL`
-  reference. Constraint-agent should scope to the cycle's
-  artifact set.
-- **Positive feedback loop induced scope creep.** By round 8 the
-  service had added `updateLeaveRequest` + `deleteLeaveRequest`
-  (not requested), dropped `getEmployeeLeave` (in the intent),
-  added `console.log("…")` as a "fix" for the phantom
-  audit-logging finding (which constraint-agent then correctly
-  flagged), and referenced `LeaveStatus.Deleted` (which doesn't
-  exist in shared/types).
-- **Retry budget overshot by 2 rounds.** `qualityGate.maxRetries: 3`
-  + `selfHealing.maxAttempts: 2` = 6 max. Cycle ran 8. Suspected
-  cause: constraint-agent verdict-passed in round 4 reset the
-  gate retry counter.
-
-Brief's verification matrix:
-
-| Question | Result |
-|---|---|
-| Did `executeScript` fire again? | ✓ Yes, 125× across 8 rounds |
-| Did code-agent correctly import from existing `leave.repository.ts`? | ✓ Yes — readFile on it every round |
-| Did the service correctly use the repository (no `pool.query`)? | ✓ Yes — delegated via repository in every round |
-| Did the gate pass cleanly with no false positives? | ✗ No — same false positives every round |
-| Was the intent scope narrow enough to avoid GP_BREACH? | ⚠ Mixed — no GP_BREACH escalation, but `failed` after budget exhaustion |
-
-Decisions made:
-
-- **Did NOT touch platform code this session.** The brief was
-  diagnostic + scoped re-run; widening scope to fix the
-  review-agent bug would have conflated measurement with
-  iteration. Recorded as the top recommended fix in the report.
-- **Did NOT abort the cycle mid-flight when it became clear the
-  loop was unproductive.** User chose "let it finish naturally"
-  via AskUserQuestion at round 5 → cleanest data for the report,
-  even at the cost of ~$0.40 in extra spend.
-- **Asked the user before pushing the setup commit to trackeros
-  main.** Auto-mode classifier blocked the first attempt as
-  out-of-brief; user approved via AskUserQuestion (selected
-  "Push setup commit"). Documented as deliberate setup, not
-  test artifact.
-
-Recommended fixes (carried into TR_011 report):
-
-- **(CRITICAL)** Tighten review-agent prompt: explicit "do NOT
-  emit when file structurally satisfies the rule"; "if concern
-  is not in IntentSpec.successCriteria AND not in
-  HARNESS.json.constraints.rules, treat as out-of-scope".
-- **(HIGH)** Add deterministic post-LLM grep filter on
-  review-agent findings — "Import cannot be resolved for X" →
-  `grep "^import.*X" <file>`; drop finding if hit. "Direct DB
-  access" → `grep "pool\.query\|db\.query" <file>`; drop if
-  no hits.
-- **(HIGH)** Investigate the 8-round overshoot. Audit
-  `gate-orchestrator.ts` retryCount increment logic.
-- **(HIGH)** Fix the review-agent `result_status='failed'` bug
-  (TR_010 / TR_011 reconfirmed across 64 executions).
-- **(MEDIUM)** Intent-agent should populate `outOfScope` more
-  generously based on the brief's narrowness.
-- **(MEDIUM)** Constraint-agent should scope to the cycle's diff,
-  not the whole project tree.
-- **(LOW)** Drop `listDirectory` from code-agent's `tools.builtin` —
-  TR_011 proves the pre-generation prompt has driven it to zero.
-
-Build status: `pnpm -r build` clean (no platform code changed).
-Docker server still on TR_010's `30b5d0b` image, healthy throughout.
-Trackeros `main`: `5e619a9` (setup commit). New file
-`docs/claude/TEST_REPORT_011.md`. No new commits on the gestalt repo
-yet — TR_011 commit is the next step.
 
 ---
 

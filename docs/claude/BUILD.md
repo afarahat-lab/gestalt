@@ -82,6 +82,24 @@ None blocking the build. Areas to keep in mind:
   access against code that correctly delegates to
   `LeaveRepository`. No `pool.query` in service. Critical
   driver for the review-agent fix below.
+- **TR_014 Aider as a swappable code-generation backend.**
+  Per-project opt-in via
+  `HARNESS.json.codeGeneration.backend: 'aider' | 'gestalt'`
+  (default `'gestalt'`). New
+  `packages/agents/generate/src/adapters/aider-adapter.ts`
+  + `aider-message-builder.ts` + `agents/aider-code-agent.ts`.
+  Aider 0.86.2 in the production Docker image; test-agent
+  skipped under Aider mode. trackeros opted in (`ccd99d0` on
+  `main`). Verified: Aider's code-agent step runs in 6–13 s
+  vs the Gestalt-native code-agent's 33–735 s (10–80×
+  faster); cleaner code; zero JSON parse failures. **Same
+  gate-side categorical hallucination as TR_013** —
+  Approach A (rule wording fix) still required.
+- **HIGH follow-up — TR_014:** Capture Aider's token spend.
+  Parse `Tokens: N sent / M received` from Aider's stdout
+  and surface as `tokens_used` on the execution row.
+- **MEDIUM follow-up — TR_014:** Finer-grained CONTEXT_GAP
+  on Aider exit codes (network / model refusal / file write).
 - **TR_013 universal evidence requirement landed.** New
   `packages/core/src/agents/evidence-requirement.ts` exports
   `EVIDENCE_REQUIREMENT_SECTION`, `QUOTED_LINE_SCHEMA_FIELD`,

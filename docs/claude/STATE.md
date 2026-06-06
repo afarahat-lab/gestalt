@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-06 (after TEST_REPORT_013 — universal evidence requirement shipped; every review + constraint signal now carries verbatim quoted evidence; 4 ungrounded findings dropped at parse; categorical hallucination still drives the cycle but now visibly so)
+**Last updated:** 2026-06-06 (after TEST_REPORT_014 — Aider shipped as a swappable code-generation backend; trackeros opted in; code-agent wall-clock drops 10–80× per round; same gate-side hallucination as TR_013 — proves the failure mode is backend-independent)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -195,6 +195,25 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
+- **TR_014 Aider as a swappable code-generation backend landed.**
+  New `packages/agents/generate/src/adapters/aider-adapter.ts`
+  + `aider-message-builder.ts` + `agents/aider-code-agent.ts`.
+  Per-project opt-in via
+  `HARNESS.json.codeGeneration.backend: 'aider' | 'gestalt'`
+  (default `'gestalt'` — existing projects unaffected).
+  Aider 0.86.2 installed in the production Docker image
+  (build-deps installed via `--virtual` + removed in the
+  same layer). `LLMClient.getBaseUrl()` + `getApiKey()`
+  exposed so the adapter routes through the same
+  registry-resolved endpoint; `executeScript` gains
+  `extraEnv?: Record<string, string>` for credential
+  forwarding. Test-agent skipped under Aider mode via
+  `opts.skipAgents` merge — Aider produces tests inline.
+  trackeros opted in (`ccd99d0` on `main`). Live
+  verification (correlation `3a114a1d-...`): 8 rounds,
+  Aider 6–13s/round (vs Gestalt code-agent's 33–735s),
+  same gate-side hallucination as TR_013, terminated via
+  TR_012 Fix 3 at 77% loop-detect.
 - **TR_013 universal evidence requirement landed.** New
   `packages/core/src/agents/evidence-requirement.ts` exports
   `EVIDENCE_REQUIREMENT_SECTION`, `QUOTED_LINE_SCHEMA_FIELD`,
@@ -360,7 +379,8 @@ the `sessions/archive/` files (everything older)._
 - **Open alerts to dismiss**: TR_010's `GP_BREACH` for
   `7afa0886-…`, TR_011's `failed` for `11a08e08-…`, TR_012's
   `gate-max-retries` for `aac73745-…`, TR_013's
-  `generate-error` for `59900af8-…`. All dismissable with
+  `generate-error` for `59900af8-…`, TR_014's
+  `gate-max-retries` for `3a114a1d-…`. All dismissable with
   `gestalt alerts dismiss`.
 - **`.env`**: `LLM_MODEL=gpt-4o` (operator default). For
   `chat-latest` routing through the registry's responses

@@ -35,6 +35,7 @@ import { ContextAgent } from '../agents/context-agent';
 import { LintConfigAgent } from '../agents/lint-config-agent';
 import { CodeAgent } from '../agents/code-agent';
 import { TestAgent } from '../agents/test-agent';
+import { AiderCodeAgent } from '../agents/aider-code-agent';
 import type { BaseLLMAgent } from '../agents/base-llm-agent';
 import { runCustomAgent } from '../agents/custom-agent-runner';
 import { loadCustomAgents } from '../config/agent-config-loader';
@@ -383,6 +384,18 @@ async function handleIntentTask(
         ? resumeCtx.skipAgents
         : undefined;
 
+    // TR_014 — when Aider is the code-generation backend, skip
+    // test-agent. Aider produces tests inline as part of the same
+    // session it generates code in; running a second LLM pass to
+    // re-generate tests would be redundant and would also re-run on
+    // the freshly-Aider-edited files (out of order with the design
+    // spec). Merged with the self-healing skip list so both signals
+    // are respected.
+    const aiderBackend = harnessConfig?.codeGeneration?.backend === 'aider';
+    const skipAgents = aiderBackend
+      ? Array.from(new Set([...(selfHealingSkipAgents ?? []), 'test-agent']))
+      : selfHealingSkipAgents;
+
     // Drive the plan to completion
     await drivePlan(
       plan,
@@ -399,7 +412,7 @@ async function handleIntentTask(
         projectCredential,
         customAgentsAfter,
         customAgentsAfterCustom,
-        skipAgents: selfHealingSkipAgents,
+        skipAgents,
       },
     );
 
@@ -750,7 +763,7 @@ async function drivePlan(
           // captures lastModelUsed on its instance after each call;
           // we read it back after `run()` returns to persist into
           // `agent_execution_logs.model_used`.
-          agentInstance = newAgentForRole(agentRole);
+          agentInstance = newAgentForRole(agentRole, opts.harnessConfig);
           // `BaseLLMAgent` is generic over the task / result shapes
           // (TTask, TResult default to `unknown`) so every layer can
           // declare its own typed pair. The generate-layer subclasses
@@ -1027,13 +1040,22 @@ function resolveMcpForAgent(
   return clients;
 }
 
-function newAgentForRole(agentRole: AgentRole): BaseLLMAgent {
+function newAgentForRole(
+  agentRole: AgentRole,
+  harnessConfig: HarnessConfig | null,
+): BaseLLMAgent {
+  // TR_014 — when the project opts in via
+  // HARNESS.json.codeGeneration.backend === 'aider', swap the
+  // Gestalt-native code-agent for the AiderCodeAgent. The test-agent
+  // step is removed from the plan by `opts.skipAgents` earlier in
+  // `handleIntentTask`, so we don't need a separate branch here.
+  const aiderBackend = harnessConfig?.codeGeneration?.backend === 'aider';
   switch (agentRole) {
     case 'intent-agent':      return new IntentAgent();
     case 'design-agent':      return new DesignAgent();
     case 'context-agent':     return new ContextAgent();
     case 'lint-config-agent': return new LintConfigAgent();
-    case 'code-agent':        return new CodeAgent();
+    case 'code-agent':        return aiderBackend ? new AiderCodeAgent() : new CodeAgent();
     case 'test-agent':        return new TestAgent();
     default:
       throw new Error(`Unknown agent role in generate layer: ${agentRole}`);

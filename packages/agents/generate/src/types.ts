@@ -172,6 +172,17 @@ export interface HarnessConfig {
       token?: string;
     }>;
   };
+  /**
+   * Code-generation backend (TR_014). Mirrors `HarnessConfig.codeGeneration`
+   * in `@gestalt/core`. Default `'gestalt'` keeps the existing
+   * code-agent + test-agent. `'aider'` swaps the code-agent step
+   * for an Aider CLI shell-out (the adapter re-reads Aider's
+   * written files as artifacts) and skips the test-agent step
+   * (Aider produces tests inline).
+   */
+  codeGeneration?: {
+    backend: 'gestalt' | 'aider';
+  };
 }
 
 export interface ArchitectureSpec {

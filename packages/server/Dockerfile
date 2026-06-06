@@ -62,7 +62,18 @@ WORKDIR /app
 # `git` is required at runtime — simple-git shells out to the system binary
 # for clone / commit / push (ADR-032). `openssh-client` is needed for SSH
 # remotes (HTTPS+PAT still works without it but most operators use both).
-RUN apk add --no-cache git openssh-client
+# `python3` + `py3-pip` ship Aider (TR_014) — opt-in code-generation
+# backend per project via HARNESS.json.codeGeneration.backend.
+# `--break-system-packages` is required on Alpine 3.20+ because PEP 668
+# treats the system Python as externally-managed; we own the image
+# entirely so the override is safe here. Aider depends on tree-sitter
+# which has C extensions — build-base + python3-dev are installed
+# temporarily for the pip build, then removed via `apk del` in the
+# same layer so the runtime image doesn't grow with compilers.
+RUN apk add --no-cache git openssh-client python3 py3-pip \
+    && apk add --no-cache --virtual .aider-build-deps build-base python3-dev \
+    && pip3 install --no-cache-dir --break-system-packages aider-chat \
+    && apk del .aider-build-deps
 
 # Install pnpm globally via npm rather than corepack — corepack caches
 # per-user (`~/.cache/node/corepack/...`) so an activation as root

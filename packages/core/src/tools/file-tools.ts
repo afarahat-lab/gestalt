@@ -385,6 +385,7 @@ export async function executeScript(
   command: string,
   workDir: string,
   timeoutMs: number = DEFAULT_SCRIPT_TIMEOUT_MS,
+  extraEnv?: Record<string, string>,
 ): Promise<ExecuteScriptResult> {
   const effectiveTimeout = Math.min(Math.max(timeoutMs, 1), MAX_SCRIPT_TIMEOUT_MS);
 
@@ -403,9 +404,14 @@ export async function executeScript(
   const startedAt = Date.now();
 
   return await new Promise<ExecuteScriptResult>((resolvePromise) => {
+    // TR_014 — extraEnv lets the AiderAdapter pass OPENAI_API_KEY /
+    // OPENAI_API_BASE / AIDER_NO_AUTO_COMMITS to the child without
+    // mutating the platform's own process.env. Tool-call callers
+    // (the read-only file-tools dispatch above) pass undefined and
+    // the child inherits process.env unchanged.
     const child = spawn('/bin/sh', ['-c', command], {
       cwd: workDir,
-      env: process.env,
+      env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
     });
 
     let stdout = '';

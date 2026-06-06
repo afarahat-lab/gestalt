@@ -122,6 +122,28 @@ export class LLMClient {
   }
 
   /**
+   * The provider base URL this client is bound to (TR_014). Exposed so
+   * shell-out integrations (Aider) can pass `OPENAI_API_BASE` to the
+   * child process and route through the same endpoint the rest of
+   * the platform uses, without re-resolving the registry row.
+   */
+  getBaseUrl(): string {
+    return this.config.baseUrl;
+  }
+
+  /**
+   * The provider API key this client is bound to (TR_014). Resolved
+   * via the same registry/vault precedence the LLM call path uses.
+   * Exposed for shell-out integrations (Aider) that need to forward
+   * the credential to a child process. Callers MUST treat the return
+   * value as a secret — never log it, never include it in error
+   * messages or telemetry.
+   */
+  getApiKey(): string {
+    return this.config.apiKey;
+  }
+
+  /**
    * Sends a request to the LLM provider.
    * Retries on transient errors (rate limits, timeouts).
    * Returns a typed Result — never throws.
