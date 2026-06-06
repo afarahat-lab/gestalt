@@ -34,6 +34,7 @@ import {
   BaseLLMAgent, extractJsonObject,
   EVIDENCE_REQUIREMENT_SECTION, QUOTED_LINE_SCHEMA_FIELD,
   dropUnevidencedFindings,
+  loadAgentConfig,
 } from '@gestalt/core';
 import type { AgentConfig, HarnessConfig } from '@gestalt/core';
 import { readFile } from 'fs/promises';
@@ -48,29 +49,22 @@ import { createContextLogger } from '@gestalt/core';
 const log = createContextLogger({ module: 'constraint-agent' });
 
 // ─── Configuration ──────────────────────────────────────────────────────────
-
-/**
- * Persona + LLM config + tool grant for the verification call.
- * `temperature: 0` because we want deterministic, auditable
- * verdicts. `maxTokens` is generous (4096) because the LLM may
- * need to interleave tool calls + observations + reasoning before
- * emitting the final JSON.
- *
- * `tools.builtin` — exactly the three tools the brief specifies:
- * `executeScript` for shell verification (compile / lint / test /
- * grep), `readFile` for spot-checking source, `searchFiles` for
- * finding rule-relevant patterns across the tree.
- */
-const AGENT_CONFIG: AgentConfig = {
-  role: 'Architectural constraint evaluator',
-  goal: 'Verify generated code satisfies all project architectural rules using executeScript + read-only file tools',
-  llm: { temperature: 0.0, maxTokens: 4000 },
-  promptExtensions: [],
-  tools: {
-    builtin: ['executeScript', 'readFile', 'searchFiles'],
-    mcp: [],
-  },
-};
+//
+// TEST_REPORT_017 — constraint-agent now resolves its config via
+// `loadAgentConfig(projectRoot, 'constraint-agent')`, the same path
+// every other LLM-driven agent uses. The previous module-level
+// `AGENT_CONFIG` constant silently ignored `agents.yaml` overrides
+// — operators tuning constraint-agent's `model` / `temperature` /
+// `max_tokens` got no signal that their config wasn't being read.
+// TR_016's verification cycle passed despite this bug; TR_017
+// closes it so future cycles can rely on the model field
+// (constraint-agent now honours `model: gpt-4o` on trackeros).
+//
+// Platform defaults for constraint-agent live in
+// `PER_ROLE_DEFAULTS['constraint-agent']` (packages/core/src/agents/
+// agent-config-loader.ts:142) — `loadAgentConfig` returns those
+// when no `agents.yaml` block is present, then merges the YAML
+// override on top.
 
 /** Cap each artifact's body when inlined into the prompt. */
 const PER_ARTIFACT_BODY_CAP = 2000;
@@ -126,18 +120,26 @@ export class ConstraintAgent extends BaseLLMAgent {
     this.lastTokensUsed = 0;
     const startedAt = Date.now();
 
-    const [harnessConfig, intentSpec] = await Promise.all([
+    // TR_017 — load the per-agent config the same way review-agent
+    // does. `loadAgentConfig` returns `PER_ROLE_DEFAULTS[
+    // 'constraint-agent']` when no `agents.yaml` block is present
+    // (preserving the original AGENT_CONFIG values: role, goal,
+    // temperature 0.0, maxTokens 4000, tools executeScript /
+    // readFile / searchFiles); the operator's `agents.yaml` block
+    // overrides on top so `model: gpt-4o` reaches the wire.
+    const [harnessConfig, intentSpec, agentConfig] = await Promise.all([
       loadHarnessConfig(task.harnessConfig.projectRoot),
       Promise.resolve(extractIntentSpec(task.artifacts)),
+      loadAgentConfig(task.harnessConfig.projectRoot, 'constraint-agent'),
     ]);
 
-    const prompt = this.buildVerificationPrompt(task, harnessConfig, intentSpec);
+    const prompt = this.buildVerificationPrompt(task, harnessConfig, intentSpec, agentConfig);
 
     let response: string;
     try {
       const result = await this.callLLMWithTools(
         prompt,
-        AGENT_CONFIG,
+        agentConfig,
         task.harnessConfig.projectRoot,
         task.correlationId,
       );
@@ -197,6 +199,7 @@ export class ConstraintAgent extends BaseLLMAgent {
     task: GateTask,
     harnessConfig: HarnessConfig | null,
     intentSpec: { rawIntent?: string; outOfScope?: string[] } | null,
+    agentConfig: AgentConfig,
   ): string {
     const rulesSection = this.buildHarnessAgentSection(harnessConfig);
     const scriptInstruction = this.buildScriptToolInstruction();
@@ -213,7 +216,11 @@ export class ConstraintAgent extends BaseLLMAgent {
         return `### ${a.path}\n\`\`\`\n${body}\n\`\`\``;
       });
 
-    return `You are an Architectural constraint evaluator working on a project clone at the current working directory.
+    // TR_017 — persona comes from the resolved AgentConfig (defaults
+    // overridden by the operator's `agents.yaml` block when present)
+    // instead of being hardcoded. Mirrors `llm-review-agent.ts`'s
+    // `buildReviewPrompt` pattern.
+    return `You are ${agentConfig.role} working on a project clone at the current working directory.
 
 ${rulesSection}
 ${scriptInstruction}

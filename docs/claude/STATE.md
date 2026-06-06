@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-06 (after TEST_REPORT_016 — review-agent switched to gpt-4o; first clean `Status: ✓ deployed` since TEST_REPORT_007. Single round, zero signals, ~$0.046. constraint-agent's hardcoded AGENT_CONFIG silently ignores agents.yaml override — new HIGHEST follow-up.)
+**Last updated:** 2026-06-06 (after TEST_REPORT_017 — constraint-agent's hardcoded AGENT_CONFIG removed; now resolves via loadAgentConfig like review-agent. Second clean `Status: ✓ deployed` in a row; constraint-agent model_used = 'gpt-4o' confirmed; 9× faster + 18× cheaper than on gpt-4o-mini.)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -195,6 +195,24 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
+- **TR_017 constraint-agent now respects `agents.yaml`.**
+  `packages/agents/quality-gate/src/agents/constraint-
+  agent.ts` — removed the module-level `AGENT_CONFIG`
+  constant; `verify()` now resolves the config via
+  `loadAgentConfig(projectRoot, 'constraint-agent')`
+  (parallel-loaded with `loadHarnessConfig` + intent-spec
+  extraction). `buildVerificationPrompt` takes the
+  resolved config and uses `agentConfig.role` in the
+  persona line. Mirrors `llm-review-agent.ts`'s loader
+  pattern verbatim. Platform defaults
+  (`PER_ROLE_DEFAULTS['constraint-agent']`) carry the
+  original AGENT_CONFIG values so projects without an
+  `agents.yaml` block behave identically. Live
+  verification: trackeros constraint-agent
+  `model_used = 'gpt-4o'` (was `'gpt-4o-mini'` in
+  TR_016); 2.4s / 3,082 tokens (vs TR_016's 22.4s /
+  56,791 tokens — 9× faster, 18× cheaper). Second clean
+  `Status: ✓ deployed` in a row.
 - **TR_016 gate agents promoted to gpt-4o (cycle deployed
   cleanly on round 1).** trackeros `agents.yaml` (commit
   `9830241` on `main`) declares per-agent overrides for
@@ -214,17 +232,9 @@ the `sessions/archive/` files (everything older)._
   because the TR_015 rule clarifications + TR_013
   evidence requirement + Aider's clean code + review-agent
   on gpt-4o was sufficient.
-- **(HIGHEST follow-up — new from TR_016)** Fix
-  constraint-agent's hardcoded `AGENT_CONFIG` constant.
-  `packages/agents/quality-gate/src/agents/constraint-
-  agent.ts:64` should call `loadAgentConfig(
-  task.harnessConfig.projectRoot, 'constraint-agent')`
-  like `llm-review-agent.ts:108` does. Without this,
-  operators tuning constraint-agent's model/temperature/
-  maxTokens via `agents.yaml` get no signal that the
-  override was silently dropped. TR_016 passed despite
-  this; future cycles on different intent shapes may
-  not.
+- **~~(HIGHEST — TR_016)~~ RESOLVED by TR_017.** Fix
+  constraint-agent's hardcoded `AGENT_CONFIG` — done.
+  See TR_017 entry above.
 - **(HIGH follow-up — new from TR_016)** Re-run the
   verification on at least one more intent shape (e.g.
   a different module, or a multi-file intent) to

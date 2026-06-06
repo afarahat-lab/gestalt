@@ -3,6 +3,122 @@
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+### Session 2026-06-06 — Claude Code (TEST_REPORT_017: fix constraint-agent hardcoded AGENT_CONFIG — second clean deploy in a row; gate-agent model overrides finally land symmetrically; constraint-agent on gpt-4o runs 9× faster + 18× cheaper than on gpt-4o-mini)
+
+One-line fix session against TR_016's HIGHEST follow-up. The
+user's brief: `constraint-agent.ts:64` defines a module-level
+`AGENT_CONFIG` constant and uses it verbatim — operators
+tuning constraint-agent's model/temperature/maxTokens via
+`agents.yaml` get no signal that the override was silently
+dropped. Replicate review-agent's `loadAgentConfig` pattern.
+No full TR_017 report needed if the cycle deploys; just
+confirm `agent_execution_logs.model_used = 'gpt-4o'` for
+constraint-agent.
+
+Outcome: **constraint-agent now honours `agents.yaml`; second
+clean `Status: ✓ deployed` in a row.** model_used field on
+trackeros's constraint-agent execution row reads
+`gpt-4o` — was `gpt-4o-mini` in TR_016. Cycle deployed cleanly
+in a single round, zero signals from either gate agent. The
+constraint-agent step ran in **2.4 seconds with 3,082 tokens**
+on gpt-4o vs TR_016's **22.4 seconds with 56,791 tokens** on
+gpt-4o-mini — 9× faster wall-clock, 18× fewer tokens. Stronger
+reasoning needs less executeScript exploration to apply the
+same rule set.
+
+What changed:
+
+- **`packages/agents/quality-gate/src/agents/constraint-agent.ts`**:
+  removed the module-level `AGENT_CONFIG` constant. Added
+  `loadAgentConfig` to the `@gestalt/core` import.
+  `verify()` now resolves the config via
+  `loadAgentConfig(task.harnessConfig.projectRoot,
+  'constraint-agent')` in parallel with the existing
+  `loadHarnessConfig` + `extractIntentSpec` Promise.all.
+  The result is passed to both `buildVerificationPrompt`
+  (where the persona line `You are <role>` now reads from
+  the resolved config) and `callLLMWithTools` (where the
+  model resolution lives). Mirrors `llm-review-agent.ts`'s
+  loader pattern verbatim. `PER_ROLE_DEFAULTS[
+  'constraint-agent']` already carries the original
+  AGENT_CONFIG values (temp 0.0, maxTokens 4000, tools
+  executeScript / readFile / searchFiles) so projects
+  without an `agents.yaml` block behave identically to
+  before.
+
+Live verification (correlation
+`458794fe-2331-4d59-b943-be16035fec47`, intent_id
+`6f2e80a2-3100-492a-bd09-1a469e4d5815`):
+
+```
+agent_role       | model_used  | tokens_used | duration_ms
+constraint-agent | gpt-4o      |       3,082 |        2431
+review-agent     | gpt-4o      |      18,844 |        4842
+code-agent       | gpt-4o-mini |           0 |        8545  (Aider)
+```
+
+Verification check from the brief — **does
+`agent_execution_logs.model_used = 'gpt-4o'` for
+constraint-agent? ✓ YES.** Single check, passed. Cycle
+deployed via the noop pipeline adapter (pr-agent →
+pipeline-agent → promotion-agent staging → promotion-agent
+production).
+
+What this unlocks:
+
+- **Symmetric gate-agent configuration.** Operators can now
+  tune constraint-agent the same way they tune review-agent
+  — via `agents.yaml`. The stale "infrastructure agents
+  NOT configurable here" comment at the top of trackeros's
+  agents.yaml is now actively misleading; future session
+  should clean it up.
+- **TR_016's headline outcome is no longer fragile.** TR_016
+  passed despite constraint-agent silently running on
+  gpt-4o-mini because the TR_015 rule clarifications +
+  TR_013 evidence requirement + Aider's clean code +
+  review-agent on gpt-4o was sufficient. TR_017 closes the
+  loop — both gate agents now respect the operator's
+  declared model.
+- **Cost characterisation per gate agent.** TR_017 gives
+  the first apples-to-apples comparison of
+  gpt-4o-mini-on-constraint-agent vs gpt-4o-on-
+  constraint-agent on the same intent + rule set. gpt-4o
+  is 9× faster + 18× cheaper for the rule-application
+  task. Adds weight to the "use the right model for the
+  job" thesis: cheaper-but-laxer for code generation
+  (Aider on gpt-4o-mini), stronger-and-more-deterministic
+  for rule application (gate agents on gpt-4o).
+
+Pending follow-ups (priority-shifted by TR_017's data):
+
+- **(HIGH — carryover from TR_016)** Re-run verification
+  on at least one more intent shape (e.g. a different
+  module, or a multi-file intent). TR_017 brings the
+  sample size to TWO (both deployed cleanly) but a
+  third shape on a different module would meaningfully
+  raise confidence.
+- **(LOW — carryover from TR_016)** Update the stale
+  comment at the top of trackeros's `agents.yaml`:
+  "Infrastructure agents (constraint-agent, ...) do
+  deterministic work and are NOT configurable here" is
+  no longer true. constraint-agent + test-runner-agent
+  are LLM-driven since TR_005; TR_017 makes
+  constraint-agent's agents.yaml override land
+  correctly.
+- Carryovers from TR_015 / TR_014: deterministic
+  post-LLM repository-pattern filter (less urgent now);
+  Aider token spend visibility; restore TR_010 mandatory
+  executeScript code-agent rule.
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker image rebuilt + restarted. Server `/health` 200
+throughout. No trackeros change required (existing
+`agents.yaml` block from TR_016 now takes effect).
+
+---
+
+
+
 ### Session 2026-06-06 — Claude Code (TEST_REPORT_016: switch gate agents to gpt-4o — first clean deploy since TR_007. Single round, zero signals, ~$0.046. constraint-agent override silently ignored (uses hardcoded config) — new HIGHEST follow-up.)
 
 Two-part fix session against TR_015's HIGHEST follow-up. The
@@ -388,227 +504,3 @@ throughout. trackeros `main` updated to `ce0c01e`. New file
 
 
 
-### Session 2026-06-06 — Claude Code (TEST_REPORT_014: Aider as a swappable code-generation backend — ships cleanly; code-agent wall-clock drops 10–80×; same gate-side hallucination as TR_013 — proves the issue is backend-independent)
-
-Seven-part implementation session against the user's brief: replace
-the Gestalt-native code-agent + test-agent with Aider, per project
-opt-in via HARNESS.json. Aider runs as a child process, edits files
-directly in the cycle's cloned work-dir, and the AiderCodeAgent
-re-reads them as artifacts so the rest of the platform (gate,
-deploy, observability) runs unchanged. Aider 0.86.2 installed in
-the production Docker image; trackeros opted in via
-`codeGeneration.backend: 'aider'`.
-
-Outcome: **Aider integration ships cleanly and works.** Aider ran 8
-times in the verification cycle, producing the same correct
-15-line `leave.service.ts` + a vitest test file every round in
-6–13 seconds (vs the Gestalt-native code-agent's 33–735 seconds
-in TR_013). Test-agent was skipped on all 8 rounds — Aider produced
-tests inline. But the cycle **still fails on the same review-agent /
-constraint-agent "Direct DB access" categorical hallucination as
-TR_013**, terminated by TR_012's loop detector at a 77% repeat
-rate. This is the cleanest possible isolation: switching the
-backend changes nothing about the gate's behaviour. **Approach A
-(tighter HARNESS.json rule wording) is still the next required
-fix.**
-
-What the user asked for:
-
-- **Part 1** — Install Aider in the production Docker image
-  (`packages/server/Dockerfile`).
-- **Part 2** — AiderAdapter in the generate package: `runAider`
-  + `parseAiderChangedFiles`. `--yes --no-git --message` flags
-  mandatory; credentials forwarded as env vars not CLI flags.
-- **Part 3** — Aider message builder: task + criteria + rules +
-  architecture + design. **No implementation instructions** —
-  Aider decides how.
-- **Part 4** — Orchestrator wiring. When the harness opts in,
-  swap CodeAgent for AiderCodeAgent and skip test-agent.
-- **Part 5** — HARNESS schema `codeGeneration.backend:
-  'gestalt' | 'aider'`, default `'gestalt'`.
-- **Part 6** — executeScript gains `extraEnv?` for credential
-  forwarding.
-- **Part 7** — trackeros opted in via HARNESS.json; commit
-  pushed to trackeros `main`.
-- Verify with the same Leave-service intent used in TR_011/012/013.
-  Compare code quality, wall-clock, and gate verdict against TR_013.
-
-What changed:
-
-- **`packages/server/Dockerfile`**: production stage gets
-  `python3` + `py3-pip` + `aider-chat`. Tree-sitter's C
-  extensions need build-base + python3-dev — installed as a
-  `--virtual .aider-build-deps` package and removed via
-  `apk del` in the same layer so the runtime image stays
-  lean. `docker compose exec server aider --version` →
-  `aider 0.86.2`.
-- **`packages/core/src/tools/file-tools.ts`**: `executeScript`
-  signature gains optional `extraEnv?: Record<string, string>`.
-  Tool-call callers pass undefined and behave exactly as before.
-- **`packages/core/src/llm/index.ts`**: `LLMClient.getBaseUrl()`
-  + `getApiKey()` for the Aider credential forward. Comment
-  marks `getApiKey()` callers MUST treat the return as secret.
-- **`packages/core/src/harness/index.ts`** +
-  **`packages/agents/generate/src/types.ts`**:
-  `codeGeneration?: { backend: 'gestalt' | 'aider' }` on
-  HarnessConfig (both core + generate-side mirror).
-- **`packages/agents/generate/src/adapters/aider-adapter.ts`**
-  (new). `runAider` spawns `aider --yes --no-git --model "<m>"
-  --message "<escaped>"` via `executeScript`, with
-  `OPENAI_API_KEY` / `OPENAI_API_BASE` / `AIDER_NO_AUTO_COMMITS=
-  true` in `extraEnv`. `parseAiderChangedFiles` extracts paths
-  from `Wrote|Created|Updated|Modified|Edited|Applied edit to`
-  lines.
-- **`packages/agents/generate/src/adapters/aider-message-builder
-  .ts`** (new). Concise: task + success criteria + out-of-scope
-  + project rules + architecture (truncated 2KB) + design
-  (truncated 2KB). No HOW instructions.
-- **`packages/agents/generate/src/agents/aider-code-agent.ts`**
-  (new). Extends `BaseLLMAgent`; overrides `run()` to: resolve
-  per-agent LLM client, pull design-spec artifact, build
-  message, run Aider, re-read written files as `code` artifacts,
-  persist a `design`-type narrative artifact at
-  `.gestalt/<correlationId>/aider-output.md`. Sets
-  `lastPrompt` / `lastLlmResponse` / `lastModelUsed` so the
-  dashboard accordion renders Aider's narrative like a normal
-  LLM response.
-- **`packages/agents/generate/src/orchestrator/orchestrator.ts`**:
-  `newAgentForRole(role, harnessConfig)` — new signature.
-  Returns AiderCodeAgent for code-agent when
-  `harnessConfig?.codeGeneration?.backend === 'aider'`.
-  Top-level `handleIntentTask` merges `'test-agent'` into
-  `opts.skipAgents` under Aider mode so the existing skip
-  path marks test-agent as `skipped` for the dashboard.
-- **trackeros `HARNESS.json`** (commit `ccd99d0` on `main`):
-  `"codeGeneration": { "backend": "aider" }` appended.
-
-Live verification (correlation `3a114a1d-…`, intent_id
-`c2772306-…`):
-
-Per-round code-agent wall-clock (Aider sessions):
-
-| Rd | code-agent (ms) | files | test-agent | gate verdict |
-|---|---|---|---|---|
-| 1 | 12,287 | 2 | skipped | gate-fail |
-| 2 |  7,782 | 2 | skipped | gate-fail |
-| 3 |  6,103 | 2 | skipped | gate-fail |
-| 4 |  8,590 | 2 | skipped | gate-fail |
-| 5 |  8,956 | 2 | skipped | gate-fail |
-| 6 |  8,760 | 2 | skipped | gate-fail |
-| 7 |  9 s avg | 2 | skipped | self-healing |
-| 8 | terminating | 2 | skipped | gate-max-retries |
-
-Comparison to TR_013's Gestalt-native code-agent: 6–13 s per
-round vs 48–735 s per round. **10–80× faster wall-clock per
-code-agent step.** Zero JSON parse failures (the round-7 failure
-mode that ended TR_013 doesn't exist for Aider).
-
-Verification matrix:
-
-| Check | Result |
-|---|---|
-| Server logs show "Running Aider code generation" | ✓ every round, with `module: "aider-code-agent"` |
-| `.gestalt/<correlationId>/aider-output.md` artifact saved | ✓ full prompt + narrative + exit code + file list |
-| `leave.service.ts` created in the work-dir | ✓ Aider wrote it; AiderCodeAgent re-read + persisted as `code` artifact |
-| Gate runs on Aider-generated files | ✓ both review + constraint reviewed them |
-| No tool-budget exhaustion | ✓ never hit the 120s adapter timeout |
-| Code quality vs TR_013 | ✓ Aider's 15-line file is cleaner than any of TR_013's rounds; matches intent exactly |
-| Evidence requirement intact | ✓ 31/31 review + constraint signals carry `Evidence: "..."` |
-
-What worked:
-
-- **Wall-clock collapse.** Aider's code-agent step is 6–13s,
-  vs TR_013's 33–735s. Total code-agent wall-clock dropped
-  from ~36 minutes to ~67 seconds across the cycle.
-- **Code quality is consistently good.** Aider produced the
-  same minimal 15-line `leave.service.ts` on every retry —
-  no scope creep over rounds (TR_013's round 4+ added
-  unrequested methods, `console.log` "audit" lines, and
-  dropped requested methods).
-- **No JSON parse failures.** Aider writes files directly;
-  the brittle JSON-mode response handling that bit TR_013's
-  round 7 doesn't exist here.
-- **Clean observability surface.** The aider-output.md
-  artifact carries the prompt + Aider's verbatim narrative
-  — operators see exactly what the model decided to do.
-- **Per-project opt-in works.** trackeros opted in via a
-  3-line HARNESS.json change; no platform code change to
-  enable. Other projects continue running the Gestalt-native
-  code-agent.
-- **Test-agent skip works.** All 8 test-agent rows are
-  `status='skipped'`, no execution, no LLM call, fast.
-- **TR_013 evidence requirement still holds.** 31/31
-  signals carry `Evidence: "..."` quotes.
-
-What didn't work:
-
-- **Same gate-side hallucination as TR_013.** Review-agent +
-  constraint-agent emit the same "Direct DB access in
-  repository" categorical confusion. Sample finding:
-  > *[Repository pattern VIOLATION] The LeaveService class
-  > is directly calling a method on the LeaveRepository...*
-  That IS the repository pattern. The LLM's category
-  confusion is independent of which backend wrote the code.
-- **Cycle still terminates at gate-max-retries.** 8 rounds,
-  same 77% loop-detector trigger as TR_013's 84%. The
-  failure mode is unchanged.
-- **Token tracking is invisible.** Aider spends tokens
-  out-of-band; `tokens_used` is 0 on every code-agent
-  execution row. Operators can't see the cost surface for
-  the Aider-backed step.
-- **Aider's pre-emit verification is its call.** The
-  Gestalt-native code-agent has the TR_010 mandatory
-  `executeScript` pre-emit step. Aider may or may not run a
-  compile check based on its internal heuristics. We pass
-  the project rule, but Aider doesn't necessarily honour it.
-- **Test file completeness is laxer.** Aider's test file
-  was missing the `beforeEach` import — scaffolds the call
-  but forgets the import.
-
-Decisions made:
-
-- **Used `apk add --virtual` for build-deps in the Dockerfile.**
-  Aider depends on tree-sitter which needs cc + python3-dev.
-  Installing them as a virtual package + `apk del` in the same
-  RUN layer keeps the runtime image lean.
-- **Exposed `getBaseUrl()` + `getApiKey()` on LLMClient.**
-  Cleanest path for the Aider adapter to route through the
-  same registry-resolved endpoint without re-resolving
-  env/vault. Comment marks `getApiKey()` as secret-tier.
-- **Test-agent skipping via `opts.skipAgents` merge** rather
-  than a dedicated AiderSkippedAgent class. Reuses the
-  existing self-healing skip path verbatim.
-- **Persisted Aider's stdout as a `design`-type artifact.**
-  Closest existing artifact type. Path is
-  `.gestalt/<correlationId>/aider-output.md`. Operators see
-  the narrative in the dashboard accordion via the standard
-  artifact rendering.
-- **Aider sessions bounded by 120s timeout.** Same as the
-  `executeScript` MAX_SCRIPT_TIMEOUT_MS cap. Never hit it
-  in the verification cycle (max session was 12.3s).
-
-Pending follow-ups:
-
-- **(HIGHEST — carryover from TR_013)** Approach A: tighten
-  trackeros's HARNESS.json constraint rule wording. TR_014
-  proves the issue is backend-independent.
-- **(HIGH — new from TR_014)** Capture Aider's token spend.
-  Parse the `Tokens: N sent / M received` line from Aider's
-  stdout when present.
-- **(MEDIUM — new from TR_014)** Surface Aider exit-code
-  reasons in the CONTEXT_GAP signal — finer taxonomy than
-  the current generic message.
-- **(MEDIUM — carryover from TR_010/011)** Constraint-agent
-  per-role MAX_TOOL_CALLS override. TR_014 round 2's
-  constraint-agent ran 513s / 78k tokens.
-- **(LOW — new from TR_014)** Operator-side: project rule
-  "Every test file MUST import its testing-framework symbols
-  explicitly" addresses Aider's missing `beforeEach` import.
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Docker image rebuilt + container restarted via `docker compose
-up -d --build`. Server `/health` 200 throughout. Aider 0.86.2
-verified inside the container. trackeros `main` updated to
-`ccd99d0`. New file `docs/claude/TEST_REPORT_014.md`.
-
----

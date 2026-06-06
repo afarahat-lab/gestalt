@@ -82,6 +82,17 @@ None blocking the build. Areas to keep in mind:
   access against code that correctly delegates to
   `LeaveRepository`. No `pool.query` in service. Critical
   driver for the review-agent fix below.
+- **TR_017 constraint-agent honours `agents.yaml`.**
+  `packages/agents/quality-gate/src/agents/constraint-
+  agent.ts` — module-level `AGENT_CONFIG` removed;
+  `verify()` resolves the config via `loadAgentConfig`
+  in parallel with the existing harness + intent-spec
+  loaders. Mirrors review-agent's loader pattern.
+  Verified live: trackeros constraint-agent
+  `model_used = 'gpt-4o'`; 9× faster + 18× cheaper
+  than on gpt-4o-mini. Second clean `Status: ✓
+  deployed` in a row.
+- **~~HIGHEST follow-up — TR_016~~ RESOLVED by TR_017.**
 - **TR_016 gate agents on gpt-4o; first clean deploy
   since TR_007.** trackeros `agents.yaml` (commit
   `9830241` on `main`) sets `constraint-agent` and
@@ -95,10 +106,7 @@ None blocking the build. Areas to keep in mind:
   `constraint-agent.ts:64` uses a hardcoded `AGENT_CONFIG`
   constant and never calls `loadAgentConfig`. New
   HIGHEST follow-up.
-- **HIGHEST follow-up — TR_016:** Fix
-  constraint-agent's hardcoded `AGENT_CONFIG` — replicate
-  review-agent's `loadAgentConfig` pattern so operators
-  can actually configure both gate agents the same way.
+- **~~HIGHEST follow-up — TR_016~~ RESOLVED by TR_017 above.**
 - **HIGH follow-up — TR_016:** Re-verify on a second
   intent shape (sample size is one).
 - **TR_015 Approach A — explicit repository-pattern rule
