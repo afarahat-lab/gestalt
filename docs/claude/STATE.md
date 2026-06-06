@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-06 (after TEST_REPORT_015 — Approach A applied to trackeros + template v0.4.0; rule wording is correct but gpt-4o-mini READS the rule then REASONS the opposite — categorical confusion isolated to the LLM-reasoning layer; gate-agent model swap promoted to HIGHEST follow-up)
+**Last updated:** 2026-06-06 (after TEST_REPORT_016 — review-agent switched to gpt-4o; first clean `Status: ✓ deployed` since TEST_REPORT_007. Single round, zero signals, ~$0.046. constraint-agent's hardcoded AGENT_CONFIG silently ignores agents.yaml override — new HIGHEST follow-up.)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -195,6 +195,41 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
+- **TR_016 gate agents promoted to gpt-4o (cycle deployed
+  cleanly on round 1).** trackeros `agents.yaml` (commit
+  `9830241` on `main`) declares per-agent overrides for
+  both constraint-agent and review-agent with
+  `model: gpt-4o`, `temperature: 0.0`. Platform
+  `PER_ROLE_DEFAULTS['review-agent'].llm.temperature`
+  lowered 0.1 → 0.0 (constraint-agent was already 0.0).
+  Live verification: single round, zero signals from
+  either gate agent, gate verdict pass, cycle DEPLOYED
+  (first time on this intent shape since TR_007).
+  ~$0.046 USD — LOWER than TR_015 because the cycle
+  converged in one round despite the gpt-4o pricing.
+  Surprise: **review-agent IS gpt-4o; constraint-agent
+  is STILL gpt-4o-mini** because `constraint-agent.ts:64`
+  uses a hardcoded `AGENT_CONFIG` constant and never
+  calls `loadAgentConfig`. The cycle passed anyway
+  because the TR_015 rule clarifications + TR_013
+  evidence requirement + Aider's clean code + review-agent
+  on gpt-4o was sufficient.
+- **(HIGHEST follow-up — new from TR_016)** Fix
+  constraint-agent's hardcoded `AGENT_CONFIG` constant.
+  `packages/agents/quality-gate/src/agents/constraint-
+  agent.ts:64` should call `loadAgentConfig(
+  task.harnessConfig.projectRoot, 'constraint-agent')`
+  like `llm-review-agent.ts:108` does. Without this,
+  operators tuning constraint-agent's model/temperature/
+  maxTokens via `agents.yaml` get no signal that the
+  override was silently dropped. TR_016 passed despite
+  this; future cycles on different intent shapes may
+  not.
+- **(HIGH follow-up — new from TR_016)** Re-run the
+  verification on at least one more intent shape (e.g.
+  a different module, or a multi-file intent) to
+  confirm the result generalises beyond a sample size
+  of 1.
 - **TR_015 Approach A — explicit repository-pattern rule
   wording applied.** trackeros HARNESS.json (commit
   `ce0c01e` on `main`) and the
@@ -414,7 +449,8 @@ the `sessions/archive/` files (everything older)._
   `gate-max-retries` for `aac73745-…`, TR_013's
   `generate-error` for `59900af8-…`, TR_014's
   `gate-max-retries` for `3a114a1d-…`, TR_015's
-  `gate-max-retries` for `d7d9f66f-…`. All dismissable with
+  `gate-max-retries` for `d7d9f66f-…`. TR_016 deployed
+  cleanly — no alert.  All dismissable with
   `gestalt alerts dismiss`.
 - **`.env`**: `LLM_MODEL=gpt-4o` (operator default). For
   `chat-latest` routing through the registry's responses

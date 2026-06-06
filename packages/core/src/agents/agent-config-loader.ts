@@ -163,7 +163,18 @@ export const PER_ROLE_DEFAULTS: Record<string, AgentConfig> = {
   'review-agent': {
     role: 'Senior engineer and code reviewer',
     goal: 'Assess generated code quality and architectural correctness — verify findings with executeScript before flagging',
-    llm: { temperature: 0.1, maxTokens: 4000 },
+    // TEST_REPORT_016 — temperature 0.0. TR_015 proved
+    // gpt-4o-mini-at-temperature-0.1 reads project rules then
+    // reasons in direct contradiction to their bodies (26/28
+    // signals quoted the rule's title; 15/28 asserted the
+    // opposite of what the rule said). Gate verdicts have NO
+    // creative bar — the rules give the model no leeway. 0.0
+    // is now the platform default; operators who want a
+    // different value override in their project's
+    // `agents.yaml`. constraint-agent has been 0.0 since
+    // TEST_REPORT_005's executeScript evolution; this brings
+    // review-agent to parity.
+    llm: { temperature: 0.0, maxTokens: 4000 },
     promptExtensions: [],
     // TEST_REPORT_007 Fix 1 — gains `executeScript`. See
     // `REVIEW_AGENT_TOOLS` doc-comment.

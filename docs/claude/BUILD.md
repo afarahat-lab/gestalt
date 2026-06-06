@@ -82,6 +82,25 @@ None blocking the build. Areas to keep in mind:
   access against code that correctly delegates to
   `LeaveRepository`. No `pool.query` in service. Critical
   driver for the review-agent fix below.
+- **TR_016 gate agents on gpt-4o; first clean deploy
+  since TR_007.** trackeros `agents.yaml` (commit
+  `9830241` on `main`) sets `constraint-agent` and
+  `review-agent` to `model: gpt-4o`, `temperature: 0.0`.
+  Platform `PER_ROLE_DEFAULTS['review-agent'].temperature`
+  lowered 0.1 → 0.0. Single-round verification cycle
+  deployed cleanly with zero signals from either gate
+  agent. ~$0.046 USD (single round at gpt-4o beats 8
+  rounds at gpt-4o-mini). **Surprise:** review-agent is
+  gpt-4o; constraint-agent is still gpt-4o-mini because
+  `constraint-agent.ts:64` uses a hardcoded `AGENT_CONFIG`
+  constant and never calls `loadAgentConfig`. New
+  HIGHEST follow-up.
+- **HIGHEST follow-up — TR_016:** Fix
+  constraint-agent's hardcoded `AGENT_CONFIG` — replicate
+  review-agent's `loadAgentConfig` pattern so operators
+  can actually configure both gate agents the same way.
+- **HIGH follow-up — TR_016:** Re-verify on a second
+  intent shape (sample size is one).
 - **TR_015 Approach A — explicit repository-pattern rule
   wording applied** (no platform code change). trackeros
   HARNESS.json (commit `ce0c01e` on `main`) and the
