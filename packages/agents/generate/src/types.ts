@@ -34,6 +34,15 @@ export type {
 export interface CustomAgentFinding {
   severity: 'high' | 'medium' | 'low';
   file: string;
+  /**
+   * TR_013 — the exact line from the artifact that constitutes the
+   * violation, quoted verbatim. Required; findings missing this field
+   * are dropped by `dropUnevidencedFindings` in `custom-agent-runner`
+   * before they reach the orchestrator's signal router. Operators
+   * should include `{{evidenceRequirement}}` + `{{quotedLineSchema}}`
+   * in their custom-agent prompt template.
+   */
+  quotedLine: string;
   description: string;
 }
 

@@ -191,12 +191,38 @@ agents:
 #   {{goldenPrinciples}}         — bullet list of GP-NNN titles + descriptions
 #   {{intentText}}               — the operator's original intent string
 #   {{projectName}}              — HARNESS.json `name` field
+#   {{evidenceRequirement}}      — TR_013. Drops in the shared "every
+#                                  finding must include quotedLine"
+#                                  prompt section. Strongly recommended
+#                                  for ANY custom agent that emits
+#                                  findings — the platform parser drops
+#                                  unevidenced findings, so omitting this
+#                                  from the prompt leaves the LLM
+#                                  blind to the requirement and EVERY
+#                                  finding it emits will be discarded.
+#   {{quotedLineSchema}}         — TR_013. Drops in the `"quotedLine":
+#                                  "..."` JSON schema field. Include
+#                                  inside the `findings[]` object in the
+#                                  Expected JSON response schema below.
+#
+# Custom agent findings must include "quotedLine" — the exact line from
+# the artifact that constitutes the violation, quoted verbatim. Findings
+# without quotedLine are automatically dropped by the platform before
+# reaching the gate. This prevents hallucinated findings from blocking
+# cycles. Include {{evidenceRequirement}} in your prompt body and
+# {{quotedLineSchema}} inside the findings[] object to surface this
+# contract to the LLM.
 #
 # Expected JSON response from the LLM:
 #   {
 #     "passed": true | false,
 #     "findings": [
-#       { "severity": "high|medium|low", "file": "path", "description": "..." }
+#       {
+#         "severity": "high|medium|low",
+#         "file": "path",
+#         "quotedLine": "the exact violating line copied verbatim",
+#         "description": "..."
+#       }
 #     ],
 #     "summary": "one-line overall verdict"
 #   }
@@ -227,6 +253,8 @@ agents:
 #     prompt: |
 #       You are {{role}}. Goal: {{goal}}.
 #
+#       {{evidenceRequirement}}
+#
 #       Review the following generated code for OWASP Top 10 issues
 #       (SQL injection, XSS, IDOR, missing auth checks, sensitive data
 #       exposure):
@@ -240,7 +268,12 @@ agents:
 #       {
 #         "passed": true|false,
 #         "findings": [
-#           { "severity": "high|medium|low", "file": "path", "description": "..." }
+#           {
+#             "severity": "high|medium|low",
+#             "file": "path",
+#             {{quotedLineSchema}},
+#             "description": "..."
+#           }
 #         ],
 #         "summary": "one line"
 #       }

@@ -1350,12 +1350,19 @@ async function runOneCustomAgentNode(
         finding.severity === 'high' ? 'high'
         : finding.severity === 'medium' ? 'medium'
         : 'low';
+      // TR_013 — include the LLM's quoted evidence in the signal so
+      // the next-round code-agent (and the operator) sees the exact
+      // line that drove the finding. `quotedLine` is guaranteed
+      // non-empty here because `dropUnevidencedFindings` discarded
+      // any finding without it.
       emittedSignals.push(buildSignal({
         correlationId,
         type,
         severity,
         sourceAgent: customAgentRole,
-        message: `[${def.name}] ${finding.description} (${finding.file})`,
+        message:
+          `[${def.name}] ${finding.description} (${finding.file})\n` +
+          `  Evidence: "${finding.quotedLine}"`,
         location: finding.file ? { file: finding.file } : undefined,
       }));
     }

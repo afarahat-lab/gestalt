@@ -78,6 +78,15 @@ export interface SelfHealingDiagnosis {
   diagnosis: string;
   rootCause: string;
   suggestedFix: string;
+  /**
+   * TR_013 — the specific error message, signal, or artifact detail
+   * that grounds the diagnosis. Optional (softer than the
+   * review-agent / constraint-agent evidence requirement) because the
+   * diagnostician reasons over failure context rather than emitting
+   * blocking findings — but absent evidence is logged at `warn` level
+   * so operators can see when a diagnosis is ungrounded.
+   */
+  evidenceQuote?: string;
   /** Reframed intent text the orchestrator dispatches as the next cycle. */
   updatedIntentText?: string;
   confidence: 'high' | 'medium' | 'low';
@@ -204,6 +213,22 @@ export class SelfHealingAgent extends BaseLLMAgent {
         : '',
       ctx.constraintRules ? `## Constraints\n${ctx.constraintRules}` : '',
       ctx.goldenPrinciples ? `## Golden principles\n${ctx.goldenPrinciples}` : '',
+      `## Evidence requirement for diagnosis
+
+Your diagnosis must be grounded in the actual failure evidence.
+For each claim in your diagnosis, reference the specific error
+message, signal, or artifact detail that supports it.
+
+In the "evidenceQuote" field, quote the specific error output or
+signal message that led to your diagnosis (verbatim from "Prior
+signals" or "Technical detail" above). If multiple signals motivate
+the diagnosis, quote the most representative one.
+
+If you cannot ground a claim in the available evidence, state it
+as uncertain in the diagnosis prose rather than asserting it as
+fact — and leave "evidenceQuote" empty. The orchestrator logs
+empty evidenceQuote at warn level so operators can see when a
+retry was dispatched without grounding.`,
       `## Available retry task types
 
 Choose the appropriate retryTaskType based on the failure:
@@ -281,6 +306,7 @@ Return ONLY a JSON object — no preamble, no markdown fences:
   "diagnosis": "What went wrong",
   "rootCause": "Underlying technical reason",
   "suggestedFix": "Specific actionable fix description",
+  "evidenceQuote": "verbatim error/signal text that grounds the diagnosis (empty if none)",
   "updatedIntentText": "Reframed intent if needed (optional)",
   "confidence": "high|medium|low",
   "shouldRetry": true|false,
@@ -302,10 +328,30 @@ Set shouldRetry=false and retryTaskType="none" when:
     try {
       const json = extractJsonObject(raw);
       const parsed = JSON.parse(json) as Partial<SelfHealingDiagnosis>;
+      // TR_013 — soft evidence requirement. Missing or empty
+      // `evidenceQuote` is logged at warn level (not dropped) because
+      // the self-healing agent diagnoses rather than emits blocking
+      // findings — a diagnosis without a grounding quote is allowed
+      // to drive a retry, but operators see the warning when one
+      // slips through.
+      const evidenceQuote =
+        typeof parsed.evidenceQuote === 'string' && parsed.evidenceQuote.trim() !== ''
+          ? parsed.evidenceQuote
+          : undefined;
+      if (!evidenceQuote) {
+        log.warn(
+          {
+            diagnosisPrefix: (parsed.diagnosis ?? '').slice(0, 80),
+            confidence: parsed.confidence,
+          },
+          'SelfHealingAgent diagnosis missing evidenceQuote — accepted, but ungrounded',
+        );
+      }
       return {
         diagnosis: typeof parsed.diagnosis === 'string' ? parsed.diagnosis : 'Unknown failure',
         rootCause: typeof parsed.rootCause === 'string' ? parsed.rootCause : 'Unknown',
         suggestedFix: typeof parsed.suggestedFix === 'string' ? parsed.suggestedFix : 'Manual review required',
+        evidenceQuote,
         updatedIntentText:
           typeof parsed.updatedIntentText === 'string' && parsed.updatedIntentText.trim() !== ''
             ? parsed.updatedIntentText

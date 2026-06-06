@@ -82,37 +82,49 @@ None blocking the build. Areas to keep in mind:
   access against code that correctly delegates to
   `LeaveRepository`. No `pool.query` in service. Critical
   driver for the review-agent fix below.
-- **TR_012 review-agent reliability fixes landed.** Three
-  platform changes (Fix 1 — `mapItemsToSignals` hard-codes
-  `CONSTRAINT_VIOLATION` so review-agent can never emit
-  GP_BREACH; Fix 2 — mandatory 5-step tool-first review
-  protocol in the prompt; Fix 3 — `detectRepeatedSignalLoop`
-  escape hatch in `self-healing-loop.ts` for >50% signal
-  fingerprint overlap across attempts). Live-proven: Fix 1 ✓
-  (0/30 review signals are GP_BREACH); Fix 3 ✓ (fired at 72%
-  repeat rate on attempt 2 with a specific
-  "Review-agent loop detected" alert); Fix 2's STEP 5 scope
-  filter ✓ (audit-logging false positive eliminated). Fix 2's
-  tool-call mandate ✗ — ignored by gpt-4o-mini (0/64
-  review-agent tool calls). Operator-side: trackeros
-  `agents.yaml` review-agent gains `executeScript`
-  (`3500a46`).
-- **HIGHEST follow-up — TR_012:** Deterministic post-LLM grep
-  filter on review-agent findings to drop the residual
-  "Direct DB access" hallucinations (28/30 of TR_012's
-  review-agent signals). Single grep + package.json
-  cross-check; cheapest high-leverage fix in the queue.
-- **HIGH follow-up — TR_012:** Try switching review-agent's
-  model to gpt-4o. gpt-4o-mini's tool-refusal pattern is
-  reconfirmed across TR_011 + TR_012; gpt-4o follows
-  imperative instructions more reliably.
-- **~~Retry-budget overshoot~~ DROPPED** (TR_012 analysis).
-  Actual budget is `gateRetries × (selfHealing + 1) = 9`
-  max, not 6. TR_011's 8 and TR_012's 8 sit within budget.
-  No bug.
+- **TR_013 universal evidence requirement landed.** New
+  `packages/core/src/agents/evidence-requirement.ts` exports
+  `EVIDENCE_REQUIREMENT_SECTION`, `QUOTED_LINE_SCHEMA_FIELD`,
+  and `dropUnevidencedFindings<T>`. Review-agent,
+  constraint-agent, and custom-agent-runner now require every
+  finding to carry `quotedLine` (the violating line, verbatim)
+  and drop items missing it before they reach the gate. Live
+  verification (correlation `59900af8-...`): 25/25 emitted
+  signals carry `Evidence: "..."` in the message; 4 findings
+  dropped at parse; LLM honestly emits `"quotedLine": ""`
+  rather than fabricate a quote. Self-healing-agent gets the
+  softer warn-when-missing variant.
+- **HIGHEST follow-up — TR_013:** Approach A — tighten
+  trackeros's HARNESS.json constraint rule wording to
+  disambiguate `pool.query` use in repositories. TR_013
+  proves the LLM IS finding real evidence; the remaining
+  problem is categorical misinterpretation of "outside the
+  repository pattern". No platform code change needed.
+- **HIGH follow-up — TR_013:** Round-7 code-agent JSON parse
+  failure ("Expected double-quoted property name in JSON at
+  position 1001"). Separate bug — 437k tokens / 12 min ending
+  in malformed JSON, likely from an unescaped quote inside an
+  inlined test-file `content` string.
+- **MEDIUM follow-up — TR_013:** Both review-agent and
+  constraint-agent read files OUTSIDE the cycle's artifact
+  set via `readFile`. Scope filter is per-finding; should
+  also bound the read reach.
+- **TR_012 review-agent reliability fixes landed
+  (carryover).** Fix 1 (severity cap), Fix 2 (mandatory
+  tool-first protocol — STEP 5 scope filter), Fix 3
+  (`detectRepeatedSignalLoop` escape hatch). All continue
+  to work in TR_013 — Fix 1 ✓ (0 GP_BREACH), Fix 2 ✓ (no
+  audit-logging false positives), Fix 3 ✓ (fires at 84%
+  repeat rate in TR_013, up from 72% in TR_012).
+- **DROPPED — TR_013:** TR_012's "deterministic post-LLM
+  grep filter" follow-up. Superseded by Approach B (evidence
+  requirement) — instead of post-filtering with hardcoded
+  patterns, the platform structurally requires quoted
+  evidence and drops unevidenced findings.
 - **Open alerts to dismiss**: TR_010's `GP_BREACH` for
   `7afa0886-…`, TR_011's `failed` for `11a08e08-…`, TR_012's
-  `gate-max-retries` for `aac73745-…`. All dismissable with
+  `gate-max-retries` for `aac73745-…`, TR_013's
+  `generate-error` for `59900af8-…`. All dismissable with
   `gestalt alerts dismiss`.
 - **Review-agent `result_status='failed'` with successful
   JSON output** (TR_010/011). Cosmetic — verdict is correct,

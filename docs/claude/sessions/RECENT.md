@@ -3,6 +3,255 @@
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+### Session 2026-06-06 — Claude Code (TEST_REPORT_013: evidence requirement for ALL agents — structural fix lands cleanly, 25/25 emitted signals carry verbatim quotes, 4 ungrounded findings dropped at parse, categorical hallucination still drives the cycle but now visibly so)
+
+Six-part implementation session against TEST_REPORT_012's
+HIGHEST follow-up. The user's brief: stop relying on the LLM
+to police itself with a tool-call mandate (TR_012 proved that
+fails) and switch to a **structural** requirement — every
+finding must carry `quotedLine`, the exact line from the
+artifact that constitutes the violation; findings without
+`quotedLine` are dropped at parse time before the gate sees
+them. No hardcoded patterns. No language-specific filters.
+Same enforcement helper shared across review-agent,
+constraint-agent, custom agents. Self-healing agent gets a
+softer warn-only variant because it diagnoses rather than
+blocks.
+
+Outcome: **structural fix works exactly as designed; the
+remaining hallucination is now operator-visible.** Every
+review + constraint signal in the live verification cycle
+carries `Evidence: "..."` with the LLM's verbatim quote.
+4 findings dropped at parse (LLM voluntarily emitted
+`"quotedLine": ""` rather than fabricate a quote). The
+persistent "Direct DB access" hallucination is now backed by
+a REAL quote (`pool.query<LeaveRequest>(req)` from
+`leave.repository.ts`) — which makes the LLM's categorical
+confusion (pool.query INSIDE a `.repository.ts` IS the
+repository pattern) immediately visible to the operator.
+Answers the brief's diagnostic question: Approach A (tighter
+HARNESS.json rule wording) is also needed because the LLM IS
+finding grounding for the wrong category.
+
+What the user asked for:
+
+- **Part 1** — `packages/core/src/agents/evidence-requirement.ts`
+  (new): `EVIDENCE_REQUIREMENT_SECTION`,
+  `QUOTED_LINE_SCHEMA_FIELD`, and `dropUnevidencedFindings<T>`
+  helper. Export from `@gestalt/core`. Single source of truth
+  for the contract.
+- **Part 2** — review-agent in `quality-gate`: inject the
+  section above the task section, add `quotedLine` to the
+  schema + interface, drop unevidenced findings in
+  `parseReview`, include the quote in the emitted signal
+  message AND the review-artifact markdown.
+- **Part 3** — constraint-agent: same pattern (prompt +
+  schema + drop + signal).
+- **Part 4** — custom agents: structural `quotedLine` on the
+  finding type + parser drops + two new substitution
+  placeholders (`{{evidenceRequirement}}`,
+  `{{quotedLineSchema}}`) operators can drop into their
+  agents.yaml prompts. Custom-agent emitted signals carry
+  `Evidence: "..."` via orchestrator.ts.
+- **Part 5** — self-healing-agent: softer variant —
+  `evidenceQuote?: string` (optional) + prompt block telling
+  the LLM to ground its diagnosis in the actual signal/error
+  text + warn log when missing (no drop, because diagnoses
+  don't block).
+- **Part 6** — corporate-ops-web-mobile template comment +
+  example update with `{{evidenceRequirement}}` /
+  `{{quotedLineSchema}}` in the security-review-agent's
+  prompt and the JSON schema's findings entry.
+- Verify on the same Leave-service intent as TR_011/012:
+  check server logs for "Finding dropped" messages, check
+  that every surviving signal includes `Evidence: "..."`,
+  check the raw LLM `llm_response` in the DB to see whether
+  the LLM (a) honestly omits findings it cannot quote, or
+  (b) fabricates quotes.
+
+What changed:
+
+- **`packages/core/src/agents/evidence-requirement.ts`** (NEW,
+  103 lines): contract module. `EVIDENCE_REQUIREMENT_SECTION`
+  carries valid + invalid evidence examples (an import
+  statement alone is invalid). `dropUnevidencedFindings<T>`
+  filters items whose `quotedLine` is missing/empty and
+  logs each drop at `info` level with file +
+  message/description/explanation prefix.
+- **`packages/core/src/index.ts`**: exports added for the
+  three symbols + the `EvidenceLogger` type.
+- **`packages/agents/quality-gate/src/agents/llm-review-agent.ts`**:
+  imports the contract, `LLMReviewItem.quotedLine: string`,
+  prompt injects the section AND adds `QUOTED_LINE_SCHEMA_FIELD`
+  to the rendered JSON schema with a closing
+  *"Any item missing quotedLine will be automatically
+  discarded"*, `parseReview` filters through
+  `dropUnevidencedFindings`, `mapItemsToSignals` and
+  `renderReviewMarkdown` both surface the quote.
+- **`packages/agents/quality-gate/src/agents/constraint-agent.ts`**:
+  same pattern. The inline parser type gains `quotedLine?`;
+  the prompt + schema include the contract; signal message
+  carries `Evidence: "{quotedLine}"`.
+- **`packages/agents/generate/src/types.ts`**:
+  `CustomAgentFinding.quotedLine: string` (required).
+- **`packages/agents/generate/src/agents/custom-agent-runner.ts`**:
+  substitution variables `evidenceRequirement` +
+  `quotedLineSchema`, drop step on findings, structural
+  `isValidFinding` made permissive on `quotedLine` so the
+  semantic drop handles it.
+- **`packages/agents/generate/src/orchestrator/orchestrator.ts`**:
+  custom-agent emitted signal message includes
+  `Evidence: "..."`.
+- **`packages/core/src/agents/self-healing-agent.ts`**: prompt
+  block + `evidenceQuote?` field + parseDiagnosis warns when
+  missing (no drop).
+- **`templates/corporate-ops-web-mobile/harness/agents.yaml`**:
+  preamble explains the requirement + the two substitution
+  variables; security-review-agent example uses both.
+
+Live verification (correlation
+`59900af8-e7a6-4f43-bfd1-4cfacb3733db`, intent_id
+`28152805-ffb4-45cc-a0e8-b528ece60fd2`):
+
+| Round | code-agent (tok / tc) | constraint (tok) | review (tok) | Outcome |
+|---|---|---|---|---|
+| 1 | 139,888 / 21 | 15,033 ✓ | 26,206 ✗ | gate-fail → retry |
+| 2 | 142,234 / 21 | 6,970 ✗ | 28,471 ✗ | gate-fail → retry |
+| 3 | 145,762 / 21 | 8,932 ✗ | 27,371 ✗ | gate-fail → retry |
+| 4 | 143,562 / 21 | 9,766 ✗ | 22,364 ✗ | gate exhausted → self-healing |
+| 5 | 160,523 / 21 | 6,789 ✗ | 29,291 ✗ | gate-fail → retry |
+| 6 | 294,481 / 21 | 14,529 ✓ | 28,494 ✗ | gate-fail → self-healing-2 |
+| 7 | **437,213 / failed** | — | — | code-agent JSON parse failure → CONTEXT_GAP |
+
+Total: ~1.74M tokens / **~$0.52 USD** at gpt-4o-mini pricing.
+
+Verification matrix vs brief:
+
+| Check | Result |
+|---|---|
+| Server logs show "Finding dropped — no quoted evidence" | ✓ 4 drops across the cycle, all `@types/pg`-class findings the LLM couldn't ground |
+| Every emitted signal carries `Evidence: "..."` in its message | ✓ 25/25 review + constraint signals |
+| LLM voluntarily omits `quotedLine` when it can't ground | ✓ raw `llm_response` shows `"quotedLine": ""` rather than a fabrication |
+| Gate pass in round 1 | ✗ "Direct DB access" still flagged (with REAL evidence — categorical confusion, not a hallucinated quote) |
+| Cost < $0.05 | ✗ $0.52, dominated by round-7's 437k-token code-agent JSON failure |
+| GP_BREACH count | ✓ 0 (TR_012 Fix 1 carries through) |
+| Loop-detection escape hatch | ✓ fired at 84% repeat rate (TR_012 Fix 3 carries through; threshold was 72% in TR_012) |
+
+What worked:
+
+- **Structural enforcement is airtight.** Across 13
+  review-agent + 12 constraint-agent emitted signals, every
+  single message carries `Evidence: "..."`. SQL query against
+  `signals.message LIKE '%Evidence:%'` returns 25/25.
+- **LLM honestly omits when it cannot ground.** Final
+  round's raw `llm_response`:
+  ```json
+  { "file": "package.json", "quotedLine": "",
+    "severity": "medium",
+    "message": "Missing type definitions for the 'pg' package..." }
+  ```
+  The LLM voluntarily left the quote empty rather than
+  fabricate one. The parser correctly dropped it. This is
+  the cleanest possible signal that the contract is in
+  the model's working set and being respected.
+- **Operator visibility on the residual hallucination.**
+  The persistent "Direct DB access" finding now carries
+  `Evidence: "const result = await this.pool.query<LeaveRequest>(req);"`.
+  Looking at the message AND the evidence together, the
+  operator immediately sees the LLM is reading
+  `leave.repository.ts` (which IS supposed to contain
+  `pool.query` — that's the repository pattern) and
+  categorically misinterpreting it as a violation. Without
+  evidence column this conclusion required cross-checking
+  the artifact tree.
+- **No platform-side code change to trackeros required.**
+  TR_010 needed an `agents.yaml` operator-side change to
+  expose `executeScript`. TR_013 needed zero operator
+  changes — the platform contract change is sufficient
+  for the structural floor.
+
+What didn't work:
+
+- **Categorical confusion still drives the cycle.** The LLM
+  finds `pool.query<LeaveRequest>(req)` in
+  `leave.repository.ts` and flags it as "outside the
+  repository pattern". That file IS a repository. The
+  quote is real. The category is wrong. Approach B alone
+  cannot fix this — Approach A (tighter HARNESS.json rule
+  wording: "pool.query is REQUIRED in `*.repository.ts` and
+  FORBIDDEN in `*.service.ts`") is still needed.
+- **Review-agent + constraint-agent review files outside
+  the cycle's artifact set.** TR_011 noted this for
+  constraint-agent; TR_013 confirms both agents read
+  `leave.repository.ts` (on main since TR_011's setup
+  commit) and flag it. Scope-filter is per-finding, not
+  per-file-read. Should be enforced at the read layer too.
+- **Round 7 code-agent emitted malformed JSON.** 437k
+  tokens, 12 minutes, ended with *"Expected double-quoted
+  property name in JSON at position 1001"* — a CONTEXT_GAP
+  separate from the evidence requirement. Likely an
+  unescaped quote in an inlined test file's `content`
+  string. Investigate the code-agent's JSON-mode response
+  handling separately.
+
+Decisions made:
+
+- **Made `isValidFinding` (custom-agent-runner) permissive
+  on `quotedLine` rather than strict.** Letting it through
+  the structural check + dropping in
+  `dropUnevidencedFindings` gives operators the diagnostic
+  log line. A strict structural check would silently filter
+  before logging.
+- **Self-healing kept softer (warn, not drop).** The
+  diagnostician's job is to reason about a failure, not to
+  emit gate-blocking findings. A warn-level log makes
+  ungrounded diagnoses visible without disrupting recovery.
+- **Did NOT touch trackeros's HARNESS.json this session.**
+  The brief's question — does the LLM honestly omit findings
+  it can't ground, or does it fabricate? — is the platform
+  question. Mixing in a project-side rule change would
+  conflate measurement with iteration. Documented as the
+  HIGHEST follow-up.
+- **Wrote the report against the 7-round failing cycle
+  rather than re-running.** The cycle failure mode is now
+  well-characterised: structural floor works, categorical
+  confusion drives looping, code-agent JSON bug terminates.
+  Re-running with the same platform fixes would produce
+  the same data.
+
+Pending follow-ups:
+
+- **(HIGHEST — new from TR_013)** Tighten trackeros's
+  HARNESS.json constraint rule wording to disambiguate
+  `pool.query` use in repositories. With the evidence
+  column now visible to the LLM on retry (it sees its
+  prior round's "Evidence: pool.query..." in
+  `priorSignals` rendering), an unambiguous rule should
+  converge in 1 round.
+- **(HIGH — new)** Round-7 code-agent JSON parse failure.
+  Separate bug from the evidence requirement. Investigate
+  the JSON-mode response handling for embedded code
+  literals containing quotes.
+- **(MEDIUM — carryover, more visible now)** Both
+  review-agent and constraint-agent review files OUTSIDE
+  the cycle's artifact set. Scope filter is per-finding;
+  should also bound `readFile` reach.
+- **(LOW — carryover)** Switch review-agent to gpt-4o.
+  gpt-4o-mini behaves well under the evidence requirement
+  (voluntarily empty-quotes when ungrounded), but gpt-4o
+  is more likely to skip the false "Direct DB access"
+  category mistake before emitting.
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker image rebuilt + container restarted via `docker
+compose up -d --build`. Server `/health` 200 throughout.
+Trackeros `main` unchanged. New file
+`docs/claude/TEST_REPORT_013.md`.
+
+---
+
+
+
 
 ### Session 2026-06-06 — Claude Code (TEST_REPORT_012: review-agent reliability fixes — severity cap + mandatory tool-first protocol + self-healing loop detection. Fix 1 and Fix 3 work in live data; Fix 2 ineffective vs gpt-4o-mini's tool-refusal; cycle still fails 8 rounds but at -45% cost with a clean specific-reason alert.)
 
@@ -424,244 +673,6 @@ Docker server still on TR_010's `30b5d0b` image, healthy throughout.
 Trackeros `main`: `5e619a9` (setup commit). New file
 `docs/claude/TEST_REPORT_011.md`. No new commits on the gestalt repo
 yet — TR_011 commit is the next step.
-
----
-
-
-
-### Session 2026-06-06 — Claude Code (TEST_REPORT_010: MAX_TOOL_CALLS cap-inside-batch + pre-generation prompt + executeScript availability — code-agent invokes executeScript 5× in a single run, the first end-to-end since TR_007; cycle escalates on legitimate review-agent findings, not platform bugs)
-
-Implementation + live verification session against
-TEST_REPORT_009's two-bug landing pad. The brief: refactor the
-`MAX_TOOL_CALLS` enforcement so the cap is checked
-**before** the per-call dispatch loop (TR_009's HTTP 400 root
-cause), add a pre-generation prompt block telling the code-agent
-to read existing deps first and skip listDirectory on output
-paths it's about to create, raise the cap from 10 to 20. Then
-re-run the Leave-module intent and answer **"does the
-tool_calls log show an executeScript call?"** — the question
-TR_009 left open.
-
-Outcome: ✓ **decisive yes.** Code-agent ran 5× `executeScript`
-in a single completed round (`mkdir` scaffold ×2, `npm run lint`,
-`npm run typecheck`, `npx tsc --noEmit`), emitted a structured
-JSON response with a `verificationNote` field, and the parser
-converted that note into a low-severity `LINT_FAILURE` signal —
-the first end-to-end production observation of the TR_008
-`verificationNote` schema. Cycle escalated to `escalate` on
-real review-agent findings (DB access outside repository pattern
-+ missing audit logging), not platform bugs.
-
-| Phase | TR_007 | TR_008 | TR_009 | **TR_010** |
-|---|---|---|---|---|
-| Code-agent result | completed | failed (rate-limit) | failed (HTTP 400) | **completed** |
-| `executeScript` calls in log | 0 | 0 (logged) | 0 | **5** |
-| Code-agent tokens | ~25.9k | ~34.2k avg | ~137k avg | 68.5k |
-| Cycle deploys | yes | no | no | no (real review findings) |
-
-What the user asked for:
-
-- **Fix 1 (HIGH)** — Move the `MAX_TOOL_CALLS` cap check to
-  batch-level. Previous code checked the cap inside the per-call
-  dispatch loop; when the cap struck mid-batch, the assistant
-  message in history carried N `tool_call_ids` but only M < N
-  `tool` response messages, and the next OpenAI call failed
-  with HTTP 400 *"tool_call_ids did not have response
-  messages"*. Synthesise rejection responses for every call in
-  an over-cap batch so history stays consistent. Pseudo-code
-  in the brief used `break` after rejection.
-- **Fix 2 (HIGH)** — Add a `## Before generating code` block
-  at the start of `code-prompt.ts`'s task section telling the
-  LLM to read existing files first, not explore non-existent
-  directories, not `listDirectory` on output paths it's about
-  to create. Raise `MAX_TOOL_CALLS` from 10 → 20.
-- Re-run the same Leave-module intent. Verify no HTTP 400,
-  at least one `executeScript`, cycle deploys on first round,
-  ≤ 15 code-agent tool calls.
-
-What changed (per fix):
-
-- **Fix 1** — `packages/core/src/agents/base-llm-agent.ts`
-  `runToolLoop`. New batch-level check before the per-call
-  loop: `if (totalToolCalls + toolCalls.length > MAX_TOOL_CALLS)`
-  → push a synthesised `tool` response for every call in the
-  batch with content *"Tool call limit reached — no further
-  tool calls permitted. Return your best answer now based on
-  what you have already gathered."* Each rejection is logged
-  into `toolCallLog` with `toolSource: 'cap-rejected'`. Inner
-  per-call cap check removed; the dispatch loop now always
-  processes the entire batch.
-- **Fix 1 refinement** — initial implementation followed the
-  brief's `break;` literally. Live verification (correlation
-  `9cafadd5-…` round 1) failed with *"Code agent failed:
-  Unexpected end of JSON input"* because `finalText` stayed
-  empty after the rejection (`stopReason` was `tool_calls`,
-  LLM never produced text). Changed to `capStruck = true;
-  continue;` so the outer loop fires once more with
-  `tools: capStruck ? [] : tools` — the LLM is forced to
-  produce final text (`stopReason === 'stop'`).
-- **Fix 1 wire fix** — `packages/core/src/llm/index.ts`
-  `callProviderWithTools`. Spreading `tools` + `tool_choice`
-  into the OpenAI body is now conditional on
-  `tools.length > 0` — sending `tools: []` +
-  `tool_choice: 'auto'` returns HTTP 400 *"tool_choice cannot
-  be specified without 'tools' parameter"*.
-- **Fix 2 — prompt** — `code-prompt.ts` task section gets a
-  new `preGenerationSection` prepended:
-  > 1. Read existing files your generated code will import
-  >    from (use readFile on each). These are listed in the
-  >    IntentSpec and design spec.
-  > 2. Do NOT explore directories that don't exist yet — you
-  >    are about to CREATE them. Call getFileTree ONCE,
-  >    then proceed directly to generation.
-  > 3. Do NOT listDirectory on paths listed as OUTPUT paths.
-  > 4. After emitting, verify with executeScript.
-  >
-  > Budget guidance: ~1 getFileTree + ~3 readFile + ~2
-  > executeScript = ~6 purposeful tool calls.
-- **Fix 2 — cap raised** — `MAX_TOOL_CALLS` 10 → 20 in
-  `base-llm-agent.ts`. Comment explains the verification-aware
-  budget: ~1 getFileTree + ~3 readFile + ~2 executeScript =
-  ~6 purposeful + retries.
-- **Fix 4 (latent bug uncovered during verification)** —
-  `packages/core/src/agents/agent-config-loader.ts`
-  `VALID_BUILTIN_TOOLS` was missing `'executeScript'`. The
-  `BuiltInToolName` type already included it, but
-  `extractTools()` filters `agents.yaml`-declared tools
-  through this Set, so any project listing `executeScript`
-  had it silently dropped. **This is why TR_007–009's
-  code-agent never invoked `executeScript`:** trackeros's
-  `agents.yaml` overrode `PER_ROLE_DEFAULTS` with a 4-tool
-  list (no executeScript), and even if an operator had added
-  it, this filter would have stripped it. Added
-  `'executeScript'` with a comment pointing at TR_007–010.
-- **Operator-side** — trackeros `agents.yaml` code-agent
-  `tools.builtin` gains `executeScript` (commit `6b7e42e`
-  on trackeros `main`).
-
-Live verification (correlation
-`7afa0886-dfef-43e4-8731-af1b48aadbd0`):
-
-| Agent | Status | Tokens | Tool calls | Duration |
-|---|---|---|---|---|
-| intent-agent | completed | 1,235 | 0 | 8s |
-| design-agent | completed | 1,034 | 0 | 7s |
-| lint-config-agent | completed | 0 | 0 | 25ms |
-| context-agent | completed | 2,773 | 1 | 11s |
-| **code-agent** | **completed** | **68,527** | **21** (5× executeScript, 8× listDirectory, 7× readFile, 1× getFileTree) | **33s** |
-| test-agent | completed | 3,035 | 0 | 16s |
-| review-agent | failed | 111,719 | 0 | 30s |
-| constraint-agent | failed | 50,748 | 21 (19× executeScript, 2× searchFiles) | 387s |
-
-Total: **~240k tokens / ~$0.14 USD** at gpt-4o-mini pricing —
-within the brief's $0.10–0.15 target.
-
-The five `executeScript` commands the code-agent ran:
-```
-1-2. mkdir -p src/modules/leave && touch leave.{model,repository,service,routes,index,test}.ts
-3.   npm run lint
-4.   npm run typecheck
-5.   npx tsc --noEmit
-```
-
-Lint + typecheck failed because trackeros's `package.json`
-doesn't declare those scripts. The LLM correctly surfaced that
-via a `verificationNote` field, which `parseCodeResponse`
-converted into a `LINT_FAILURE` signal:
-> *"Code-agent pre-emit verification did not pass: The module
-> structure was created successfully, but I was unable to run
-> lint and typecheck scripts as they are missing from
-> package.json."*
-
-**First observed end-to-end use of the TR_008 verificationNote
-schema in production data.**
-
-Generated artifacts: 5 source files + 5 test files for the
-Leave module (model / repository / service / routes / index +
-4 unit tests + 1 module test). **First time the trackeros
-scaffolding has progressed past the code-agent step since
-TEST_REPORT_007.**
-
-Gate verdict: `escalate` — 1 `GOLDEN_PRINCIPLE_BREACH` (DB
-access outside repository pattern) + 3 review-agent
-`CONSTRAINT_VIOLATION` (missing audit logging, test framework
-mismatch, unresolved import) + 2 constraint-agent
-`CONSTRAINT_VIOLATION` (error shape, unhandled promise). These
-are **real architectural findings** on the generated code, not
-platform failures.
-
-Brief's verification matrix:
-
-| Check | Result |
-|---|---|
-| No HTTP 400 *"tool_call_ids did not have response messages"* | ✓ pass |
-| Code-agent reads existing deps | ✓ pass (7× readFile) |
-| At least one executeScript call | ✓ **pass (5×)** |
-| No listDirectory on non-existent paths | ⚠ partial (8× — down from 14× in TR_009) |
-| Cycle deploys on first round | ✗ escalated on real findings |
-| Total code-agent tool calls ≤ 15 | ⚠ 21 (hit the new cap of 20 + 1 rejection batch entry) |
-
-Decisions made:
-
-- **Departed from the brief's literal `break` after cap
-  rejection.** Live verification showed the LLM produced no
-  text on the rejected turn, leaving `finalText` empty. The
-  brief's intent ("LLM is explicitly told to stop requesting
-  tools and return its answer") required a synthesis turn —
-  changed to `continue` + empty-`tools` next call so the model
-  is forced to produce text.
-- **Fixed `VALID_BUILTIN_TOOLS` even though it wasn't in the
-  brief.** Without it, the verification matrix mechanically
-  could not pass — the LLM couldn't invoke `executeScript`
-  because the loader silently stripped it. Documented as a
-  scope expansion in the report.
-- **Updated trackeros `agents.yaml` for the same reason.** Even
-  with the loader fix, trackeros's existing 4-tool declaration
-  needed `executeScript` appended to expose it.
-- **Wrote the report against the escalated cycle rather than
-  re-running.** The escalation is on legitimate findings; the
-  fixes work. Re-running to chase deploy success would
-  conflate platform observation with content-quality
-  iteration.
-
-Pending follow-ups:
-
-- **(HIGH) Review-agent `result_status = 'failed'` with
-  successful JSON output.** `agent_execution_logs` row marked
-  failed (empty `error_message`) but `llm_response` is
-  well-formed JSON AND 4 `signals` rows were emitted with
-  `source_agent='review-agent'`. Cosmetic — verdict is correct,
-  row label is wrong. Likely a race in the gate-orchestrator
-  failure-path.
-- **(MEDIUM) Constraint-agent 387s / 50k-token /
-  19-executeScript budget** on the Leave intent. Now the
-  slowest agent in the cycle by 5×. Restructure the prompt
-  to batch verifications or introduce a per-role
-  `MAX_TOOL_CALLS` override.
-- **(MEDIUM) Code-agent still emits 8× listDirectory** despite
-  the new pre-generation block. Down from 14× in TR_009,
-  still significant. Options: drop `listDirectory` from
-  code-agent's `tools.builtin` (lean on `getFileTree`); or
-  strengthen the prompt with hard examples of unhelpful
-  exploration.
-- **(MEDIUM) Add `n_turns` + `final_stop_reason` columns** to
-  `agent_execution_logs` (carried over from TR_008/009) — would
-  make "agent hit the cap" detectable without grepping server
-  logs.
-- **(LOW) Update the corporate-ops-web-mobile template
-  `agents.yaml`** to include `executeScript` for code-agent /
-  review-agent / constraint-agent so newly-bootstrapped
-  projects don't repeat this issue.
-- **(LOW) trackeros `package.json`** doesn't expose `lint` or
-  `typecheck` scripts. The code-agent caught it via
-  `verificationNote`. Either add scripts or drive a follow-up
-  intent.
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Docker image rebuilt + container restarted via
-`docker compose up -d --build`. Server `/health` 200 throughout.
-Trackeros `main` updated to `6b7e42e`. New file
-`docs/claude/TEST_REPORT_010.md`.
 
 ---
 

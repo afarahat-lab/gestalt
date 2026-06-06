@@ -34,13 +34,26 @@ import {
   extractJsonObject,
   renderHarnessAgentRules,
   renderScriptToolInstruction,
+  createContextLogger,
+  EVIDENCE_REQUIREMENT_SECTION,
+  QUOTED_LINE_SCHEMA_FIELD,
+  dropUnevidencedFindings,
 } from '@gestalt/core';
 import type { AgentConfig } from '@gestalt/core';
 import type { AgentResult } from '@gestalt/agents-generate';
 
+const reviewLog = createContextLogger({ module: 'review-agent' });
+
 interface LLMReviewItem {
   file?: string;
   line?: number;
+  /**
+   * TR_013 — the exact line from the artifact that constitutes the
+   * violation, quoted verbatim. Required; findings missing this field
+   * are dropped by `dropUnevidencedFindings` in `parseReview` before
+   * they reach the gate.
+   */
+  quotedLine: string;
   severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
   category: 'security' | 'architecture' | 'golden-principle' | 'bug' | 'style';
   message: string;
@@ -607,7 +620,7 @@ identify concerns the generate layer missed. Be specific and concrete —
 no generic advice. Only flag concerns that are actually present in the
 code below.
 ${harnessRulesSection}${scriptInstruction}${severityLimitsSection}
-${verificationGuidance}${outOfScopeSection}${projectStateSection}${scaffoldingSection}${constraintsSection}${principlesSection}${consistencySection}
+${verificationGuidance}${EVIDENCE_REQUIREMENT_SECTION}${outOfScopeSection}${projectStateSection}${scaffoldingSection}${constraintsSection}${principlesSection}${consistencySection}
 ## Files under review
 
 ${files.join('\n\n')}
@@ -624,13 +637,16 @@ schema:
     {
       "file": "<path of the file the concern is in>",
       "line": <1-based line number, or omit if file-wide>,
+      ${QUOTED_LINE_SCHEMA_FIELD},
       "severity": "<critical | high | medium | low | info>",
       "category": "<security | architecture | golden-principle | bug | style>",
-      "message": "<one-sentence specific concern>",
+      "message": "<one-sentence specific concern — explain why this specific line is a violation>",
       "fixHint": "<one-sentence suggested fix, optional>"
     }
   ]
 }
+
+Any item missing "quotedLine" will be automatically discarded.
 
 Severity rules:
 - critical: security issue with immediate impact (hardcoded secret, unguarded SQL, etc.) — blocks merge
@@ -645,14 +661,25 @@ ${extensions}`;
 
 function parseReview(raw: string): LLMReview {
   const parsed = JSON.parse(extractJsonObject(raw)) as Partial<LLMReview>;
+  const rawItems = Array.isArray(parsed.items)
+    ? parsed.items.filter(
+        (i): i is LLMReviewItem =>
+          !!i &&
+          typeof i.message === 'string' &&
+          typeof i.severity === 'string' &&
+          typeof i.category === 'string',
+      )
+    : [];
+
+  // TR_013 — drop findings the LLM cannot ground in a verbatim quote
+  // from the artifact. The shared `dropUnevidencedFindings` helper logs
+  // each drop at `info` level so operators can see hallucination rate.
+  const validItems = dropUnevidencedFindings(rawItems, reviewLog);
+
   return {
     summary: typeof parsed.summary === 'string' ? parsed.summary : '',
     overallVerdict: parsed.overallVerdict ?? 'pass',
-    items: Array.isArray(parsed.items)
-      ? parsed.items.filter((i): i is LLMReviewItem =>
-        !!i && typeof i.message === 'string' && typeof i.severity === 'string' && typeof i.category === 'string',
-      )
-      : [],
+    items: validItems,
   };
 }
 
@@ -683,13 +710,20 @@ function mapItemsToSignals(
     // for when the LLM ignores the instruction. Downgrade to
     // CONSTRAINT_VIOLATION/high so the finding still drives a retry
     // round but never escalates the cycle to human review.
+    // TR_013 — surface the LLM's quoted evidence in the signal message
+    // so the operator (and the next-round code-agent) can see the exact
+    // line that drove the finding. Saved unconditionally — the parser
+    // would have dropped the item if `quotedLine` were missing.
     out.push({
       id: crypto.randomUUID(),
       correlationId,
       type: 'CONSTRAINT_VIOLATION',
       severity: mapSeverity(item.severity),
       agentRole: 'review-agent',
-      message: `[review/${item.category}] ${item.message}${item.fixHint ? ` Hint: ${item.fixHint}` : ''}`,
+      message:
+        `[review/${item.category}] ${item.message}\n` +
+        `  Evidence: "${item.quotedLine}"` +
+        (item.fixHint ? `\n  Fix: ${item.fixHint}` : ''),
       location: item.file
         ? { file: item.file, line: item.line, rule: `review/${item.category}` }
         : null,
@@ -743,6 +777,8 @@ function renderReviewMarkdown(review: LLMReview): string {
     lines.push(`### ${item.severity.toUpperCase()} · ${item.category} · ${loc}`);
     lines.push('');
     lines.push(item.message);
+    lines.push('');
+    lines.push(`**Evidence:** \`${item.quotedLine}\``);
     if (item.fixHint) {
       lines.push('');
       lines.push(`**Suggested fix:** ${item.fixHint}`);

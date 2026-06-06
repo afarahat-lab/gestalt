@@ -67,6 +67,12 @@ export {
 export {
   extractJsonObject, parseLlmJson,
 } from './agents/json-extract';
+export {
+  EVIDENCE_REQUIREMENT_SECTION,
+  QUOTED_LINE_SCHEMA_FIELD,
+  dropUnevidencedFindings,
+} from './agents/evidence-requirement';
+export type { EvidenceLogger } from './agents/evidence-requirement';
 export type {
   AgentConfig, AgentLlmConfig, AgentToolConfig, AgentsYaml,
   CustomAgentDefinition, CustomAgentNode,

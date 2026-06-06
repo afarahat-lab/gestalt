@@ -19,11 +19,17 @@
  * (ADR-013) — custom agents contribute typed signals only.
  */
 
-import { getLLMClientForModel, extractJsonObject } from '@gestalt/core';
+import {
+  getLLMClientForModel, extractJsonObject, createContextLogger,
+  EVIDENCE_REQUIREMENT_SECTION, QUOTED_LINE_SCHEMA_FIELD,
+  dropUnevidencedFindings,
+} from '@gestalt/core';
 import type {
   ContextSnapshot, CustomAgentDefinition, CustomAgentFinding,
   CustomAgentResult, GeneratedArtifact, Principle,
 } from '../types';
+
+const customAgentLog = createContextLogger({ module: 'custom-agent-runner' });
 
 const MAX_ARTIFACT_CHARS = 2000;
 
@@ -40,6 +46,14 @@ export async function runCustomAgent(
 ): Promise<CustomAgentResult> {
   const startedAt = Date.now();
 
+  // TR_013 — `{{evidenceRequirement}}` and `{{quotedLineSchema}}` are
+  // substitution variables operators can drop into their custom-agent
+  // prompt template. They expand to the shared evidence-requirement
+  // section and the `"quotedLine": "..."` JSON schema field
+  // respectively. Operators who don't include them in their prompt
+  // template still benefit from the parser-side enforcement below
+  // (`dropUnevidencedFindings`), but their LLM won't have the
+  // instruction in-prompt — those findings will be dropped wholesale.
   const prompt = substitutePromptVariables(definition.prompt, {
     role: definition.role,
     goal: definition.goal,
@@ -47,6 +61,8 @@ export async function runCustomAgent(
     goldenPrinciples: formatGoldenPrinciples(ctx.goldenPrinciples),
     intentText: ctx.intentSpec.rawIntent,
     projectName: ctx.harness.name,
+    evidenceRequirement: EVIDENCE_REQUIREMENT_SECTION,
+    quotedLineSchema: QUOTED_LINE_SCHEMA_FIELD,
   });
 
   let modelUsed: string | null = null;
@@ -78,9 +94,16 @@ export async function runCustomAgent(
     }
 
     const parsed = safeParseResponse(result.value.content);
-    const findings = Array.isArray(parsed.findings)
+    const rawFindings = Array.isArray(parsed.findings)
       ? parsed.findings.filter(isValidFinding)
       : [];
+    // TR_013 — drop findings the LLM cannot ground in a verbatim quote
+    // from the artifact. Operators should include
+    // `{{evidenceRequirement}}` + `{{quotedLineSchema}}` in their
+    // custom-agent prompt; if they do not, every finding is dropped
+    // here, which is the intended behaviour (hallucinated findings
+    // never reach the gate).
+    const findings = dropUnevidencedFindings(rawFindings, customAgentLog);
     // If the LLM omitted `passed`, infer from findings: any high
     // severity = failed, otherwise passed. Matches operator
     // expectation for a custom agent that returns only findings.
@@ -166,10 +189,15 @@ function safeParseResponse(raw: string): ParsedResponse {
 function isValidFinding(value: unknown): value is CustomAgentFinding {
   if (!value || typeof value !== 'object') return false;
   const f = value as Record<string, unknown>;
+  // TR_013 — `quotedLine` is treated as optional at the structural
+  // level (so a missing field doesn't crash the parser); the
+  // downstream `dropUnevidencedFindings` call discards entries whose
+  // `quotedLine` is empty / absent, logging each drop.
   return (
     (f['severity'] === 'high' || f['severity'] === 'medium' || f['severity'] === 'low')
     && typeof f['file'] === 'string'
     && typeof f['description'] === 'string'
+    && (f['quotedLine'] === undefined || typeof f['quotedLine'] === 'string')
   );
 }
 

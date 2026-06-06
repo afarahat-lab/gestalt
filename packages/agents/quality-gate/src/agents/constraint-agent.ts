@@ -30,7 +30,11 @@
  * orchestrator.
  */
 
-import { BaseLLMAgent, extractJsonObject } from '@gestalt/core';
+import {
+  BaseLLMAgent, extractJsonObject,
+  EVIDENCE_REQUIREMENT_SECTION, QUOTED_LINE_SCHEMA_FIELD,
+  dropUnevidencedFindings,
+} from '@gestalt/core';
 import type { AgentConfig, HarnessConfig } from '@gestalt/core';
 import { readFile } from 'fs/promises';
 import { join } from 'path';
@@ -74,14 +78,29 @@ const MAX_ARTIFACTS_IN_PROMPT = 12;
 
 // ─── Response parsing ─────────────────────────────────────────────────────-
 
+interface ParsedViolation {
+  constraintId?: string;
+  file?: string;
+  line?: number;
+  /**
+   * TR_013 — the exact line from the artifact that constitutes the
+   * violation, quoted verbatim. Required; violations missing this
+   * field are dropped by `dropUnevidencedFindings` in
+   * `parseViolations` before they reach the gate.
+   */
+  quotedLine?: string;
+  explanation?: string;
+  severity?: string;
+  /**
+   * Used by `dropUnevidencedFindings` (which looks at
+   * `message` / `description` / `explanation`). Optional alias; the
+   * agent's contract still emits `explanation`.
+   */
+  message?: string;
+}
+
 interface ParsedResponse {
-  violations?: Array<{
-    constraintId?: string;
-    file?: string;
-    line?: number;
-    explanation?: string;
-    severity?: string;
-  }>;
+  violations?: ParsedViolation[];
   summary?: string;
 }
 
@@ -198,6 +217,7 @@ export class ConstraintAgent extends BaseLLMAgent {
 
 ${rulesSection}
 ${scriptInstruction}
+${EVIDENCE_REQUIREMENT_SECTION}
 ## Intent
 ${rawIntent}
 
@@ -228,13 +248,16 @@ Return ONLY a single JSON object (no preamble, no markdown fences):
       "constraintId": "which rule was violated",
       "file": "path/to/file",
       "line": 42,
-      "explanation": "what is wrong and why this violates the rule",
+      ${QUOTED_LINE_SCHEMA_FIELD},
+      "explanation": "what is wrong and why this specific line violates the rule",
       "severity": "high" | "medium" | "low"
     }
   ],
   "summary": "N violations found"
 }
 \`\`\`
+
+Any violation missing "quotedLine" will be automatically discarded.
 
 If every rule passes, return \`{"violations": [], "summary": "0 violations"}\`.`;
   }
@@ -256,9 +279,15 @@ If every rule passes, return \`{"violations": [], "summary": "0 violations"}\`.`
       return [];
     }
 
-    const items = Array.isArray(parsed.violations) ? parsed.violations : [];
+    const rawItems = Array.isArray(parsed.violations) ? parsed.violations : [];
+
+    // TR_013 — drop violations the LLM cannot ground in a verbatim
+    // quote from the artifact. The shared helper logs each drop at
+    // `info` level so operators can see hallucination rate.
+    const validItems = dropUnevidencedFindings(rawItems, log);
+
     const signals: GateSignal[] = [];
-    for (const v of items) {
+    for (const v of validItems) {
       const file = typeof v.file === 'string' ? v.file : '';
       const explanation = typeof v.explanation === 'string' ? v.explanation : '';
       if (!file || !explanation) continue;
@@ -270,13 +299,21 @@ If every rule passes, return \`{"violations": [], "summary": "0 violations"}\`.`
       const signalType: SignalType = severity === 'critical'
         ? 'GOLDEN_PRINCIPLE_BREACH'
         : 'CONSTRAINT_VIOLATION';
+      // TR_013 — surface the LLM's quoted evidence in the signal so
+      // the next-round code-agent (and the operator) sees the exact
+      // line that drove the finding. `quotedLine` is guaranteed
+      // present here because `dropUnevidencedFindings` discarded any
+      // entry missing it.
+      const quotedLine = (v.quotedLine ?? '').trim();
       signals.push({
         id: crypto.randomUUID(),
         correlationId: task.correlationId,
         type: signalType,
         severity,
         agentRole: 'constraint-agent',
-        message: `[${constraintId}] ${explanation}`,
+        message:
+          `[${constraintId}] ${explanation}\n` +
+          `  Evidence: "${quotedLine}"`,
         location: {
           file,
           line,

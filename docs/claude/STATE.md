@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-06 (after TEST_REPORT_012 — review-agent reliability fixes shipped; severity cap + self-healing loop detection working in live data; mandatory tool-first protocol delivered but ignored by gpt-4o-mini)
+**Last updated:** 2026-06-06 (after TEST_REPORT_013 — universal evidence requirement shipped; every review + constraint signal now carries verbatim quoted evidence; 4 ungrounded findings dropped at parse; categorical hallucination still drives the cycle but now visibly so)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -195,119 +195,110 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
-- **TR_012 review-agent reliability fixes landed.** Three
-  platform changes (severity cap in `llm-review-agent.ts`
-  `mapItemsToSignals` so review-agent can never emit
-  `GOLDEN_PRINCIPLE_BREACH`; mandatory tool-first review
-  protocol in the same file's prompt; `detectRepeatedSignalLoop`
-  + escape hatch in `self-healing-loop.ts` so the cycle
-  escalates when >50% of a self-healing-retry's signals
-  fingerprint-match the prior attempt) + one trackeros
+- **TR_013 universal evidence requirement landed.** New
+  `packages/core/src/agents/evidence-requirement.ts` exports
+  `EVIDENCE_REQUIREMENT_SECTION`, `QUOTED_LINE_SCHEMA_FIELD`,
+  and `dropUnevidencedFindings<T>`. Wired into review-agent,
+  constraint-agent, and custom-agent-runner — every finding
+  now requires `quotedLine` (the exact violating line quoted
+  verbatim) and the parser drops items missing it before they
+  reach the gate. Self-healing-agent gets a softer
+  warn-when-missing variant (`evidenceQuote?: string`). Live
+  verification (correlation `59900af8-...`): 25/25 emitted
+  signals carry `Evidence: "..."` in the message; 4 findings
+  voluntarily dropped because the LLM emitted
+  `"quotedLine": ""` rather than fabricate a quote;
+  0 GOLDEN_PRINCIPLE_BREACH signals (TR_012 Fix 1 carries
+  through); TR_012 Fix 3 loop detector fires at 84% repeat
+  rate (vs 72% in TR_012). The persistent "Direct DB access"
+  finding survives — backed by REAL evidence
+  (`pool.query<LeaveRequest>(req)` from `leave.repository.ts`)
+  — because the LLM correctly quotes a real line but
+  categorically misinterprets "outside the repository pattern".
+- **TR_012 review-agent reliability fixes landed (carryover).**
+  Three platform changes (severity cap in `llm-review-agent.ts`
+  `mapItemsToSignals`; mandatory tool-first review protocol
+  in the same file's prompt; `detectRepeatedSignalLoop` +
+  escape hatch in `self-healing-loop.ts`) + one trackeros
   operator change (`executeScript` added to
-  `review-agent.tools.builtin`, commit `3500a46`). TR_012
-  proved Fix 1 ✓ (0/30 review signals are GP_BREACH) and
-  Fix 3 ✓ (fired at 72% repeat rate on attempt 2 with a
-  specific "Review-agent loop detected" alert). Fix 2's
-  STEP 5 scope-filter ✓ (audit-logging false positive
-  gone — TR_011 had 8/8 rounds, TR_012 has 0/30); Fix 2's
-  STEPS 1–3 tool-call mandate ✗ (gpt-4o-mini's tool-refusal
-  pattern from TR_011 reconfirmed; 0/64 review-agent tool
-  calls). Cycle cost -45% vs TR_011.
-- **(HIGHEST follow-up — TR_012)** Deterministic post-LLM
-  grep filter on review-agent findings. 28/30 of TR_012's
-  review-agent signals are "Direct DB access" hallucinations
-  against the repository file (which is correctly using
-  pool.query — that IS the pattern). A `grep -E
-  "pool\.query|db\.query|new Pool"` check on the artifact set
-  excluding `shared/db/` drops the finding if no matches.
-  Same treatment for "Missing dependency X" → drop if X is
-  in package.json.
-- **(HIGH follow-up — TR_012)** Try switching review-agent's
-  model to gpt-4o. gpt-4o-mini's tool-refusal pattern is now
-  well-documented across TR_011 + TR_012. ~$0.04/round still
-  in budget if it converges in 1–2 rounds.
-- **executeScript invocation is consistent for code-agent and
-  constraint-agent** (TR_010/011/012). Code-agent ~21×/round;
-  constraint-agent 5–25×/round. Review-agent: **0× in every
-  round across TR_011 + TR_012** even with the new mandatory
-  protocol — see TR_012 HIGHEST follow-up.
+  `review-agent.tools.builtin`, commit `3500a46`). All three
+  fixes continue to behave as in TR_012 — Fix 1 ✓
+  (0 GP_BREACH), Fix 2's scope-filter ✓ (0 audit-logging
+  false positives), Fix 3 ✓ (loop detector fires at 84%).
+- **(HIGHEST follow-up — TR_013)** Approach A on the project
+  side: tighten trackeros's HARNESS.json constraint rule
+  wording to disambiguate `pool.query` use in repositories.
+  TR_013 proves the LLM IS finding real evidence — the
+  remaining problem is categorical misinterpretation, not
+  hallucinated grounding. An unambiguous "pool.query is
+  REQUIRED in `*.repository.ts` and FORBIDDEN in
+  `*.service.ts`" rule should converge in 1 round now that
+  the LLM sees `Evidence: "..."` from prior rounds in
+  `priorSignals`. No platform code change needed for this
+  follow-up.
+- **(HIGH follow-up — TR_013)** Round-7 code-agent JSON
+  parse failure ("Expected double-quoted property name in
+  JSON at position 1001"). Separate bug — 437k tokens, 12
+  minutes, ended with malformed JSON likely from an
+  unescaped quote inside an inlined test file `content`
+  string. Investigate the code-agent's JSON-mode response
+  handling for embedded code literals.
+- **(MEDIUM follow-up — TR_013)** Both review-agent and
+  constraint-agent review files OUTSIDE the cycle's artifact
+  set. TR_011 noted this for constraint-agent; TR_013
+  confirms both read `leave.repository.ts` (pre-existing on
+  main) via `readFile` and flag it. The TR_012 scope-filter
+  is per-finding; should also bound `readFile` reach to the
+  cycle's artifact set.
+- **(LOW follow-up — TR_013)** Try switching review-agent's
+  model to gpt-4o. gpt-4o-mini behaves well under the
+  evidence requirement (voluntarily empty-quotes when
+  ungrounded) but is more likely to miscategorise; gpt-4o
+  is more likely to recognise that pool.query inside
+  `leave.repository.ts` IS the repository pattern.
+- **(DROPPED — TR_013)** TR_012's "deterministic post-LLM
+  grep filter" follow-up. The evidence requirement
+  supersedes it — instead of post-filtering with hardcoded
+  patterns, we structurally require the LLM to ground every
+  finding in a verbatim quote. Approach B is the platform
+  contract; Approach A (rule wording) finishes the job
+  project-side.
+- **executeScript invocation patterns** (TR_010/011/012/013).
+  Code-agent ~21×/round; constraint-agent 5–25×/round.
+  Review-agent: **0× across TR_011/012/013** — gpt-4o-mini
+  ignores imperative tool-call mandates. Switching to gpt-4o
+  is the next candidate experiment (LOW follow-up above).
 - **Tool-call persistence is incremental** in
   `BaseLLMAgent.runToolLoop()` (TR_009 Fix 1). Mid-loop
   throws preserve full tool-call logs in
   `agent_execution_logs`.
 - **Trackeros code-agent runs on gpt-4o-mini** (trackeros
   `9c41633`). Zero rate-limit errors; ~3× cheaper.
-- **`MAX_TOOL_CALLS` cap-inside-batch is fixed** (TR_010
-  Fix 1). Cap check moved BEFORE the per-call dispatch loop;
-  over-cap batches get synthesised rejection responses for
-  every `tool_call_id`, then a synthesis turn with
-  `tools: []` is fired so the LLM produces final text
-  (`stopReason === 'stop'`). HTTP 400
-  *"tool_call_ids did not have response messages"* is gone.
-- **`MAX_TOOL_CALLS` raised from 10 → 20 + pre-generation
-  prompt block in code-prompt.ts** (TR_010 Fix 2). Tells the
-  LLM to read existing deps first, not explore non-existent
-  paths. TR_011 VALIDATED this: `listDirectory` count is 0
-  across all 8 TR_011 rounds (down from 14× in TR_009).
+- **`MAX_TOOL_CALLS` cap-inside-batch fixed + raised 10→20**
+  + pre-generation prompt block in code-prompt.ts (TR_010 Fix
+  1+2). Over-cap batches synthesise rejection responses for
+  every `tool_call_id`, then a synthesis turn with `tools: []`
+  fires so the LLM emits final text. Pre-generation prompt
+  block drives `listDirectory` to 0 across TR_011/012/013.
 - **`VALID_BUILTIN_TOOLS` includes `executeScript`** (TR_010
   Fix 4 — latent bug; loader was silently dropping it).
 - **Empty-tools wire path is safe** (TR_010 Fix 3). When
   `tools: []`, also drop `tool_choice` from OpenAI body.
-- **Review-agent hallucination addressed by TR_012's three
-  fixes, with the worst symptoms eliminated:**
-  - GP_BREACH from review-agent — **eliminated** (Fix 1).
-  - Audit-logging / RBAC / input-validation false
-    positives — **eliminated** (Fix 2's STEP 5 scope filter).
-  - Persistent round-over-round loops on residual
-    hallucinations — **capped** (Fix 3 escape hatch).
-  - **Remaining gap**: 28/30 of TR_012's review-agent
-    signals are "Direct DB access" hallucinations against the
-    repository file. Fix 2's mandatory tool-call instruction
-    is ignored by gpt-4o-mini (0/64 review-agent tool calls
-    across TR_011 + TR_012). Next step (HIGHEST follow-up)
-    is the deterministic grep filter.
-- **Review-agent `result_status = 'failed'` with successful
-  JSON output** (TR_010 finding, TR_011 reconfirms across 8
-  rounds). `agent_execution_logs` row marked failed (empty
+- **(HIGH carryover from TR_010/011/013) Review-agent
+  `result_status = 'failed'` with successful JSON output.**
+  `agent_execution_logs` row marked failed (empty
   `error_message`) but `llm_response` is well-formed JSON
-  AND signals rows are emitted with `source_agent='review-
-  agent'`. Cosmetic but blocks operator triage —
-  can't distinguish "review-agent crashed" from "review-agent
-  emitted false positives". Fix priority: HIGH.
-- **~~HIGH~~ DROPPED: Retry-budget overshoot.** TR_011
-  thought 6 rounds was the budget; TR_012 proves the actual
-  budget is `gateRetries × (selfHealing + 1) = 3 × 3 = 9`
-  max. TR_011's 8 and TR_012's 8 both sit one round under
-  that. No bug, no fix needed. Gate-orchestrator retryCount
-  increment logic is correct.
-- **TR_010 GP_BREACH was a FALSE POSITIVE** (TR_011 analysis).
-  Review-agent's "Direct DB access in service" finding
-  fired against code that correctly imports + delegates to
-  `LeaveRepository`. No `pool.query` in the service.
-  Three of TR_010's five review-agent findings were false
-  positives or mistargeted.
-- **Constraint-agent 387-second / 50k-token / 19-executeScript
-  budget on TR_010's Leave intent.** TR_011 confirms similar
-  pattern (8-21 tool calls / round). Restructure prompt to
-  batch verifications or per-role MAX_TOOL_CALLS override.
-- **Constraint-agent reviews files outside the cycle's
-  artifact set** (TR_011 finding). Flagged
-  `src/shared/db/connection.ts` (pre-existing infrastructure
-  on main, not generated this cycle) for "hardcoded
-  credentials" on its `process.env.DATABASE_URL` line.
-  Constraint-agent should scope to the cycle's diff.
-- **TR_004 Fix 4 self-healing escape hatch (new-violations
-  detection)** still not exercised live. TR_012's new
-  `detectRepeatedSignalLoop` escape hatch (repeated-signals
-  detection) IS proven live (fired at 72% repeat rate on
-  attempt 2). Both hatches sit in the same code path; the
-  new-violations one would fire if a code-agent amendment
-  introduced novel violations the diagnostician couldn't
-  reason through.
-- **Fix 1 (env-default apiShape) not yet live-verified.**
-  Code path in place; needs `LLM_MODEL=chat-latest` +
-  `platform_llms.chat-latest.api_shape='responses'` and a
-  test cycle to confirm `max_completion_tokens` flows.
+  AND signals rows emitted. Cosmetic but blocks operator
+  triage — can't distinguish "review-agent crashed" from
+  "review-agent emitted false positives".
+- **TR_004 Fix 4 self-healing escape hatch
+  (new-violations detection)** still not exercised live.
+  TR_012's `detectRepeatedSignalLoop` (repeated-signals
+  detection) IS proven live at 72% (TR_012) and 84% (TR_013).
+  Both hatches sit in the same code path.
+- **Fix 1 (env-default apiShape) not yet live-verified** —
+  needs `LLM_MODEL=chat-latest` +
+  `platform_llms.chat-latest.api_shape='responses'`.
 - **Older test-report follow-ups** (all LOW): test-agent
   punts on method coverage with
   "// Additional tests can be added similarly" (TR_004);
@@ -366,12 +357,11 @@ the `sessions/archive/` files (everything older)._
 - **Synthetic trackeros branches** from live test cycles
   (TR_002 / 003 merged; TR_004+ cycles failed at gate and
   never pushed). Branch-name pattern: `gestalt/<correlation>-`.
-- **One open alert** from TR_010's escalated Leave cycle
-  (correlation `7afa0886-…`, type `GP_BREACH`, severity
-  `critical`). Dismiss with `gestalt alerts dismiss` after
-  the architectural findings are addressed in a follow-up
-  intent. (TR_009's alert may also still be open; same
-  command.)
+- **Open alerts to dismiss**: TR_010's `GP_BREACH` for
+  `7afa0886-…`, TR_011's `failed` for `11a08e08-…`, TR_012's
+  `gate-max-retries` for `aac73745-…`, TR_013's
+  `generate-error` for `59900af8-…`. All dismissable with
+  `gestalt alerts dismiss`.
 - **`.env`**: `LLM_MODEL=gpt-4o` (operator default). For
   `chat-latest` routing through the registry's responses
   api_shape, see TR_003 Fix 1 follow-up.
