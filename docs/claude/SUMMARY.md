@@ -11,7 +11,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-07 (after TR_021 — externalised the gate-agent verificationGuidance from `.ts` files into HARNESS.json's `agentConfig[role].verificationGuidance`. Pure refactor; platform mechanics (evidence requirement, severity ceiling, JSON schema, parser-level dropUnevidencedFindings, ABSOLUTE_MAX_RETRIES) stay in code; project-specific "how to verify before flagging" hints become configurable per project. constraint-agent gained the new section "for free" via the shared helper. Two trackeros cycles back-to-back both `Status: ✓ deployed` single-round: PR #55 (pre-commit, no-regression check on old HARNESS.json) and PR #56 (post-commit, both gate agents render the new `Verification guidance for this project` block — direct prompt inspection confirms). Template bumped 0.6.0 → 0.7.0.)
+**Last updated:** 2026-06-07 (after ADRs 042–049 — documentation-only session codifying the platform/operator split. ADR-042 makes the TR_021 refactor a permanent rule (LLM guidance prose in HARNESS.json + agents.yaml, never `.ts`). ADRs 043–049 codify the Aider opt-in backend (043), the gpt-4o-for-gate / gpt-4o-mini-for-code-gen policy (044), the evidence-requirement for all finding-emitting agents (045), LLM-driven script execution for gate verification (046), CI-owns-runtime / gate-owns-architecture extension to ADR-041 (047), LLM-driven retry routing instead of hardcoded dispatch maps (048), and phased architecture consultation (049). No platform code change; no migrations. Previously (TR_021): externalised gate-agent verificationGuidance from `.ts` into HARNESS.json's `agentConfig[role].verificationGuidance`. Two trackeros cycles back-to-back both `Status: ✓ deployed` single-round (PR #55, PR #56). Template bumped 0.6.0 → 0.7.0.)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -423,6 +423,25 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### ADRs 042–049 — Platform/operator split and related principles codified
+
+Documentation-only session. Eight ADRs appended to
+`docs/DECISIONS.md`: ADR-042 (LLM guidance prose lives in
+HARNESS.json + agents.yaml, never `.ts`), ADR-043 (Aider opt-in
+backend), ADR-044 (gpt-4o for gate, gpt-4o-mini for code-gen),
+ADR-045 (evidence requirement — every finding needs a
+`quotedLine`), ADR-046 (LLM-driven script execution for gate
+verification — no hardcoded script commands), ADR-047 (CI/CD
+owns runtime verification; gate owns architectural review —
+extends ADR-041), ADR-048 (LLM-driven retry routing via
+`SelfHealingDiagnosis.retryTaskType`, no hardcoded dispatch
+maps), ADR-049 (architecture agent uses phased consultation —
+`designFeature()` + `designPhase()` — not single-call full
+design). No platform code change; no migrations.
+
+**Operator action:** None. ADRs are read-only contracts the
+platform already honours.
+
 ### TR_021 — Externalise gate-agent verificationGuidance to HARNESS.json
 
 Refactor: STEP 1-5 verification protocol lifted from
@@ -504,6 +523,95 @@ Moved to [@docs/claude/ARCHITECTURE.md](./ARCHITECTURE.md#key-type-alignment-rul
 
 
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
+
+---
+### Session 2026-06-07 — Claude Code (ADRs 042–049: codify platform/operator split + Aider backend + gate model policy + evidence requirement + LLM-driven script verification + CI-owns-runtime + LLM-driven retry routing + phased architecture)
+
+Documentation-only session. Eight ADRs added to `docs/DECISIONS.md`
+codifying principles either learned through TR_007 → TR_021 or that
+govern the upcoming planning-feature implementation. No platform
+code change; no migrations.
+
+What was added:
+
+- **ADR-042** — LLM prompt content belongs in HARNESS.json +
+  agents.yaml, not in TypeScript files. Codifies TR_021's refactor
+  as a permanent rule. Stays in `.ts`: schemas, framing, evidence
+  enforcement, parsing, severity caps. Goes in `agents.yaml`: role
+  / goal / prompt_extensions / domain guidance. Goes in
+  `HARNESS.json agentConfig`: rules + verificationGuidance +
+  project-specific hints. Code reviews must reject `.ts` PRs that
+  add LLM guidance prose.
+- **ADR-043** — Aider as opt-in code generation backend. Enabled
+  per-project via `HARNESS.json codeGeneration.backend: "aider"`.
+  The Aider message stays minimal — task, rules, architecture
+  context only. HOW to implement is Aider's call. Custom
+  code-agent retained as default for non-opt-in projects.
+- **ADR-044** — Gate agents require gpt-4o; code generation uses
+  gpt-4o-mini. Codifies TR_015 + TR_016 finding: gpt-4o-mini
+  cannot follow rules that contradict its training bias (8 rounds
+  flagging `pool.query()` in `*.repository.ts` despite explicit
+  "this is CORRECT" rule). gpt-4o for the gate (small call
+  volume); gpt-4o-mini for Aider's tool loop (200k TPM ceiling).
+- **ADR-045** — Evidence requirement for all finding-emitting
+  agents. Every finding must include `quotedLine` with the exact
+  code quoted verbatim. Findings without `quotedLine` are dropped
+  by `dropUnevidencedFindings()` before reaching the gate verdict.
+  Eliminates hallucinated findings structurally, not via prompt
+  engineering.
+- **ADR-046** — LLM-driven script execution for gate verification.
+  No hardcoded script commands in platform `.ts` files. LLM
+  decides what to run based on project language / stack /
+  finding. `HARNESS.json agentConfig.verificationGuidance` gives
+  hints; the LLM picks the approach. Platform-level blocklist on
+  destructive operations (rm -rf, git push, git commit, sudo,
+  curl | bash) is never configurable.
+- **ADR-047** — CI/CD owns runtime verification; Gestalt gate
+  owns architectural review. Extends ADR-041. lint-agent /
+  security-agent / test-runner-agent removed permanently. CI runs
+  the project's own ESLint / Jest / Semgrep — more accurate than
+  platform stubs. Re-adding those agents to the gate is
+  explicitly prohibited.
+- **ADR-048** — Self-healing uses LLM-driven retry routing, not
+  hardcoded dispatch maps. `SelfHealingDiagnosis.retryTaskType`
+  is the authoritative dispatch decision. The LLM understands
+  failure semantics (git non-fast-forward → deploy-layer, TS
+  compile error → generate-layer) without per-case programming.
+  Unknown failures fall through to `generate:intent`.
+- **ADR-049** — Architecture agent uses phased consultation, not
+  single-call full design. Two modes: `designFeature()` (high-level
+  — domain entities, module list, phase sequence, no impl detail)
+  and `designPhase()` (focused — interface signatures, import
+  paths, SQL schema, measurable success criteria; receives prior
+  phases' actual code as context). High-level design committed to
+  `ARCHITECTURE.md` before any code generation. Future CrewAI
+  migration becomes an architecture crew (chief / data / app
+  architect) on the same two-mode pattern.
+
+Commits:
+
+- `013e49f` — ADR-042 (committed and pushed earlier in session)
+- `<TBD>` — ADRs 043–049 + RECENT.md / STATE.md / BUILD.md /
+  SUMMARY.md regeneration (this commit)
+
+Decisions made:
+
+- **Ordered ADRs 042–049 by the principle they govern**, not
+  chronologically by when the lesson was learned. ADR-042 (the
+  split itself) leads because it defines the framework the others
+  live within.
+- **Did not change platform code.** The ADRs codify behaviour
+  that's already deployed (or that governs the planning feature
+  about to be built); they're a contract, not a refactor. Future
+  PRs that violate any ADR must justify the deviation in their
+  own ADR amendment.
+- **No new follow-ups added.** Every ADR points at code that
+  already exists or at the planning feature about to be built.
+
+Build status: no platform code change. `pnpm -r build` not
+re-run. Docker image untouched. No new migrations. TR_019 session
+rotated to `sessions/archive/2026-06-w1.md` to keep RECENT.md
+under the 3-session / 40 KB ceiling.
 
 ---
 ### Session 2026-06-07 — Claude Code (TR_021: externalise verificationGuidance from gate-agent .ts → HARNESS.json — refactor only, two clean deploys back-to-back)
@@ -875,205 +983,5 @@ Fix 4). Template auto-refreshed at boot: `version: "0.6.0"`.
 Server `/health` 200 throughout. New file
 `docs/claude/TEST_REPORT_020.md`. **First end-to-end deploy on the
 real `github-actions` pipeline adapter.**
-
----
-### Session 2026-06-07 — Claude Code (TEST_REPORT_019: real GitHub Actions CI integration end-to-end — architectural chain verified; cycle hits a runaway gate-retry-budget bug after 46 rounds)
-
-First end-to-end test of the TR_018 / ADR-041 architectural change
-against a **real** `github-actions` pipeline adapter on trackeros (the
-prior verification was via `noop`). Brief: switch trackeros to
-github-actions + autoMerge, submit a simple "add /health endpoint"
-intent, watch CI run for real (Compile / Test / Lint / Security
-scan), watch the gate dispatch on CI-pass with `readFromBranch=true`,
-watch the cycle deploy.
-
-Outcome: **architectural chain VERIFIED end-to-end with real CI**.
-Every transition in the ADR-041 chain fires correctly across 46
-retry rounds. CI runs all 4 stages green in 35–53s per round.
-pipeline-agent correctly polls workflow_dispatch and detects pass.
-The gate clones the PR branch, checks it out, and reads source
-files from the working tree (`mode: branch`) on every gate
-invocation. Both gate agents confirmed on `gpt-4o` (88/88 calls).
-**Cycle did NOT deploy** — hit a separate runaway-loop bug in the
-gate-fail dispatch path (46 retries vs `MAX_GATE_RETRIES = 3`
-budget). Manually terminated after ~50 minutes / ~$10 USD.
-
-What didn't pass:
-
-- **Gate retry budget NOT enforced.** `gate-orchestrator.ts:57`
-  defines `MAX_GATE_RETRIES = 3`. Live cycle ran 46 rounds. Root
-  cause hypothesis: `retryCount` is set in the new generate task
-  payload when gate-fail dispatches retry, but the count is not
-  carried through the deploy:pr → deploy:pipeline → gate:review
-  response path on the next iteration, so every gate re-entry
-  sees `payload.retryCount ?? 0` → 0 → ∞. **Highest-priority new
-  follow-up.** intent.attempt_count was also 0 throughout
-  (related but distinct symptom). 0 self-healing-agent runs
-  recorded, so it's not the gate-fail-handoff-to-self-healing
-  path doing the loop.
-- **constraint-agent flags `console.log` in `src/index.ts`** every
-  round. Aider's `app.listen(PORT, () => { console.log(\`Server
-  running on port \${PORT}\`); });` is the standard Express
-  startup-log idiom. trackeros's rule "No console.log/warn/error
-  in production source files" is correct-but-blocking — Aider
-  would need to introduce a logger module to resolve, which
-  exceeds the intent scope.
-
-trackeros operator fixes applied (six blocking issues discovered):
-
-1. **`.github/workflows/gestalt.yml` was the pre-ADR-041 stub** —
-   no `push: branches: ['gestalt/**']` trigger, no Compile/Lint/
-   Security stages. Replaced with the TR_018 template body
-   substituted to npm + 4-stage job. Commit `e926f7a8` then
-   `7a494c63` on trackeros `main`.
-2. **No `.gitignore`** — 9,379 `node_modules/` files were tracked.
-   CI's `npm install` hit `EUNSUPPORTEDPROTOCOL: Unsupported URL
-   Type "link:": link:./scripts/eslint-plugin` from a committed
-   pnpm-style `link:` ref in a transitive package.json. Added a
-   proper `.gitignore` + `git rm -r --cached node_modules`.
-   Commit `be0cf7b7`.
-3. **`package.json` missing scripts.** Added
-   `build: "tsc --noEmit"`, `lint: "echo \"No lint configured\""`,
-   added `--passWithNoTests` to test. Bumped `jest` + `ts-jest` +
-   `@types/jest` 27 → 29 for TS-5 peer-deps compatibility.
-4. **npm arborist Link.matches bug** under the bumped tree.
-   Switched workflow's `npm install` → `npm install
-   --legacy-peer-deps`. Commit `7a494c63`.
-5. **5 broken pre-existing tests in `tests/unit/`** (TR_011 setup
-   debris). Wrong relative paths, meta-tested infra files, used
-   `jest.fn().mock.instances[0]` without `Mock<...>` typing.
-   Silent while pipeline adapter was `noop`; surfaced as soon as
-   CI ran jest. Deleted all 5. Commit `c93a12e5`.
-6. **Stale `HARNESS.json`** — `qualityGate.required` still had
-   `[lint, typecheck, unit-tests, ...]` (pre-ADR-041);
-   `agentConfig['test-runner-agent']` block still present (silently
-   ignored since TR_018). Trimmed both.
-
-What worked (the architectural chain):
-
-```
-Aider generates code (6–13s)
-  → pr-agent pushes to gestalt/** branch
-    → GitHub Actions auto-triggers via push event AND
-      workflow_dispatch (pipeline-agent) AND pull_request
-      (3 runs per round, all identical work — operator-cost
-      follow-up)
-      → Compile ✓ → Test ✓ → Lint ✓ → Security scan ✓ (35–53s)
-        → pipeline-agent polls workflow_dispatch run
-          → CI passed → dispatch gate:review with
-            readFromBranch=true / branch / prNumber / prUrl /
-            ciRunId
-            → gate-orchestrator clones repo
-              → git fetch origin <branch>
-                → git checkout -B <branch> origin/<branch>
-                  → readSourceFilesFromWorkDir walks tree
-                    → constraint-agent + review-agent run
-                      against the actual PR branch source
-```
-
-Verified live: 46 × `"Checked out PR branch for gate review"` log
-lines; 45 review-agent and 45 constraint-agent executions; 0
-self-healing-agent calls.
-
-Live verification — final intent
-`1e84be4c-0494-4ba8-a946-d20dbf4ab898` (correlation
-`91a108fb-...`, PR #52):
-
-| agent_role | runs | total_tokens | total_seconds |
-|---|---:|---:|---:|
-| review-agent | 45 | 870,064 | 249 |
-| constraint-agent | 45 | 231,088 | 163 |
-| intent-agent | 46 | 59,469 | 280 |
-| design-agent | 46 | 32,640 | 89 |
-| context-agent | 46 | 1,569 | 6 |
-| pipeline-agent | 46 | — | 2,185 (mostly polling CI) |
-| pr-agent | 46 | — | 579 |
-| code-agent (Aider) | 46 | 0 (TR_014 follow-up) | 207 |
-
-Gate-agent model verification: query joined on
-`agent_execution_logs.model_used` → **88 / 88 gate calls on
-gpt-4o**. TR_017's loader fix continues to land symmetrically
-for both constraint-agent + review-agent. Sample successful CI
-run: `27073550241`, trigger `pull_request`, duration 35s, all 4
-stages green.
-
-Decisions made:
-
-- **Did NOT fix the gate-retry runaway loop in this session.**
-  The session brief was to verify the real CI integration, which
-  required fixing six trackeros operator issues first. The
-  runaway loop emerged from the verification data; isolating
-  where `retryCount` drops out of the deploy → gate transition
-  needs a separate diff-focused session against gate-orchestrator
-  + deploy-orchestrator + generate-orchestrator.
-- **Manually terminated the runaway intent** via
-  `UPDATE intents SET status='failed'` after 50 minutes / 46
-  rounds / ~$10 USD. The architectural chain was fully verified
-  by round 5; the additional 41 rounds added no signal beyond
-  isolating the gate-retry bug.
-- **Did NOT switch `pull_request` and `workflow_dispatch`
-  triggers off** despite seeing 3× CI runs per push. Future
-  follow-up (HIGH).
-- **Pushed the operator fixes directly to trackeros `main`**
-  rather than via a PR. Six separate commits documenting each
-  fix:
-  - `e926f7a8` workflow + package.json + HARNESS.json trim
-  - `7a494c63` `--legacy-peer-deps`
-  - `be0cf7b7` `.gitignore` + untrack 9379 node_modules files
-  - `c93a12e5` delete 5 broken pre-existing tests
-
-Pending follow-ups (NEW from TR_019):
-
-- **(HIGHEST — new from TR_019)** Gate retry budget not
-  respected. Trace `retryCount` through
-  generate-orchestrator → deploy:pr → deploy:pipeline →
-  gate:review on the response path. The retry counter is set in
-  the new generate task but not carried back through the chain,
-  causing unbounded retries (46 vs `MAX_GATE_RETRIES = 3`).
-  Bisect candidates: TR_018 deploy-orchestrator refactor; TR_018
-  generate→deploy:pr direct dispatch (was generate→gate:review).
-- **(HIGH — new from TR_019)** Three CI runs per push
-  (workflow_dispatch + push + pull_request) all do identical
-  work. Drop one (recommend `pull_request: branches: [main]`
-  from the template).
-- **(MEDIUM — new from TR_019)** `gestalt init` should scaffold
-  a basic `.gitignore` + ensure jest/ts-jest/@types/jest
-  versions align with TypeScript at `package.json` scaffolding
-  time. trackeros's mismatch (jest@27 + ts-jest unspecified +
-  TS@5) was latent under `noop` and only surfaced when CI ran
-  jest.
-- **(LOW — new from TR_019)** Template `{{ciSetupSteps}}` for
-  Node/npm should include `--legacy-peer-deps` on `npm install`
-  until the upstream npm arborist bug is fixed.
-- **(LOW — new from TR_019)** trackeros's broken pre-existing
-  meta-tests have been removed. Add a sanity check in
-  `gestalt init` to verify scaffolded tests at least pass
-  `tsc --noEmit`.
-
-Carryover follow-ups (unchanged by TR_019):
-
-- **(HIGH — TR_018)** Restore the TR_010 mandatory
-  `executeScript tsc --noEmit` code-agent rule on trackeros's
-  HARNESS.json. CI's `Compile` step catches type errors post-hoc,
-  but the TR_010 rule catches them pre-emit during Aider's
-  generation. Both belong.
-- **(MEDIUM — TR_014)** Aider token-spend visibility. Parse
-  `Tokens: N sent / M received` from Aider's stdout and surface
-  as `tokens_used` on the execution row. `code-agent` still shows
-  0 tokens across all 46 rounds.
-- **(MEDIUM — TR_013)** Both review-agent and constraint-agent
-  read files OUTSIDE the cycle's artifact set via `readFile`.
-  TR_019's gate clones the branch + reads the whole tree
-  intentionally, so this carryover is less relevant under
-  ADR-041 — but worth verifying the scope filter still applies
-  on the per-finding side.
-- **(LOW — TR_018)** Stale trackeros `test-runner-agent`
-  references — cleaned up in TR_019 commit `e926f7a8`.
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Docker image untouched in this session (no platform code change).
-Server `/health` 200 throughout. trackeros `main` updated through
-4 commits ending at `c93a12e5`. New file
-`docs/claude/TEST_REPORT_019.md`.
 
 ---

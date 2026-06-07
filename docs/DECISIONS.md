@@ -1226,3 +1226,280 @@ A `.ts` prompt file passes review if it contains no English
 prose that guides the LLM's reasoning about the project domain.
 It should read like a template with placeholders, not like
 a prompt.
+
+---
+
+## ADR-043 — Aider as opt-in code generation backend
+
+**Date:** 2026-06
+**Status:** Accepted
+
+**Context:**
+The custom code-agent used LLM tool calls (readFile, listDirectory,
+searchFiles, getFileTree) to explore the project and generate code.
+This proved fragile: agents exhausted tool call budgets exploring
+empty directories, missed compilation errors, and generated code
+without verifying it compiled. Aider is a battle-tested AI coding
+tool with built-in repository awareness, test execution, and
+multi-file editing capability.
+
+**Decision:**
+Aider is the preferred code generation backend. It is enabled
+per-project via `HARNESS.json codeGeneration.backend: "aider"`.
+The generate orchestrator checks this flag and either runs Aider
+(via executeScript) or falls back to the custom code-agent.
+The Aider message is intentionally minimal — task, rules, and
+architecture context. HOW to implement is Aider's decision.
+
+**Rationale:**
+Aider's repository map understands the codebase without expensive
+tool calls. Its built-in test execution catches errors before
+committing. Its targeted file editing avoids scope creep. The
+platform provides governance (gate, deploy, audit); Aider provides
+code generation quality. These complement each other.
+
+**Consequences:**
+- Aider must be installed in the server Docker image (pip install aider-chat)
+- The Aider message must remain minimal — do not add implementation
+  instructions; Aider decides HOW to implement
+- test-agent is skipped in Aider mode (Aider writes tests inline)
+- The custom code-agent is retained as the default for projects
+  that have not opted in to Aider
+
+---
+
+## ADR-044 — Gate agents require gpt-4o; code generation uses gpt-4o-mini
+
+**Date:** 2026-06
+**Status:** Accepted
+
+**Context:**
+TEST_REPORT_015 proved conclusively that gpt-4o-mini cannot
+reliably follow rules that contradict its training bias. The
+model read explicit rules stating "pool.query() in *.repository.ts
+is CORRECT — do not flag it" and then flagged it anyway, 8 rounds
+in a row. gpt-4o has significantly stronger instruction-following
+capability and correctly applied the rule in TR_016.
+
+**Decision:**
+Gate agents (constraint-agent, review-agent) must use gpt-4o or
+an equivalent instruction-following capable model. Code generation
+(Aider) uses gpt-4o-mini for its 200k TPM ceiling and lower cost.
+Model assignments are per-project via agents.yaml overrides —
+not hardcoded in the platform.
+
+**Rationale:**
+The gate is the quality enforcement layer. False positives in the
+gate cause infinite retry loops that waste tokens and block
+deployments. The cost of gpt-4o for the gate (two small LLM calls
+per cycle) is justified by the reliability gain. Code generation
+at high token volumes (Aider's tool loop) requires gpt-4o-mini's
+200k TPM ceiling.
+
+**Consequences:**
+- Default platform `agents.yaml` template sets gate agents to
+  model: ~ (platform default). Projects must override to gpt-4o
+  in their agents.yaml if the platform default is gpt-4o-mini
+- Never set gate agents to gpt-4o-mini without extensive testing
+  of instruction-following on the specific rule set in use
+
+---
+
+## ADR-045 — Evidence requirement for all finding-emitting agents
+
+**Date:** 2026-06
+**Status:** Accepted
+
+**Context:**
+Gate agents were emitting findings based on pattern-matching and
+inference without quoting the specific code that constituted the
+violation. This produced hallucinated findings on correct code
+(e.g. flagging ILeaveRepository import as "direct DB access"),
+causing retry loops. TEST_REPORT_011 through TR_013 documented
+this extensively.
+
+**Decision:**
+Any agent that emits a finding, signal, or violation must provide
+a `quotedLine` field containing the exact line of code that is
+the violation, quoted verbatim from the artifact. Findings without
+`quotedLine` are dropped by `dropUnevidencedFindings()` before
+reaching the gate verdict. This applies to review-agent,
+constraint-agent, and all custom agents.
+
+**Rationale:**
+A finding that cannot be grounded in specific quoted evidence is
+an inference, not a fact. Requiring quoted evidence forces the
+LLM to locate the actual violating code before flagging it.
+If the code does not exist, the finding cannot be emitted.
+This eliminates hallucinated findings structurally rather than
+through prompt engineering.
+
+**Consequences:**
+- `EVIDENCE_REQUIREMENT_SECTION` and `dropUnevidencedFindings`
+  live in @gestalt/core and are shared by all gate agents
+- The JSON schema for all agent finding responses includes
+  `quotedLine` as a required field
+- Parse failure defaults to dropping the finding — never block
+  a cycle because a finding lacks evidence
+- The self-healing-agent uses a softer version (warning, not drop)
+  since it diagnoses failures rather than making blocking claims
+
+---
+
+## ADR-046 — LLM-driven script execution for gate verification
+
+**Date:** 2026-06
+**Status:** Accepted
+
+**Context:**
+Gate agents originally used hardcoded regex patterns for constraint
+checking. These were language-specific, brittle, and produced
+false positives on valid code patterns (e.g. flagging type-only
+imports as direct database access). The alternative — pure LLM
+evaluation without any tool use — hallucinated findings.
+
+**Decision:**
+Gate agents use the `executeScript` built-in tool to verify
+findings before emitting them. What scripts to run is decided
+by the LLM based on the project language, stack, and the specific
+finding being verified. No script commands are hardcoded in
+platform `.ts` files. The HARNESS.json `agentConfig.verificationGuidance`
+field provides project-specific hints about what to verify,
+but the LLM decides the approach.
+
+The `executeScript` sandbox has a hard platform-level blocklist
+of destructive operations (rm -rf, git push, git commit, sudo,
+curl | bash). This blocklist is never configurable.
+
+**Rationale:**
+An LLM that can run `tsc --noEmit` and see actual compiler output
+has real evidence for its findings. An LLM reasoning from text
+alone hallusinates. The script approach is language-agnostic —
+the LLM knows what tools are appropriate for TypeScript vs Python
+vs Go without being told. Hardcoding script commands would
+re-introduce the language-specific brittleness of the regex approach.
+
+**Consequences:**
+- `executeScript` is opt-in per agent via tools.builtin in agents.yaml
+- It is enabled by default for constraint-agent and review-agent
+- Code-agent has it available for pre-commit self-verification
+- stdout capped at 10KB, stderr at 5KB to prevent context overflow
+- Timeout defaults to 30s, max 120s
+
+---
+
+## ADR-047 — CI/CD owns runtime verification; Gestalt gate owns architectural review
+
+**Date:** 2026-06
+**Status:** Accepted (extends ADR-041)
+
+**Context:**
+lint-agent, security-agent, and test-runner-agent were originally
+planned as Gestalt gate agents that would run ESLint, Semgrep,
+and test runners internally. This would duplicate what CI/CD
+already does with the project's own tool configuration.
+
+**Decision:**
+Runtime verification (compilation, test execution, lint, security
+scanning) belongs exclusively in CI/CD. Gestalt's gate layer
+(constraint-agent, review-agent) handles only what CI cannot do:
+architectural rule enforcement and design spec compliance.
+lint-agent, security-agent, and test-runner-agent are removed.
+
+**Rationale:**
+CI/CD runs the exact tools with the exact configuration the team
+maintains (.eslintrc, jest.config.js, semgrep.yml). Running
+parallel checks in Gestalt creates redundancy, potential
+contradictions, and duplication of tool configuration. The
+Gestalt gate's value is in architectural intelligence — not
+in re-running tools that CI already runs better.
+
+**Consequences:**
+- The CI template (gestalt.yml / .gitlab-ci.yml / azure-pipelines.yml)
+  is comprehensive: compile + test + lint + security (Semgrep)
+- The Gestalt gate only runs after CI passes (ADR-041)
+- Adding lint/test/security agents back to the Gestalt gate
+  is explicitly prohibited by this ADR
+
+---
+
+## ADR-048 — Self-healing uses LLM-driven retry routing, not hardcoded dispatch maps
+
+**Date:** 2026-06
+**Status:** Accepted
+
+**Context:**
+The self-healing loop initially used a hardcoded RETRY_TASK_TYPE
+map to decide which layer to retry for each failure type
+(e.g. deploy-error → deploy:pr, gate-max-retries → generate:intent).
+This was rigid — it could not handle novel failures and required
+code changes to add new failure patterns.
+
+**Decision:**
+The SelfHealingAgent's LLM diagnosis includes a `retryTaskType`
+field that dynamically selects the retry layer based on failure
+context. The platform does not maintain a hardcoded dispatch map.
+Available retry task types are documented in the diagnosis prompt
+as options; the LLM chooses based on the specific failure.
+
+**Rationale:**
+A non-fast-forward git push error is a deploy-layer failure —
+retrying the generate layer wastes tokens regenerating correct
+code. A TypeScript compilation error is a generate-layer failure —
+retrying the deploy layer without fixing the code accomplishes
+nothing. The LLM understands the failure semantics and chooses
+the appropriate retry layer without being explicitly programmed
+for every case.
+
+**Consequences:**
+- `SelfHealingDiagnosis.retryTaskType` is the authoritative
+  dispatch decision — no hardcoded maps anywhere in the platform
+- The diagnosis prompt documents available retry task types
+  as options with descriptions
+- Unknown or novel failure types default to generate:intent
+  as the safe fallback
+
+---
+
+## ADR-049 — Architecture agent uses phased consultation, not single-call full design
+
+**Date:** 2026-06
+**Status:** Accepted
+
+**Context:**
+A single LLM call to design a complete feature architecture
+loses context and produces shallow results. A leave management
+system requires domain model design, module boundary decisions,
+API surface design, database schema, and testing strategy —
+too much for one context window to reason about deeply.
+
+**Decision:**
+The architecture agent is consulted in two modes:
+1. High-level (feature-level): produces domain entities, module
+   list, dependency map, and recommended phase sequence. No
+   implementation detail.
+2. Focused (phase-level): produces exact interface signatures,
+   import paths, SQL schema for this specific phase, and
+   measurable success criteria. Receives actual built code from
+   prior phases as context.
+
+**Rationale:**
+The same principle applies to architecture as to code generation —
+scope matters. A focused architecture consultation for one phase
+produces actionable, precise specifications. A full-feature
+architecture produces vague generalities. The phase-level
+consultation grounds its recommendations in what was actually
+built, not just what was planned.
+
+**Future:** When CrewAI migration occurs, the architecture agent
+becomes an architecture crew (chief architect, data architect,
+application architect) using the same two-mode consultation pattern.
+The interface stays identical; the implementation improves.
+
+**Consequences:**
+- architecture-agent.ts exposes two methods: designFeature() and
+  designPhase()
+- Phase-level consultation always receives completed phase results
+  as context — never designs in a vacuum
+- High-level design is committed to ARCHITECTURE.md before any
+  code is generated

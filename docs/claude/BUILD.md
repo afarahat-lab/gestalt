@@ -54,6 +54,25 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### ADRs 042–049 — Platform/operator split and related principles codified
+
+Documentation-only session. Eight ADRs appended to
+`docs/DECISIONS.md`: ADR-042 (LLM guidance prose lives in
+HARNESS.json + agents.yaml, never `.ts`), ADR-043 (Aider opt-in
+backend), ADR-044 (gpt-4o for gate, gpt-4o-mini for code-gen),
+ADR-045 (evidence requirement — every finding needs a
+`quotedLine`), ADR-046 (LLM-driven script execution for gate
+verification — no hardcoded script commands), ADR-047 (CI/CD
+owns runtime verification; gate owns architectural review —
+extends ADR-041), ADR-048 (LLM-driven retry routing via
+`SelfHealingDiagnosis.retryTaskType`, no hardcoded dispatch
+maps), ADR-049 (architecture agent uses phased consultation —
+`designFeature()` + `designPhase()` — not single-call full
+design). No platform code change; no migrations.
+
+**Operator action:** None. ADRs are read-only contracts the
+platform already honours.
+
 ### TR_021 — Externalise gate-agent verificationGuidance to HARNESS.json
 
 Refactor: STEP 1-5 verification protocol lifted from
