@@ -11,9 +11,9 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-07 (after ADRs 042–049 — documentation-only session codifying the platform/operator split. ADR-042 makes the TR_021 refactor a permanent rule (LLM guidance prose in HARNESS.json + agents.yaml, never `.ts`). ADRs 043–049 codify the Aider opt-in backend (043), the gpt-4o-for-gate / gpt-4o-mini-for-code-gen policy (044), the evidence-requirement for all finding-emitting agents (045), LLM-driven script execution for gate verification (046), CI-owns-runtime / gate-owns-architecture extension to ADR-041 (047), LLM-driven retry routing instead of hardcoded dispatch maps (048), and phased architecture consultation (049). No platform code change; no migrations. Previously (TR_021): externalised gate-agent verificationGuidance from `.ts` into HARNESS.json's `agentConfig[role].verificationGuidance`. Two trackeros cycles back-to-back both `Status: ✓ deployed` single-round (PR #55, PR #56). Template bumped 0.6.0 → 0.7.0.)
+**Last updated:** 2026-06-07 (after PLANNING_LAYER — new `@gestalt/agents-planning` package + migration 024 introducing autonomous feature decomposition. Three planning agents (architecture-agent / planner-agent / phase-evaluator-agent) all extend BaseLLMAgent and read config via the standard `loadAgentConfig` + HARNESS.json `agentConfig[role]` paths — strict ADR-042 compliance, no LLM guidance prose in `.ts`. New BullMQ queue `gestalt-planning` carries `planning:start`, `planning:phase`, `planning:evaluate`. The orchestrator subscribes to the in-process event bus so deploy-stage `intent.status-changed` events fan back to evaluation without coupling code in the deploy layer. New `POST /features` route + `gestalt feature submit/list/show` CLI commands. Template bumped 0.7.0 → 0.8.0. Live verified on trackeros: feature `ea19b18e` submitted → planner produced a 1-phase plan → PLAN.md + docs/ARCHITECTURE.md update committed to trackeros `main` → phase intent dispatched → generate ran → pr-agent opened PR #57 → CI ran (real GitHub Actions, code-agent had a TS resolveJsonModule mistake → CI failed → event bus → planning:evaluate → phase marked failed, feature marked blocked). End-to-end loop confirmed.)
 **Repo:** https://github.com/afarahat-lab/gestalt
-**Migrations:** 023 (latest: `023_llm_api_shape`)
+**Migrations:** 024 (latest: `024_features`)
 
 ---
 
@@ -21,16 +21,16 @@ the `sessions/archive/` files (everything older)._
 
 ### Platform foundations
 
-- All 12 buildable packages compile (`pnpm -r build`).
+- All 13 buildable packages compile (`pnpm -r build`).
 - `docker-compose up -d` brings server + postgres + redis healthy.
-- All 23 migrations apply on first start.
+- All 24 migrations apply on first start.
 - Server reachable on `http://localhost:3000`; `/health` returns 200;
   protected routes return 401 without a JWT.
 - Dashboard SPA served at `/app/*`; shareable deep-link URLs work.
 - First-boot bootstrap verified: `gestalt init-admin` → `gestalt login`
   → `/auth/me` returns the user.
 
-### Four SDLC layers (all wired end-to-end)
+### Five SDLC layers (all wired end-to-end)
 
 - **generate** — intent → design → context → lint-config → code → test;
   custom agents in `agents.yaml` interleave via `runs_after`.
@@ -53,6 +53,22 @@ the `sessions/archive/` files (everything older)._
   `node-cron`. Context-file intents take a direct-fix path via
   context-fixer (path-guarded to `docs/*` + `AGENTS.md`).
   `MonitoringAdapter` (Prometheus / Datadog / NoOp).
+- **planning** (migration 024) — three agents (architecture-agent /
+  planner-agent / phase-evaluator-agent) drive an autonomous feature
+  decomposition loop. Operator submits a feature; orchestrator clones
+  the repo, runs architecture-agent for the high-level design, runs
+  planner-agent for the phase plan, commits `PLAN.md` + appends to
+  `docs/ARCHITECTURE.md`, then dispatches phase 1 as a regular
+  `generate:intent`. The in-process event bus subscriber maps each
+  phase intent's terminal status (`deployed` / `failed`) into a
+  `planning:evaluate` dispatch; phase-evaluator-agent decides whether
+  to continue, adjust remaining phases, or escalate. Bounded by
+  `HARNESS.json.planner` (`maxPhasesPerFeature`, `maxFilesPerPhase`,
+  `architectureReviewPerPhase`). All LLM guidance prose lives in
+  `agents.yaml` (`prompt_extensions`) + `HARNESS.json.agentConfig`
+  (`rules` / `architectureGuidance` / `phaseScopingRules` /
+  `evaluationCriteria`) per ADR-042 — `.ts` carries only structural
+  framing + JSON schemas.
 
 ### Identity + auth
 
@@ -209,6 +225,29 @@ the `sessions/archive/` files (everything older)._
 ---
 
 ## Active follow-ups (small)
+
+### PLANNING_LAYER — Autonomous feature decomposition (migration 024)
+
+New `@gestalt/agents-planning` package + `planning:start` / `planning:phase`
+/ `planning:evaluate` task types on a new `gestalt-planning` BullMQ
+queue. Three new agent roles (architecture-agent / planner-agent /
+phase-evaluator-agent), three new postgres tables (features /
+feature_phases / feature_plan_log), `POST /features` route, and
+`gestalt feature submit/list/show` CLI commands. The orchestrator
+loop: clone repo → architecture-agent → planner-agent → write
+PLAN.md → commit + push → dispatch phase 1 as `generate:intent` →
+event-bus subscriber catches terminal status → planning:evaluate
+→ phase-evaluator-agent → either next phase, mark feature
+completed, or block. Strict ADR-042 compliance — every guidance
+prose string lives in `agents.yaml.prompt_extensions` or
+`HARNESS.json.agentConfig[role]` (`rules` / `architectureGuidance`
+/ `phaseScopingRules` / `evaluationCriteria`); only structural
+framing + JSON schemas live in `packages/agents/planning/src/prompts/`.
+Live verified on trackeros: feature `ea19b18e` ran the full loop
+end-to-end against real GitHub Actions CI (CI failed due to a
+pre-existing code-agent issue; the planning loop correctly marked
+the phase failed and the feature blocked). Template bumped
+0.7.0 → 0.8.0.
 
 ### TR_021 — Externalise verificationGuidance to HARNESS.json
 

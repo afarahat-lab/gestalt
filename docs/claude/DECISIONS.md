@@ -42,6 +42,11 @@ ADR to respect; read the canonical file to know **why**._
   prevents collision with built-ins
 - **ADR-040** — `auth.config.json` as the primary identity config
   source; sensitive fields reference vault secrets via `*SecretId`
+- **ADR-041** — Quality gate runs AFTER CI, before merge (LLM gate
+  reviews code CI has already compiled / tested / linted)
+- **ADR-042** — LLM prompt content lives in `HARNESS.json` +
+  `agents.yaml`; `.ts` carries only platform mechanics (schemas,
+  framing, evidence enforcement, parsing, severity caps)
 - **ADR-043** — Aider as opt-in code generation backend
   (`HARNESS.json codeGeneration.backend`)
 - **ADR-044** — Gate agents use gpt-4o; code generation uses
