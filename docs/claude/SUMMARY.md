@@ -292,6 +292,25 @@ See `docs/claude/TEST_REPORT_020.md`.
 
 ### Active follow-ups (carryover or NEW)
 
+- **(MEDIUM — NEW from PLANNING_LAYER)** The phase-1 intent
+  on trackeros failed because Aider generated `require('../../../package.json')`
+  without `resolveJsonModule` in tsconfig. Not a planning bug —
+  pre-existing code-agent / Aider behaviour — but the planning
+  loop blocking on it surfaces the cost. Either (a) extend the
+  template's TypeScript scaffolding to enable `resolveJsonModule`
+  + `esModuleInterop` by default, or (b) add a phase-evaluator-agent
+  retry budget so a single CI failure doesn't auto-block the feature.
+- **(LOW — NEW from PLANNING_LAYER)** Per-phase architecture pass
+  is disabled on trackeros (`architectureReviewPerPhase: false`).
+  Verify the per-phase pass on a project that opts in — needed
+  to confirm the second architecture-agent entry point works.
+- **(LOW — NEW from PLANNING_LAYER)** The orchestrator stores
+  phase scope adjustments under `feature_phases.result.pendingScopeAdjustment`
+  and the next `planning:phase` reads them when assembling the
+  intent text. The scope itself never overwrites the original
+  `scope` column — by design, so the planner's first draft stays
+  visible to operators. Consider a dedicated `scope_history` array
+  if operators need a full history.
 - **(LOW — NEW from TR_021)** Consider migrating the
   `consistencySection` block (cross-artifact checks:
   test-framework match, import resolution, @types/* coverage,
@@ -424,18 +443,18 @@ docker-compose logs -f server
 
 | | |
 |---|---|
-| `pnpm -r build` | ✅ clean (12 packages) |
+| `pnpm -r build` | ✅ clean (13 packages) |
 | `docker-compose up -d` | ✅ healthy (server / postgres / redis) |
-| Migrations applied | 023 (latest: `023_llm_api_shape`) |
+| Migrations applied | 024 (latest: `024_features`) |
 | Server reachable | `http://localhost:3000/health` returns 200 |
 | Dashboard | served at `http://localhost:3000/app/` |
 
-The 12 buildable packages: `@gestalt/core`, `@gestalt/adapter-postgres`,
+The 13 buildable packages: `@gestalt/core`, `@gestalt/adapter-postgres`,
 `@gestalt/adapter-oracle` (stub), `@gestalt/adapter-mssql` (stub),
 `@gestalt/agents-generate`, `@gestalt/agents-quality-gate`,
 `@gestalt/agents-deploy`, `@gestalt/agents-maintenance`,
-`@gestalt/registry`, `@gestalt/server`, `@gestalt/cli`,
-`@gestalt/dashboard`.
+`@gestalt/agents-planning` (migration 024), `@gestalt/registry`,
+`@gestalt/server`, `@gestalt/cli`, `@gestalt/dashboard`.
 
 ---
 
@@ -461,6 +480,30 @@ None blocking the build. Areas to keep in mind:
 ---
 
 ## Pending operator actions
+
+### PLANNING_LAYER — Autonomous feature decomposition (migration 024)
+
+New package `@gestalt/agents-planning` + new BullMQ queue
+`gestalt-planning` + new postgres tables (features /
+feature_phases / feature_plan_log) + new server routes
+(`POST/GET /features`, `GET /features/:id`) + new CLI commands
+(`gestalt feature submit/list/show`). Three new agent roles
+(architecture-agent / planner-agent / phase-evaluator-agent),
+all extending BaseLLMAgent and reading config from agents.yaml +
+HARNESS.json `agentConfig`. New `HARNESS.json.planner` block
+(`enabled`, `maxPhasesPerFeature`, `maxFilesPerPhase`,
+`architectureReviewPerPhase`) opt-in per project. Template
+bumped 0.7.0 → 0.8.0. Live verified on trackeros — feature
+`ea19b18e` ran the full architecture → plan → phase 1 → CI →
+event-bus → evaluate loop end-to-end against real GitHub
+Actions; phase failed because Aider's generated TS used
+`require('package.json')` without `resolveJsonModule` (pre-
+existing code-agent issue unrelated to planning).
+
+**Operator action:** Add the planner block + planning
+agentConfig entries to existing projects' `HARNESS.json` to
+opt in. trackeros has been migrated as part of the verify
+cycle (commit `3fc936fe` on `main`).
 
 ### ADRs 042–049 — Platform/operator split and related principles codified
 

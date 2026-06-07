@@ -192,20 +192,149 @@ fallback. `platform_identity_config` table (migration 017) lets
 operators configure providers via the dashboard with values
 referencing vault `*SecretId`s.
 
+### ADR-041 — Quality gate runs AFTER CI
+The LLM gate (constraint-agent + review-agent) runs as a pre-merge
+step on the PR branch, AFTER CI passes. CI owns compile / test /
+lint / security via the project's own tooling. Pre-CI `lint-agent`
+/ `security-agent` / `test-runner-agent` are gone. Generate
+orchestrator dispatches `deploy:pr` directly at end of cycle (not
+`gate:review`); deploy's `deploy:pipeline` success branch
+dispatches `gate:review` with `readFromBranch: true` + branch /
+prNumber / prUrl / ciRunId. Gate clones the PR branch, checks it
+out, reads source files from the working tree. On pass:
+`deploy:promotion`. On fail: `resumeOnBranch` so the retry leg
+pushes to the same PR.
+**Implication:** never re-add the deleted pre-CI gate agents
+(ADR-047 forbids it). Don't re-route generate → gate:review
+directly. Don't open a second PR on gate-fail retry — the same
+branch must receive the fix commit.
+
+### ADR-042 — LLM prompt content lives in HARNESS.json + agents.yaml
+Project-specific LLM guidance prose (rules, `verificationGuidance`,
+`prompt_extensions`, `architectureGuidance`, `phaseScopingRules`,
+`evaluationCriteria`, role / goal) lives in
+`HARNESS.json.agentConfig[role]` or `agents.yaml`. `.ts` carries
+only platform mechanics: JSON response schemas, structural
+framing ("You are {role}. Goal: {goal}."), evidence requirement
+(`EVIDENCE_REQUIREMENT_SECTION`), parsing, severity caps, tool
+instruction boilerplate. Injection points are
+`buildHarnessAgentSection()` (HARNESS.json) and `loadAgentConfig()`
+(agents.yaml).
+**Implication:** if you catch yourself adding English prose to a
+`.ts` prompt file that guides LLM reasoning about the project
+domain, stop — it belongs in `HARNESS.json.agentConfig[role].rules`
+or `verificationGuidance`. A `.ts` prompt file should read like a
+template with placeholders, not like a prompt.
+
+### ADR-043 — Aider as opt-in code-gen backend
+`HARNESS.json codeGeneration.backend: "aider"` swaps the
+generate-layer code-agent for Aider, invoked via the
+`executeScript` tool. The Aider message stays minimal — task +
+rules + architecture context only; HOW to implement is Aider's
+call. `test-agent` is skipped when Aider runs (Aider writes
+tests inline). The custom code-agent remains the default for
+projects that haven't opted in.
+**Implication:** don't add implementation instructions to the
+Aider message. Don't run `test-agent` when Aider mode is active.
+Aider must be installed in the server Docker image
+(`pip install aider-chat`).
+
+### ADR-044 — Gate uses gpt-4o; code-gen uses gpt-4o-mini
+gpt-4o-mini cannot reliably follow rules that contradict its
+training bias (TR_015 proof: 8 rounds flagging `pool.query()` in
+`*.repository.ts` despite explicit "this is CORRECT" rule). Gate
+agents (constraint-agent, review-agent) must use gpt-4o or an
+equivalent. Code-gen tolerates gpt-4o-mini for the 200 k TPM
+ceiling. Per-project assignment via `agents.yaml` model
+overrides — never hardcoded.
+**Implication:** never set gate agents to gpt-4o-mini without
+extensive instruction-following testing on the specific rule set.
+Reach for code-gen-tier models for code-gen volume; gate-tier
+models for verdict reliability.
+
+### ADR-045 — Evidence requirement (`quotedLine`)
+Every finding from review-agent / constraint-agent / custom
+finding-emitting agents must carry a `quotedLine` field with the
+violating code quoted verbatim from the artifact.
+`dropUnevidencedFindings()` drops findings without `quotedLine`
+before the gate verdict. Lives in `@gestalt/core` and is shared.
+**Implication:** any new finding-emitting agent's JSON response
+schema must require `quotedLine`. Parse failure defaults to
+dropping the finding — never block a cycle for evidence-shape
+issues. self-healing-agent uses a softer warning (not drop)
+since it diagnoses failures rather than making blocking claims.
+
+### ADR-046 — LLM-driven `executeScript` for gate verification
+No hardcoded script commands in platform `.ts` files. Gate agents
+get `executeScript` as a built-in tool; the LLM decides what to
+run based on project language / stack / finding.
+`HARNESS.json.agentConfig.verificationGuidance` provides hints;
+the LLM picks the approach. Platform-level blocklist (`rm -rf`,
+`git push`, `git commit`, `sudo`, `curl | bash`) is never
+configurable. stdout capped 10 KB / stderr 5 KB. Timeout 30 s
+default / 120 s max.
+**Implication:** never write `executeScript({ command: "tsc
+--noEmit" })` or similar in a `.ts` prompt — put the hint in
+HARNESS.json `verificationGuidance` and let the LLM choose. Never
+relax the blocklist.
+
+### ADR-047 — CI owns runtime, gate owns architecture
+Extends ADR-041. Compile / test / lint / security belong in CI/CD
+with the project's own config (`.eslintrc`, `jest.config.js`,
+`semgrep.yml`). Gate handles architectural rule enforcement and
+design-spec compliance only. `lint-agent` / `security-agent` /
+`test-runner-agent` permanently removed.
+**Implication:** adding any of those agents back to the gate is
+explicitly prohibited by this ADR. A new "runtime check" goes in
+the CI template, not in the gate.
+
+### ADR-048 — LLM-driven retry routing
+`SelfHealingDiagnosis.retryTaskType` is the authoritative
+dispatch decision. The platform does NOT maintain a hardcoded
+`RETRY_TASK_TYPE` map. The diagnosis prompt documents available
+retry task types as options; the LLM picks based on failure
+semantics (git non-fast-forward → `deploy:pr`, TS compile error
+→ `generate:code`). Unknown / novel failures fall through to
+`generate:intent` as a safe default.
+**Implication:** never reintroduce a hardcoded failure-type →
+layer map. New failure shapes are handled by widening the
+diagnosis prompt's option list (and its descriptions), not by
+adding code paths.
+
+### ADR-049 — Phased architecture consultation
+architecture-agent exposes two methods: `designFeature()`
+(high-level — domain entities, module list, dependency map,
+phase sequence; no implementation detail) and `designPhase()`
+(focused — interface signatures, import paths, SQL schema,
+measurable success criteria; receives prior phases' actual code
+as context). High-level design is committed to
+`docs/ARCHITECTURE.md` before any code generation. Phase-level
+consultation never designs in a vacuum.
+**Implication:** never collapse the two methods into a single
+"design everything up front" call. `designPhase()` must receive
+completed phase results. Future CrewAI migration keeps the same
+two-mode interface (chief / data / app architect crew); don't
+change the surface.
+
 ---
 
 ## ADR fast-lookup matrix
 
 | Code path | Read first |
 |---|---|
-| Editing an agent's LLM call | ADR-002, ADR-007, ADR-038 |
+| Editing an agent's LLM call | ADR-002, ADR-007, ADR-038, ADR-042 |
+| Editing prompt content / agent reasoning | ADR-042, ADR-045, ADR-046 |
 | Editing the orchestrator | ADR-002, ADR-003, ADR-007 |
-| Adding a new agent role | ADR-007, ADR-013, ADR-037 |
-| Editing pipeline / deploy | ADR-033, ADR-034 |
+| Adding a new agent role | ADR-007, ADR-013, ADR-037, ADR-042 |
+| Editing the gate / pre-merge flow | ADR-041, ADR-045, ADR-046, ADR-047 |
+| Editing pipeline / deploy | ADR-033, ADR-034, ADR-041 |
+| Editing code-gen / Aider integration | ADR-043, ADR-044 |
+| Editing self-healing / retry routing | ADR-048 |
+| Editing planning / architecture agent | ADR-049 |
 | Editing maintenance agents | ADR-018, ADR-035 |
 | Touching Git / clones | ADR-032 |
 | Touching auth / users | ADR-024, ADR-025, ADR-026 |
 | Configuring providers | ADR-040 |
 | Touching the database | ADR-004 |
-| Touching custom agents | ADR-037 |
-| Touching tools / MCP | ADR-038, ADR-039 |
+| Touching custom agents | ADR-037, ADR-042 |
+| Touching tools / MCP | ADR-038, ADR-039, ADR-046 |
