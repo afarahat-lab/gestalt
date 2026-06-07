@@ -127,17 +127,47 @@ const TOOL_OUTPUT_LOG_TRUNCATE = 500;
  * OR guidance for the given role — callers concatenate
  * unconditionally.
  */
+/**
+ * Per-agent prompt section, as rendered into the LLM prompt. Includes
+ * everything declared under `HARNESS.json.agentConfig[role]`:
+ *
+ *   - `.rules[]`                → "### Rules you must enforce"
+ *   - `.verificationGuidance[]` → "### Verification guidance for
+ *                                  this project" (TR_021)
+ *   - `.phaseScopingRules[]`    → "### Phase scoping rules"
+ *                                  (migration 024 — planner-agent)
+ *   - `.evaluationCriteria[]`   → "### Evaluation criteria"
+ *                                  (migration 024 — phase-evaluator-agent)
+ *   - `.architectureGuidance[]` → "### Architecture guidance"
+ *                                  (migration 024 — architecture-agent)
+ *
+ * All sections are optional and rendered in this fixed order. Each
+ * agent receives whatever subset the project declares — empty when
+ * the project declares nothing, which is the legacy default. Empty
+ * string when the role has no agentConfig entry at all.
+ */
 export function renderHarnessAgentRules(
   agentRole: string,
   harnessConfig:
-    | { agentConfig?: Record<string, { rules?: string[]; verificationGuidance?: string[] }> }
+    | {
+        agentConfig?: Record<string, {
+          rules?: string[];
+          verificationGuidance?: string[];
+          phaseScopingRules?: string[];
+          evaluationCriteria?: string[];
+          architectureGuidance?: string[];
+        }>;
+      }
     | null
     | undefined,
 ): string {
   const cfg = harnessConfig?.agentConfig?.[agentRole];
-  const hasRules = !!cfg?.rules && cfg.rules.length > 0;
-  const hasGuidance = !!cfg?.verificationGuidance && cfg.verificationGuidance.length > 0;
-  if (!hasRules && !hasGuidance) return '';
+  const hasRules     = !!cfg?.rules && cfg.rules.length > 0;
+  const hasGuidance  = !!cfg?.verificationGuidance && cfg.verificationGuidance.length > 0;
+  const hasScoping   = !!cfg?.phaseScopingRules && cfg.phaseScopingRules.length > 0;
+  const hasEval      = !!cfg?.evaluationCriteria && cfg.evaluationCriteria.length > 0;
+  const hasArch      = !!cfg?.architectureGuidance && cfg.architectureGuidance.length > 0;
+  if (!hasRules && !hasGuidance && !hasScoping && !hasEval && !hasArch) return '';
 
   const parts: string[] = ['## Agent configuration (from HARNESS.json)', ''];
 
@@ -151,6 +181,27 @@ export function renderHarnessAgentRules(
     parts.push('### Verification guidance for this project');
     parts.push('When verifying findings, use these project-specific hints:');
     cfg!.verificationGuidance!.forEach((g) => parts.push(`- ${g}`));
+    parts.push('');
+  }
+
+  if (hasScoping) {
+    parts.push('### Phase scoping rules');
+    parts.push('Use these examples and rules when shaping each phase:');
+    cfg!.phaseScopingRules!.forEach((r) => parts.push(`- ${r}`));
+    parts.push('');
+  }
+
+  if (hasEval) {
+    parts.push('### Evaluation criteria');
+    parts.push('When judging a completed phase, apply these criteria:');
+    cfg!.evaluationCriteria!.forEach((c) => parts.push(`- ${c}`));
+    parts.push('');
+  }
+
+  if (hasArch) {
+    parts.push('### Architecture guidance');
+    parts.push('Follow these project-specific architecture principles:');
+    cfg!.architectureGuidance!.forEach((g) => parts.push(`- ${g}`));
     parts.push('');
   }
 
@@ -554,7 +605,15 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
    */
   protected buildHarnessAgentSection(
     harnessConfig:
-      | { agentConfig?: Record<string, { rules?: string[]; verificationGuidance?: string[] }> }
+      | {
+          agentConfig?: Record<string, {
+            rules?: string[];
+            verificationGuidance?: string[];
+            phaseScopingRules?: string[];
+            evaluationCriteria?: string[];
+            architectureGuidance?: string[];
+          }>;
+        }
       | null
       | undefined,
   ): string {

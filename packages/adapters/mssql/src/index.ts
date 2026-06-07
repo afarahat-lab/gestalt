@@ -21,3 +21,4 @@ export {
 } from './repositories/identity-config';
 export { MssqlPlatformGroupRepository } from './repositories/platform-groups';
 export { MssqlSelfHealingConfigRepository } from './repositories/self-healing-config';
+export { MssqlFeatureRepository } from './repositories/features';

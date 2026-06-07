@@ -22,6 +22,7 @@
     "@gestalt/agents-quality-gate": "workspace:*",
     "@gestalt/agents-deploy": "workspace:*",
     "@gestalt/agents-maintenance": "workspace:*",
+    "@gestalt/agents-planning": "workspace:*",
     "@gestalt/core": "workspace:*",
     "@node-saml/node-saml": "^4.0.5",
     "adm-zip": "^0.5.10",

@@ -30,7 +30,17 @@ export type AgentRole =
    * of any plan — invoked directly from `runSelfHealingLoop` outside
    * the orchestrator's per-step iteration.
    */
-  | 'self-healing-agent';
+  | 'self-healing-agent'
+  /**
+   * Planning layer (migration 024). Three agents drive feature
+   * decomposition and phased execution:
+   *   - architecture-agent     designs feature- and phase-level architecture
+   *   - planner-agent          decomposes a feature into ordered phases
+   *   - phase-evaluator-agent  reviews each completed phase + recommends adjustments
+   */
+  | 'architecture-agent'
+  | 'planner-agent'
+  | 'phase-evaluator-agent';
 
 // ─── Signal types ─────────────────────────────────────────────────────────────
 
@@ -60,7 +70,16 @@ export type TaskType =
   | 'maintenance:drift'
   | 'maintenance:alignment'
   | 'maintenance:gc'
-  | 'maintenance:evaluation';
+  | 'maintenance:evaluation'
+  /**
+   * Planning task types (migration 024).
+   *   - `planning:start`     creates the architecture + phase plan for a feature
+   *   - `planning:phase`     submits the current phase as a generate:intent
+   *   - `planning:evaluate`  runs phase-evaluator after a phase deploys
+   */
+  | 'planning:start'
+  | 'planning:phase'
+  | 'planning:evaluate';
 
 export type TaskPriority = 'critical' | 'high' | 'normal' | 'background';
 

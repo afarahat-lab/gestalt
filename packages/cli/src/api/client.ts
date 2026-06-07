@@ -1146,6 +1146,62 @@ export class GestaltApiClient {
     await this.delete(`/projects/${projectId}/members/${userId}`);
   }
 
+  // ─── Features (planning layer, migration 024) ──────────────────────────────
+
+  async submitFeature(params: {
+    title: string;
+    description: string;
+    projectId: string;
+  }): Promise<{ data: { id: string; title: string; status: string } }> {
+    return this.post('/features', params);
+  }
+
+  async listFeatures(params: { projectId?: string }): Promise<{
+    data: Array<{
+      id: string;
+      projectId: string;
+      title: string;
+      description: string;
+      status: string;
+      phaseCount: number;
+      currentPhase: number;
+      createdAt: string;
+    }>;
+    total: number;
+  }> {
+    return this.get('/features', params as Record<string, unknown>);
+  }
+
+  async getFeature(id: string): Promise<{
+    data: {
+      id: string;
+      projectId: string;
+      title: string;
+      description: string;
+      status: string;
+      architecture: string | null;
+      phaseCount: number;
+      currentPhase: number;
+      phases: Array<{
+        id: string;
+        phaseIndex: number;
+        title: string;
+        scope: string;
+        status: string;
+        intentId: string | null;
+      }>;
+      planLog: Array<{
+        id: string;
+        phaseIndex: number | null;
+        eventType: string;
+        summary: string;
+        createdAt: string;
+      }>;
+    };
+  }> {
+    return this.get(`/features/${id}`);
+  }
+
   // ─── SSE stream ────────────────────────────────────────────────────────────
 
   /**

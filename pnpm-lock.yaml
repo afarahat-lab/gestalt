@@ -144,6 +144,25 @@ importers:
         specifier: ^1.6.0
         version: 1.6.1(@types/node@20.19.41)
 
+  packages/agents/planning:
+    dependencies:
+      '@gestalt/core':
+        specifier: workspace:*
+        version: link:../../core
+      simple-git:
+        specifier: ^3.23.0
+        version: 3.36.0
+    devDependencies:
+      '@types/node':
+        specifier: ^20.0.0
+        version: 20.19.41
+      typescript:
+        specifier: ^5.4.0
+        version: 5.9.3
+      vitest:
+        specifier: ^1.6.0
+        version: 1.6.1(@types/node@20.19.41)
+
   packages/agents/quality-gate:
     dependencies:
       '@gestalt/agents-generate':
@@ -327,6 +346,9 @@ importers:
       '@gestalt/agents-maintenance':
         specifier: workspace:*
         version: link:../agents/maintenance
+      '@gestalt/agents-planning':
+        specifier: workspace:*
+        version: link:../agents/planning
       '@gestalt/agents-quality-gate':
         specifier: workspace:*
         version: link:../agents/quality-gate

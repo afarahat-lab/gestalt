@@ -41,6 +41,7 @@ import { registerPlatformToolsRoutes } from './routes/platform-tools';
 import { registerIdentityRoutes } from './routes/identity';
 import { registerGroupRoutes } from './routes/groups';
 import { registerGitReposRoutes } from './routes/git-repos';
+import { registerFeatureRoutes } from './routes/features';
 import { correlationHook } from './middleware/correlation';
 import { auditHook } from './middleware/audit';
 import type { AuthManager } from './auth/auth-manager';
@@ -113,6 +114,7 @@ export async function createApp(
   await registerIdentityRoutes(app, authManager);
   await registerGroupRoutes(app);
   await registerGitReposRoutes(app);
+  await registerFeatureRoutes(app);
 
   // ─── Dashboard static files ────────────────────────────────────────────────
   //

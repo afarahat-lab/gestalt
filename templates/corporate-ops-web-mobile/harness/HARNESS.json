@@ -92,12 +92,59 @@
         "Findings without file-evidence (a real line from a real file) must be recorded as severity 'low' and category 'style'. The gate-orchestrator drops low/info findings, so weak guesses stay in the review artifact instead of driving a retry.",
         "Apply the scope filter: skip any finding whose subject matter appears in IntentSpec.outOfScope. If the intent excludes 'API layer', do not flag missing audit logging on a service file. If the intent excludes 'RBAC', do not flag missing role checks."
       ]
+    },
+    "architecture-agent": {
+      "rules": [
+        "High-level architecture must fit within the existing module structure defined in ARCHITECTURE.md",
+        "Do not introduce circular dependencies between modules",
+        "Per-phase designs must only reference files that exist or are being created in that phase"
+      ],
+      "architectureGuidance": [
+        "For high-level design: identify domain entities (names + key attributes), module list (name + path + what it owns), dependency direction, and recommended phase sequence. Nothing more.",
+        "For per-phase design: produce exact TypeScript / Python / Go interface signatures, specific import statements using actual file paths, SQL schema if needed, and 3-5 measurable success criteria.",
+        "Phase designs must reference only files that already exist OR files being created in this phase — never assume future phases exist.",
+        "Keep per-phase designs focused on the phase scope — do not redesign the whole feature."
+      ]
+    },
+    "planner-agent": {
+      "rules": [
+        "Maximum 5 files per phase",
+        "Each phase must be independently deployable through CI and the gate",
+        "Phases must be ordered by dependency — never reference a file from a future phase"
+      ],
+      "phaseScopingRules": [
+        "GOOD scope: 'Create src/modules/leave/leave.model.ts with TypeScript interfaces for LeaveRequest and CreateLeaveRequestDto. Import LeaveType, LeaveStatus from src/shared/types/index.ts which already exists.' — specific, concrete, references real paths.",
+        "BAD scope: 'Build the leave module' — too broad, Aider will lose context.",
+        "GOOD scope: 'Create src/modules/leave/leave.repository.ts implementing ILeaveRepository from leave.model.ts. Use Pool from src/shared/db/connection.ts. Implement 5 methods: createRequest, findById, findByEmployeeId, findPendingByManagerId, updateStatus.' — single concern, exact file references.",
+        "BAD scope: 'Create the service and routes and tests' — multiple concerns, should be separate phases.",
+        "Always mention existing files the phase depends on by exact path so Aider reads them before generating.",
+        "Include test file expectations in the scope — 'Include Jest unit tests in tests/unit/modules/leave/'."
+      ]
+    },
+    "phase-evaluator-agent": {
+      "rules": [
+        "Evaluate based on actual built files, not planned files",
+        "Adjust remaining phase scopes to use actual file paths, not planned paths",
+        "Only escalate when architectural incompatibility cannot be resolved by adjusting remaining phases"
+      ],
+      "evaluationCriteria": [
+        "Success: the phase's success criteria are met AND the code compiles AND CI passed.",
+        "Partial success: some criteria met, remaining phases can compensate — adjust their scope and continue.",
+        "Escalate: the built code is architecturally incompatible with the remaining phases AND self-healing cannot fix it.",
+        "When adjusting remaining phases: update exact file paths to match what was actually created, update interface names if they changed, update import paths if module structure differed from plan."
+      ]
     }
   },
   "pipeline": {
     "adapter": "noop",
     "autoMerge": false,
     "mergeMethod": "squash"
+  },
+  "planner": {
+    "enabled": true,
+    "maxPhasesPerFeature": 10,
+    "maxFilesPerPhase": 5,
+    "architectureReviewPerPhase": true
   },
   "maintenance": {
     "driftCheck":     { "enabled": true, "scheduleUtc": "0 2 * * *" },

@@ -21,3 +21,4 @@ export {
 } from './repositories/identity-config';
 export { OraclePlatformGroupRepository } from './repositories/platform-groups';
 export { OracleSelfHealingConfigRepository } from './repositories/self-healing-config';
+export { OracleFeatureRepository } from './repositories/features';

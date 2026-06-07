@@ -29,6 +29,7 @@ import { startOrchestratorWorker } from '@gestalt/agents-generate';
 import { startGateWorker } from '@gestalt/agents-quality-gate';
 import { startDeployWorker } from '@gestalt/agents-deploy';
 import { startMaintenanceScheduler } from '@gestalt/agents-maintenance';
+import { startPlanningWorker } from '@gestalt/agents-planning';
 import { createApp } from './app';
 import { createAuthManager } from './auth/auth-manager';
 import { loadIdentityConfig } from './auth/config-loader';
@@ -171,6 +172,13 @@ export async function startServer(): Promise<void> {
   // 9. Maintenance scheduler (4 node-cron schedules in-process)
   startMaintenanceScheduler({ queueConfig: config.queue });
   log.info('Maintenance scheduler started');
+
+  // 9b. Planning worker (migration 024 — drains bull:gestalt-planning:*).
+  // Also subscribes to the in-process event bus so deploy-stage
+  // intent.status-changed events (deployed / failed) auto-dispatch
+  // planning:evaluate. No coupling code in the deploy layer.
+  startPlanningWorker(config.queue);
+  log.info('Planning worker started');
 
   // 10. Fastify app
   const app = await createApp(config, authManager);

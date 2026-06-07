@@ -170,6 +170,54 @@ agents:
       builtin: [readFile, listDirectory]
     prompt_extensions: []
 
+  # ── Planning layer (migration 024) ──────────────────────────────
+  # architecture-agent is consulted twice per feature:
+  #   1. High-level design (feature-level) — before any code is written
+  #   2. Focused design (phase-level)      — before each phase is submitted
+  # Operator opt-in: HARNESS.json `planner.enabled` controls whether
+  # the planning layer engages at all; `planner.architectureReviewPerPhase`
+  # controls the per-phase pass.
+  architecture-agent:
+    role: "Senior software architect"
+    goal: "Produce high-level architecture designs and focused per-phase technical specifications that fit the existing project structure"
+    llm:
+      model: ~
+      temperature: 0.1
+      max_tokens: 3000
+    prompt_extensions:
+      - "Always ground your design in the existing ARCHITECTURE.md — extend it, never contradict it"
+      - "High-level designs focus on domain entities, module boundaries, and dependency direction only — not implementation details"
+      - "Per-phase designs focus on exact interfaces, import paths, and success criteria for that specific phase only"
+      - "Domain entities should have minimal attributes at the high level — add detail in per-phase designs"
+      - "Module dependencies must be acyclic — check before recommending"
+
+  planner-agent:
+    role: "Technical project planner"
+    goal: "Decompose a feature into a sequence of small, independently deployable phases that each fit within Aider's effective context window"
+    llm:
+      model: ~
+      temperature: 0.1
+      max_tokens: 3000
+    prompt_extensions:
+      - "Each phase must touch at most 5 files — prefer 2-3 files per phase"
+      - "Each phase must have a single clear concern (model, repository, service, routes — not combined)"
+      - "Phases must be ordered by dependency — a phase can only use files from prior phases or existing files"
+      - "The scope field must be Aider-ready: specific, self-contained, referencing existing files by exact path"
+      - "Maximum 10 phases per feature — if more are needed, the feature is too large and should be split"
+
+  phase-evaluator-agent:
+    role: "Technical delivery reviewer"
+    goal: "Evaluate what was actually built in a completed phase, assess whether it matches the plan, and recommend adjustments to subsequent phases based on real results"
+    llm:
+      model: ~
+      temperature: 0.1
+      max_tokens: 2000
+    prompt_extensions:
+      - "Base your evaluation on the actual files built — not on what was planned"
+      - "If the implementation differs from the plan but is still correct, that is acceptable — adjust the plan, not the verdict"
+      - "Only escalate to human if the phase produced code that is fundamentally incompatible with the remaining phases"
+      - "Adjustments to remaining phases should update file paths, interface names, and import statements to match what was actually built"
+
 
 # ─── Custom agents (ADR-037) ─────────────────────────────────────────────────
 # Project-specific LLM agents that run after the framework generate agents

@@ -74,6 +74,25 @@ export interface ConstraintRule {
 export interface HarnessAgentConfig {
   rules?: string[];
   verificationGuidance?: string[];
+  /**
+   * Planning layer additions (migration 024). Per-agent guidance for
+   * the three planning agents:
+   *
+   *   - `phaseScopingRules`     → planner-agent: examples of good vs
+   *     bad phase scopes
+   *   - `evaluationCriteria`    → phase-evaluator-agent: when to mark
+   *     success / partial / escalate
+   *   - `architectureGuidance`  → architecture-agent: how to approach
+   *     high-level vs per-phase design
+   *
+   * Same contract as `rules` + `verificationGuidance` — operators
+   * customise per project without touching platform code. The platform
+   * mechanics (JSON schemas, parsing, loop logic) stay in the agent
+   * .ts files; the prompt content the LLM reads lives here.
+   */
+  phaseScopingRules?: string[];
+  evaluationCriteria?: string[];
+  architectureGuidance?: string[];
 }
 
 export interface HarnessConfig {
@@ -163,6 +182,20 @@ export interface HarnessConfig {
    */
   codeGeneration?: {
     backend: 'gestalt' | 'aider';
+  };
+  /**
+   * Planning layer configuration (migration 024). Absent → planner
+   * disabled; projects opt in by adding this block. Bounds the
+   * planner-agent's output (max phases, max files per phase) so a
+   * runaway LLM cannot blow through the operator's budget. When
+   * `architectureReviewPerPhase` is true, architecture-agent is
+   * consulted before every phase, not just at the feature level.
+   */
+  planner?: {
+    enabled: boolean;
+    maxPhasesPerFeature: number;
+    maxFilesPerPhase: number;
+    architectureReviewPerPhase: boolean;
   };
 }
 

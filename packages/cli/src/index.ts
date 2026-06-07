@@ -103,6 +103,9 @@ import {
 import {
   intentListCommand, intentShowCommand, intentSubmitCommand,
 } from './commands/intent';
+import {
+  featureSubmitCommand, featureListCommand, featureShowCommand,
+} from './commands/feature';
 import { gateShowCommand } from './commands/gate';
 import { deployListCommand, deployShowCommand } from './commands/deploy';
 import {
@@ -1249,6 +1252,38 @@ deploy
       server: opts.server,
       project: opts.project,
     }).catch(fatalError);
+  });
+
+// gestalt feature — planning layer (migration 024)
+const feature = program
+  .command('feature')
+  .description('Plan and execute features — decompose into deployable phases, then run them autonomously through the SDLC chain');
+
+feature
+  .command('submit <description>')
+  .description('Submit a new feature for planning. Server runs architecture-agent + planner-agent, writes PLAN.md, then submits the first phase automatically.')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <name>', 'Project name or UUID (overrides current project)')
+  .option('--title <text>', 'Short title (defaults to the first sentence of the description)')
+  .action(async (description: string, opts: { server?: string; project?: string; title?: string }) => {
+    await featureSubmitCommand(description, opts).catch(fatalError);
+  });
+
+feature
+  .command('list')
+  .description('List features for a project (defaults to the current project; omit --project to list across all accessible projects)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <name>', 'Filter to a project by name')
+  .action(async (opts: { server?: string; project?: string }) => {
+    await featureListCommand(opts).catch(fatalError);
+  });
+
+feature
+  .command('show <id>')
+  .description('Show feature detail — phases, status, plan log (UUID or 8-char prefix)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .action(async (id: string, opts: { server?: string }) => {
+    await featureShowCommand(id, opts).catch(fatalError);
   });
 
 // gestalt status

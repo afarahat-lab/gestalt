@@ -4,9 +4,9 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-07 (after ADRs 042–049 — documentation-only session codifying the platform/operator split. ADR-042 makes the TR_021 refactor a permanent rule (LLM guidance prose in HARNESS.json + agents.yaml, never `.ts`). ADRs 043–049 codify the Aider opt-in backend (043), the gpt-4o-for-gate / gpt-4o-mini-for-code-gen policy (044), the evidence-requirement for all finding-emitting agents (045), LLM-driven script execution for gate verification (046), CI-owns-runtime / gate-owns-architecture extension to ADR-041 (047), LLM-driven retry routing instead of hardcoded dispatch maps (048), and phased architecture consultation (049). No platform code change; no migrations. Previously (TR_021): externalised gate-agent verificationGuidance from `.ts` into HARNESS.json's `agentConfig[role].verificationGuidance`. Two trackeros cycles back-to-back both `Status: ✓ deployed` single-round (PR #55, PR #56). Template bumped 0.6.0 → 0.7.0.)
+**Last updated:** 2026-06-07 (after PLANNING_LAYER — new `@gestalt/agents-planning` package + migration 024 introducing autonomous feature decomposition. Three planning agents (architecture-agent / planner-agent / phase-evaluator-agent) all extend BaseLLMAgent and read config via the standard `loadAgentConfig` + HARNESS.json `agentConfig[role]` paths — strict ADR-042 compliance, no LLM guidance prose in `.ts`. New BullMQ queue `gestalt-planning` carries `planning:start`, `planning:phase`, `planning:evaluate`. The orchestrator subscribes to the in-process event bus so deploy-stage `intent.status-changed` events fan back to evaluation without coupling code in the deploy layer. New `POST /features` route + `gestalt feature submit/list/show` CLI commands. Template bumped 0.7.0 → 0.8.0. Live verified on trackeros: feature `ea19b18e` submitted → planner produced a 1-phase plan → PLAN.md + docs/ARCHITECTURE.md update committed to trackeros `main` → phase intent dispatched → generate ran → pr-agent opened PR #57 → CI ran (real GitHub Actions, code-agent had a TS resolveJsonModule mistake → CI failed → event bus → planning:evaluate → phase marked failed, feature marked blocked). End-to-end loop confirmed.)
 **Repo:** https://github.com/afarahat-lab/gestalt
-**Migrations:** 023 (latest: `023_llm_api_shape`)
+**Migrations:** 024 (latest: `024_features`)
 
 ---
 
@@ -14,16 +14,16 @@ the `sessions/archive/` files (everything older)._
 
 ### Platform foundations
 
-- All 12 buildable packages compile (`pnpm -r build`).
+- All 13 buildable packages compile (`pnpm -r build`).
 - `docker-compose up -d` brings server + postgres + redis healthy.
-- All 23 migrations apply on first start.
+- All 24 migrations apply on first start.
 - Server reachable on `http://localhost:3000`; `/health` returns 200;
   protected routes return 401 without a JWT.
 - Dashboard SPA served at `/app/*`; shareable deep-link URLs work.
 - First-boot bootstrap verified: `gestalt init-admin` → `gestalt login`
   → `/auth/me` returns the user.
 
-### Four SDLC layers (all wired end-to-end)
+### Five SDLC layers (all wired end-to-end)
 
 - **generate** — intent → design → context → lint-config → code → test;
   custom agents in `agents.yaml` interleave via `runs_after`.
@@ -46,6 +46,22 @@ the `sessions/archive/` files (everything older)._
   `node-cron`. Context-file intents take a direct-fix path via
   context-fixer (path-guarded to `docs/*` + `AGENTS.md`).
   `MonitoringAdapter` (Prometheus / Datadog / NoOp).
+- **planning** (migration 024) — three agents (architecture-agent /
+  planner-agent / phase-evaluator-agent) drive an autonomous feature
+  decomposition loop. Operator submits a feature; orchestrator clones
+  the repo, runs architecture-agent for the high-level design, runs
+  planner-agent for the phase plan, commits `PLAN.md` + appends to
+  `docs/ARCHITECTURE.md`, then dispatches phase 1 as a regular
+  `generate:intent`. The in-process event bus subscriber maps each
+  phase intent's terminal status (`deployed` / `failed`) into a
+  `planning:evaluate` dispatch; phase-evaluator-agent decides whether
+  to continue, adjust remaining phases, or escalate. Bounded by
+  `HARNESS.json.planner` (`maxPhasesPerFeature`, `maxFilesPerPhase`,
+  `architectureReviewPerPhase`). All LLM guidance prose lives in
+  `agents.yaml` (`prompt_extensions`) + `HARNESS.json.agentConfig`
+  (`rules` / `architectureGuidance` / `phaseScopingRules` /
+  `evaluationCriteria`) per ADR-042 — `.ts` carries only structural
+  framing + JSON schemas.
 
 ### Identity + auth
 
@@ -203,49 +219,72 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
+### PLANNING_LAYER — Autonomous feature decomposition (migration 024)
+
+New `@gestalt/agents-planning` package + `planning:start` / `planning:phase`
+/ `planning:evaluate` task types on a new `gestalt-planning` BullMQ
+queue. Three new agent roles (architecture-agent / planner-agent /
+phase-evaluator-agent), three new postgres tables (features /
+feature_phases / feature_plan_log), `POST /features` route, and
+`gestalt feature submit/list/show` CLI commands. The orchestrator
+loop: clone repo → architecture-agent → planner-agent → write
+PLAN.md → commit + push → dispatch phase 1 as `generate:intent` →
+event-bus subscriber catches terminal status → planning:evaluate
+→ phase-evaluator-agent → either next phase, mark feature
+completed, or block. Strict ADR-042 compliance — every guidance
+prose string lives in `agents.yaml.prompt_extensions` or
+`HARNESS.json.agentConfig[role]` (`rules` / `architectureGuidance`
+/ `phaseScopingRules` / `evaluationCriteria`); only structural
+framing + JSON schemas live in `packages/agents/planning/src/prompts/`.
+Live verified on trackeros: feature `ea19b18e` ran the full loop
+end-to-end against real GitHub Actions CI (CI failed due to a
+pre-existing code-agent issue; the planning loop correctly marked
+the phase failed and the feature blocked). Template bumped
+0.7.0 → 0.8.0.
+
 ### TR_021 — Externalise verificationGuidance to HARNESS.json
 
-Pure refactor: the project-specific "HOW to verify before
-flagging" hints lifted out of `llm-review-agent.ts` and into
-`HARNESS.json.agentConfig[role].verificationGuidance`. Platform
-mechanics (evidence requirement, severity ceiling, JSON schema,
-parser-level enforcement, ABSOLUTE_MAX_RETRIES) stay in code.
-constraint-agent gained the configurable section "for free"
-via the shared `renderHarnessAgentRules` helper. Two trackeros
-cycles back-to-back both deployed single-round
-(PR #55 pre-commit, PR #56 post-commit). Template
-bumped 0.6.0 → 0.7.0.
+Refactor (kept brief; see `sessions/RECENT.md` for the full
+narrative). Lifted project-specific "HOW to verify before
+flagging" hints out of `llm-review-agent.ts` and into
+`HARNESS.json.agentConfig[role].verificationGuidance`. PLANNING_LAYER
+extended the same helper to render three more sub-section types
+(phaseScopingRules, evaluationCriteria, architectureGuidance).
+Template went 0.6.0 → 0.7.0 → 0.8.0.
 
 ### TR_020 — Real GitHub Actions deploy works end-to-end
 
 trackeros's first `Status: ✓ deployed` against the real
 `github-actions` adapter — 1m 58s, single round, PR #54
-squash-merged via auto-merge. Four fixes against TR_019's runaway:
-console.log rule scope, retryCount threading + safety net, CI
-trigger dedupe (3→1 per push), executeScript stripped from
-review-agent + "trust CI" prompt. Template bumped 0.5.0 → 0.6.0.
-See `docs/claude/TEST_REPORT_020.md`.
+squash-merged. See `docs/claude/TEST_REPORT_020.md`.
 
-### Resolved by TR_020
+### Resolved by TR_020 (kept brief)
 
-- **~~(HIGHEST — TR_019)~~ RESOLVED.** Gate retry budget not
-  enforced — `retryCount` threading restored through
-  generate→deploy:pr→deploy:pipeline→gate:review; new
-  `ABSOLUTE_MAX_RETRIES=5` checked via persisted
-  `intent.attemptCount`; `incrementAttemptCount` now called by
-  `maybeDispatchRetry` on every retry. Verified live in TR_020
-  cycle 1: 4 rounds = 1 initial + 3 retries, then clean
-  `gate-max-retries` exit.
-- **~~(HIGH — TR_019)~~ RESOLVED.** Three CI runs per push reduced
-  to one. `GitHubActionsAdapter.triggerPipeline` polls the push-
-  triggered run instead of dispatching workflow_dispatch.
-  `pull_request: branches: [main]` removed from template.
-- **~~(HIGH — TR_017)~~ RESOLVED — broadly.** Re-verify on a
-  second intent shape — TR_017 + TR_019 + TR_020 = three distinct
-  cycle shapes across the gate.
+Gate retry budget threading + ABSOLUTE_MAX_RETRIES + CI dedupe
+all resolved. See `docs/claude/TEST_REPORT_020.md` for the full
+diff.
 
 ### Active follow-ups (carryover or NEW)
 
+- **(MEDIUM — NEW from PLANNING_LAYER)** The phase-1 intent
+  on trackeros failed because Aider generated `require('../../../package.json')`
+  without `resolveJsonModule` in tsconfig. Not a planning bug —
+  pre-existing code-agent / Aider behaviour — but the planning
+  loop blocking on it surfaces the cost. Either (a) extend the
+  template's TypeScript scaffolding to enable `resolveJsonModule`
+  + `esModuleInterop` by default, or (b) add a phase-evaluator-agent
+  retry budget so a single CI failure doesn't auto-block the feature.
+- **(LOW — NEW from PLANNING_LAYER)** Per-phase architecture pass
+  is disabled on trackeros (`architectureReviewPerPhase: false`).
+  Verify the per-phase pass on a project that opts in — needed
+  to confirm the second architecture-agent entry point works.
+- **(LOW — NEW from PLANNING_LAYER)** The orchestrator stores
+  phase scope adjustments under `feature_phases.result.pendingScopeAdjustment`
+  and the next `planning:phase` reads them when assembling the
+  intent text. The scope itself never overwrites the original
+  `scope` column — by design, so the planner's first draft stays
+  visible to operators. Consider a dedicated `scope_history` array
+  if operators need a full history.
 - **(LOW — NEW from TR_021)** Consider migrating the
   `consistencySection` block (cross-artifact checks:
   test-framework match, import resolution, @types/* coverage,
@@ -282,31 +321,20 @@ See `docs/claude/TEST_REPORT_020.md`.
 
 ### Architecture follow-ups (all LOW unless marked)
 
-- Tool-call persistence is incremental in
-  `BaseLLMAgent.runToolLoop()` (TR_009 Fix 1).
-- Review-agent `result_status='failed'` with successful JSON
-  output (TR_010/011). Cosmetic only; verdict correct.
-- TR_004 Fix 4 self-healing escape hatch not exercised live.
-- executeScript invocation patterns (TR_010-013): code-agent
-  ~21×/round; review-agent zero post-TR_017 (not re-verified).
-- Dashboard bundle 1010 KB raw / 319 KB gzipped — code-split
-  via dynamic `import()`.
+Pruned to top items; see `sessions/archive/` for the full
+historical list.
+
 - Retry cycle full re-runs all generate agents — skip
   intent/design/context when artifacts in Git tip.
-- `qualityGate.maxRetries` hardcoded to 3 — read per-project.
+- `qualityGate.maxRetries` + `planner.maxPhasesPerFeature`
+  hardcoded fallbacks (3 / 10) — wire through HARNESS reads
+  for projects that override.
 - Promotion workflow dispatches against hardcoded `'main'` ref.
-  Projects on `master` / `trunk` will fail. Thread
-  `project.defaultBranch` through.
+  Projects on `master` / `trunk` will fail.
 - No proactive PAT-scope validation at registration.
-- Return-URL preservation across login (intent ID dropped).
-- Vite dev-server proxy `/api` entry is dead config.
 - Encrypt Git PATs at rest in legacy `project_git_credentials`.
 - LLM model name not validated at startup.
-- HA replica support for OIDC state (in-memory today).
-- (MEDIUM, TR_004) test-agent punts on method coverage;
-  IntentSpec lacks `dependencies` block; context-agent has 4
-  tools but never uses them (TR_002).
-- TR_003 Fix 1 (env-default apiShape) not yet live-verified.
+- (MEDIUM, TR_004) test-agent punts on method coverage.
 
 ---
 
@@ -314,16 +342,13 @@ See `docs/claude/TEST_REPORT_020.md`.
 
 ### trackeros state (current)
 
-- **trackeros `main`** at commit `13223d29` (TR_021
-  HARNESS.json verificationGuidance added). Pipeline adapter
-  `github-actions` + autoMerge true. Workflow triggers: push
-  (gestalt/**) + workflow_dispatch. 4-stage CI (Compile / Test
-  / Lint / Security) green in ~35s.
-- **Stranded PR branches** from TR_019 failed cycles (PRs #49–#52)
-  remain. Close with `gh pr close <#> --delete-branch` when
-  convenient. TR_020+TR_021 PRs (#54–#56) all merged.
-- **trackeros PR #46** synthetic test PR (2026-06-04) — close
-  with `gh pr close 46 --repo afarahat-lab/trackeros --delete-branch`.
+- **trackeros `main`** at commit `6f2a500b` (planning-layer
+  PLAN.md committed by feature `ea19b18e`). Pipeline adapter
+  `github-actions` + autoMerge true. HARNESS.json now carries
+  the planner block + planning agentConfig (commit `3fc936fe`).
+- **Stranded PR branches** from TR_019 + PLANNING_LAYER (PRs
+  #49–#52, #57) remain. Close with `gh pr close <#> --delete-branch`
+  when convenient. TR_020+TR_021 PRs (#54–#56) all merged.
 - **Re-create vault secret for OpenAI API key** if the operator
   wants vault-backed routing. Both LLMs currently in env-var
   mode (`apiKeyEnv: 'LLM_API_KEY'`) and working.

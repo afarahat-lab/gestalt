@@ -33,6 +33,7 @@ import {
 } from './repositories/identity-config';
 import { PostgresPlatformGroupRepository } from './repositories/platform-groups';
 import { PostgresSelfHealingConfigRepository } from './repositories/self-healing-config';
+import { PostgresFeatureRepository } from './repositories/features';
 export {
   LastLLMError, CannotDeleteDefaultLLMError,
 } from './repositories/platform-llms';
@@ -77,5 +78,6 @@ export async function createPostgresAdapter(databaseUrl: string): Promise<Reposi
     roleMappings:       new PostgresRoleMappingRepository(),
     platformGroups:     new PostgresPlatformGroupRepository(),
     selfHealingConfig:  new PostgresSelfHealingConfigRepository(),
+    features:           new PostgresFeatureRepository(),
   };
 }

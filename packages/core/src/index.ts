@@ -142,6 +142,9 @@ export type {
   AgentExecutionLogRepository,
   ProjectMembershipRepository,
   InterventionRepository,
+  // Planning layer (migration 024)
+  FeatureRecord, FeaturePhaseRecord, FeaturePlanLogRecord,
+  FeatureStatus, PhaseStatus, FeatureRepository,
 } from './repository/index';
 export { getRepositories, setRepositories } from './repository/index';
 

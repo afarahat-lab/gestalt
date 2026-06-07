@@ -539,6 +539,104 @@ export interface ProjectRepository extends BaseRepository {
   deleteAllCredentials(projectId: string): Promise<number>;
 }
 
+// ─── Feature repository (migration 024 — planning layer) ────────────────────
+
+export type FeatureStatus = 'planning' | 'in-progress' | 'completed' | 'blocked' | 'cancelled';
+export type PhaseStatus   = 'pending' | 'in-progress' | 'deployed' | 'failed' | 'skipped';
+
+export interface FeatureRecord {
+  id: string;
+  projectId: string;
+  title: string;
+  description: string;
+  status: FeatureStatus;
+  /** High-level architecture markdown produced by architecture-agent. */
+  architecture: string | null;
+  phaseCount: number;
+  /**
+   * Zero-based index of the phase the planner is currently working
+   * on. Bumped after each phase deploys. `phaseCount - 1` is the last
+   * phase; `currentPhase === phaseCount` indicates "all phases done".
+   */
+  currentPhase: number;
+  createdBy: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface FeaturePhaseRecord {
+  id: string;
+  featureId: string;
+  phaseIndex: number;
+  title: string;
+  /** Aider-ready scope description for this phase. */
+  scope: string;
+  /** Per-phase architecture markdown produced by architecture-agent. */
+  architecture: string | null;
+  /** Other phase titles this one depends on. Free-form strings. */
+  dependencies: string[];
+  status: PhaseStatus;
+  /** The generate:intent dispatched for this phase. Null until submission. */
+  intentId: string | null;
+  /** Phase-evaluator-agent's verdict JSON. Null until evaluation. */
+  result: unknown | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/**
+ * Append-only event log for operator visibility. Each row is one
+ * transition during the feature's planning + execution loop:
+ * architecture-designed, plan-built, phase-submitted, phase-deployed,
+ * phase-evaluated, plan-adjusted, feature-completed, feature-failed.
+ */
+export interface FeaturePlanLogRecord {
+  id: string;
+  featureId: string;
+  phaseIndex: number | null;
+  eventType: string;
+  summary: string;
+  detail: unknown | null;
+  createdAt: Date;
+}
+
+export interface FeatureRepository extends BaseRepository {
+  create(feature: Omit<FeatureRecord, 'createdAt' | 'updatedAt' | 'architecture' | 'phaseCount' | 'currentPhase' | 'status'>): Promise<FeatureRecord>;
+  findById(id: string): Promise<FeatureRecord | null>;
+  listByProject(projectId: string): Promise<FeatureRecord[]>;
+  updateStatus(id: string, status: FeatureStatus): Promise<FeatureRecord>;
+  /**
+   * Persists the high-level architecture markdown + phase count
+   * after architecture-agent + planner-agent run. Called once per
+   * feature, atomically.
+   */
+  saveArchitectureAndPlan(id: string, params: { architecture: string; phaseCount: number }): Promise<FeatureRecord>;
+  /**
+   * Bumps `current_phase` to the supplied value. Called after each
+   * phase reaches a terminal status (deployed / failed / skipped).
+   */
+  setCurrentPhase(id: string, phaseIndex: number): Promise<FeatureRecord>;
+
+  // ── feature_phases CRUD ─────────────────────────────────────────
+  createPhase(phase: Omit<FeaturePhaseRecord, 'createdAt' | 'updatedAt' | 'status' | 'intentId' | 'result'>): Promise<FeaturePhaseRecord>;
+  findPhaseByIndex(featureId: string, phaseIndex: number): Promise<FeaturePhaseRecord | null>;
+  listPhases(featureId: string): Promise<FeaturePhaseRecord[]>;
+  updatePhaseIntent(phaseId: string, intentId: string): Promise<FeaturePhaseRecord>;
+  updatePhaseStatus(phaseId: string, status: PhaseStatus): Promise<FeaturePhaseRecord>;
+  savePhaseResult(phaseId: string, result: unknown): Promise<FeaturePhaseRecord>;
+  /**
+   * Reverse lookup — given an intent id, find the phase row that
+   * dispatched it. Used by the deploy → planning callback to walk
+   * back from a deployed intent to the feature loop. Returns null
+   * for intents not driven by the planner.
+   */
+  findPhaseByIntent(intentId: string): Promise<FeaturePhaseRecord | null>;
+
+  // ── feature_plan_log append-only log ────────────────────────────
+  appendLog(entry: Omit<FeaturePlanLogRecord, 'id' | 'createdAt'>): Promise<FeaturePlanLogRecord>;
+  listLog(featureId: string): Promise<FeaturePlanLogRecord[]>;
+}
+
 // ─── Repository registry ──────────────────────────────────────────────────────
 
 /**
@@ -579,6 +677,12 @@ export interface RepositoryRegistry {
    * Migration 020.
    */
   selfHealingConfig: SelfHealingConfigRepository;
+  /**
+   * Features + phases + plan log (migration 024 — planning layer).
+   * Operators submit features via `POST /features`; the planning
+   * orchestrator drives the architecture → plan → phase loop.
+   */
+  features: FeatureRepository;
 }
 
 // ─── Platform LLM registry (migration 014) ───────────────────────────────────

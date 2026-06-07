@@ -29,6 +29,12 @@ export const QUEUE_NAMES = {
   gate:        'gestalt-gate',
   deploy:      'gestalt-deploy',
   maintenance: 'gestalt-maintenance',
+  /**
+   * Planning queue (migration 024). Carries `planning:start`,
+   * `planning:phase`, and `planning:evaluate` tasks dispatched by
+   * the planning orchestrator and the deploy → planning callback.
+   */
+  planning:    'gestalt-planning',
 } as const;
 
 export type QueueName = typeof QUEUE_NAMES[keyof typeof QUEUE_NAMES];
@@ -224,5 +230,6 @@ function resolveQueueName(taskType: TaskType): QueueName {
   if (taskType.startsWith('gate:'))     return QUEUE_NAMES.gate;
   if (taskType.startsWith('deploy:'))   return QUEUE_NAMES.deploy;
   if (taskType.startsWith('maintenance:')) return QUEUE_NAMES.maintenance;
+  if (taskType.startsWith('planning:')) return QUEUE_NAMES.planning;
   throw new Error(`Cannot resolve queue for unknown task type: ${taskType}`);
 }

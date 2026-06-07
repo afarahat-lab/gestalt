@@ -22,6 +22,7 @@ COPY packages/agents/generate/package.json           ./packages/agents/generate/
 COPY packages/agents/quality-gate/package.json       ./packages/agents/quality-gate/
 COPY packages/agents/deploy/package.json             ./packages/agents/deploy/
 COPY packages/agents/maintenance/package.json        ./packages/agents/maintenance/
+COPY packages/agents/planning/package.json           ./packages/agents/planning/
 
 # Install dependencies — no lockfile exists yet so use --no-frozen-lockfile
 # Once a lockfile is committed, change this to --frozen-lockfile
@@ -38,6 +39,7 @@ COPY packages/agents/generate      ./packages/agents/generate
 COPY packages/agents/quality-gate  ./packages/agents/quality-gate
 COPY packages/agents/deploy        ./packages/agents/deploy
 COPY packages/agents/maintenance   ./packages/agents/maintenance
+COPY packages/agents/planning      ./packages/agents/planning
 
 # Harness templates (ADR-036). The engine reads + substitutes these
 # at init-harness time; they ship as part of the image so the server
@@ -51,6 +53,7 @@ RUN pnpm --filter @gestalt/agents-generate build
 RUN pnpm --filter @gestalt/agents-quality-gate build
 RUN pnpm --filter @gestalt/agents-deploy build
 RUN pnpm --filter @gestalt/agents-maintenance build
+RUN pnpm --filter @gestalt/agents-planning build
 RUN pnpm --filter @gestalt/server build
 RUN pnpm --filter @gestalt/dashboard build
 
@@ -100,6 +103,8 @@ COPY --from=builder /app/packages/agents/deploy/package.json    ./packages/agent
 COPY --from=builder /app/packages/agents/deploy/dist            ./packages/agents/deploy/dist
 COPY --from=builder /app/packages/agents/maintenance/package.json ./packages/agents/maintenance/package.json
 COPY --from=builder /app/packages/agents/maintenance/dist       ./packages/agents/maintenance/dist
+COPY --from=builder /app/packages/agents/planning/package.json  ./packages/agents/planning/package.json
+COPY --from=builder /app/packages/agents/planning/dist          ./packages/agents/planning/dist
 COPY --from=builder /app/packages/server/package.json           ./packages/server/package.json
 COPY --from=builder /app/packages/server/dist                   ./packages/server/dist
 
