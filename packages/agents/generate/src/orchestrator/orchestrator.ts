@@ -486,6 +486,18 @@ async function handleIntentTask(
         resumeOnBranch: payload.resumeOnBranch,
         prNumber: payload.prNumber,
         prUrl: payload.prUrl,
+        // TR_020 — thread the cycle's retry counter forward so the
+        // gate's MAX_GATE_RETRIES budget actually fires (TR_019 46-
+        // round loop was caused by this hop dropping retryCount).
+        // priorSignals threads forward too so future loop-detection
+        // logic can compare across cycles without a DB read.
+        retryCount,
+        priorSignals: priorSignals.map((s) => ({
+          type: s.type,
+          message: s.message,
+          sourceAgent: s.sourceAgent,
+          severity: s.severity,
+        })),
       },
       createdAt: new Date(),
       expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),

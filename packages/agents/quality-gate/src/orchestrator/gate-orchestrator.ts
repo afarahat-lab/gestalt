@@ -56,6 +56,20 @@ import type {
  */
 const MAX_GATE_RETRIES = 3;
 
+/**
+ * TR_020 — absolute safety net. Even if `retryCount` threading
+ * regresses again (TR_019 ran 46 rounds because the deploy chain
+ * dropped retryCount), this hard cap ensures the gate never spins
+ * past 5 cycles regardless of payload contents. Checked BEFORE the
+ * primary `MAX_GATE_RETRIES` check uses payload.retryCount, so a
+ * broken upstream that resets the counter to 0 still escalates here.
+ * The intent's `attemptCount` column is the source of truth for
+ * "how many cycles has this intent actually consumed", populated
+ * exclusively by self-healing-loop's `incrementAttemptCount` AND now
+ * by `maybeDispatchRetry` on every dispatch.
+ */
+const ABSOLUTE_MAX_RETRIES = 5;
+
 const log = createContextLogger({ module: 'gate-orchestrator' });
 
 interface GateTaskPayload {
@@ -1092,6 +1106,19 @@ async function maybeDispatchRetry(args: {
 
   const retryableSignals = gateResult.signals.filter((s) => s.autoResolvable);
 
+  // TR_020 — absolute safety net. Use the intent's persisted
+  // `attemptCount` as the source of truth — survives even if the
+  // payload's retryCount got reset to 0 by an upstream regression.
+  const intentRecord = await getRepositories().intents.findById(payload.intentId);
+  const persistedAttempts = intentRecord?.attemptCount ?? 0;
+  if (persistedAttempts >= ABSOLUTE_MAX_RETRIES) {
+    childLog.warn(
+      { persistedAttempts, max: ABSOLUTE_MAX_RETRIES, payloadRetryCount: retryCount },
+      'Gate fail — absolute retry limit reached, escalating regardless of payload retryCount',
+    );
+    return false;
+  }
+
   if (retryCount >= MAX_GATE_RETRIES) {
     childLog.warn(
       { retryCount, max: MAX_GATE_RETRIES },
@@ -1103,6 +1130,15 @@ async function maybeDispatchRetry(args: {
     childLog.warn('Gate fail — no auto-resolvable signals; cannot retry');
     return false;
   }
+
+  // TR_020 — every gate retry dispatch increments the intent's
+  // persisted attempt counter. This drives both the ABSOLUTE_MAX_RETRIES
+  // safety net above AND the self-healing loop's currentAttempt
+  // computation (currently relied on by detectRepeatedSignalLoop +
+  // the retry-introduced-violations escape hatch). Pre-TR_020, only
+  // the self-healing-loop dispatch path incremented attemptCount, so
+  // the plain maybeDispatchRetry path never moved the counter.
+  await getRepositories().intents.incrementAttemptCount(payload.intentId);
 
   const projectId = payload.projectId
     ?? (await getRepositories().intents.findById(payload.intentId))?.projectId;

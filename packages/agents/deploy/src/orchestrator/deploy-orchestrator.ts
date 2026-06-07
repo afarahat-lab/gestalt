@@ -87,6 +87,15 @@ interface DeployPRPayload extends SelfHealingDispatchFields {
   branch?: string;
   prNumber?: number;
   prUrl?: string;
+  /**
+   * TEST_REPORT_020 — gate-retry threading. Carries the cycle's
+   * retry counter + the signals from the previous gate round
+   * forward through the deploy chain so the next gate:review entry
+   * sees the right `retryCount` (was previously dropped at every
+   * generate→deploy:pr hop, causing the TR_019 runaway loop).
+   */
+  retryCount?: number;
+  priorSignals?: Array<{ type: string; message: string; sourceAgent: string; severity: string }>;
 }
 
 interface DeployPipelinePayload extends SelfHealingDispatchFields {
@@ -101,6 +110,9 @@ interface DeployPipelinePayload extends SelfHealingDispatchFields {
    * for compat with legacy in-flight queue jobs.
    */
   intentText?: string;
+  /** TEST_REPORT_020 — gate-retry threading. See DeployPRPayload. */
+  retryCount?: number;
+  priorSignals?: Array<{ type: string; message: string; sourceAgent: string; severity: string }>;
 }
 
 interface DeployPromotionPayload extends SelfHealingDispatchFields {
@@ -197,6 +209,9 @@ async function handleDeployTask(
           prNumber: result.prNumber,
           // Forward for the eventual auto-merge commit subject.
           intentText: payload.intentText,
+          // TR_020 — gate-retry threading.
+          retryCount: payload.retryCount,
+          priorSignals: payload.priorSignals,
         } satisfies DeployPipelinePayload,
         createdAt: new Date(),
         expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),
@@ -286,6 +301,11 @@ async function handleDeployTask(
           prUrl: payload.prUrl,
           ciRunId: result.outcome.runId,
           text: payload.intentText,
+          // TR_020 — thread the cycle's retry counter forward so the
+          // gate's MAX_GATE_RETRIES budget actually fires. Was dropped
+          // by every generate→deploy:pr→deploy:pipeline→gate:review hop
+          // pre-TR_020, which caused the TR_019 46-round runaway loop.
+          retryCount: payload.retryCount,
         },
         createdAt: new Date(),
         expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),

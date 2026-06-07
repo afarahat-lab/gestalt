@@ -38,17 +38,13 @@ import {
 const GITHUB_API = 'https://api.github.com';
 const WORKFLOW_FILE = 'gestalt.yml';
 
-// Run discovery — GitHub does not return the runId from a workflow_dispatch
-// call, so we poll `GET /actions/runs` until the newly-created run shows
-// up. The initial 3s wait is the typical latency we've observed; the 10
-// retries at 2s give 23s total before giving up.
+// TR_020 — pr-agent's push event triggers the workflow; we poll
+// `GET /actions/runs` until the push-triggered run shows up. Same
+// budget the old workflow_dispatch path used (3s initial + 10 × 2s
+// = 23s) — GitHub's push-to-run latency is similar.
 const RUN_LOOKUP_INITIAL_DELAY_MS = 3_000;
 const RUN_LOOKUP_MAX_ATTEMPTS = 10;
 const RUN_LOOKUP_INTERVAL_MS = 2_000;
-// Tolerance applied when filtering runs by `created_at >= dispatchedAt`.
-// GitHub's run-creation timestamp may be slightly before the dispatch
-// returns — a small negative skew keeps us from missing the right run.
-const DISPATCH_CLOCK_SKEW_MS = 2_000;
 
 export interface GitHubActionsAdapterOptions {
   /** PAT from project_git_credentials — needs `repo` + `workflow` scopes. */
@@ -121,36 +117,25 @@ export class GitHubActionsAdapter implements PipelineAdapter {
     branch: string;
     correlationId: string;
   }): Promise<{ runId: string }> {
-    // workflow_dispatch is fire-and-forget — GitHub does not return the
-    // run id. Capture the dispatch timestamp first so we can filter the
-    // run list to runs that were created after our dispatch (avoids
-    // picking up concurrent runs on the same branch from other triggers).
-    const dispatchedAt = Date.now();
-
-    const dispatchRes = await this.fetch(
-      `${GITHUB_API}/repos/${this.owner}/${this.repo}/actions/workflows/${this.workflowFile}/dispatches`,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          ref: params.branch,
-          inputs: {
-            correlationId: params.correlationId,
-            environment: 'ci',
-            branch: params.branch,
-          },
-        }),
-      },
-    );
-    if (!dispatchRes.ok) {
-      const body = await dispatchRes.text();
-      this.throwIfAuthError(dispatchRes.status, body, 'triggerPipeline', 'workflow');
-      throw new Error(`GitHub dispatch failed (${dispatchRes.status}): ${body}`);
-    }
-
-    // Initial wait + retry loop so we don't race GitHub's run-creation.
+    // TR_020 — switched from workflow_dispatch to polling the
+    // push-event run. pr-agent has already pushed the branch by the
+    // time this is called, so GitHub has (or imminently will have)
+    // queued a `push`-triggered run. Calling workflow_dispatch on
+    // top would create a SECOND identical run, wasting CI minutes
+    // (TR_019 documented 3 runs per push: dispatch + push +
+    // pull_request). The pull_request trigger has been dropped from
+    // the workflow template; workflow_dispatch is retained in the
+    // workflow file but only for promotion-agent's staging /
+    // production deploy invocation. We don't try to dispatch here
+    // anymore.
+    //
+    // Polling shape: 3s initial wait, then up to 10 × 2s. Same
+    // budget the dispatch path used — push delivery latency is
+    // similar to dispatch acknowledgement latency.
+    const pollStartedAt = Date.now();
     await sleep(RUN_LOOKUP_INITIAL_DELAY_MS);
     for (let attempt = 0; attempt < RUN_LOOKUP_MAX_ATTEMPTS; attempt++) {
-      const runId = await this.findDispatchedRun(params.branch, dispatchedAt);
+      const runId = await this.findPushRun(params.branch, pollStartedAt);
       if (runId !== null) return { runId };
       if (attempt < RUN_LOOKUP_MAX_ATTEMPTS - 1) {
         await sleep(RUN_LOOKUP_INTERVAL_MS);
@@ -158,8 +143,8 @@ export class GitHubActionsAdapter implements PipelineAdapter {
     }
     const waitedMs = RUN_LOOKUP_INITIAL_DELAY_MS + (RUN_LOOKUP_MAX_ATTEMPTS - 1) * RUN_LOOKUP_INTERVAL_MS;
     throw new Error(
-      `GitHub Actions: dispatched workflow but no matching run appeared within ${Math.round(waitedMs / 1000)}s ` +
-      `(branch=${params.branch})`,
+      `GitHub Actions: no push-triggered run appeared on branch ${params.branch} within ${Math.round(waitedMs / 1000)}s. ` +
+      `Verify the workflow file has \`on: push: branches: ['gestalt/**']\` and that pr-agent's push actually landed.`,
     );
   }
 
@@ -285,18 +270,25 @@ export class GitHubActionsAdapter implements PipelineAdapter {
   }
 
   /**
-   * Look for the workflow run our dispatch created. Filters by:
+   * TR_020 — find the most recent `push`-event workflow run on the
+   * given branch. pr-agent's push triggers a run automatically; this
+   * method just locates the run id so pipeline-agent can poll it.
+   *
+   * Filters by:
    *   - branch (head_branch)
-   *   - workflow_dispatch event
-   *   - run was created AT OR AFTER the dispatch moment (minus a small
-   *     skew tolerance) — this is what stops us from picking up a
-   *     concurrent run from a different trigger
+   *   - push event
+   *   - run created within a wide skew window of the poll-start
+   *     timestamp — wide because the push can finish ~tens of ms
+   *     before we start polling, and we don't want to miss it. A
+   *     concurrent push on the SAME branch would also race here; the
+   *     "most recent" sort + the "newest only" return keeps us on the
+   *     freshest run, which is what pr-agent just pushed.
    * Returns the most recent matching run, or `null` if none yet.
    */
-  private async findDispatchedRun(branch: string, dispatchedAt: number): Promise<string | null> {
+  private async findPushRun(branch: string, pollStartedAt: number): Promise<string | null> {
     const url =
       `${GITHUB_API}/repos/${this.owner}/${this.repo}/actions/runs` +
-      `?branch=${encodeURIComponent(branch)}&event=workflow_dispatch&per_page=10`;
+      `?branch=${encodeURIComponent(branch)}&event=push&per_page=10`;
     const res = await this.fetch(url);
     if (!res.ok) {
       const body = await res.text();
@@ -311,7 +303,13 @@ export class GitHubActionsAdapter implements PipelineAdapter {
         created_at: string;
       }>;
     };
-    const since = dispatchedAt - DISPATCH_CLOCK_SKEW_MS;
+    // Wider tolerance than the legacy dispatch lookup: pr-agent's
+    // push happened BEFORE this method was even called, so we don't
+    // need (or want) to filter to runs after pollStartedAt — we want
+    // the most recent run on this branch, period. A 60-second skew
+    // is the safety floor: if the run is older than that, something
+    // is wrong (probably a stale run from a previous cycle).
+    const since = pollStartedAt - 60_000;
     const candidates = (body.workflow_runs ?? [])
       .filter((r) => r.head_branch === branch)
       .filter((r) => Date.parse(r.created_at) >= since)

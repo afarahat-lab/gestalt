@@ -20,11 +20,17 @@
 # build / lint / integration test / deploy commands.
 
 name: gestalt
+# TR_020 — one CI run per Aider push.
+#   - `push` triggers CI on every Gestalt branch commit (the
+#     bread-and-butter pre-gate quality check).
+#   - `workflow_dispatch` is retained ONLY for promotion-agent's
+#     staging / production deploy invocation (different
+#     `inputs.environment` value than CI).
+# `pull_request` removed pre-TR_020 (duplicated the push trigger,
+# tripled CI minutes in TR_019).
 on:
   push:
     branches: ['gestalt/**']
-  pull_request:
-    branches: [main]
   workflow_dispatch:
     inputs:
       environment:
