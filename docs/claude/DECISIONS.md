@@ -61,6 +61,8 @@ ADR to respect; read the canonical file to know **why**._
   hardcoded dispatch maps
 - **ADR-049** — Architecture agent uses phased consultation —
   high-level then per-phase
+- **ADR-050** — All evaluation and routing decisions made by LLM —
+  no hardcoded decision logic
 
 ---
 
@@ -316,21 +318,49 @@ completed phase results. Future CrewAI migration keeps the same
 two-mode interface (chief / data / app architect crew); don't
 change the surface.
 
+### ADR-050 — LLM-driven evaluation and routing (no hardcoded decision logic)
+Any decision that requires evaluating context, classifying a
+situation, or choosing between multiple actions is made by an
+LLM — never by a hardcoded `switch`, `if/else` chain, regex,
+or string-match map. The platform supplies the tools to gather
+evidence (`executeScript`, `readFile`), the JSON output schema,
+and the routing logic for each possible value. The LLM supplies
+the evaluation, classification, and chosen action. Hardcoded
+logic is acceptable ONLY for: safety blocklists (e.g.
+`BLOCKED_PATTERNS` in executeScript), structural validation
+(UUID / JSON syntax / file-extension checks), and platform
+mechanics that are deterministic consequences of a prior LLM
+decision (e.g. dispatching to the queue named in
+`diagnosis.retryTaskType`).
+**Implication:** when adding a new type of evaluation, the
+default question is "what LLM output field drives this
+routing?" — not "what conditions should I check?". Regex for
+semantic evaluation, "known error" lookup tables, and
+failure-type → handler maps all fail this ADR. Project-specific
+guidance lands in `HARNESS.json agentConfig` rules (ADR-042)
+as LLM instructions, not as platform checks.
+**Compliance test:** if a reviewer can replace a code block
+with "ask the LLM and route on its answer", that block should
+be replaced. If the block is a direct consequence of a previous
+LLM decision (routing on `diagnosis.retryTaskType`), it is
+acceptable routing logic, not evaluation logic.
+
 ---
 
 ## ADR fast-lookup matrix
 
 | Code path | Read first |
 |---|---|
-| Editing an agent's LLM call | ADR-002, ADR-007, ADR-038, ADR-042 |
-| Editing prompt content / agent reasoning | ADR-042, ADR-045, ADR-046 |
-| Editing the orchestrator | ADR-002, ADR-003, ADR-007 |
-| Adding a new agent role | ADR-007, ADR-013, ADR-037, ADR-042 |
-| Editing the gate / pre-merge flow | ADR-041, ADR-045, ADR-046, ADR-047 |
+| Editing an agent's LLM call | ADR-002, ADR-007, ADR-038, ADR-042, ADR-050 |
+| Editing prompt content / agent reasoning | ADR-042, ADR-045, ADR-046, ADR-050 |
+| Editing the orchestrator | ADR-002, ADR-003, ADR-007, ADR-050 |
+| Adding a new agent role | ADR-007, ADR-013, ADR-037, ADR-042, ADR-050 |
+| Editing the gate / pre-merge flow | ADR-041, ADR-045, ADR-046, ADR-047, ADR-050 |
 | Editing pipeline / deploy | ADR-033, ADR-034, ADR-041 |
 | Editing code-gen / Aider integration | ADR-043, ADR-044 |
-| Editing self-healing / retry routing | ADR-048 |
-| Editing planning / architecture agent | ADR-049 |
+| Editing self-healing / retry routing | ADR-048, ADR-050 |
+| Editing planning / architecture agent | ADR-049, ADR-050 |
+| Adding any decision logic (`switch` / `if/else` / regex / dispatch map) | ADR-050 |
 | Editing maintenance agents | ADR-018, ADR-035 |
 | Touching Git / clones | ADR-032 |
 | Touching auth / users | ADR-024, ADR-025, ADR-026 |

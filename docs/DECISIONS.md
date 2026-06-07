@@ -1503,3 +1503,88 @@ The interface stays identical; the implementation improves.
   as context — never designs in a vacuum
 - High-level design is committed to ARCHITECTURE.md before any
   code is generated
+
+---
+
+## ADR-050 — All evaluation and routing decisions are made by LLM, never by hardcoded logic
+
+**Date:** 2026-06
+**Status:** Accepted
+
+**Context:**
+Throughout the platform's development, there was a recurring
+temptation to hardcode decision logic — mapping failure types
+to retry strategies, classifying errors by regex patterns,
+routing failures to specific handlers based on string matching.
+Every time this was done, it produced brittle behaviour that
+broke on cases not anticipated at design time.
+
+Examples of hardcoded logic that was later replaced:
+- `RETRY_TASK_TYPE` map (failure type → retry layer) — replaced
+  with LLM-chosen `retryTaskType` in `SelfHealingDiagnosis`
+- Regex patterns in constraint-agent — replaced with LLM
+  evaluation via `executeScript`
+- `verificationGuidance` constants in `.ts` files — replaced
+  with HARNESS.json operator-configurable guidance
+- Hardcoded failure classification patterns — replaced with
+  LLM diagnosis and `action` field
+
+**Decision:**
+Any decision that requires evaluating context, classifying a
+situation, or choosing between multiple actions MUST be made
+by an LLM. The platform provides:
+- The tools to gather evidence (executeScript, readFile)
+- The structured output schema (JSON with typed fields)
+- The routing logic (what to do with each possible output value)
+
+The LLM provides:
+- The evaluation (what does this evidence mean?)
+- The classification (what type of situation is this?)
+- The decision (what action should be taken?)
+
+Hardcoded decision logic is only acceptable for:
+- Safety blocklists (BLOCKED_PATTERNS in executeScript) —
+  these are security constraints, not evaluations
+- Structural validation (is this valid JSON? does this field
+  exist?) — these are format checks, not semantic decisions
+- Platform mechanics (routing a 'retry' action to the correct
+  queue) — these are deterministic consequences of LLM decisions
+
+**Rationale:**
+LLMs generalise. Hardcoded logic does not. A regex that
+catches `pool.query` as a DB violation will never catch
+the equivalent pattern in Python (`session.execute`) or Go
+(`db.Query`). An LLM that understands "all database queries
+must go through the repository layer" applies this rule
+correctly in any language without modification.
+
+The same applies to failure analysis: hardcoding
+"Cannot find module → resolveJsonModule missing" works
+for one error. An LLM reading the full CI failure output
+can correctly diagnose any configuration gap in any language
+and generate the appropriate fix intent.
+
+**Consequences:**
+- No `switch` statements or `if/else` chains that map string
+  values to actions in agent or orchestrator code. The LLM
+  returns an `action` field; the platform routes based on it.
+- No regex patterns for semantic evaluation. Regex is
+  acceptable only for structural validation (UUID format,
+  file extension, JSON syntax).
+- No hardcoded lists of "known errors" or "known fixes".
+  The LLM's training data and reasoning capability handle
+  the long tail of cases.
+- When adding a new type of evaluation to the platform,
+  the default question is: "what LLM output field drives
+  this routing?" — not "what conditions should I check?"
+- HARNESS.json `agentConfig` rules guide the LLM's reasoning
+  about project-specific patterns (ADR-042). These are
+  instructions to the LLM, not hardcoded checks.
+
+**The test for compliance:**
+If a code reviewer can replace a block of platform code with
+"ask the LLM and route on its answer", that block should be
+replaced. If the block is a direct consequence of a previous
+LLM decision (e.g. dispatching to the queue named in
+`diagnosis.retryTaskType`), it is acceptable routing logic,
+not evaluation logic.
