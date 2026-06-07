@@ -42,6 +42,20 @@ ADR to respect; read the canonical file to know **why**._
   prevents collision with built-ins
 - **ADR-040** — `auth.config.json` as the primary identity config
   source; sensitive fields reference vault secrets via `*SecretId`
+- **ADR-043** — Aider as opt-in code generation backend
+  (`HARNESS.json codeGeneration.backend`)
+- **ADR-044** — Gate agents use gpt-4o; code generation uses
+  gpt-4o-mini
+- **ADR-045** — Evidence requirement (`quotedLine`) for all
+  finding-emitting agents
+- **ADR-046** — LLM-driven `executeScript` for gate verification —
+  no hardcoded commands
+- **ADR-047** — CI/CD owns runtime verification; Gestalt gate owns
+  architectural review
+- **ADR-048** — Self-healing uses LLM-driven retry routing — no
+  hardcoded dispatch maps
+- **ADR-049** — Architecture agent uses phased consultation —
+  high-level then per-phase
 
 ---
 
