@@ -3,6 +3,179 @@
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+### Session 2026-06-07 — Claude Code (TR_022: scaffolding fixes + phase retry budget + per-phase architecture verification — full planning loop live-tested on leave management feature)
+
+Follow-up to PLANNING_LAYER. Three fixes plus four verification
+runs against trackeros to confirm the planning loop is fully
+operational under real CI.
+
+What changed (code):
+
+- **Migration 025** — `ALTER TABLE feature_phases ADD COLUMN
+  retry_count INTEGER NOT NULL DEFAULT 0`. Existing rows
+  start at 0 so the semantics on the next cycle match
+  pre-TR_022 behaviour exactly.
+- **`@gestalt/core`** — `HarnessConfig.planner` gains optional
+  `maxPhaseRetries` (default 2 — one initial attempt + 2
+  retries = 3 total per phase). `FeaturePhaseRecord` gains
+  `retryCount: number`. `FeatureRepository` gains
+  `incrementPhaseRetry(phaseId): Promise<number>`. Postgres
+  impl plus Oracle/MSSQL throw-stubs all updated.
+- **`@gestalt/agents-planning`** — `handlePlanningEvaluate`'s
+  failure branch rewritten. Instead of immediately marking the
+  feature blocked, the orchestrator reads
+  `planner.maxPhaseRetries` via a fast shallow-clone helper
+  (`readMaxPhaseRetries` — appended at the bottom of
+  `planning-orchestrator.ts`), compares to `phase.retryCount`,
+  and either dispatches a fresh `planning:phase` for the same
+  phase (logged as `phase-retry`) or transitions to
+  `phase-failed` with budget exhausted. The retry uses the
+  same phase row — same scope, same architecture notes — so
+  the next-round Aider sees identical inputs.
+- **`packages/server/src/templates/stack-config.ts`** —
+  `buildStackPrompt` extended with a TypeScript-specific
+  paragraph instructing the LLM to include the JSON-import rule
+  in `agentPromptExtensions`. `parseStackConfig` defensively
+  injects the rule (via the new `TS_JSON_IMPORT_RULE` const)
+  whenever `language === 'TypeScript'` and the LLM forgot it.
+  `DEFAULT_AGENT_PROMPT_EXTENSIONS` updated so the failure-
+  default path also carries the rule.
+- **Template (`templates/corporate-ops-web-mobile/harness/HARNESS.json`)** —
+  `planner.maxPhaseRetries: 2` added; `agentConfig.code-agent.rules`
+  gains the JSON-import rule. Template bumped 0.8.0 → 0.9.0.
+
+trackeros operator commits (already on `main`):
+
+- `a7494aaa` — tsconfig.json `resolveJsonModule` +
+  `allowSyntheticDefaultImports`; HARNESS.json
+  `code-agent.rules` JSON-import rule; planner block bumped
+  to `{maxPhasesPerFeature: 10, maxFilesPerPhase: 5,
+  architectureReviewPerPhase: false, maxPhaseRetries: 2}`.
+- `b99e1716` — revert of the temporary
+  `architectureReviewPerPhase: true` test toggle.
+
+Live verification matrix:
+
+| Check (from brief) | Verified? | Evidence |
+|---|---|---|
+| architecture-agent runs | ✓ | Feature `1a5dcfc5`: log entry `architecture-designed Feature architecture: 4 module(s), 2 recommended phase(s)` at 19:12:53 |
+| PLAN.md committed to repo | ✓ | trackeros commit `ebd5bbdf` |
+| docs/ARCHITECTURE.md updated | ✓ | "Leave Management Module" section appended in same commit |
+| Phase 1 intent submitted automatically | ✓ | Plan log `phase-submitted [phase 1] … intent 8f93f513` at 19:13:10 |
+| **TR_022 — retry budget honoured** | ✓ | Plan log shows `phase-retry 1/2` at 19:16:22 and `phase-retry 2/2` at 19:19:41 before `phase-failed after 2 retries` at 19:22:44 |
+| **TR_022 — per-phase architecture review fires when opted in** | ✓ | Feature `37799ea9` (test-only flag flip): log entry `phase-architecture-designed [phase 1] Phase 1 architecture: 1 interface(s), 3 criteria` at 19:24:59 between `plan-built` and `phase-submitted` |
+| CI passes after tsconfig fix | ✗ partial | The TS5083 `resolveJsonModule` class is fixed (no longer flagged). New failures are property-mismatch errors in Aider's generated code (e.g. `Property 'employeeId' does not exist on type 'CreateLeaveRequestDto'`) — a pre-existing code-agent / Aider problem, not a tsconfig issue |
+| Phase 1 deploys | ✗ | Blocked by the Aider issue above |
+| Phase evaluator runs | ✗ | Only runs on successful deploy — guarded by design |
+| Phase 2 submitted | ✗ | Same reason |
+| `gestalt feature show <id>` renders progress correctly | ✓ | Three live polls in this session, including the retry events |
+
+The brief's primary verification target — the **autonomous
+planning loop with retry budget** — passed every check. The
+secondary target (clean deploy through CI) is gated on the
+Aider behaviour follow-up, captured below.
+
+PLAN.md produced for the leave-management feature
+(5 phases, 4 modules, 3 domain entities):
+
+```markdown
+# PLAN.md — Leave management module
+
+## Modules
+- **leave** (`src/modules/leave`)
+- **balance** (`src/modules/balance`)
+- **policy** (`src/modules/policy`)
+- **employee** (`src/modules/employee`)
+
+## Domain entities
+- **LeaveRequest** — id, employeeId, type, startDate,
+  endDate, status, managerId, managerComment, createdAt
+- **LeaveBalance** — employeeId, leaveType, totalDays,
+  usedDays, year
+- **LeavePolicy** — id, leaveType, defaultDaysPerYear,
+  maxConsecutiveDays, requiresApproval, createdAt
+
+## Phases
+1. Create leave model
+2. Implement leave request submission (depends on Phase 1)
+3. Implement leave request approval (depends on Phase 2)
+4. Create leave balance management (depends on Phase 1)
+5. Implement leave policy configuration
+```
+
+Full PLAN.md text in trackeros `main`:
+https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
+(commit `ebd5bbdf`).
+
+Decisions made:
+
+- **`readMaxPhaseRetries` does its own shallow clone** rather
+  than hoisting harness-read above the failure check. Cleaner
+  separation — the retry branch never touches the (larger)
+  evaluate-clone path. Cost: ~250ms per failure dispatch on a
+  small repo; acceptable for an error path.
+- **Retry preserves the original `scope` column** and
+  re-dispatches the same `planning:phase` payload. The phase
+  row's `scope` / `architecture` are the plan — the retry
+  should not mutate the plan, just give Aider another swing
+  at it. Operators who want a "smart retry" with a refined
+  scope can use the existing `pendingScopeAdjustment`
+  mechanism the evaluator already populates.
+- **Per-phase architecture verified via a test-flip + revert**
+  rather than left permanently enabled on trackeros. The flag
+  multiplies architecture-agent cost N-fold per feature; the
+  default `false` is the right operator choice on trackeros's
+  budget. The verification proved the code path runs; the
+  flag is now safe to flip true on any project that wants it.
+- **`maxPhaseRetries: 0`** was used during the per-phase
+  architecture verification cycle so the test feature didn't
+  burn the retry budget on unrelated Aider failures while
+  proving the architecture flag's behaviour. Reverted with
+  the architecture flag in the same revert commit.
+
+Pending follow-ups (NEW from TR_022):
+
+- **(HIGH)** Aider generates code that references fields not
+  present on the DTO (e.g. `employeeId`, `reason`, reason on
+  `CreateLeaveRequestDto`). Three consecutive attempts on
+  Phase 1 all produced the same class of error. Either
+  (a) extend the code-agent prompt with a "before writing a
+  service / repository, READ the DTO file and only reference
+  the fields you see there" rule, or (b) require Aider to
+  emit the model + repository in the same call so the model
+  is in its context when writing the repository. Captured as
+  TR_023 work.
+- **(LOW)** `readMaxPhaseRetries` could cache HARNESS.json
+  per feature for the duration of a feature lifecycle —
+  today it re-clones on every failure dispatch.
+
+Carryover follow-ups (status updates):
+
+- **(RESOLVED by TR_022)** PLANNING_LAYER's MEDIUM follow-up:
+  "phase failure → feature blocked is too eager" — now
+  bounded by `planner.maxPhaseRetries`.
+- **(RESOLVED by TR_022)** PLANNING_LAYER's LOW follow-up:
+  per-phase architecture pass not yet live-verified —
+  verified via feature `37799ea9`.
+- **(STILL OPEN — NEW HIGH)** TR_023 — Aider DTO-field
+  hallucination (described above).
+- **(STILL OPEN — HIGH)** TR_018/020: restore TR_010
+  mandatory `executeScript tsc --noEmit` code-agent rule on
+  trackeros's HARNESS.json. Would catch this class of error
+  pre-emit.
+- **(STILL OPEN — MEDIUM)** TR_014: Aider token-spend
+  capture in `agent_executions.tokens_used`.
+
+Build status: `pnpm -r build` clean across all 13 packages.
+Migration 025 applied at boot. Template auto-refreshed:
+`version: "0.9.0"`. Server `/health` 200 throughout.
+Stale trackeros PRs #49–52, #57 closed with
+`--delete-branch` per the brief. New trackeros PRs from this
+session (#58–#62) all closed automatically by the gate-
+failure path or remain open under the blocked feature — not
+worth closing individually until the Aider fix lands.
+
+---
 ### Session 2026-06-07 — Claude Code (PLANNING_LAYER: autonomous feature decomposition + phased execution — new `@gestalt/agents-planning` package + migration 024 + first live end-to-end loop on trackeros)
 
 Largest single-session build of the platform to date: a complete
@@ -310,180 +483,6 @@ Build status: no platform code change. `pnpm -r build` not
 re-run. Docker image untouched. No new migrations. TR_019 session
 rotated to `sessions/archive/2026-06-w1.md` to keep RECENT.md
 under the 3-session / 40 KB ceiling.
-
----
-### Session 2026-06-07 — Claude Code (TR_021: externalise verificationGuidance from gate-agent .ts → HARNESS.json — refactor only, two clean deploys back-to-back)
-
-Pure refactor session. The brief: lift the project-specific
-"HOW to verify findings" guidance out of the platform's gate-agent
-TypeScript files into HARNESS.json's
-`agentConfig[role].verificationGuidance`. Platform mechanics stay
-in code; domain hints become configurable per project. No
-behaviour change expected; no new migrations.
-
-What changed (code):
-
-- **`packages/core/src/harness/index.ts`** — `HarnessAgentConfig`
-  gains optional `verificationGuidance?: string[]`. Doc comment
-  explains the split: rules = WHAT to enforce; verificationGuidance
-  = HOW to verify before flagging. Platform mechanics (evidence
-  requirement, severity ceiling, JSON schema, parser-level
-  `dropUnevidencedFindings`, `ABSOLUTE_MAX_RETRIES`) stay in code.
-- **`packages/core/src/agents/base-llm-agent.ts`** —
-  `renderHarnessAgentRules` rewritten. Now emits a single
-  `## Agent configuration (from HARNESS.json)` header with two
-  sub-sections: `### Rules you must enforce` (from `.rules[]`)
-  and `### Verification guidance for this project` (from
-  `.verificationGuidance[]`). Empty when both are absent. Class
-  wrapper `buildHarnessAgentSection` signature widened to the
-  new agentCfg shape. Same call-site contract — every existing
-  caller (`code-prompt.ts`, `constraint-agent.ts`,
-  `llm-review-agent.ts`) gets verificationGuidance for free.
-- **`packages/agents/quality-gate/src/agents/llm-review-agent.ts`** —
-  the hardcoded `verificationGuidance` const (TR_020's STEP 1-5
-  MANDATORY SEQUENCE: trust-CI, searchFiles for DB access,
-  readFile package.json, architecture-only reasoning, scope
-  filter) deleted entirely (~70 lines). Its `${verificationGuidance}`
-  reference removed from the final prompt template literal.
-  `loadFullHarness` + `buildReviewPrompt` parameter types widened
-  to include `verificationGuidance`. Doc comment block above
-  `harnessRulesSection` rewritten to capture the TR_007 → TR_011
-  → TR_012 → TR_020 → TR_021 history (rules-only → STEP protocol
-  → trust-CI → HARNESS.json).
-- **`packages/agents/quality-gate/src/agents/constraint-agent.ts`** —
-  zero code changes. The agent already calls
-  `this.buildHarnessAgentSection(harnessConfig)`, which now
-  automatically renders both rules + verificationGuidance from
-  the updated helper. Project-specific guidance lands in the
-  prompt without touching constraint-agent's prompt builder.
-
-Templates + trackeros HARNESS.json:
-
-- **`templates/corporate-ops-web-mobile/harness/HARNESS.json`** —
-  new `verificationGuidance` arrays on `agentConfig['constraint-agent']`
-  (4 hints: DB-access via searchFiles, import-resolution via
-  `tsc --noEmit`, missing-dependency via package.json read,
-  console.log via searchFiles with entry-point exclusion) and
-  `agentConfig['review-agent']` (5 hints: trust-CI, DB-access
-  via searchFiles, missing-dependency via package.json,
-  evidenceless-finding downgrade, IntentSpec.outOfScope filter).
-- **`templates/corporate-ops-web-mobile/template.json`** —
-  version `0.6.0` → `0.7.0`. Boot log confirmed refresh
-  ("Refreshed built-in template (version bump), version: 0.7.0").
-- **`/Users/amrmohamed/Work/trackeros/HARNESS.json`** — same
-  `verificationGuidance` arrays added to constraint-agent +
-  review-agent blocks. Operator commit `13223d29` on trackeros
-  `main` (rebased onto upstream `3d3f8570`).
-
-Live verification — two trackeros cycles back-to-back:
-
-| Cycle | Intent | PR | Result | Wall-clock |
-|---|---|---|---|---|
-| Pre-commit | "Add a /ready endpoint..." (715567ff-…) | [#55](https://github.com/afarahat-lab/trackeros/pull/55) | ✓ deployed, single round, attempt_count=0 | ~80s |
-| Post-commit | "Add a /alive endpoint..." (87aec19c-…) | [#56](https://github.com/afarahat-lab/trackeros/pull/56) | ✓ deployed, single round, attempt_count=0 | ~80s |
-
-Cycle 1 cloned the pre-TR_021 trackeros HARNESS.json (still missing
-verificationGuidance). Gate passed cleanly anyway — confirms the
-"no behaviour change" guarantee: removing the platform's hardcoded
-verificationGuidance does NOT degrade the gate on projects that
-have not yet added the HARNESS.json entries. (Cycle 1 had
-trackeros's existing `agents.yaml` review-agent `prompt_extensions`
-with the trust-CI rule, which carries the most important
-hallucination-prevention hint regardless of where it lives.)
-
-Cycle 2 cloned the post-TR_021 trackeros HARNESS.json with the new
-verificationGuidance arrays. Direct prompt inspection confirms
-both agents now render the new section:
-
-- **review-agent prompt** — `grep "Verification guidance for this
-  project"` → 1 hit; `grep "Trust CI for build correctness"` → 1
-  hit. The TR_020 STEP 1-5 protocol content is back in the prompt,
-  now sourced from HARNESS.json instead of `.ts`.
-- **constraint-agent prompt** — `grep "Verification guidance for
-  this project"` → 1 hit. Four bullets (DB-access / import /
-  dependency / console.log) all present. constraint-agent
-  gained the configurable verificationGuidance section "for free"
-  via the shared helper, no .ts edit.
-
-Per-agent stats for cycle 2 (intent 87aec19c-…):
-
-| agent_role | runs | tokens | duration_ms |
-|---|---:|---:|---:|
-| review-agent | 1 | 10,968 | 3,228 |
-| constraint-agent | 1 | 6,375 | 3,967 |
-| code-agent (Aider) | 1 | 0 (TR_014 follow-up) | 5,112 |
-| pr-agent | 1 | — | 13,093 |
-| pipeline-agent | 1 | — | 35,825 |
-| promotion-agent | 2 | — | 5,893 (staging + production) |
-
-Token delta vs TR_020 cycle 2 (the same prompt content but
-hardcoded in .ts): review-agent ~+1.5k tokens (10,968 vs 9,428 on
-TR_020), constraint-agent ~+1.1k tokens (6,375 vs 5,272). Small
-overhead from the markdown-header noise around the new
-sub-section + slight prompt-content variance round to round. No
-hit on cycle time.
-
-Decisions made:
-
-- **Kept the platform's `severityLimitsSection` in code.** The
-  brief explicitly listed "severity cap" as a non-negotiable
-  platform mechanic. It's enforced both in prompt and in
-  `mapItemsToSignals` post-LLM downgrade — both stay.
-- **Kept the platform's `EVIDENCE_REQUIREMENT_SECTION` in code.**
-  Same — explicitly listed as platform-mechanic. The
-  parser-level `dropUnevidencedFindings` enforcement is
-  redundant-by-design (belt + braces). Both stay.
-- **constraint-agent's prompt builder unchanged.** Already used
-  the shared helper. The HARNESS.json entries flow through
-  automatically with no code change.
-- **Pushed trackeros HARNESS.json edit directly to `main`** (one
-  commit, additive only, low blast radius). This is the same
-  pattern TR_019/TR_020 used for trackeros operator fixes.
-- **Did NOT delete the trust-CI prompt extension from trackeros's
-  `agents.yaml` review-agent override** even though the same
-  guidance now lives in HARNESS.json's verificationGuidance.
-  The redundancy is intentional — operators can grep either
-  location to discover the rule, and the harness owner may
-  rotate one without intending to drop the other.
-
-Pending follow-ups (NEW from TR_021):
-
-- **(LOW)** Consider migrating the `consistencySection`
-  (cross-artifact checks: test-framework match, import
-  resolution, @types/* coverage, test-file placement) to
-  HARNESS.json verificationGuidance too. Currently still
-  hardcoded in `buildReviewPrompt`. It's borderline
-  platform-mechanic / project-specific — works fine where it
-  is, but a future test-framework-agnostic project might want
-  to tune the rules.
-
-Carryover follow-ups (status updates):
-
-- **(STILL OPEN — HIGH)** TR_018/020: restore TR_010 mandatory
-  `executeScript tsc --noEmit` code-agent rule on trackeros's
-  HARNESS.json.
-- **(STILL OPEN — MEDIUM)** TR_014: Aider token-spend capture
-  in `agent_executions.tokens_used`.
-- **(STILL OPEN — MEDIUM)** TR_019: `gestalt init` scaffold a
-  `.gitignore` + align jest/ts-jest/@types/jest with TS.
-- **(STILL OPEN — LOW)** TR_019: template `{{ciSetupSteps}}`
-  for Node/npm should add `--legacy-peer-deps`.
-- **(STILL OPEN — LOW)** TR_019: add `tsc --noEmit` sanity check
-  on scaffolded tests in `gestalt init`.
-- **(STILL OPEN — LOW)** TR_020: extend the "trust CI" rule to
-  constraint-agent's verificationGuidance. — **Now done in
-  this session** as part of the migration: the constraint-agent
-  doesn't include the trust-CI bullet today (it has its own
-  executeScript pattern), but the HARNESS.json structure now
-  makes adding it a one-line edit.
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Docker image rebuilt + container restarted once; `/health` 200
-throughout. Built-in template auto-refreshed at boot (0.6.0 →
-0.7.0). No test report needed — this is a refactor with the
-same observable behaviour as TR_020. trackeros commit
-`13223d29` pushed to `main`. Two trackeros PRs (#55 + #56) both
-squash-merged via auto-merge.
 
 
 ---

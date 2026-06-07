@@ -29,7 +29,7 @@ export class MssqlFeatureRepository implements FeatureRepository {
   ): Promise<FeatureRecord> { return notImplemented(); }
   async setCurrentPhase(_id: string, _phaseIndex: number): Promise<FeatureRecord> { return notImplemented(); }
   async createPhase(
-    _phase: Omit<FeaturePhaseRecord, 'createdAt' | 'updatedAt' | 'status' | 'intentId' | 'result'>,
+    _phase: Omit<FeaturePhaseRecord, 'createdAt' | 'updatedAt' | 'status' | 'intentId' | 'result' | 'retryCount'>,
   ): Promise<FeaturePhaseRecord> { return notImplemented(); }
   async findPhaseByIndex(_featureId: string, _phaseIndex: number): Promise<FeaturePhaseRecord | null> { return notImplemented(); }
   async listPhases(_featureId: string): Promise<FeaturePhaseRecord[]> { return notImplemented(); }
@@ -37,6 +37,7 @@ export class MssqlFeatureRepository implements FeatureRepository {
   async updatePhaseStatus(_phaseId: string, _status: PhaseStatus): Promise<FeaturePhaseRecord> { return notImplemented(); }
   async savePhaseResult(_phaseId: string, _result: unknown): Promise<FeaturePhaseRecord> { return notImplemented(); }
   async findPhaseByIntent(_intentId: string): Promise<FeaturePhaseRecord | null> { return notImplemented(); }
+  async incrementPhaseRetry(_phaseId: string): Promise<number> { return notImplemented(); }
   async appendLog(
     _entry: Omit<FeaturePlanLogRecord, 'id' | 'createdAt'>,
   ): Promise<FeaturePlanLogRecord> { return notImplemented(); }

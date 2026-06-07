@@ -196,6 +196,14 @@ export interface HarnessConfig {
     maxPhasesPerFeature: number;
     maxFilesPerPhase: number;
     architectureReviewPerPhase: boolean;
+    /**
+     * TR_022 — max retries for a single phase before the orchestrator
+     * gives up and marks the feature blocked. Default `2` when the
+     * field is absent (one initial attempt + 2 retries = 3 total
+     * attempts per phase). Set to `0` to restore pre-TR_022 behaviour
+     * (one attempt, no retries).
+     */
+    maxPhaseRetries?: number;
   };
 }
 

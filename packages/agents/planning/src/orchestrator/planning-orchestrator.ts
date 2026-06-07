@@ -78,6 +78,11 @@ type PlanningPayload =
 
 const DEFAULT_MAX_PHASES = 10;
 const DEFAULT_MAX_FILES_PER_PHASE = 5;
+// TR_022 — default phase retry budget (one initial attempt + 2
+// retries = 3 total attempts per phase). Operators tune via
+// `HARNESS.json.planner.maxPhaseRetries`. Set to 0 to restore the
+// pre-TR_022 behaviour (one attempt, no retry).
+const DEFAULT_MAX_PHASE_RETRIES = 2;
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -509,9 +514,41 @@ async function handlePlanningEvaluate(
   if (!project) throw new Error(`Project ${feature.projectId} not found`);
 
   if (!payload.intentDeployedSuccessfully) {
+    // TR_022 — honour `planner.maxPhaseRetries` (default 2). Quick
+    // shallow clone just to read HARNESS.json; on any failure we
+    // fall back to the platform default. Faster than a full clone +
+    // harness snapshot because we only need one field.
+    const maxPhaseRetries = await readMaxPhaseRetries(project, correlationId, childLog);
+    if (phase.retryCount < maxPhaseRetries) {
+      const newRetryCount = await features.incrementPhaseRetry(phase.id);
+      await features.appendLog({
+        featureId: feature.id,
+        phaseIndex: phase.phaseIndex,
+        eventType: 'phase-retry',
+        summary: `Phase ${phase.phaseIndex + 1} (${phase.title}) failed — retry ${newRetryCount}/${maxPhaseRetries}`,
+        detail: { retryCount: newRetryCount, maxPhaseRetries },
+      });
+      childLog.info(
+        { featureId: feature.id, phaseId: phase.id, retryCount: newRetryCount, maxPhaseRetries },
+        'Phase failed — retrying within budget',
+      );
+      await dispatch<PlanningPhasePayload>({
+        id: crypto.randomUUID(),
+        correlationId,
+        type: 'planning:phase',
+        sourceAgent: 'orchestrator',
+        targetAgent: 'planner-agent',
+        priority: 'normal' as TaskPriority,
+        payload: { featureId: feature.id, phaseIndex: phase.phaseIndex },
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      }, getQueueConfig());
+      return;
+    }
+
     childLog.warn(
-      { featureId: feature.id, phaseId: phase.id },
-      'Phase intent did not deploy — marking phase failed and feature blocked',
+      { featureId: feature.id, phaseId: phase.id, retryCount: phase.retryCount, maxPhaseRetries },
+      'Phase retry budget exhausted — marking phase failed and feature blocked',
     );
     await features.updatePhaseStatus(phase.id, 'failed');
     await features.updateStatus(feature.id, 'blocked');
@@ -519,8 +556,8 @@ async function handlePlanningEvaluate(
       featureId: feature.id,
       phaseIndex: phase.phaseIndex,
       eventType: 'phase-failed',
-      summary: `Phase ${phase.phaseIndex + 1} (${phase.title}) did not deploy — feature blocked`,
-      detail: null,
+      summary: `Phase ${phase.phaseIndex + 1} (${phase.title}) failed after ${maxPhaseRetries} retries — feature blocked`,
+      detail: { retryCount: phase.retryCount, maxPhaseRetries },
     });
     return;
   }
@@ -779,4 +816,42 @@ function boundsFromHarness(
     maxPhases: Math.max(1, Math.min(50, p.maxPhasesPerFeature || DEFAULT_MAX_PHASES)),
     maxFilesPerPhase: Math.max(1, Math.min(50, p.maxFilesPerPhase || DEFAULT_MAX_FILES_PER_PHASE)),
   };
+}
+
+/**
+ * TR_022 — read `planner.maxPhaseRetries` from the project's
+ * HARNESS.json. Quick shallow clone + JSON parse (no full harness
+ * snapshot needed for a single field). On ANY failure path returns
+ * `DEFAULT_MAX_PHASE_RETRIES` — the retry budget should never
+ * silently disappear because of a parse hiccup. Validates the
+ * value is a non-negative integer ≤ 10 before returning it.
+ */
+async function readMaxPhaseRetries(
+  project: { gitUrl: string; defaultBranch: string; name: string; id: string },
+  correlationId: string,
+  childLog: ReturnType<typeof createContextLogger>,
+): Promise<number> {
+  const token = await resolveProjectCredential(project as Parameters<typeof resolveProjectCredential>[0]);
+  if (!token) return DEFAULT_MAX_PHASE_RETRIES;
+
+  const workDir = await mkdtemp(join(tmpdir(), `gestalt-planning-retries-${correlationId}-`));
+  try {
+    const cloneUrl = authenticatedGitUrl(project.gitUrl, token);
+    await simpleGit().clone(cloneUrl, workDir, ['--depth=1']);
+    const raw = await readFile(join(workDir, 'HARNESS.json'), 'utf8');
+    const parsed = JSON.parse(raw) as { planner?: { maxPhaseRetries?: number } };
+    const value = parsed.planner?.maxPhaseRetries;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      return DEFAULT_MAX_PHASE_RETRIES;
+    }
+    return Math.min(10, Math.floor(value));
+  } catch (err) {
+    childLog.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'readMaxPhaseRetries fell back to default',
+    );
+    return DEFAULT_MAX_PHASE_RETRIES;
+  } finally {
+    await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+  }
 }

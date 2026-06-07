@@ -111,7 +111,7 @@ export class PostgresFeatureRepository implements FeatureRepository {
   // ── feature_phases ──────────────────────────────────────────────
 
   async createPhase(
-    phase: Omit<FeaturePhaseRecord, 'createdAt' | 'updatedAt' | 'status' | 'intentId' | 'result'>,
+    phase: Omit<FeaturePhaseRecord, 'createdAt' | 'updatedAt' | 'status' | 'intentId' | 'result' | 'retryCount'>,
   ): Promise<FeaturePhaseRecord> {
     const db = getDb();
     const [row] = await db<FeaturePhaseRecord[]>`
@@ -194,6 +194,18 @@ export class PostgresFeatureRepository implements FeatureRepository {
     return row ? this.hydratePhase(row) : null;
   }
 
+  async incrementPhaseRetry(phaseId: string): Promise<number> {
+    const db = getDb();
+    const [row] = await db<{ retryCount: number }[]>`
+      UPDATE feature_phases
+      SET retry_count = retry_count + 1, updated_at = NOW()
+      WHERE id = ${phaseId}
+      RETURNING retry_count
+    `;
+    if (!row) throw new Error(`Feature phase ${phaseId} not found`);
+    return row.retryCount;
+  }
+
   // ── feature_plan_log ────────────────────────────────────────────
 
   async appendLog(
@@ -235,6 +247,8 @@ export class PostgresFeatureRepository implements FeatureRepository {
       // already; defensive cast for older drivers.
       dependencies: Array.isArray(row.dependencies) ? row.dependencies : [],
       result: parseJsonb<unknown>(row.result, null),
+      // TR_022 — column DEFAULT 0; defensive for legacy rows / drivers.
+      retryCount: typeof row.retryCount === 'number' ? row.retryCount : 0,
     };
   }
 

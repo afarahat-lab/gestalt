@@ -73,7 +73,8 @@
       "rules": [
         "Generated code must compile without errors. Verify with executeScript before returning.",
         "All imports must resolve to files that exist in the project or are declared in package.json.",
-        "You MUST run a compile/lint check via executeScript before emitting the final files. This is not optional."
+        "You MUST run a compile/lint check via executeScript before emitting the final files. This is not optional.",
+        "Do not use require() for JSON imports — import them using ES module syntax with resolveJsonModule enabled in tsconfig."
       ]
     },
     "review-agent": {
@@ -144,7 +145,8 @@
     "enabled": true,
     "maxPhasesPerFeature": 10,
     "maxFilesPerPhase": 5,
-    "architectureReviewPerPhase": true
+    "architectureReviewPerPhase": true,
+    "maxPhaseRetries": 2
   },
   "maintenance": {
     "driftCheck":     { "enabled": true, "scheduleUtc": "0 2 * * *" },

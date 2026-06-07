@@ -85,6 +85,10 @@ export interface StackConfig {
 const DEFAULT_AGENT_PROMPT_EXTENSIONS: string[] = [
   'Always add a JSDoc comment to every exported function',
   'Use Result<T,E> pattern for error handling',
+  // TR_022 — TypeScript default stack carries this rule by default.
+  // Mirrored in `parseStackConfig` for the non-default path so every
+  // TypeScript project sees it, not just the failure-default route.
+  'Do not use require() for JSON imports — import them using ES module syntax with resolveJsonModule enabled in tsconfig.',
 ];
 
 const DEFAULT_MODULE_STRUCTURE =
@@ -271,8 +275,29 @@ Examples of ciSetupSteps for Node/npm:
 "- uses: actions/setup-node@v4\\n  with:\\n    node-version: '22'\\n- run: npm install --ci"
 
 Examples of ciSetupSteps for Python/pip:
-"- uses: actions/setup-python@v5\\n  with:\\n    python-version: '3.12'\\n- run: pip install -r requirements.txt"`;
+"- uses: actions/setup-python@v5\\n  with:\\n    python-version: '3.12'\\n- run: pip install -r requirements.txt"
+
+For TypeScript projects, tsconfig.json must always include:
+  "resolveJsonModule": true,
+  "esModuleInterop": true,
+  "allowSyntheticDefaultImports": true
+These flags prevent common import errors in generated code (e.g. require("package.json")
+or "default import" errors against CJS modules). When the language is TypeScript, include
+the rule "Use ES module syntax with resolveJsonModule for JSON imports — never require()"
+inside agentPromptExtensions so the code-agent reads it on every cycle.`;
 }
+
+/**
+ * TR_022 — guaranteed code-agent rule for TypeScript projects. The
+ * LLM prompt instructs the model to include this in
+ * `agentPromptExtensions` for TypeScript stacks, but we also
+ * inject it deterministically in `parseStackConfig` so it's
+ * present even on LLM failure paths (defaults) and even when the
+ * LLM forgets. Same rule string twice is fine — the renderer
+ * de-duplicates on exact equality below.
+ */
+const TS_JSON_IMPORT_RULE =
+  'Do not use require() for JSON imports — import them using ES module syntax with resolveJsonModule enabled in tsconfig.';
 
 /**
  * Parses the LLM response into a typed `StackConfig`. Defensive on
@@ -303,9 +328,17 @@ export function parseStackConfig(raw: string): StackConfig {
     const moduleStructure = stringOr(parsed.moduleStructure, DEFAULT_STACK_CONFIG.moduleStructure);
     const architectureNotes = stringOr(parsed.architectureNotes, DEFAULT_STACK_CONFIG.architectureNotes);
 
-    const agentPromptExtensions = Array.isArray(parsed.agentPromptExtensions)
+    const agentPromptExtensionsRaw = Array.isArray(parsed.agentPromptExtensions)
       ? parsed.agentPromptExtensions.filter((s): s is string => typeof s === 'string')
       : [];
+    // TR_022 — guarantee the JSON-import / tsconfig-flags rule for
+    // TypeScript projects even if the LLM forgot it. Exact-equality
+    // de-dupe so the rule never appears twice when the LLM did
+    // include it.
+    const isTypeScript = language.toLowerCase() === 'typescript';
+    const agentPromptExtensions = isTypeScript && !agentPromptExtensionsRaw.includes(TS_JSON_IMPORT_RULE)
+      ? [...agentPromptExtensionsRaw, TS_JSON_IMPORT_RULE]
+      : agentPromptExtensionsRaw;
 
     // The LLM emits `ciSetupSteps` with its own (often inconsistent)
     // indentation. Normalise via `indentSteps` so every line lands

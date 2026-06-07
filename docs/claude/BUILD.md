@@ -18,7 +18,7 @@ docker-compose logs -f server
 |---|---|
 | `pnpm -r build` | ✅ clean (13 packages) |
 | `docker-compose up -d` | ✅ healthy (server / postgres / redis) |
-| Migrations applied | 024 (latest: `024_features`) |
+| Migrations applied | 025 (latest: `025_feature_phase_retry`) |
 | Server reachable | `http://localhost:3000/health` returns 200 |
 | Dashboard | served at `http://localhost:3000/app/` |
 
@@ -53,6 +53,33 @@ None blocking the build. Areas to keep in mind:
 ---
 
 ## Pending operator actions
+
+### TR_022 — Scaffolding fixes + phase retry budget (migration 025)
+
+Three operator-facing changes plus a verified end-to-end retest
+of the planning loop on a 5-phase feature.
+
+- **Migration 025** — `feature_phases.retry_count INTEGER NOT NULL
+  DEFAULT 0`. Existing rows start at 0.
+- **`HarnessConfig.planner.maxPhaseRetries`** — new optional field,
+  default 2 (one initial attempt + 2 retries). Set to 0 to
+  restore pre-TR_022 single-attempt behaviour.
+- **Template HARNESS.json** — `agentConfig.code-agent.rules` gets
+  the JSON-import rule; `planner.maxPhaseRetries: 2` added.
+  Template bumped 0.8.0 → 0.9.0.
+- **`stack-config.ts`** — TypeScript stacks always carry the
+  JSON-import rule in `agentPromptExtensions` (LLM path + the
+  default-config path).
+
+trackeros migrated as part of the verify cycle:
+- `tsconfig.json` gains `resolveJsonModule` +
+  `allowSyntheticDefaultImports`.
+- `HARNESS.json` gets `code-agent.rules` JSON-import rule +
+  planner block bumped to `{10, 5, false, 2}`.
+
+**Operator action:** Existing projects can adopt the new
+`maxPhaseRetries` field by editing `HARNESS.json.planner`.
+Absent → defaults to 2 in `readMaxPhaseRetries`.
 
 ### PLANNING_LAYER — Autonomous feature decomposition (migration 024)
 

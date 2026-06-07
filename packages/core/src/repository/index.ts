@@ -580,6 +580,14 @@ export interface FeaturePhaseRecord {
   intentId: string | null;
   /** Phase-evaluator-agent's verdict JSON. Null until evaluation. */
   result: unknown | null;
+  /**
+   * TR_022 — count of retries the planning orchestrator has already
+   * dispatched for this phase. Capped at
+   * `HARNESS.json.planner.maxPhaseRetries` (default 2). Migration 025
+   * defaults the column to 0 so existing rows behave exactly as they
+   * did pre-TR_022.
+   */
+  retryCount: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -618,12 +626,19 @@ export interface FeatureRepository extends BaseRepository {
   setCurrentPhase(id: string, phaseIndex: number): Promise<FeatureRecord>;
 
   // ── feature_phases CRUD ─────────────────────────────────────────
-  createPhase(phase: Omit<FeaturePhaseRecord, 'createdAt' | 'updatedAt' | 'status' | 'intentId' | 'result'>): Promise<FeaturePhaseRecord>;
+  createPhase(phase: Omit<FeaturePhaseRecord, 'createdAt' | 'updatedAt' | 'status' | 'intentId' | 'result' | 'retryCount'>): Promise<FeaturePhaseRecord>;
   findPhaseByIndex(featureId: string, phaseIndex: number): Promise<FeaturePhaseRecord | null>;
   listPhases(featureId: string): Promise<FeaturePhaseRecord[]>;
   updatePhaseIntent(phaseId: string, intentId: string): Promise<FeaturePhaseRecord>;
   updatePhaseStatus(phaseId: string, status: PhaseStatus): Promise<FeaturePhaseRecord>;
   savePhaseResult(phaseId: string, result: unknown): Promise<FeaturePhaseRecord>;
+  /**
+   * TR_022 — atomically bumps `feature_phases.retry_count` and returns
+   * the new value. Read by the planning orchestrator on phase failure
+   * before deciding whether to re-dispatch `planning:phase` or block
+   * the feature.
+   */
+  incrementPhaseRetry(phaseId: string): Promise<number>;
   /**
    * Reverse lookup — given an intent id, find the phase row that
    * dispatched it. Used by the deploy → planning callback to walk
