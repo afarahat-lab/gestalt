@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-06 (after TEST_REPORT_018 — gate moves to post-CI per ADR-041. `lint-agent` / `security-agent` / `test-runner-agent` deleted; CI now owns lint/tests/security via the project's own tooling. Generate dispatches `deploy:pr` directly; pipeline-agent on CI-pass dispatches `gate:review` with `readFromBranch: true`; gate clones + checks out PR branch + reads source files; on pass dispatches `deploy:promotion`; on fail forwards `resumeOnBranch` so Aider's fix lands on the same PR. End-to-end chain verified live. Template bumped to 0.5.0.)
+**Last updated:** 2026-06-07 (after TEST_REPORT_019 — TR_018's ADR-041 chain end-to-end-verified against a REAL `github-actions` pipeline adapter on trackeros. 4-stage CI (Compile / Test / Lint / Security) green in 35s; pipeline-agent polls + detects pass; gate clones PR branch + reads source files; both gate agents confirmed on gpt-4o. Cycle did NOT deploy — hit a separate runaway-loop bug: gate retries 46× vs `MAX_GATE_RETRIES=3` budget (new HIGHEST follow-up). Six trackeros operator issues fixed in four `main` commits — `.gitignore` added + 9379 node_modules untracked, `gestalt.yml` workflow replaced with post-CI template, package.json scripts/jest 27→29 + `--legacy-peer-deps`, broken pre-existing tests deleted, HARNESS.json trimmed.)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -203,321 +203,157 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
-- **TR_018 ADR-041 (gate moves to post-CI) landed.**
-  `lint-agent` / `security-agent` / `test-runner-agent` deleted.
-  Generate orchestrator dispatches `deploy:pr` directly.
-  Deploy-orchestrator on `deploy:pipeline` success dispatches
-  `gate:review` with `readFromBranch: true` / `branch` /
-  `prNumber` / `prUrl` / `ciRunId`. Gate clones, fetches +
-  checks out PR branch, walks the tree for source files
-  (`readSourceFilesFromWorkDir`, capped at 200 files / 64k
-  per file). On pass dispatches `deploy:promotion` (staging);
-  on fail forwards `resumeOnBranch` to the generate retry so
-  Aider pushes the fix commit to the same PR branch (CI
-  re-triggers automatically). New `StackConfig.lintCmd`;
-  comprehensive CI template (`Compile / Test / Lint / Semgrep`);
-  template bumped 0.4.0 → 0.5.0 + refresh confirmed at boot.
-  ADR-041 documented in `docs/DECISIONS.md`. Live verification
-  (correlation `59d81261-...`): every new dispatch transition
-  fires exactly as designed (see TEST_REPORT_018.md). Cycle
-  did NOT reach `deployed` — gate caught real bugs in Aider's
-  output (unresolved import, unknown-typed error, missing
-  `user` on Request) and exhausted the retry budget. The
-  architectural change is verified end-to-end; outcome is
-  gated on Aider's code quality on this specific intent.
-- **(HIGH — new from TR_018)** Restore the TR_010 mandatory
-  `executeScript tsc --noEmit` code-agent rule on trackeros's
-  HARNESS.json. Aider's leave.routes.ts cut had real
-  TypeScript errors the gate caught; the missing self-check
-  rule meant Aider didn't catch them itself. Same rule the
-  TR_015 brief accidentally dropped.
-- **(MEDIUM — new from TR_018)** Switch trackeros's
-  `pipeline.adapter` from `noop` to `github-actions` next
-  session to exercise the new comprehensive CI workflow
-  (Compile / Test / Lint / Semgrep) end-to-end. trackeros's
-  existing committed `gestalt.yml` predates the `lintCmd`
-  substitution + the comprehensive workflow body, so the
-  switch will require pushing the new template body to
-  trackeros's `.github/workflows/gestalt.yml`.
-- **(LOW — new from TR_018)** Clean up trackeros's stale
-  `test-runner-agent` references in HARNESS.json
-  (agentConfig + qualityGate.required) + agents.yaml
-  (per-agent block). Silently ignored today; no behaviour
-  change.
-- **TR_017 constraint-agent now respects `agents.yaml`.**
-  `packages/agents/quality-gate/src/agents/constraint-
-  agent.ts` — removed the module-level `AGENT_CONFIG`
-  constant; `verify()` now resolves the config via
-  `loadAgentConfig(projectRoot, 'constraint-agent')`
-  (parallel-loaded with `loadHarnessConfig` + intent-spec
-  extraction). `buildVerificationPrompt` takes the
-  resolved config and uses `agentConfig.role` in the
-  persona line. Mirrors `llm-review-agent.ts`'s loader
-  pattern verbatim. Platform defaults
-  (`PER_ROLE_DEFAULTS['constraint-agent']`) carry the
-  original AGENT_CONFIG values so projects without an
-  `agents.yaml` block behave identically. Live
-  verification: trackeros constraint-agent
-  `model_used = 'gpt-4o'` (was `'gpt-4o-mini'` in
-  TR_016); 2.4s / 3,082 tokens (vs TR_016's 22.4s /
-  56,791 tokens — 9× faster, 18× cheaper). Second clean
-  `Status: ✓ deployed` in a row.
-- **TR_016 gate agents promoted to gpt-4o (cycle deployed
-  cleanly on round 1).** trackeros `agents.yaml` (commit
-  `9830241` on `main`) declares per-agent overrides for
-  both constraint-agent and review-agent with
-  `model: gpt-4o`, `temperature: 0.0`. Platform
-  `PER_ROLE_DEFAULTS['review-agent'].llm.temperature`
-  lowered 0.1 → 0.0 (constraint-agent was already 0.0).
-  Live verification: single round, zero signals from
-  either gate agent, gate verdict pass, cycle DEPLOYED
-  (first time on this intent shape since TR_007).
-  ~$0.046 USD — LOWER than TR_015 because the cycle
-  converged in one round despite the gpt-4o pricing.
-  Surprise: **review-agent IS gpt-4o; constraint-agent
-  is STILL gpt-4o-mini** because `constraint-agent.ts:64`
-  uses a hardcoded `AGENT_CONFIG` constant and never
-  calls `loadAgentConfig`. The cycle passed anyway
-  because the TR_015 rule clarifications + TR_013
-  evidence requirement + Aider's clean code + review-agent
-  on gpt-4o was sufficient.
-- **~~(HIGHEST — TR_016)~~ RESOLVED by TR_017.** Fix
-  constraint-agent's hardcoded `AGENT_CONFIG` — done.
-  See TR_017 entry above.
-- **(HIGH follow-up — new from TR_016)** Re-run the
-  verification on at least one more intent shape (e.g.
-  a different module, or a multi-file intent) to
-  confirm the result generalises beyond a sample size
-  of 1.
-- **TR_015 Approach A — explicit repository-pattern rule
-  wording applied.** trackeros HARNESS.json (commit
-  `ce0c01e` on `main`) and the
-  `corporate-ops-web-mobile` template (version bumped
-  `0.3.1` → `0.4.0`; refresh confirmed in server boot log)
-  both carry the new constraint-agent + review-agent rules
-  with explicit positive AND negative examples and
-  file-name patterns. Aider produced the cleanest
-  `leave.service.ts` of any cycle (proper DI). But
-  gpt-4o-mini READS the rule (its title prefix appears in
-  26/28 constraint-agent signals) and REASONS the opposite
-  (15 signals explicitly assert "pool.query in a
-  repository file is not allowed" — direct contradiction of
-  the rule's body). Cycle terminated via TR_012 Fix 3 loop
-  detector at 74% repeat rate. ~$0.087 USD.
-- **(HIGHEST follow-up — TR_015 promotes from LOW)** Switch
-  gate-agent model gpt-4o-mini → gpt-4o. Five cycles
-  (TR_011/012/013/014/015) of reading-rules-then-emitting-
-  the-opposite are sufficient evidence. Configure in
-  trackeros `agents.yaml` per-agent override: `constraint-
-  agent: { llm: { model: gpt-4o } }`, `review-agent: { llm:
-  { model: gpt-4o } }`. No platform code change needed.
-- **(HIGH follow-up — re-promoted from TR_012 by TR_015)**
-  Deterministic post-LLM filter for "pool.query in
-  *.repository.ts flagged as violation". TR_013 evidence
-  requirement gives the parser `location.file` +
-  `quotedLine` — one-line exemption catches this category.
-  Approach A alone is insufficient; this is the structural
-  belt to the gpt-4o braces.
-- **(MEDIUM follow-up — new from TR_015)** Restore the
-  TR_010 mandatory executeScript code-agent rule. The brief
-  dropped it; Aider's test file regressed the
-  `beforeEach`-import miss as a result.
-- **TR_014 Aider as a swappable code-generation backend landed.**
-  New `packages/agents/generate/src/adapters/aider-adapter.ts`
-  + `aider-message-builder.ts` + `agents/aider-code-agent.ts`.
-  Per-project opt-in via
-  `HARNESS.json.codeGeneration.backend: 'aider' | 'gestalt'`
-  (default `'gestalt'` — existing projects unaffected).
-  Aider 0.86.2 installed in the production Docker image
-  (build-deps installed via `--virtual` + removed in the
-  same layer). `LLMClient.getBaseUrl()` + `getApiKey()`
-  exposed so the adapter routes through the same
-  registry-resolved endpoint; `executeScript` gains
-  `extraEnv?: Record<string, string>` for credential
-  forwarding. Test-agent skipped under Aider mode via
-  `opts.skipAgents` merge — Aider produces tests inline.
-  trackeros opted in (`ccd99d0` on `main`). Live
-  verification (correlation `3a114a1d-...`): 8 rounds,
-  Aider 6–13s/round (vs Gestalt code-agent's 33–735s),
-  same gate-side hallucination as TR_013, terminated via
-  TR_012 Fix 3 at 77% loop-detect.
-- **TR_013 universal evidence requirement landed.** New
-  `packages/core/src/agents/evidence-requirement.ts` exports
-  `EVIDENCE_REQUIREMENT_SECTION`, `QUOTED_LINE_SCHEMA_FIELD`,
-  and `dropUnevidencedFindings<T>`. Wired into review-agent,
-  constraint-agent, and custom-agent-runner — every finding
-  now requires `quotedLine` (the exact violating line quoted
-  verbatim) and the parser drops items missing it before they
-  reach the gate. Self-healing-agent gets a softer
-  warn-when-missing variant (`evidenceQuote?: string`). Live
-  verification (correlation `59900af8-...`): 25/25 emitted
-  signals carry `Evidence: "..."` in the message; 4 findings
-  voluntarily dropped because the LLM emitted
-  `"quotedLine": ""` rather than fabricate a quote;
-  0 GOLDEN_PRINCIPLE_BREACH signals (TR_012 Fix 1 carries
-  through); TR_012 Fix 3 loop detector fires at 84% repeat
-  rate (vs 72% in TR_012). The persistent "Direct DB access"
-  finding survives — backed by REAL evidence
-  (`pool.query<LeaveRequest>(req)` from `leave.repository.ts`)
-  — because the LLM correctly quotes a real line but
-  categorically misinterprets "outside the repository pattern".
-- **TR_012 review-agent reliability fixes landed (carryover).**
-  Three platform changes (severity cap in `llm-review-agent.ts`
-  `mapItemsToSignals`; mandatory tool-first review protocol
-  in the same file's prompt; `detectRepeatedSignalLoop` +
-  escape hatch in `self-healing-loop.ts`) + one trackeros
-  operator change (`executeScript` added to
-  `review-agent.tools.builtin`, commit `3500a46`). All three
-  fixes continue to behave as in TR_012 — Fix 1 ✓
-  (0 GP_BREACH), Fix 2's scope-filter ✓ (0 audit-logging
-  false positives), Fix 3 ✓ (loop detector fires at 84%).
-- **(HIGHEST follow-up — TR_013)** Approach A on the project
-  side: tighten trackeros's HARNESS.json constraint rule
-  wording to disambiguate `pool.query` use in repositories.
-  TR_013 proves the LLM IS finding real evidence — the
-  remaining problem is categorical misinterpretation, not
-  hallucinated grounding. An unambiguous "pool.query is
-  REQUIRED in `*.repository.ts` and FORBIDDEN in
-  `*.service.ts`" rule should converge in 1 round now that
-  the LLM sees `Evidence: "..."` from prior rounds in
-  `priorSignals`. No platform code change needed for this
-  follow-up.
-- **(HIGH follow-up — TR_013)** Round-7 code-agent JSON
-  parse failure ("Expected double-quoted property name in
-  JSON at position 1001"). Separate bug — 437k tokens, 12
-  minutes, ended with malformed JSON likely from an
-  unescaped quote inside an inlined test file `content`
-  string. Investigate the code-agent's JSON-mode response
-  handling for embedded code literals.
-- **(MEDIUM follow-up — TR_013)** Both review-agent and
-  constraint-agent review files OUTSIDE the cycle's artifact
-  set. TR_011 noted this for constraint-agent; TR_013
-  confirms both read `leave.repository.ts` (pre-existing on
-  main) via `readFile` and flag it. The TR_012 scope-filter
-  is per-finding; should also bound `readFile` reach to the
-  cycle's artifact set.
-- **(LOW follow-up — TR_013)** Try switching review-agent's
-  model to gpt-4o. gpt-4o-mini behaves well under the
-  evidence requirement (voluntarily empty-quotes when
-  ungrounded) but is more likely to miscategorise; gpt-4o
-  is more likely to recognise that pool.query inside
-  `leave.repository.ts` IS the repository pattern.
-- **(DROPPED — TR_013)** TR_012's "deterministic post-LLM
-  grep filter" follow-up. The evidence requirement
-  supersedes it — instead of post-filtering with hardcoded
-  patterns, we structurally require the LLM to ground every
-  finding in a verbatim quote. Approach B is the platform
-  contract; Approach A (rule wording) finishes the job
-  project-side.
-- **executeScript invocation patterns** (TR_010/011/012/013).
-  Code-agent ~21×/round; constraint-agent 5–25×/round.
-  Review-agent: **0× across TR_011/012/013** — gpt-4o-mini
-  ignores imperative tool-call mandates. Switching to gpt-4o
-  is the next candidate experiment (LOW follow-up above).
+### TR_019 — Real GitHub Actions CI verified end-to-end
+
+ADR-041 chain verified live with a real `github-actions` pipeline
+adapter. 4-stage CI (Compile / Test / Lint / Security scan) green
+in 35s; pipeline-agent polls + detects pass; gate clones PR branch
++ reads source files; both gate agents on gpt-4o (88/88 calls).
+**Cycle did NOT deploy** — gate retry budget runaway (46 rounds vs
+`MAX_GATE_RETRIES=3`). Six trackeros operator issues fixed in four
+`main` commits. See `docs/claude/TEST_REPORT_019.md`.
+
+- **(HIGHEST — new from TR_019)** Gate retry budget not enforced.
+  `gate-orchestrator.ts:57` defines `MAX_GATE_RETRIES = 3`. Live
+  cycle ran 46 rounds. Root cause hypothesis: `retryCount` is set
+  in the new generate task payload when gate-fail dispatches retry,
+  but the count is dropped during the deploy:pr → deploy:pipeline →
+  gate:review response path. Every gate re-entry sees
+  `payload.retryCount ?? 0` → 0 → ∞. `intent.attempt_count = 0`
+  throughout (related). 0 self-healing-agent runs, so it's not the
+  gate-fail-to-self-healing path. Bisect candidate: TR_018's
+  generate→deploy:pr direct dispatch (was generate→gate:review),
+  which may have dropped retryCount threading.
+- **(HIGH — new from TR_019)** Three CI runs per push
+  (workflow_dispatch + push + pull_request) all do identical work.
+  Drop `pull_request: branches: [main]` from the template — push
+  already covers the gestalt/** branches.
+- **(MEDIUM — new from TR_019)** `gestalt init` should scaffold a
+  `.gitignore` + align jest/ts-jest/@types/jest versions with TS
+  scaffolding time. trackeros's jest@27 + TS@5 mismatch was latent
+  under `noop` and only surfaced when CI ran jest. Same scaffolding
+  should also align Node 22 across project + workflow files.
+- **(LOW — new from TR_019)** Template `{{ciSetupSteps}}` for
+  Node/npm should add `--legacy-peer-deps` on `npm install` until
+  the upstream npm arborist `Link.matches` bug is fixed.
+- **(LOW — new from TR_019)** Add a `tsc --noEmit` sanity check on
+  scaffolded tests in `gestalt init` so future meta-test debris is
+  caught before commit.
+
+### Resolved by TR_019
+
+- **~~(MEDIUM — TR_018)~~ RESOLVED.** trackeros pipeline.adapter
+  switched from `noop` to `github-actions` + autoMerge enabled.
+- **~~(LOW — TR_018)~~ RESOLVED.** Stale trackeros
+  `test-runner-agent` references removed.
+
+### Carryovers (TR_018 / TR_014)
+
+- **(HIGH — TR_018)** Restore the TR_010 mandatory `executeScript
+  tsc --noEmit` code-agent rule on trackeros's HARNESS.json. CI's
+  `Compile` step catches the same errors post-hoc but the rule
+  catches them pre-emit during Aider's generation.
+- **(MEDIUM — TR_014)** Aider token-spend visibility. Parse
+  `Tokens: N sent / M received` from Aider's stdout. code-agent
+  rows still show 0 tokens across all rounds.
+
+### Architecture follow-ups (carryover, all LOW)
+
 - **Tool-call persistence is incremental** in
-  `BaseLLMAgent.runToolLoop()` (TR_009 Fix 1). Mid-loop
-  throws preserve full tool-call logs in
-  `agent_execution_logs`.
-- **Trackeros code-agent runs on gpt-4o-mini** (trackeros
-  `9c41633`). Zero rate-limit errors; ~3× cheaper.
-- **`MAX_TOOL_CALLS` cap-inside-batch fixed + raised 10→20**
-  + pre-generation prompt block in code-prompt.ts (TR_010 Fix
-  1+2). Over-cap batches synthesise rejection responses for
-  every `tool_call_id`, then a synthesis turn with `tools: []`
-  fires so the LLM emits final text. Pre-generation prompt
-  block drives `listDirectory` to 0 across TR_011/012/013.
-- **`VALID_BUILTIN_TOOLS` includes `executeScript`** (TR_010
-  Fix 4 — latent bug; loader was silently dropping it).
-- **Empty-tools wire path is safe** (TR_010 Fix 3). When
-  `tools: []`, also drop `tool_choice` from OpenAI body.
-- **(HIGH carryover from TR_010/011/013) Review-agent
-  `result_status = 'failed'` with successful JSON output.**
-  `agent_execution_logs` row marked failed (empty
-  `error_message`) but `llm_response` is well-formed JSON
-  AND signals rows emitted. Cosmetic but blocks operator
-  triage — can't distinguish "review-agent crashed" from
-  "review-agent emitted false positives".
-- **TR_004 Fix 4 self-healing escape hatch
-  (new-violations detection)** still not exercised live.
-  TR_012's `detectRepeatedSignalLoop` (repeated-signals
-  detection) IS proven live at 72% (TR_012) and 84% (TR_013).
-  Both hatches sit in the same code path.
-- **Fix 1 (env-default apiShape) not yet live-verified** —
-  needs `LLM_MODEL=chat-latest` +
-  `platform_llms.chat-latest.api_shape='responses'`.
-- **Older test-report follow-ups** (all LOW): test-agent
-  punts on method coverage with
-  "// Additional tests can be added similarly" (TR_004);
-  IntentSpec lacks a `dependencies` block (TR_004, MEDIUM);
-  context-agent has 4 tools but never uses them (TR_002 #4).
-  Full detail in `TEST_REPORT_*.md`.
+  `BaseLLMAgent.runToolLoop()` (TR_009 Fix 1). Mid-loop throws
+  preserve full tool-call logs in `agent_execution_logs`.
+- **Review-agent `result_status='failed'` with successful JSON
+  output** (TR_010/011). Cosmetic — verdict is correct, row label
+  is wrong. Trace gate-orchestrator failure-path vs signal emit.
+- **TR_004 Fix 4 self-healing escape hatch (new-violations
+  detection)** still not exercised live. TR_012's
+  `detectRepeatedSignalLoop` IS proven live.
+- **executeScript invocation patterns** (TR_010/011/012/013).
+  Code-agent ~21×/round; constraint-agent 5–25×/round. Review-agent
+  zero in TR_011-013; the gpt-4o switch (TR_016) was supposed to
+  fix this but has not been re-verified post-TR_017.
 - **Dashboard bundle is 1010 KB raw / 319 KB gzipped** after the
-  CodeMirror addition (2026-06-04). Above Vite's 500 KB warning.
-  Future code-split via dynamic `import()` would restore the
-  main bundle to ~370 KB.
-- **Retry cycle full re-runs all generate agents** even though
-  only routed agents need fresh work. Skipping intent/design/
-  context when prior artifacts are present in the Git tip would
-  speed retries by ~30 s.
+  CodeMirror addition. Above Vite's 500 KB warning. Candidate for
+  a future code-split via dynamic `import()`.
+- **Retry cycle full re-runs all generate agents** even though only
+  routed agents need fresh work. Skipping intent/design/context
+  when prior artifacts are present in the Git tip would speed
+  retries by ~30s.
 - **`qualityGate.maxRetries` hardcoded to 3** in both gate and
-  generate orchestrators; reading it per-project from
-  HARNESS.json is a small follow-up.
-- **Promotion workflow dispatches against a hardcoded `'main'`
-  ref.** Projects on `master` / `trunk` will see promotion
-  workflow-dispatch fail. Thread `project.defaultBranch` through.
-- **No proactive PAT-scope validation at registration /
-  set-adapter time.** A PAT missing `workflow` scope only
-  surfaces on the first pipeline dispatch.
+  generate orchestrators; reading it per-project from HARNESS.json
+  is a small follow-up.
+- **Promotion workflow dispatches against a hardcoded `'main'` ref.**
+  Projects on `master` / `trunk` will see promotion workflow-dispatch
+  fail. Thread `project.defaultBranch` through.
+- **No proactive PAT-scope validation at registration / set-adapter
+  time.** A PAT missing `workflow` scope only surfaces on the first
+  pipeline dispatch.
 - **Return-URL preservation across login.** Pasting
-  `/app/intents/<id>` in a fresh tab bounces to `/app/login`
-  then lands on `/app/` (intent ID dropped).
-- **Vite dev-server proxy `/api` entry is dead** — server has
-  no routes under `/api`. Pre-existing dead config; remove on
-  next dashboard touch.
+  `/app/intents/<id>` in a fresh tab bounces to `/app/login` then
+  lands on `/app/` (intent ID dropped).
+- **Vite dev-server proxy `/api` entry is dead** — server has no
+  routes under `/api`. Pre-existing dead config; remove on next
+  dashboard touch.
 - **Encrypt Git PATs at rest in the legacy
-  `project_git_credentials` table.** Vault path is the modern
-  flow; legacy plain-token path still has the TODO comment.
+  `project_git_credentials` table.** Vault path is the modern flow;
+  legacy plain-token path still has the TODO comment.
 - **LLM model name not validated at startup** — an invalid model
   only surfaces as a 404 on the first LLM call.
 - **HA replica support for OIDC state.** Today's state is
   in-memory; multi-replica deployments would need Redis-backed
-  state so the callback can hit a different replica than the
-  login.
+  state so the callback can hit a different replica than the login.
+- **Older test-report follow-ups** (all LOW): test-agent punts on
+  method coverage with "// Additional tests can be added similarly"
+  (TR_004); IntentSpec lacks a `dependencies` block (TR_004,
+  MEDIUM); context-agent has 4 tools but never uses them (TR_002).
+- **Fix 1 (env-default apiShape) not yet live-verified** — needs
+  `LLM_MODEL=chat-latest` +
+  `platform_llms.chat-latest.api_shape='responses'`.
 
 ---
 
 ## Operator caveats / pending actions
 
-- **trackeros `.github/workflows/gestalt.yml`** still pins Node
-  20 (project bootstrapped before the 2026-06-04 Node 22 LTS
-  template change). Edit `node-version: '20'` → `'22'` + commit
-  manually. Non-breaking — Node 20 still works.
+### TR_019 trackeros state (current)
+
+- **trackeros `main` updated through 4 commits** ending at
+  `c93a12e5`. Pipeline adapter `github-actions` + autoMerge true.
+  Workflow on push (gestalt/**), pull_request (main),
+  workflow_dispatch. Comprehensive 4-stage CI (Compile / Test /
+  Lint / Security) green in 35s.
+- **trackeros stranded PR branches** from TR_019 cycles:
+  `gestalt/37bd74af-...` (PR #49 closed via gate fail),
+  `gestalt/e8da427e-...` (PR #50), `gestalt/c18dcfba-...` (PR #51),
+  `gestalt/91a108fb-...` (PR #52, the long runaway cycle). All
+  failed; manually close + delete branch when convenient.
+- **trackeros runaway alerts** from TR_019:
+  `gestalt alerts list` will show the latest. Dismissable with
+  `gestalt alerts dismiss <id>`.
+
+### Older trackeros caveats (unchanged from TR_018)
+
+- **trackeros `.github/workflows/gestalt.yml`** now uses Node 22
+  via the TR_019 replacement. Done.
 - **trackeros PR #46** — synthetic test PR opened during
   vault-credential live verification (2026-06-04). Close with
   `gh pr close 46 --repo afarahat-lab/trackeros --delete-branch`.
 - **Re-create vault secret for OpenAI API key** if the operator
-  wants vault-backed routing. The dev-override container restart
-  during ADR-023 (apiShape) verification regenerated
-  `master.key`, breaking the prior vault secret. Both LLMs are
-  currently in env-var mode and working.
-- **Synthetic trackeros branches** from live test cycles
-  (TR_002 / 003 merged; TR_004+ cycles failed at gate and
-  never pushed). Branch-name pattern: `gestalt/<correlation>-`.
-- **Open alerts to dismiss**: TR_010's `GP_BREACH` for
-  `7afa0886-…`, TR_011's `failed` for `11a08e08-…`, TR_012's
-  `gate-max-retries` for `aac73745-…`, TR_013's
-  `generate-error` for `59900af8-…`, TR_014's
-  `gate-max-retries` for `3a114a1d-…`, TR_015's
-  `gate-max-retries` for `d7d9f66f-…`. TR_016 deployed
-  cleanly — no alert.  All dismissable with
-  `gestalt alerts dismiss`.
+  wants vault-backed routing. Both LLMs currently in env-var
+  mode (`apiKeyEnv: 'LLM_API_KEY'`) and working.
+- **Synthetic trackeros branches** from older live test cycles
+  (TR_002 / 003 merged; TR_004+ failed at gate and never pushed).
+  Branch-name pattern: `gestalt/<correlation>-`.
+- **Open alerts to dismiss**: prior cycle alerts from
+  TR_010–TR_018 still in the list. All dismissable.
 - **`.env`**: `LLM_MODEL=gpt-4o` (operator default). For
   `chat-latest` routing through the registry's responses
   api_shape, see TR_003 Fix 1 follow-up.
 - **`master.key`**: now generated in the workspace root
-  (gitignored, mode 600), mounted into the container by
-  default via `docker-compose.yml` (TEST_REPORT_003 Fix 2).
-  Survives `docker compose up -d --build`.
+  (gitignored, mode 600), mounted into the container by default
+  via `docker-compose.yml` (TEST_REPORT_003 Fix 2). Survives
+  `docker compose up -d --build`.
+
+---
 
 ---
 
