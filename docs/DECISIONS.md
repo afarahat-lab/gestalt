@@ -1141,3 +1141,88 @@ and their `PER_ROLE_DEFAULTS` entries.
 - Pre-existing alerts for `gate-max-retries` continue to fire
   when retries are exhausted; the only behaviour change is that
   the retry leg now pushes to the same PR branch.
+
+---
+
+## ADR-042 — LLM prompt content belongs in HARNESS.json and agents.yaml, not in TypeScript files
+
+**Date:** 2026-06
+**Status:** Accepted
+
+**Context:**
+Early in the platform's development, LLM prompt content was
+embedded directly in TypeScript `.ts` files as string constants
+(e.g. `verificationGuidance`, `AGENT_CONFIG`, inline prompt
+templates). This created several problems:
+- Operators cannot customise agent reasoning without modifying
+  platform source code and rebuilding
+- Different projects with different stacks, languages, or
+  conventions cannot tune agent behaviour
+- Prompt improvements require code changes, reviews, and
+  deployments rather than config file edits
+- The distinction between "how the platform works" and "what
+  the platform looks for" was lost
+
+**Decision:**
+All LLM prompt content that guides agent reasoning is
+externalised to `HARNESS.json` (via `agentConfig`) and
+`agents.yaml` (via `role`, `goal`, `prompt_extensions`,
+and domain-specific guidance fields). TypeScript prompt
+files contain only platform mechanics.
+
+**The split — what goes where:**
+
+Stays in `.ts` (platform mechanics — not operator-configurable):
+- JSON response schemas (platform contracts)
+- Structural framing ("You are {role}. Goal: {goal}.")
+- Context injection placeholders
+- Evidence requirement enforcement (`EVIDENCE_REQUIREMENT_SECTION`)
+- Parsing and validation logic
+- Signal severity caps
+- Tool instruction boilerplate (`buildScriptToolInstruction`)
+
+Goes in `agents.yaml` (per-agent, operator-tunable):
+- `role` — professional title of the agent
+- `goal` — one-sentence mission statement
+- `prompt_extensions` — standing project rules appended to every prompt
+- Domain-specific guidance fields:
+  `phaseScopingRules`, `evaluationCriteria`, `architectureGuidance`
+
+Goes in `HARNESS.json agentConfig` (per-project, operator-tunable):
+- `rules` — architectural and quality rules the agent enforces
+- `verificationGuidance` — project-specific hints on how to
+  verify findings before emitting them
+- Domain-specific guidance that varies by project language,
+  framework, or architecture pattern
+
+**Rationale:**
+This separation mirrors a key principle: the platform owns HOW
+agents work (mechanics), operators own WHAT agents look for
+(domain knowledge). An operator running a Python/FastAPI project
+should be able to change agent reasoning to match their stack
+by editing HARNESS.json — not by forking the platform.
+
+This also ensures prompt improvements from real-world testing
+(e.g. the repository pattern rule clarifications from
+TEST_REPORT_013 through 016) can be captured as config changes
+rather than code changes, making them easier to apply and share
+across projects.
+
+**Consequences:**
+- All new agents must follow this split from day one
+- Existing agents are refactored to this pattern incrementally
+  as they are touched
+- `buildHarnessAgentSection()` in `BaseLLMAgent` is the single
+  injection point for HARNESS.json agent config
+- `loadAgentConfig()` is the single injection point for
+  agents.yaml config
+- Code reviews must reject any PR that adds LLM guidance text
+  directly to a `.ts` prompt file
+- The `agents.yaml` template ships with sensible defaults so
+  new projects work out of the box without editing config
+
+**Verification:**
+A `.ts` prompt file passes review if it contains no English
+prose that guides the LLM's reasoning about the project domain.
+It should read like a template with placeholders, not like
+a prompt.
