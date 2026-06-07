@@ -68,15 +68,39 @@ const CONSTRAINT_AGENT_TOOLS: AgentToolConfig = {
 };
 
 /**
- * TEST_REPORT_007 Fix 1 — review-agent now ALSO gets executeScript so
- * it can run `tsc --noEmit` to verify import resolution before
- * flagging "Import cannot be resolved" findings. The cycle's
- * cloned tree under `/tmp/gestalt-gate-<corr>-<rand>/` has
- * `node_modules/` installed by the orchestrator, so the compiler
- * sees the same view the deployed branch will.
+ * TR_020 — `executeScript` REMOVED from the default.
+ *
+ * Under ADR-041 (post-CI gate, TR_018) the gate runs AFTER CI has
+ * already verified build / tests / lint / security on the PR branch.
+ * The gate's clone under `/tmp/gestalt-gate-<corr>-<rand>/` does NOT
+ * have `node_modules/` installed (gate-orchestrator skips
+ * `npm install` to keep clone time bounded) so `tsc --noEmit` from
+ * inside the gate always fails with "Cannot find module 'typescript'"
+ * — review-agent then categorically misinterprets that as
+ * "TypeScript not installed in the project", emits a
+ * CONSTRAINT_VIOLATION, and the cycle loops (TR_020's first cycle
+ * burned 4 rounds × 83k review-agent tokens on exactly this).
+ *
+ * The platform contract under ADR-041: CI is the source of truth
+ * for compile / test / lint / security verdicts. The gate's job is
+ * architecture + intent-spec adherence, not re-running CI's checks.
+ * Operators who want executeScript in their gate can re-add it via
+ * `agents.yaml` (e.g. for projects with a working node_modules in
+ * the repo or a stack where exec is the only way to check
+ * something) — opt-in, not default.
+ *
+ * The platform's `review-agent` prompt template ALSO updated in
+ * TR_020 to instruct the LLM NOT to flag missing build tools and
+ * NOT to re-run CI-verified commands.
+ *
+ * Pre-TR_020 historical context (TR_007 Fix 1, TR_012 Fix 2):
+ * executeScript was added so review-agent could run `tsc --noEmit`
+ * itself. That made sense under the pre-CI gate (TR_017 and
+ * earlier) where the gate ran BEFORE CI and was the only quality
+ * check. Under ADR-041 the situation reversed — CI runs first.
  */
 const REVIEW_AGENT_TOOLS: AgentToolConfig = {
-  builtin: ['executeScript', 'readFile', 'searchFiles'],
+  builtin: ['readFile', 'searchFiles'],
 };
 
 /** context-fixer's pared-down set — just enough to verify the

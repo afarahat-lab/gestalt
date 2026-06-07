@@ -408,42 +408,66 @@ function buildReviewPrompt(
     `(CONSTRAINT_VIOLATION) — the gate-orchestrator's retry loop ` +
     `will still surface the finding to the code-agent.\n`;
 
-  // TR_012 Fix 2 — strict tool-first protocol replaces the advisory
-  // verification guidance. The model is told to call specific tools
-  // before reasoning; findings without tool evidence must be
-  // downgraded to severity "low" (the gate-orchestrator drops
-  // low/info from the signal stream so they don't drive retries).
+  // TR_020 — protocol rewritten for the post-CI gate (ADR-041).
+  // CI has already validated build / tests / lint / security on the
+  // PR branch before this agent runs; the gate's clone has no
+  // node_modules and no compiler tooling — running tsc / jest /
+  // eslint inside the gate would fail with infrastructure errors
+  // that the LLM consistently misinterprets as project issues
+  // (TR_020 round 1 burned 4 rounds × 83k tokens on exactly this).
+  //
+  // Trust CI. The gate's job is architectural review, not re-
+  // running CI's checks. STEP 1 is now the CI-trust statement;
+  // STEPS 2–4 are file-tool-based and unchanged from TR_012's
+  // working pattern (searchFiles + readFile).
+  //
+  // Pre-TR_020 (TR_012 Fix 2 historical): the protocol opened with
+  // a mandatory `executeScript({ command: "npx tsc --noEmit" })`
+  // call. That worked under the pre-CI gate (TR_017 and earlier)
+  // because the orchestrator left node_modules in place; under
+  // ADR-041 the clone is read-only and the call always fails.
   const verificationGuidance =
     `## Review protocol — MANDATORY SEQUENCE\n\n` +
     `You MUST follow this sequence. Do not skip steps.\n\n` +
-    `STEP 1 — Run \`tsc --noEmit\`.\n` +
-    `Call \`executeScript({ command: "npx tsc --noEmit" })\`. Record ` +
-    `the exit code and any errors. This is your primary evidence ` +
-    `for import-resolution and type-shape findings. If tsc passes, ` +
-    `do NOT emit "Import cannot be resolved" or "Type mismatch" ` +
-    `findings — the compiler disagrees and you have less evidence ` +
-    `than it does.\n\n` +
+    `STEP 1 — Trust CI's verdict on build correctness.\n` +
+    `CI ran \`build\` / \`tests\` / \`lint\` / \`security scan\` on the ` +
+    `exact code you are reviewing BEFORE you were invoked, and CI ` +
+    `passed (otherwise you would not be running). Therefore:\n` +
+    `  - Do NOT flag "Import cannot be resolved" / "Type mismatch" ` +
+    `/ "TypeScript not installed" / "Compiler not configured" — ` +
+    `the compiler ran in CI and did not complain.\n` +
+    `  - Do NOT flag missing build tools, missing test runners, ` +
+    `missing linters. The gate's clone has NO \`node_modules/\` — ` +
+    `the absence of installed tools is a property of the gate ` +
+    `environment, not the project.\n` +
+    `  - Do NOT attempt to run \`npx tsc\`, \`npm test\`, \`npm run ` +
+    `lint\`, or any other build-tool command. They will fail with ` +
+    `\`Cannot find module\` infrastructure errors that are not ` +
+    `actionable.\n\n` +
     `STEP 2 — Check for genuine direct-DB-access violations.\n` +
     `Call \`searchFiles({ pattern: "pool\\\\.query|db\\\\.query|new Pool" })\` ` +
     `and \`searchFiles({ pattern: "require\\\\(.*(pg|mysql|postgres)" })\`. ` +
     `Only flag a DB-access violation if these searches return matches ` +
-    `OUTSIDE \`src/shared/db/\` (which is the project's sanctioned ` +
-    `connection module). If the searches return zero matches in the ` +
-    `cycle's artifact set, do NOT emit a "Direct DB access in service" ` +
-    `finding.\n\n` +
+    `OUTSIDE \`src/shared/db/\` AND outside any \`*.repository.ts\` ` +
+    `file (repository files are the sanctioned location). If the ` +
+    `searches return zero qualifying matches, do NOT emit a "Direct ` +
+    `DB access in service" finding.\n\n` +
     `STEP 3 — Read \`package.json\`.\n` +
     `Call \`readFile({ path: "package.json" })\`. Do NOT flag a ` +
     `dependency as missing if it already appears in \`dependencies\`, ` +
     `\`devDependencies\`, or \`peerDependencies\`. The Project state ` +
     `section below also includes this content — cross-check both.\n\n` +
-    `STEP 4 — Only then reason about findings.\n` +
-    `Using the tool outputs from steps 1–3 as evidence, identify ` +
-    `genuine violations. A finding WITHOUT tool evidence must be ` +
-    `recorded as severity \`low\` and category \`style\` — never ` +
-    `\`high\`, never \`medium\`, never \`critical\`. The gate-orchestrator ` +
-    `drops \`low\`/\`info\` from the signal stream, so untestable ` +
-    `concerns go into the review artifact for the operator's eye ` +
-    `instead of driving a retry.\n\n` +
+    `STEP 4 — Reason about ARCHITECTURE findings only.\n` +
+    `Using STEP 2 + STEP 3 evidence + the source files in the prompt, ` +
+    `identify genuine architectural / intent-spec / constraint-rule ` +
+    `violations. Focus on: layering (services → repositories), ` +
+    `routing, dependency direction, intent-spec scope, project ` +
+    `constraint rules. NOT on: build correctness (CI handles it), ` +
+    `tool availability (irrelevant), test coverage (separate concern). ` +
+    `A finding without file-evidence (a real line from a real file) ` +
+    `must be recorded as severity \`low\` and category \`style\`. The ` +
+    `gate-orchestrator drops \`low\`/\`info\`, so weak findings stay in ` +
+    `the review artifact instead of driving a retry.\n\n` +
     `STEP 5 — Apply the scope filter.\n` +
     `Remove any finding whose subject matter appears in ` +
     `IntentSpec.outOfScope (see the "Out of scope" section below). ` +

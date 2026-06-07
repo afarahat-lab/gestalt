@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-07 (after TEST_REPORT_019 — TR_018's ADR-041 chain end-to-end-verified against a REAL `github-actions` pipeline adapter on trackeros. 4-stage CI (Compile / Test / Lint / Security) green in 35s; pipeline-agent polls + detects pass; gate clones PR branch + reads source files; both gate agents confirmed on gpt-4o. Cycle did NOT deploy — hit a separate runaway-loop bug: gate retries 46× vs `MAX_GATE_RETRIES=3` budget (new HIGHEST follow-up). Six trackeros operator issues fixed in four `main` commits — `.gitignore` added + 9379 node_modules untracked, `gestalt.yml` workflow replaced with post-CI template, package.json scripts/jest 27→29 + `--legacy-peer-deps`, broken pre-existing tests deleted, HARNESS.json trimmed.)
+**Last updated:** 2026-06-07 (after TEST_REPORT_020 — TR_019's 46-round runaway loop FIXED, CI triggers DEDUPED 3→1 per push, and the first end-to-end `Status: ✓ deployed` against the real `github-actions` adapter — 1m 58s wall-clock, single round, PR #54 squash-merged. Four fixes: (1) console.log rule scoped to business-logic files only (allow in entry-points); (2) `retryCount` threading restored through generate→deploy:pr→deploy:pipeline→gate:review chain + `ABSOLUTE_MAX_RETRIES=5` safety net + `incrementAttemptCount` on every gate retry; (3) `GitHubActionsAdapter.triggerPipeline` polls push-triggered run instead of dispatching workflow_dispatch + `pull_request` trigger dropped from template; (4) `executeScript` stripped from review-agent's default tools + STEP 1 of mandatory protocol rewritten to "trust CI" (the gate's clone has no node_modules under ADR-041; `tsc --noEmit` always failed → review-agent hallucinated "TypeScript not installed"). Template bumped 0.5.0 → 0.6.0.)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -203,49 +203,50 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
-### TR_019 — Real GitHub Actions CI verified end-to-end
+### TR_020 — Real GitHub Actions deploy works end-to-end
 
-ADR-041 chain verified live with a real `github-actions` pipeline
-adapter. 4-stage CI (Compile / Test / Lint / Security scan) green
-in 35s; pipeline-agent polls + detects pass; gate clones PR branch
-+ reads source files; both gate agents on gpt-4o (88/88 calls).
-**Cycle did NOT deploy** — gate retry budget runaway (46 rounds vs
-`MAX_GATE_RETRIES=3`). Six trackeros operator issues fixed in four
-`main` commits. See `docs/claude/TEST_REPORT_019.md`.
+trackeros's first `Status: ✓ deployed` against the real
+`github-actions` adapter — 1m 58s, single round, PR #54
+squash-merged via auto-merge. Four fixes against TR_019's runaway:
+console.log rule scope, retryCount threading + safety net, CI
+trigger dedupe (3→1 per push), executeScript stripped from
+review-agent + "trust CI" prompt. Template bumped 0.5.0 → 0.6.0.
+See `docs/claude/TEST_REPORT_020.md`.
 
-- **(HIGHEST — new from TR_019)** Gate retry budget not enforced.
-  `gate-orchestrator.ts:57` defines `MAX_GATE_RETRIES = 3`. Live
-  cycle ran 46 rounds. Root cause hypothesis: `retryCount` is set
-  in the new generate task payload when gate-fail dispatches retry,
-  but the count is dropped during the deploy:pr → deploy:pipeline →
-  gate:review response path. Every gate re-entry sees
-  `payload.retryCount ?? 0` → 0 → ∞. `intent.attempt_count = 0`
-  throughout (related). 0 self-healing-agent runs, so it's not the
-  gate-fail-to-self-healing path. Bisect candidate: TR_018's
-  generate→deploy:pr direct dispatch (was generate→gate:review),
-  which may have dropped retryCount threading.
-- **(HIGH — new from TR_019)** Three CI runs per push
-  (workflow_dispatch + push + pull_request) all do identical work.
-  Drop `pull_request: branches: [main]` from the template — push
-  already covers the gestalt/** branches.
-- **(MEDIUM — new from TR_019)** `gestalt init` should scaffold a
-  `.gitignore` + align jest/ts-jest/@types/jest versions with TS
-  scaffolding time. trackeros's jest@27 + TS@5 mismatch was latent
-  under `noop` and only surfaced when CI ran jest. Same scaffolding
-  should also align Node 22 across project + workflow files.
-- **(LOW — new from TR_019)** Template `{{ciSetupSteps}}` for
-  Node/npm should add `--legacy-peer-deps` on `npm install` until
-  the upstream npm arborist `Link.matches` bug is fixed.
-- **(LOW — new from TR_019)** Add a `tsc --noEmit` sanity check on
-  scaffolded tests in `gestalt init` so future meta-test debris is
-  caught before commit.
+### Resolved by TR_020
 
-### Resolved by TR_019
+- **~~(HIGHEST — TR_019)~~ RESOLVED.** Gate retry budget not
+  enforced — `retryCount` threading restored through
+  generate→deploy:pr→deploy:pipeline→gate:review; new
+  `ABSOLUTE_MAX_RETRIES=5` checked via persisted
+  `intent.attemptCount`; `incrementAttemptCount` now called by
+  `maybeDispatchRetry` on every retry. Verified live in TR_020
+  cycle 1: 4 rounds = 1 initial + 3 retries, then clean
+  `gate-max-retries` exit.
+- **~~(HIGH — TR_019)~~ RESOLVED.** Three CI runs per push reduced
+  to one. `GitHubActionsAdapter.triggerPipeline` polls the push-
+  triggered run instead of dispatching workflow_dispatch.
+  `pull_request: branches: [main]` removed from template.
+- **~~(HIGH — TR_017)~~ RESOLVED — broadly.** Re-verify on a
+  second intent shape — TR_017 + TR_019 + TR_020 = three distinct
+  cycle shapes across the gate.
 
-- **~~(MEDIUM — TR_018)~~ RESOLVED.** trackeros pipeline.adapter
-  switched from `noop` to `github-actions` + autoMerge enabled.
-- **~~(LOW — TR_018)~~ RESOLVED.** Stale trackeros
-  `test-runner-agent` references removed.
+### Active follow-ups (carryover or NEW from TR_020)
+
+- **(LOW — NEW from TR_020)** Consider extending the "trust CI"
+  prompt rule to constraint-agent. It doesn't currently hit the
+  same TS-compiler hallucination because its prompt doesn't open
+  with `tsc`, but a future regression could.
+- **(MEDIUM — TR_019, still relevant)** `gestalt init` should
+  scaffold a `.gitignore` + align jest/ts-jest/@types/jest
+  versions with TypeScript. trackeros's jest@27 + TS@5 mismatch
+  was latent under `noop`; same scaffolding should align Node 22.
+- **(LOW — TR_019, still relevant)** Template
+  `{{ciSetupSteps}}` for Node/npm should add `--legacy-peer-deps`
+  on `npm install` until the upstream npm arborist
+  `Link.matches` bug is fixed.
+- **(LOW — TR_019, still relevant)** Add a `tsc --noEmit` sanity
+  check on scaffolded tests in `gestalt init`.
 
 ### Carryovers (TR_018 / TR_014)
 

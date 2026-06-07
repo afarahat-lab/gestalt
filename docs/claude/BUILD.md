@@ -54,30 +54,36 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
-### TR_019 — Real GitHub Actions CI integration verified
+### TR_019 — Real GitHub Actions CI integration verified (superseded by TR_020 deploy)
 
-Architectural chain (Aider → pr-agent → GH Actions → pipeline-agent
-→ gate → promotion) verified end-to-end on trackeros's first
-`github-actions` adapter cycle. CI runs 4 stages (Compile / Test /
-Lint / Security) green in 35s; gate clones PR branch + reads source
-files; both gate agents run on gpt-4o. **Cycle did NOT deploy** —
-46 retry rounds before manual termination at ~$10 USD. See
-`docs/claude/TEST_REPORT_019.md`.
+### TR_020 — First clean github-actions deploy
 
-- **HIGHEST — TR_019:** Gate retry budget not respected. Live cycle
-  ran 46 rounds vs `MAX_GATE_RETRIES = 3`. `retryCount` is set in
-  the new generate task payload when gate-fail dispatches retry,
-  but is dropped during the deploy:pr → deploy:pipeline →
-  gate:review response path. Trace through
-  `generate-orchestrator.handleIntentTask` end-of-cycle dispatch
-  + deploy-orchestrator's pipeline-pass → gate:review dispatch +
-  the gate's next entry payload. Likely root cause: TR_018's
-  generate→deploy:pr direct dispatch dropped the retryCount
-  threading that the older generate→gate:review chain had.
-- **HIGH — TR_019:** Three CI runs per push (workflow_dispatch +
-  push + pull_request) all do identical work in 35–53s.
-  Recommend dropping `pull_request: branches: [main]` from the
-  template — push already covers it.
+trackeros's first `Status: ✓ deployed` against the real
+`github-actions` adapter: 1m 58s, single round, PR #54
+squash-merged. Four fixes against TR_019's runaway: console.log
+rule scope, retryCount threading, CI trigger dedupe (3→1),
+executeScript stripped from review-agent + "trust CI" prompt.
+Template bumped 0.5.0 → 0.6.0. See
+`docs/claude/TEST_REPORT_020.md`.
+
+**Resolved by TR_020:**
+- ~~HIGHEST — TR_019: gate retry budget not enforced~~ — fixed
+  via retryCount threading through
+  generate→deploy:pr→deploy:pipeline→gate:review +
+  `ABSOLUTE_MAX_RETRIES = 5` safety net + `incrementAttemptCount`
+  on every gate retry.
+- ~~HIGH — TR_019: 3 CI runs per push~~ — fixed via
+  `GitHubActionsAdapter.triggerPipeline` polling push-triggered
+  run + `pull_request` trigger removed from template.
+
+**New from TR_020:**
+- **LOW — TR_020:** Consider extending the "trust CI" prompt rule
+  to constraint-agent. Doesn't currently hit the same TS-compiler
+  hallucination because its prompt doesn't open with `tsc`, but a
+  future regression could.
+
+### Carryovers (TR_019 / TR_018 / TR_014)
+
 - **MEDIUM — TR_019:** `gestalt init` should scaffold a
   `.gitignore` + align jest/ts-jest/@types/jest versions with
   TypeScript. trackeros's jest@27 + TS@5 mismatch was latent
@@ -86,35 +92,20 @@ files; both gate agents run on gpt-4o. **Cycle did NOT deploy** —
   should include `--legacy-peer-deps` on `npm install` until the
   upstream npm arborist `Link.matches` bug is fixed.
 - **LOW — TR_019:** Add a `tsc --noEmit` sanity check on
-  scaffolded tests in `gestalt init` so future meta-test debris
-  is caught before commit.
-
-### TR_019 trackeros operator commits (already pushed)
-
-Four commits on trackeros `main` between `e926f7a8` and `c93a12e5`:
-- comprehensive `gestalt.yml` workflow (push trigger + 4-stage job)
-- package.json scripts + jest/ts-jest/@types/jest 27 → 29
-- HARNESS.json `qualityGate.required` trimmed; stale
-  `agentConfig['test-runner-agent']` removed
-- `npm install --legacy-peer-deps`
-- proper `.gitignore` + untrack 9,379 `node_modules/` files
-- delete 5 broken pre-existing meta-tests in `tests/unit/`
-
-### Carryovers (TR_018 / TR_017 / TR_014)
-
-- **HIGH — TR_018:** Restore TR_010 mandatory
-  `executeScript tsc --noEmit` code-agent rule on trackeros's
-  HARNESS.json (dropped per the TR_015 brief). CI's `Compile`
-  catches the same errors post-hoc, but the TR_010 rule catches
-  them pre-emit.
+  scaffolded tests in `gestalt init`.
+- **HIGH — TR_018:** Restore TR_010 mandatory `executeScript
+  tsc --noEmit` code-agent rule on trackeros's HARNESS.json.
 - **MEDIUM — TR_014:** Aider token-spend capture. Parse
   `Tokens: N sent / M received` from Aider's stdout and surface
-  as `tokens_used` on the execution row. code-agent rows still
-  show 0 across all rounds.
-- **MEDIUM — TR_018 (RESOLVED by TR_019):** Switch trackeros's
-  `pipeline.adapter` to `github-actions` — done.
-- **LOW — TR_018 (RESOLVED by TR_019):** Clean up trackeros's
-  stale `test-runner-agent` references — done.
+  as `tokens_used` on the execution row.
+
+### TR_020 trackeros operator commits (already pushed)
+
+Two commits on trackeros `main`:
+- `99a48c73` — HARNESS.json console.log rewording + gestalt.yml
+  pull_request trigger removed
+- `f926e840` — agents.yaml review-agent tools stripped +
+  trust-CI prompt extension
 
 ### Platform state caveats (unchanged)
 
