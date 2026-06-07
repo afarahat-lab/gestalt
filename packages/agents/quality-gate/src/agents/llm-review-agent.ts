@@ -329,10 +329,12 @@ async function loadProjectStateFiles(
  */
 async function loadFullHarness(
   projectRoot: string,
-): Promise<{ agentConfig?: Record<string, { rules?: string[] }> } | null> {
+): Promise<{ agentConfig?: Record<string, { rules?: string[]; verificationGuidance?: string[] }> } | null> {
   try {
     const raw = await readFile(join(projectRoot, 'HARNESS.json'), 'utf8');
-    return JSON.parse(raw) as { agentConfig?: Record<string, { rules?: string[] }> };
+    return JSON.parse(raw) as {
+      agentConfig?: Record<string, { rules?: string[]; verificationGuidance?: string[] }>;
+    };
   } catch {
     return null;
   }
@@ -347,7 +349,7 @@ function buildReviewPrompt(
   testFramework?: string,
   intentSpecOutOfScope?: string[],
   projectStateFiles?: Record<string, string>,
-  fullHarness?: { agentConfig?: Record<string, { rules?: string[] }> } | null,
+  fullHarness?: { agentConfig?: Record<string, { rules?: string[]; verificationGuidance?: string[] }> } | null,
 ): string {
   let used = 0;
   const files: string[] = [];
@@ -364,27 +366,24 @@ function buildReviewPrompt(
     `You are ${agentConfig.role} working on the Gestalt platform.\n` +
     `Your goal: ${agentConfig.goal}\n`;
 
-  // TEST_REPORT_007 Fix 1 — render the review-agent's own rules from
-  // HARNESS.json's `agentConfig['review-agent'].rules`, the
-  // `executeScript` direction, and a mandatory tool-first protocol
-  // block. These sit at the TOP of the prompt body (right after
-  // persona) so they take precedence over the golden-principles
-  // and cross-artifact checks below.
+  // TR_021 — render the review-agent's per-project rules AND
+  // verification guidance from HARNESS.json's
+  // `agentConfig['review-agent']`. `renderHarnessAgentRules` emits
+  // both sub-sections (rules + verification guidance) so the model
+  // sees the project's "WHAT to look for" hints right after the
+  // persona, ahead of the golden-principles + cross-artifact
+  // checks below. Platform mechanics (severity ceiling, evidence
+  // requirement, JSON schema) stay in code further down.
   //
-  // TEST_REPORT_012 — review-agent fixes from TR_011's 8-round
-  // hallucination cycle. TR_011 proved that TR_007's advisory
-  // "verify before flagging" block was being ignored — review-agent
-  // made 0 tool calls across 64 executions / 8 rounds. The fix:
-  //
-  //   1. (this prompt) Replace the advisory verificationGuidance
-  //      with a strict numbered protocol the model MUST follow
-  //      before reasoning about findings, plus an explicit
-  //      severity ceiling so review-agent can never claim
-  //      GP_BREACH (which by-design requires tool-verified
-  //      evidence — only the constraint-agent can produce that).
-  //   2. (mapItemsToSignals) Belt-and-braces — downgrade any
-  //      `critical` item the LLM emits anyway to `high`
-  //      (CONSTRAINT_VIOLATION), never GP_BREACH.
+  // History:
+  // - TR_007: rules-only injection (advisory).
+  // - TR_011/TR_012: added a hardcoded "MANDATORY SEQUENCE" STEP
+  //   1-5 protocol + severity-ceiling enforcement when 8 rounds of
+  //   review-agent ignored advisory guidance.
+  // - TR_020: rewrote STEP 1 to "trust CI" for the post-CI gate.
+  // - TR_021 (this): STEP 1-5 moved verbatim into
+  //   `verificationGuidance` on HARNESS.json. Severity ceiling +
+  //   the post-LLM downgrade in mapItemsToSignals remain here.
   const harnessRulesSection = renderHarnessAgentRules('review-agent', fullHarness ?? null);
   const scriptInstruction = renderScriptToolInstruction();
 
@@ -408,74 +407,14 @@ function buildReviewPrompt(
     `(CONSTRAINT_VIOLATION) — the gate-orchestrator's retry loop ` +
     `will still surface the finding to the code-agent.\n`;
 
-  // TR_020 — protocol rewritten for the post-CI gate (ADR-041).
-  // CI has already validated build / tests / lint / security on the
-  // PR branch before this agent runs; the gate's clone has no
-  // node_modules and no compiler tooling — running tsc / jest /
-  // eslint inside the gate would fail with infrastructure errors
-  // that the LLM consistently misinterprets as project issues
-  // (TR_020 round 1 burned 4 rounds × 83k tokens on exactly this).
-  //
-  // Trust CI. The gate's job is architectural review, not re-
-  // running CI's checks. STEP 1 is now the CI-trust statement;
-  // STEPS 2–4 are file-tool-based and unchanged from TR_012's
-  // working pattern (searchFiles + readFile).
-  //
-  // Pre-TR_020 (TR_012 Fix 2 historical): the protocol opened with
-  // a mandatory `executeScript({ command: "npx tsc --noEmit" })`
-  // call. That worked under the pre-CI gate (TR_017 and earlier)
-  // because the orchestrator left node_modules in place; under
-  // ADR-041 the clone is read-only and the call always fails.
-  const verificationGuidance =
-    `## Review protocol — MANDATORY SEQUENCE\n\n` +
-    `You MUST follow this sequence. Do not skip steps.\n\n` +
-    `STEP 1 — Trust CI's verdict on build correctness.\n` +
-    `CI ran \`build\` / \`tests\` / \`lint\` / \`security scan\` on the ` +
-    `exact code you are reviewing BEFORE you were invoked, and CI ` +
-    `passed (otherwise you would not be running). Therefore:\n` +
-    `  - Do NOT flag "Import cannot be resolved" / "Type mismatch" ` +
-    `/ "TypeScript not installed" / "Compiler not configured" — ` +
-    `the compiler ran in CI and did not complain.\n` +
-    `  - Do NOT flag missing build tools, missing test runners, ` +
-    `missing linters. The gate's clone has NO \`node_modules/\` — ` +
-    `the absence of installed tools is a property of the gate ` +
-    `environment, not the project.\n` +
-    `  - Do NOT attempt to run \`npx tsc\`, \`npm test\`, \`npm run ` +
-    `lint\`, or any other build-tool command. They will fail with ` +
-    `\`Cannot find module\` infrastructure errors that are not ` +
-    `actionable.\n\n` +
-    `STEP 2 — Check for genuine direct-DB-access violations.\n` +
-    `Call \`searchFiles({ pattern: "pool\\\\.query|db\\\\.query|new Pool" })\` ` +
-    `and \`searchFiles({ pattern: "require\\\\(.*(pg|mysql|postgres)" })\`. ` +
-    `Only flag a DB-access violation if these searches return matches ` +
-    `OUTSIDE \`src/shared/db/\` AND outside any \`*.repository.ts\` ` +
-    `file (repository files are the sanctioned location). If the ` +
-    `searches return zero qualifying matches, do NOT emit a "Direct ` +
-    `DB access in service" finding.\n\n` +
-    `STEP 3 — Read \`package.json\`.\n` +
-    `Call \`readFile({ path: "package.json" })\`. Do NOT flag a ` +
-    `dependency as missing if it already appears in \`dependencies\`, ` +
-    `\`devDependencies\`, or \`peerDependencies\`. The Project state ` +
-    `section below also includes this content — cross-check both.\n\n` +
-    `STEP 4 — Reason about ARCHITECTURE findings only.\n` +
-    `Using STEP 2 + STEP 3 evidence + the source files in the prompt, ` +
-    `identify genuine architectural / intent-spec / constraint-rule ` +
-    `violations. Focus on: layering (services → repositories), ` +
-    `routing, dependency direction, intent-spec scope, project ` +
-    `constraint rules. NOT on: build correctness (CI handles it), ` +
-    `tool availability (irrelevant), test coverage (separate concern). ` +
-    `A finding without file-evidence (a real line from a real file) ` +
-    `must be recorded as severity \`low\` and category \`style\`. The ` +
-    `gate-orchestrator drops \`low\`/\`info\`, so weak findings stay in ` +
-    `the review artifact instead of driving a retry.\n\n` +
-    `STEP 5 — Apply the scope filter.\n` +
-    `Remove any finding whose subject matter appears in ` +
-    `IntentSpec.outOfScope (see the "Out of scope" section below). ` +
-    `If the intent excludes "API layer", do NOT flag missing audit ` +
-    `logging on a service file. If the intent excludes "RBAC", do ` +
-    `NOT flag missing role checks. Audit logging / RBAC / error ` +
-    `middleware / input validation belong to a FUTURE intent that ` +
-    `includes the relevant layer, not this one.\n`;
+  // TR_021 — project-specific verification guidance (STEP 1-5
+  // mandatory protocol) lifted to HARNESS.json's
+  // `agentConfig['review-agent'].verificationGuidance`. The
+  // `harnessRulesSection` above now renders both rules and guidance.
+  // Platform mechanics (evidence requirement, severity ceiling,
+  // schema enforcement, parser-level dropUnevidencedFindings) stay
+  // in code — see severityLimitsSection + EVIDENCE_REQUIREMENT_SECTION
+  // below and the post-LLM downgrade in mapItemsToSignals.
 
   // Project constraint rules from HARNESS.json — checked verbatim by
   // the constraint-agent after generation; flagging them here lets
@@ -644,7 +583,7 @@ identify concerns the generate layer missed. Be specific and concrete —
 no generic advice. Only flag concerns that are actually present in the
 code below.
 ${harnessRulesSection}${scriptInstruction}${severityLimitsSection}
-${verificationGuidance}${EVIDENCE_REQUIREMENT_SECTION}${outOfScopeSection}${projectStateSection}${scaffoldingSection}${constraintsSection}${principlesSection}${consistencySection}
+${EVIDENCE_REQUIREMENT_SECTION}${outOfScopeSection}${projectStateSection}${scaffoldingSection}${constraintsSection}${principlesSection}${consistencySection}
 ## Files under review
 
 ${files.join('\n\n')}

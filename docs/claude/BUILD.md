@@ -54,33 +54,32 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
-### TR_019 — Real GitHub Actions CI integration verified (superseded by TR_020 deploy)
+### TR_021 — Externalise gate-agent verificationGuidance to HARNESS.json
+
+Refactor: STEP 1-5 verification protocol lifted from
+`llm-review-agent.ts` into
+`HARNESS.json.agentConfig[role].verificationGuidance`. Platform
+mechanics (evidence requirement, severity ceiling, JSON schema,
+parser-level dropUnevidencedFindings, ABSOLUTE_MAX_RETRIES) stay
+in code. constraint-agent gained the configurable section "for
+free" via the shared `renderHarnessAgentRules` helper. Template
+bumped 0.6.0 → 0.7.0. Two trackeros cycles deployed
+single-round (PR #55 pre-commit no-regression + PR #56
+post-commit prompt-render verified). No new migrations.
 
 ### TR_020 — First clean github-actions deploy
 
 trackeros's first `Status: ✓ deployed` against the real
 `github-actions` adapter: 1m 58s, single round, PR #54
-squash-merged. Four fixes against TR_019's runaway: console.log
-rule scope, retryCount threading, CI trigger dedupe (3→1),
-executeScript stripped from review-agent + "trust CI" prompt.
-Template bumped 0.5.0 → 0.6.0. See
-`docs/claude/TEST_REPORT_020.md`.
+squash-merged. Four fixes: console.log rule scope, retryCount
+threading, CI trigger dedupe (3→1), executeScript stripped +
+"trust CI" prompt. Template bumped 0.5.0 → 0.6.0.
 
-**Resolved by TR_020:**
-- ~~HIGHEST — TR_019: gate retry budget not enforced~~ — fixed
-  via retryCount threading through
-  generate→deploy:pr→deploy:pipeline→gate:review +
-  `ABSOLUTE_MAX_RETRIES = 5` safety net + `incrementAttemptCount`
-  on every gate retry.
-- ~~HIGH — TR_019: 3 CI runs per push~~ — fixed via
-  `GitHubActionsAdapter.triggerPipeline` polling push-triggered
-  run + `pull_request` trigger removed from template.
-
-**New from TR_020:**
-- **LOW — TR_020:** Consider extending the "trust CI" prompt rule
-  to constraint-agent. Doesn't currently hit the same TS-compiler
-  hallucination because its prompt doesn't open with `tsc`, but a
-  future regression could.
+**Resolved (structurally) by TR_021:**
+- ~~LOW — TR_020: extend "trust CI" rule to constraint-agent~~ —
+  now a one-line edit to
+  `agentConfig['constraint-agent'].verificationGuidance` in
+  HARNESS.json; no platform code change required.
 
 ### Carryovers (TR_019 / TR_018 / TR_014)
 
@@ -99,13 +98,14 @@ Template bumped 0.5.0 → 0.6.0. See
   `Tokens: N sent / M received` from Aider's stdout and surface
   as `tokens_used` on the execution row.
 
-### TR_020 trackeros operator commits (already pushed)
+### Recent trackeros operator commits (already pushed)
 
-Two commits on trackeros `main`:
-- `99a48c73` — HARNESS.json console.log rewording + gestalt.yml
-  pull_request trigger removed
-- `f926e840` — agents.yaml review-agent tools stripped +
-  trust-CI prompt extension
+- `13223d29` (TR_021) — HARNESS.json `verificationGuidance`
+  arrays added to constraint-agent + review-agent blocks.
+- `f926e840` (TR_020) — agents.yaml review-agent tools stripped
+  + trust-CI prompt extension.
+- `99a48c73` (TR_020) — HARNESS.json console.log rewording +
+  gestalt.yml pull_request trigger removed.
 
 ### Platform state caveats (unchanged)
 

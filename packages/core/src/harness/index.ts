@@ -61,9 +61,19 @@ export interface ConstraintRule {
  * TEST_REPORT_005 (executeScript-evolution) — per-agent rules section
  * on HARNESS.json. Plain-English only; the LLM decides what scripts
  * to run / files to read to verify each rule.
+ *
+ * `verificationGuidance` (TR_021) — project-specific hints about HOW
+ * to verify findings before emitting them. Examples:
+ *   - "For DB access findings: run searchFiles for 'pool.query' first"
+ *   - "For import findings: run tsc --noEmit before flagging"
+ * Renders into the prompt as a "Verification guidance for this project"
+ * block under the rules section. Supplements (does not replace) the
+ * platform's mandatory evidence requirement, severity ceiling, and
+ * JSON-schema enforcement which stay hardcoded in the agent .ts files.
  */
 export interface HarnessAgentConfig {
   rules?: string[];
+  verificationGuidance?: string[];
 }
 
 export interface HarnessConfig {

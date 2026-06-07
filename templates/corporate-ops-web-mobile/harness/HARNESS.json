@@ -61,6 +61,12 @@
         "No console.log/warn/error in business-logic files (services, repositories, controllers, routes, modules). Console statements in entry-point files (index.ts, main.ts, server.ts, app.ts, bootstrap.ts) are ACCEPTABLE for startup logging (e.g. `app.listen(PORT, () => console.log(...))`) and MUST NOT be flagged.",
         "All async functions must handle errors — no unhandled promise rejections.",
         "No hardcoded credentials or connection strings in source files."
+      ],
+      "verificationGuidance": [
+        "For direct-DB-access findings: run searchFiles with pattern 'pool\\.query|db\\.query|new Pool|createConnection' and confirm matches exist OUTSIDE src/shared/db/ AND outside any *.repository.ts file before flagging. If every match is inside a repository file or shared/db/, emit NO violation.",
+        "For import-resolution findings: run executeScript with `npx tsc --noEmit` and only flag imports the compiler explicitly reports as unresolved. Do not flag based on visual inspection alone.",
+        "For missing-dependency findings: run readFile on package.json before flagging. A dependency is not missing if it appears in dependencies, devDependencies, or peerDependencies.",
+        "For console.log findings: run searchFiles with pattern 'console\\.(log|warn|error)' and exclude matches inside entry-point files (index.ts, main.ts, server.ts, app.ts, bootstrap.ts) — startup logging there is acceptable."
       ]
     },
     "code-agent": {
@@ -77,8 +83,14 @@
         "REPOSITORY PATTERN — what is CORRECT (do NOT flag): A *.repository.ts file that calls pool.query() or db.query(). That is its purpose.",
         "REPOSITORY PATTERN — what is CORRECT (do NOT flag): A service file that imports a repository and delegates to it.",
         "REPOSITORY PATTERN — VIOLATION: Any non-repository file calling pool.query() or new Pool() directly.",
-        "Verify import resolution by running tsc --noEmit before flagging unresolved imports.",
         "Do not flag golden principle violations for concerns excluded by IntentSpec.outOfScope."
+      ],
+      "verificationGuidance": [
+        "Trust CI for build correctness. CI ran build / tests / lint / security scan on this exact code BEFORE you were invoked and passed (otherwise you would not be running). Do NOT flag 'TypeScript not installed', 'Import cannot be resolved', 'Type mismatch', missing build tools, missing test runners, or missing linters — the compiler ran in CI and did not complain. Do NOT attempt to run `npx tsc`, `npm test`, or `npm run lint`; the gate's clone has no node_modules and those calls will fail with infrastructure errors that are not actionable.",
+        "For direct-DB-access findings: run searchFiles with pattern 'pool\\.query|db\\.query|new Pool'. Only flag matches OUTSIDE src/shared/db/ AND outside any *.repository.ts file (those are the sanctioned locations). If every match is inside a repository or shared/db/, emit NO 'Direct DB access' finding.",
+        "For missing-dependency findings: run readFile on package.json first. Do not flag a dependency as missing if it already appears in dependencies, devDependencies, or peerDependencies. The Project state section also includes this content — cross-check both.",
+        "Findings without file-evidence (a real line from a real file) must be recorded as severity 'low' and category 'style'. The gate-orchestrator drops low/info findings, so weak guesses stay in the review artifact instead of driving a retry.",
+        "Apply the scope filter: skip any finding whose subject matter appears in IntentSpec.outOfScope. If the intent excludes 'API layer', do not flag missing audit logging on a service file. If the intent excludes 'RBAC', do not flag missing role checks."
       ]
     }
   },

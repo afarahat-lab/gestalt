@@ -3,6 +3,181 @@
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+### Session 2026-06-07 — Claude Code (TR_021: externalise verificationGuidance from gate-agent .ts → HARNESS.json — refactor only, two clean deploys back-to-back)
+
+Pure refactor session. The brief: lift the project-specific
+"HOW to verify findings" guidance out of the platform's gate-agent
+TypeScript files into HARNESS.json's
+`agentConfig[role].verificationGuidance`. Platform mechanics stay
+in code; domain hints become configurable per project. No
+behaviour change expected; no new migrations.
+
+What changed (code):
+
+- **`packages/core/src/harness/index.ts`** — `HarnessAgentConfig`
+  gains optional `verificationGuidance?: string[]`. Doc comment
+  explains the split: rules = WHAT to enforce; verificationGuidance
+  = HOW to verify before flagging. Platform mechanics (evidence
+  requirement, severity ceiling, JSON schema, parser-level
+  `dropUnevidencedFindings`, `ABSOLUTE_MAX_RETRIES`) stay in code.
+- **`packages/core/src/agents/base-llm-agent.ts`** —
+  `renderHarnessAgentRules` rewritten. Now emits a single
+  `## Agent configuration (from HARNESS.json)` header with two
+  sub-sections: `### Rules you must enforce` (from `.rules[]`)
+  and `### Verification guidance for this project` (from
+  `.verificationGuidance[]`). Empty when both are absent. Class
+  wrapper `buildHarnessAgentSection` signature widened to the
+  new agentCfg shape. Same call-site contract — every existing
+  caller (`code-prompt.ts`, `constraint-agent.ts`,
+  `llm-review-agent.ts`) gets verificationGuidance for free.
+- **`packages/agents/quality-gate/src/agents/llm-review-agent.ts`** —
+  the hardcoded `verificationGuidance` const (TR_020's STEP 1-5
+  MANDATORY SEQUENCE: trust-CI, searchFiles for DB access,
+  readFile package.json, architecture-only reasoning, scope
+  filter) deleted entirely (~70 lines). Its `${verificationGuidance}`
+  reference removed from the final prompt template literal.
+  `loadFullHarness` + `buildReviewPrompt` parameter types widened
+  to include `verificationGuidance`. Doc comment block above
+  `harnessRulesSection` rewritten to capture the TR_007 → TR_011
+  → TR_012 → TR_020 → TR_021 history (rules-only → STEP protocol
+  → trust-CI → HARNESS.json).
+- **`packages/agents/quality-gate/src/agents/constraint-agent.ts`** —
+  zero code changes. The agent already calls
+  `this.buildHarnessAgentSection(harnessConfig)`, which now
+  automatically renders both rules + verificationGuidance from
+  the updated helper. Project-specific guidance lands in the
+  prompt without touching constraint-agent's prompt builder.
+
+Templates + trackeros HARNESS.json:
+
+- **`templates/corporate-ops-web-mobile/harness/HARNESS.json`** —
+  new `verificationGuidance` arrays on `agentConfig['constraint-agent']`
+  (4 hints: DB-access via searchFiles, import-resolution via
+  `tsc --noEmit`, missing-dependency via package.json read,
+  console.log via searchFiles with entry-point exclusion) and
+  `agentConfig['review-agent']` (5 hints: trust-CI, DB-access
+  via searchFiles, missing-dependency via package.json,
+  evidenceless-finding downgrade, IntentSpec.outOfScope filter).
+- **`templates/corporate-ops-web-mobile/template.json`** —
+  version `0.6.0` → `0.7.0`. Boot log confirmed refresh
+  ("Refreshed built-in template (version bump), version: 0.7.0").
+- **`/Users/amrmohamed/Work/trackeros/HARNESS.json`** — same
+  `verificationGuidance` arrays added to constraint-agent +
+  review-agent blocks. Operator commit `13223d29` on trackeros
+  `main` (rebased onto upstream `3d3f8570`).
+
+Live verification — two trackeros cycles back-to-back:
+
+| Cycle | Intent | PR | Result | Wall-clock |
+|---|---|---|---|---|
+| Pre-commit | "Add a /ready endpoint..." (715567ff-…) | [#55](https://github.com/afarahat-lab/trackeros/pull/55) | ✓ deployed, single round, attempt_count=0 | ~80s |
+| Post-commit | "Add a /alive endpoint..." (87aec19c-…) | [#56](https://github.com/afarahat-lab/trackeros/pull/56) | ✓ deployed, single round, attempt_count=0 | ~80s |
+
+Cycle 1 cloned the pre-TR_021 trackeros HARNESS.json (still missing
+verificationGuidance). Gate passed cleanly anyway — confirms the
+"no behaviour change" guarantee: removing the platform's hardcoded
+verificationGuidance does NOT degrade the gate on projects that
+have not yet added the HARNESS.json entries. (Cycle 1 had
+trackeros's existing `agents.yaml` review-agent `prompt_extensions`
+with the trust-CI rule, which carries the most important
+hallucination-prevention hint regardless of where it lives.)
+
+Cycle 2 cloned the post-TR_021 trackeros HARNESS.json with the new
+verificationGuidance arrays. Direct prompt inspection confirms
+both agents now render the new section:
+
+- **review-agent prompt** — `grep "Verification guidance for this
+  project"` → 1 hit; `grep "Trust CI for build correctness"` → 1
+  hit. The TR_020 STEP 1-5 protocol content is back in the prompt,
+  now sourced from HARNESS.json instead of `.ts`.
+- **constraint-agent prompt** — `grep "Verification guidance for
+  this project"` → 1 hit. Four bullets (DB-access / import /
+  dependency / console.log) all present. constraint-agent
+  gained the configurable verificationGuidance section "for free"
+  via the shared helper, no .ts edit.
+
+Per-agent stats for cycle 2 (intent 87aec19c-…):
+
+| agent_role | runs | tokens | duration_ms |
+|---|---:|---:|---:|
+| review-agent | 1 | 10,968 | 3,228 |
+| constraint-agent | 1 | 6,375 | 3,967 |
+| code-agent (Aider) | 1 | 0 (TR_014 follow-up) | 5,112 |
+| pr-agent | 1 | — | 13,093 |
+| pipeline-agent | 1 | — | 35,825 |
+| promotion-agent | 2 | — | 5,893 (staging + production) |
+
+Token delta vs TR_020 cycle 2 (the same prompt content but
+hardcoded in .ts): review-agent ~+1.5k tokens (10,968 vs 9,428 on
+TR_020), constraint-agent ~+1.1k tokens (6,375 vs 5,272). Small
+overhead from the markdown-header noise around the new
+sub-section + slight prompt-content variance round to round. No
+hit on cycle time.
+
+Decisions made:
+
+- **Kept the platform's `severityLimitsSection` in code.** The
+  brief explicitly listed "severity cap" as a non-negotiable
+  platform mechanic. It's enforced both in prompt and in
+  `mapItemsToSignals` post-LLM downgrade — both stay.
+- **Kept the platform's `EVIDENCE_REQUIREMENT_SECTION` in code.**
+  Same — explicitly listed as platform-mechanic. The
+  parser-level `dropUnevidencedFindings` enforcement is
+  redundant-by-design (belt + braces). Both stay.
+- **constraint-agent's prompt builder unchanged.** Already used
+  the shared helper. The HARNESS.json entries flow through
+  automatically with no code change.
+- **Pushed trackeros HARNESS.json edit directly to `main`** (one
+  commit, additive only, low blast radius). This is the same
+  pattern TR_019/TR_020 used for trackeros operator fixes.
+- **Did NOT delete the trust-CI prompt extension from trackeros's
+  `agents.yaml` review-agent override** even though the same
+  guidance now lives in HARNESS.json's verificationGuidance.
+  The redundancy is intentional — operators can grep either
+  location to discover the rule, and the harness owner may
+  rotate one without intending to drop the other.
+
+Pending follow-ups (NEW from TR_021):
+
+- **(LOW)** Consider migrating the `consistencySection`
+  (cross-artifact checks: test-framework match, import
+  resolution, @types/* coverage, test-file placement) to
+  HARNESS.json verificationGuidance too. Currently still
+  hardcoded in `buildReviewPrompt`. It's borderline
+  platform-mechanic / project-specific — works fine where it
+  is, but a future test-framework-agnostic project might want
+  to tune the rules.
+
+Carryover follow-ups (status updates):
+
+- **(STILL OPEN — HIGH)** TR_018/020: restore TR_010 mandatory
+  `executeScript tsc --noEmit` code-agent rule on trackeros's
+  HARNESS.json.
+- **(STILL OPEN — MEDIUM)** TR_014: Aider token-spend capture
+  in `agent_executions.tokens_used`.
+- **(STILL OPEN — MEDIUM)** TR_019: `gestalt init` scaffold a
+  `.gitignore` + align jest/ts-jest/@types/jest with TS.
+- **(STILL OPEN — LOW)** TR_019: template `{{ciSetupSteps}}`
+  for Node/npm should add `--legacy-peer-deps`.
+- **(STILL OPEN — LOW)** TR_019: add `tsc --noEmit` sanity check
+  on scaffolded tests in `gestalt init`.
+- **(STILL OPEN — LOW)** TR_020: extend the "trust CI" rule to
+  constraint-agent's verificationGuidance. — **Now done in
+  this session** as part of the migration: the constraint-agent
+  doesn't include the trust-CI bullet today (it has its own
+  executeScript pattern), but the HARNESS.json structure now
+  makes adding it a one-line edit.
+
+Build status: `pnpm -r build` clean across all 12 packages.
+Docker image rebuilt + container restarted once; `/health` 200
+throughout. Built-in template auto-refreshed at boot (0.6.0 →
+0.7.0). No test report needed — this is a refactor with the
+same observable behaviour as TR_020. trackeros commit
+`13223d29` pushed to `main`. Two trackeros PRs (#55 + #56) both
+squash-merged via auto-merge.
+
+---
+
 ### Session 2026-06-07 — Claude Code (TEST_REPORT_020: fix TR_019 runaway loop + dedupe CI triggers — first clean github-actions deploy in 1m 58s)
 
 Three-fix session against TR_019's runaway gate loop + the 3-CI-runs-
@@ -399,221 +574,3 @@ Server `/health` 200 throughout. trackeros `main` updated through
 `docs/claude/TEST_REPORT_019.md`.
 
 ---
-### Session 2026-06-06 — Claude Code (TEST_REPORT_018: gate moves to post-CI — ADR-041; deletes lint/security/test-runner agents; new dispatch chain Aider → pr-agent → CI → gate → promotion verified end-to-end)
-
-Architectural change session. The brief: move the LLM quality
-gate from pre-push (before pr-agent opens the PR) to post-CI
-(after CI passes, before promotion-agent merges). Delete the
-three stub agents (`lint-agent`, `security-agent`,
-`test-runner-agent`) — CI now owns lint / unit-tests / security
-scan via the project's own tooling. The Gestalt LLM gate
-focuses exclusively on architectural compliance + design-spec
-adherence (constraint-agent + review-agent only). Add ADR-041
-documenting the decision.
-
-Outcome: **architectural change verified end-to-end on the
-first cycle.** Every dispatch transition in the new chain
-fires correctly. The gate-orchestrator now clones, fetches +
-checks out the PR branch, and reads source files directly from
-the working tree (`mode: branch`) rather than the artifact set
-generate carried over the queue. On a gate pass with
-`readFromBranch: true`, dispatch flips from `deploy:pr` (legacy
-path, preserved as fallback) to `deploy:promotion` (staging) —
-the rest of the deploy chain (production promotion + auto-merge)
-is unchanged. On a gate fail, `maybeDispatchRetry` now forwards
-`resumeOnBranch: payload.branch` to the generate retry leg so
-Aider's fix commit lands on the same PR branch instead of
-opening a second PR. CI re-triggers automatically on the push
-(`push: branches: ['gestalt/**']`), the gate re-runs against the
-new code.
-
-What changed (code):
-
-- **`packages/agents/quality-gate/src/agents/`** —
-  `lint-agent.ts`, `security-agent.ts`, `test-runner-agent.ts`
-  deleted. `index.ts` exports + `types.ts` `GateAgentRole`
-  union trimmed to `constraint-agent | review-agent`.
-  Unused `SecurityFinding`, `OWASPSeverity`, `TestFailure`,
-  `TestRunResult`, `runLintAgent` / `runSecurityAgent` /
-  `runTestRunnerAgent` removed.
-- **`packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`** —
-  `GateTaskPayload` gains `readFromBranch?: boolean`,
-  `branch?: string`, `prNumber?: number`, `prUrl?: string`,
-  `ciRunId?: string`. New code path between clone + GateTask
-  build: `git fetch origin <branch> && git checkout -B <branch>
-  origin/<branch>`. New `readSourceFilesFromWorkDir(projectRoot,
-  correlationId, log)` walks the tree, filters by
-  `SOURCE_FILE_EXTENSIONS` (`.ts .tsx .js .py .go .java .rs
-  .cs .rb .kt .swift` etc.), skips `node_modules` / `dist` /
-  `build` / `target` / `__pycache__` / `.venv` / etc., capped
-  at `MAX_GATE_FILES=200` / `MAX_FILE_BYTES=64k`. New
-  `dispatchPromotion(args)` helper sends `deploy:promotion`
-  (staging) with `prNumber` + `branch` + `intentText`. Pass-
-  verdict branch splits on `payload.readFromBranch` — true →
-  promotion (ADR-041), false → legacy `dispatchDeployPR` (kept
-  for in-flight pre-ADR-041 jobs). `maybeDispatchRetry`
-  forwards `resumeOnBranch` + `prNumber` + `prUrl` to the
-  generate retry leg.
-- **`packages/agents/generate/src/orchestrator/orchestrator.ts`** —
-  end of `handleIntentTask` swaps
-  `transitionIntent('in-review') + dispatch('gate:review')`
-  for a direct `dispatch('deploy:pr')`. pr-agent owns the
-  `deploying` transition. Pipeline-feedback resume context
-  (`resumeOnBranch` / `prNumber` / `prUrl`) is forwarded
-  through unchanged.
-- **`packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`** —
-  in `deploy:pipeline`'s `outcome.kind === 'passed'` branch:
-  `transitionIntent → 'in-review'` then dispatch `gate:review`
-  with `readFromBranch: true` / `branch` / `prNumber` /
-  `prUrl` / `ciRunId`. Replaces the previous direct
-  `deploy:promotion` dispatch. CI-failure self-healing branch
-  unchanged.
-- **`packages/core/src/types.ts`** — `AgentRole` loses
-  `lint-agent | security-agent | test-runner-agent`;
-  `TaskType` loses `gate:lint | gate:security |
-  gate:test-runner`.
-- **`packages/core/src/agents/agent-config-loader.ts`** —
-  `PER_ROLE_DEFAULTS['test-runner-agent']` entry +
-  `TEST_RUNNER_AGENT_TOOLS` constant removed.
-- **`packages/server/src/routes/agents.ts`** —
-  `GATE_FRAMEWORK_ROLES` becomes `{constraint-agent,
-  review-agent}`; `GATE_INFRASTRUCTURE_AGENTS` now empty.
-- **CLI + dashboard classification sets** updated
-  (`packages/cli/src/ui/execution-graph.ts`, `gate.ts`,
-  `IntentDetail.tsx`, `ProjectSettings.tsx`,
-  `ActiveAgents.tsx`).
-
-Stack config + templates:
-
-- **`packages/server/src/templates/stack-config.ts`** —
-  `StackConfig` gains `lintCmd: string`.
-  `DEFAULT_STACK_CONFIG.lintCmd = 'pnpm run lint'`. LLM
-  prompt asks for `lintCmd` with examples by stack (eslint /
-  flake8 / golangci-lint / `echo "No lint configured"`).
-- **`packages/server/src/routes/{projects,templates}.ts`** —
-  substitution + known-variable allow-list updated.
-- **`templates/corporate-ops-web-mobile/ci/gestalt.yml`** —
-  re-written comprehensively: `Compile` (`{{buildCmd}}`),
-  `Test` (`{{testCmd}}`), `Lint` (`{{lintCmd}}`),
-  `Security scan` (Semgrep auto, `continue-on-error`).
-  Triggers on `push: branches: ['gestalt/**']` +
-  `pull_request: branches: [main]` so CI runs whenever
-  pr-agent pushes.
-- **`templates/corporate-ops-web-mobile/template.json`** —
-  version `0.4.0` → `0.5.0`. Refresh confirmed in boot log
-  ("Refreshed built-in template (version bump),
-  previousVersion: 0.4.0, version: 0.5.0").
-- **`templates/corporate-ops-web-mobile/harness/HARNESS.json`**
-  — `_comment_gate` documentation field added.
-  `qualityGate.required` trimmed from
-  `[lint, typecheck, unit-tests, constraint-check,
-  security-scan]` to `[constraint-check, design-review]`.
-  `agentConfig['test-runner-agent']` block removed.
-- **`docs/DECISIONS.md`** — ADR-041 appended. Decision,
-  rationale, implementation, consequences fully documented.
-
-Live verification (correlation
-`59d81261-035b-4b6e-96d0-24a210b7fe44`, intent
-`db4810bc-...`): every dispatch transition in the new chain
-fires exactly as designed:
-
-```
-Orchestrator received intent task
-All generate steps complete, dispatching to deploy:pr (ADR-041 — gate runs post-CI)
-Deploy orchestrator received task            taskType: deploy:pr
-Pushed fix to existing branch — re-triggering pipeline
-Deploy orchestrator received task            taskType: deploy:pipeline
-Resolved pipeline adapter
-Pipeline triggered — polling for terminal status
-Pipeline status update                       (noop adapter — passed)
-Quality gate received task
-Cloning project repo for gate review
-Checked out PR branch for gate review        (NEW — ADR-041)
-Gate artifacts resolved                      mode: branch  (NEW — ADR-041)
-Gate failed — 4 CONSTRAINT_VIOLATION
-Gate fail — dispatched retry to generate queue
-Orchestrator received intent task            (retry)
-Resuming cycle on existing branch (pipeline-feedback)
-```
-
-Verification matrix:
-
-| Check | Result |
-|---|---|
-| `generate complete → deploy:pr` (NOT `gate:review`) | ✓ |
-| pipeline-agent CI-pass → `gate:review` (NOT `deploy:promotion`) | ✓ |
-| Gate clones PR branch via `git fetch + git checkout -B` | ✓ |
-| Gate loads source files from branch (`mode: branch`) | ✓ |
-| Gate-fail retry forwards `resumeOnBranch: branch` | ✓ |
-| pr-agent on retry leg pushes to existing branch | ✓ |
-| CI re-triggers automatically (noop) | ✓ |
-| `lint-agent` / `security-agent` / `test-runner-agent` no longer in agent_executions | ✓ |
-
-What didn't pass:
-
-- **Cycle did NOT reach `deployed`.** Six retry legs were
-  consumed before `gate-max-retries` fired and the intent
-  transitioned to `failed`. The new dispatch chain was the
-  whole point of the verification — it works end-to-end. The
-  gate caught **real bugs Aider's first cut left behind**
-  (unresolved `LeaveService` import, `error: unknown` not
-  narrowed, `req.user` not typed). These are accurate
-  review-agent findings, NOT the categorical hallucinations
-  TR_011-TR_015 documented — the rule-clarity + evidence-
-  requirement work from prior reports holds. The cycle
-  outcome is gated on Aider's code quality on this specific
-  intent, not on the architectural change.
-- Per-leg shape: `pr-agent (12s) → pipeline-agent (9s, noop
-  CI pass) → constraint-agent (2-4s, pass) → review-agent
-  (5-9s, fail with 3-9 real findings)`. Each leg ~30s of
-  agent time + ~10s of clone overhead.
-
-Decisions made:
-
-- **Preserved legacy pre-CI gate path
-  (`readFromBranch: false`) as a fallback.** Any in-flight
-  pre-ADR-041 BullMQ jobs queued before this deploy still
-  complete correctly via `dispatchDeployPR` on a pass.
-- **Did NOT modify trackeros's HARNESS.json or agents.yaml
-  in this session.** trackeros still carries
-  `agentConfig['test-runner-agent']` rules + an `agents.yaml`
-  `test-runner-agent` block. The platform silently ignores
-  these now (no role mapping); operators can clean up
-  opportunistically.
-- **Did NOT switch trackeros's pipeline adapter from `noop`
-  to `github-actions`.** That would have exercised the real
-  CI workflow (build + test + lint + Semgrep). Out of scope
-  for the architectural-change verification; the noop adapter
-  proves the dispatch chain end-to-end.
-
-Pending follow-ups (priority-shifted by TR_018):
-
-- **(HIGH — new)** Aider's leave.routes.ts cut has real
-  TypeScript errors (unresolved `LeaveService` import,
-  unknown-typed `error`, missing `user` on Request). The
-  TR_010 mandatory `executeScript tsc --noEmit` code-agent
-  rule (dropped in TR_015's trackeros brief) would have
-  caught these before the gate. Restore the rule on
-  trackeros's HARNESS.json next session.
-- **(MEDIUM — new)** trackeros's `pipeline.adapter` is
-  `noop`. Switch to `github-actions` next session to verify
-  the CI workflow end-to-end (Compile / Test / Lint /
-  Semgrep). Will need to push the `lintCmd` substitution
-  through too — trackeros's existing CI workflow predates
-  the lintCmd field.
-- **(LOW — new)** Clean up trackeros's stale
-  `test-runner-agent` references in HARNESS.json +
-  agents.yaml + qualityGate.required.
-
-Build status: `pnpm -r build` clean across all 12 packages.
-Docker image rebuilt + container restarted; `/health` 200
-throughout. Built-in template auto-refreshed at boot
-(0.4.0 → 0.5.0). New file `docs/claude/TEST_REPORT_018.md`.
-**This is the largest architectural change since the
-self-healing loop landed in migration 020** — gate moved a
-full layer downstream + three stub agents deleted +
-end-to-end dispatch chain rewired. Zero migrations needed.
-
----
-
-

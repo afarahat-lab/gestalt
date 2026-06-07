@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-07 (after TEST_REPORT_020 — TR_019's 46-round runaway loop FIXED, CI triggers DEDUPED 3→1 per push, and the first end-to-end `Status: ✓ deployed` against the real `github-actions` adapter — 1m 58s wall-clock, single round, PR #54 squash-merged. Four fixes: (1) console.log rule scoped to business-logic files only (allow in entry-points); (2) `retryCount` threading restored through generate→deploy:pr→deploy:pipeline→gate:review chain + `ABSOLUTE_MAX_RETRIES=5` safety net + `incrementAttemptCount` on every gate retry; (3) `GitHubActionsAdapter.triggerPipeline` polls push-triggered run instead of dispatching workflow_dispatch + `pull_request` trigger dropped from template; (4) `executeScript` stripped from review-agent's default tools + STEP 1 of mandatory protocol rewritten to "trust CI" (the gate's clone has no node_modules under ADR-041; `tsc --noEmit` always failed → review-agent hallucinated "TypeScript not installed"). Template bumped 0.5.0 → 0.6.0.)
+**Last updated:** 2026-06-07 (after TR_021 — externalised the gate-agent verificationGuidance from `.ts` files into HARNESS.json's `agentConfig[role].verificationGuidance`. Pure refactor; platform mechanics (evidence requirement, severity ceiling, JSON schema, parser-level dropUnevidencedFindings, ABSOLUTE_MAX_RETRIES) stay in code; project-specific "how to verify before flagging" hints become configurable per project. constraint-agent gained the new section "for free" via the shared helper. Two trackeros cycles back-to-back both `Status: ✓ deployed` single-round: PR #55 (pre-commit, no-regression check on old HARNESS.json) and PR #56 (post-commit, both gate agents render the new `Verification guidance for this project` block — direct prompt inspection confirms). Template bumped 0.6.0 → 0.7.0.)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 023 (latest: `023_llm_api_shape`)
 
@@ -203,6 +203,19 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
+### TR_021 — Externalise verificationGuidance to HARNESS.json
+
+Pure refactor: the project-specific "HOW to verify before
+flagging" hints lifted out of `llm-review-agent.ts` and into
+`HARNESS.json.agentConfig[role].verificationGuidance`. Platform
+mechanics (evidence requirement, severity ceiling, JSON schema,
+parser-level enforcement, ABSOLUTE_MAX_RETRIES) stay in code.
+constraint-agent gained the configurable section "for free"
+via the shared `renderHarnessAgentRules` helper. Two trackeros
+cycles back-to-back both deployed single-round
+(PR #55 pre-commit, PR #56 post-commit). Template
+bumped 0.6.0 → 0.7.0.
+
 ### TR_020 — Real GitHub Actions deploy works end-to-end
 
 trackeros's first `Status: ✓ deployed` against the real
@@ -231,12 +244,21 @@ See `docs/claude/TEST_REPORT_020.md`.
   second intent shape — TR_017 + TR_019 + TR_020 = three distinct
   cycle shapes across the gate.
 
-### Active follow-ups (carryover or NEW from TR_020)
+### Active follow-ups (carryover or NEW)
 
-- **(LOW — NEW from TR_020)** Consider extending the "trust CI"
-  prompt rule to constraint-agent. It doesn't currently hit the
-  same TS-compiler hallucination because its prompt doesn't open
-  with `tsc`, but a future regression could.
+- **(LOW — NEW from TR_021)** Consider migrating the
+  `consistencySection` block (cross-artifact checks:
+  test-framework match, import resolution, @types/* coverage,
+  test-file placement) out of `llm-review-agent.ts`'s
+  `buildReviewPrompt` into HARNESS.json verificationGuidance.
+  Borderline platform-mechanic / project-specific; works fine
+  in code today but a non-Node project might want to tune it.
+- **(LOW — NEW from TR_021, structurally addressed)** The TR_020
+  "extend trust-CI to constraint-agent" item is now a one-line
+  edit to `agentConfig['constraint-agent'].verificationGuidance`
+  in HARNESS.json. Not added in TR_021 because constraint-agent
+  doesn't currently hit the hallucination; documented here so
+  the next regression can be fixed without a code change.
 - **(MEDIUM — TR_019, still relevant)** `gestalt init` should
   scaffold a `.gitignore` + align jest/ts-jest/@types/jest
   versions with TypeScript. trackeros's jest@27 + TS@5 mismatch
@@ -258,103 +280,61 @@ See `docs/claude/TEST_REPORT_020.md`.
   `Tokens: N sent / M received` from Aider's stdout. code-agent
   rows still show 0 tokens across all rounds.
 
-### Architecture follow-ups (carryover, all LOW)
+### Architecture follow-ups (all LOW unless marked)
 
-- **Tool-call persistence is incremental** in
-  `BaseLLMAgent.runToolLoop()` (TR_009 Fix 1). Mid-loop throws
-  preserve full tool-call logs in `agent_execution_logs`.
-- **Review-agent `result_status='failed'` with successful JSON
-  output** (TR_010/011). Cosmetic — verdict is correct, row label
-  is wrong. Trace gate-orchestrator failure-path vs signal emit.
-- **TR_004 Fix 4 self-healing escape hatch (new-violations
-  detection)** still not exercised live. TR_012's
-  `detectRepeatedSignalLoop` IS proven live.
-- **executeScript invocation patterns** (TR_010/011/012/013).
-  Code-agent ~21×/round; constraint-agent 5–25×/round. Review-agent
-  zero in TR_011-013; the gpt-4o switch (TR_016) was supposed to
-  fix this but has not been re-verified post-TR_017.
-- **Dashboard bundle is 1010 KB raw / 319 KB gzipped** after the
-  CodeMirror addition. Above Vite's 500 KB warning. Candidate for
-  a future code-split via dynamic `import()`.
-- **Retry cycle full re-runs all generate agents** even though only
-  routed agents need fresh work. Skipping intent/design/context
-  when prior artifacts are present in the Git tip would speed
-  retries by ~30s.
-- **`qualityGate.maxRetries` hardcoded to 3** in both gate and
-  generate orchestrators; reading it per-project from HARNESS.json
-  is a small follow-up.
-- **Promotion workflow dispatches against a hardcoded `'main'` ref.**
-  Projects on `master` / `trunk` will see promotion workflow-dispatch
-  fail. Thread `project.defaultBranch` through.
-- **No proactive PAT-scope validation at registration / set-adapter
-  time.** A PAT missing `workflow` scope only surfaces on the first
-  pipeline dispatch.
-- **Return-URL preservation across login.** Pasting
-  `/app/intents/<id>` in a fresh tab bounces to `/app/login` then
-  lands on `/app/` (intent ID dropped).
-- **Vite dev-server proxy `/api` entry is dead** — server has no
-  routes under `/api`. Pre-existing dead config; remove on next
-  dashboard touch.
-- **Encrypt Git PATs at rest in the legacy
-  `project_git_credentials` table.** Vault path is the modern flow;
-  legacy plain-token path still has the TODO comment.
-- **LLM model name not validated at startup** — an invalid model
-  only surfaces as a 404 on the first LLM call.
-- **HA replica support for OIDC state.** Today's state is
-  in-memory; multi-replica deployments would need Redis-backed
-  state so the callback can hit a different replica than the login.
-- **Older test-report follow-ups** (all LOW): test-agent punts on
-  method coverage with "// Additional tests can be added similarly"
-  (TR_004); IntentSpec lacks a `dependencies` block (TR_004,
-  MEDIUM); context-agent has 4 tools but never uses them (TR_002).
-- **Fix 1 (env-default apiShape) not yet live-verified** — needs
-  `LLM_MODEL=chat-latest` +
-  `platform_llms.chat-latest.api_shape='responses'`.
+- Tool-call persistence is incremental in
+  `BaseLLMAgent.runToolLoop()` (TR_009 Fix 1).
+- Review-agent `result_status='failed'` with successful JSON
+  output (TR_010/011). Cosmetic only; verdict correct.
+- TR_004 Fix 4 self-healing escape hatch not exercised live.
+- executeScript invocation patterns (TR_010-013): code-agent
+  ~21×/round; review-agent zero post-TR_017 (not re-verified).
+- Dashboard bundle 1010 KB raw / 319 KB gzipped — code-split
+  via dynamic `import()`.
+- Retry cycle full re-runs all generate agents — skip
+  intent/design/context when artifacts in Git tip.
+- `qualityGate.maxRetries` hardcoded to 3 — read per-project.
+- Promotion workflow dispatches against hardcoded `'main'` ref.
+  Projects on `master` / `trunk` will fail. Thread
+  `project.defaultBranch` through.
+- No proactive PAT-scope validation at registration.
+- Return-URL preservation across login (intent ID dropped).
+- Vite dev-server proxy `/api` entry is dead config.
+- Encrypt Git PATs at rest in legacy `project_git_credentials`.
+- LLM model name not validated at startup.
+- HA replica support for OIDC state (in-memory today).
+- (MEDIUM, TR_004) test-agent punts on method coverage;
+  IntentSpec lacks `dependencies` block; context-agent has 4
+  tools but never uses them (TR_002).
+- TR_003 Fix 1 (env-default apiShape) not yet live-verified.
 
 ---
 
 ## Operator caveats / pending actions
 
-### TR_019 trackeros state (current)
+### trackeros state (current)
 
-- **trackeros `main` updated through 4 commits** ending at
-  `c93a12e5`. Pipeline adapter `github-actions` + autoMerge true.
-  Workflow on push (gestalt/**), pull_request (main),
-  workflow_dispatch. Comprehensive 4-stage CI (Compile / Test /
-  Lint / Security) green in 35s.
-- **trackeros stranded PR branches** from TR_019 cycles:
-  `gestalt/37bd74af-...` (PR #49 closed via gate fail),
-  `gestalt/e8da427e-...` (PR #50), `gestalt/c18dcfba-...` (PR #51),
-  `gestalt/91a108fb-...` (PR #52, the long runaway cycle). All
-  failed; manually close + delete branch when convenient.
-- **trackeros runaway alerts** from TR_019:
-  `gestalt alerts list` will show the latest. Dismissable with
-  `gestalt alerts dismiss <id>`.
-
-### Older trackeros caveats (unchanged from TR_018)
-
-- **trackeros `.github/workflows/gestalt.yml`** now uses Node 22
-  via the TR_019 replacement. Done.
-- **trackeros PR #46** — synthetic test PR opened during
-  vault-credential live verification (2026-06-04). Close with
-  `gh pr close 46 --repo afarahat-lab/trackeros --delete-branch`.
+- **trackeros `main`** at commit `13223d29` (TR_021
+  HARNESS.json verificationGuidance added). Pipeline adapter
+  `github-actions` + autoMerge true. Workflow triggers: push
+  (gestalt/**) + workflow_dispatch. 4-stage CI (Compile / Test
+  / Lint / Security) green in ~35s.
+- **Stranded PR branches** from TR_019 failed cycles (PRs #49–#52)
+  remain. Close with `gh pr close <#> --delete-branch` when
+  convenient. TR_020+TR_021 PRs (#54–#56) all merged.
+- **trackeros PR #46** synthetic test PR (2026-06-04) — close
+  with `gh pr close 46 --repo afarahat-lab/trackeros --delete-branch`.
 - **Re-create vault secret for OpenAI API key** if the operator
   wants vault-backed routing. Both LLMs currently in env-var
   mode (`apiKeyEnv: 'LLM_API_KEY'`) and working.
-- **Synthetic trackeros branches** from older live test cycles
-  (TR_002 / 003 merged; TR_004+ failed at gate and never pushed).
-  Branch-name pattern: `gestalt/<correlation>-`.
-- **Open alerts to dismiss**: prior cycle alerts from
-  TR_010–TR_018 still in the list. All dismissable.
-- **`.env`**: `LLM_MODEL=gpt-4o` (operator default). For
-  `chat-latest` routing through the registry's responses
-  api_shape, see TR_003 Fix 1 follow-up.
-- **`master.key`**: now generated in the workspace root
-  (gitignored, mode 600), mounted into the container by default
-  via `docker-compose.yml` (TEST_REPORT_003 Fix 2). Survives
-  `docker compose up -d --build`.
-
----
+- **Open alerts to dismiss**: cycle alerts from TR_010–TR_019.
+  Dismissable with `gestalt alerts dismiss <id>`.
+- **`.env`**: `LLM_MODEL=gpt-4o` (operator default).
+- **`master.key`** generated locally (workspace root, mode 600,
+  gitignored) + mounted into the container via
+  `docker-compose.yml`. Survives `docker compose up -d --build`.
+  Back up out-of-band; losing it makes every vault-encrypted
+  secret unreadable.
 
 ---
 

@@ -108,8 +108,15 @@ const TOOL_OUTPUT_LOG_TRUNCATE = 500;
 
 /**
  * TEST_REPORT_005 / TEST_REPORT_007 evolution — render the per-agent
- * rules section from `HARNESS.json.agentConfig[role].rules` as a
- * plain-text markdown block.
+ * rules section from `HARNESS.json.agentConfig[role]` as a plain-text
+ * markdown block. Includes two sub-sections:
+ *
+ *   - "Rules you must enforce" — from `.rules[]`
+ *   - "Verification guidance for this project" — from
+ *     `.verificationGuidance[]` (TR_021). Project-specific hints
+ *     about HOW to verify findings before emitting them. Platform
+ *     mechanics (evidence requirement, severity ceiling, JSON
+ *     schema) stay in the agent .ts files.
  *
  * Standalone (not on the class) because function-based prompt
  * builders (`code-prompt.ts`, etc.) need to call it without a
@@ -117,20 +124,37 @@ const TOOL_OUTPUT_LOG_TRUNCATE = 500;
  * delegates here.
  *
  * Returns the empty string when the project hasn't declared rules
- * for the given role — callers concatenate unconditionally.
+ * OR guidance for the given role — callers concatenate
+ * unconditionally.
  */
 export function renderHarnessAgentRules(
   agentRole: string,
-  harnessConfig: { agentConfig?: Record<string, { rules?: string[] }> } | null | undefined,
+  harnessConfig:
+    | { agentConfig?: Record<string, { rules?: string[]; verificationGuidance?: string[] }> }
+    | null
+    | undefined,
 ): string {
   const cfg = harnessConfig?.agentConfig?.[agentRole];
-  if (!cfg?.rules || cfg.rules.length === 0) return '';
-  return [
-    '## Rules you must enforce (from HARNESS.json)',
-    '',
-    ...cfg.rules.map((r) => `- ${r}`),
-    '',
-  ].join('\n');
+  const hasRules = !!cfg?.rules && cfg.rules.length > 0;
+  const hasGuidance = !!cfg?.verificationGuidance && cfg.verificationGuidance.length > 0;
+  if (!hasRules && !hasGuidance) return '';
+
+  const parts: string[] = ['## Agent configuration (from HARNESS.json)', ''];
+
+  if (hasRules) {
+    parts.push('### Rules you must enforce');
+    cfg!.rules!.forEach((r) => parts.push(`- ${r}`));
+    parts.push('');
+  }
+
+  if (hasGuidance) {
+    parts.push('### Verification guidance for this project');
+    parts.push('When verifying findings, use these project-specific hints:');
+    cfg!.verificationGuidance!.forEach((g) => parts.push(`- ${g}`));
+    parts.push('');
+  }
+
+  return parts.join('\n');
 }
 
 /**
@@ -529,7 +553,10 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
    * `renderHarnessAgentRules(roleName, harnessConfig)` directly.
    */
   protected buildHarnessAgentSection(
-    harnessConfig: { agentConfig?: Record<string, { rules?: string[] }> } | null | undefined,
+    harnessConfig:
+      | { agentConfig?: Record<string, { rules?: string[]; verificationGuidance?: string[] }> }
+      | null
+      | undefined,
   ): string {
     return renderHarnessAgentRules(this.agentRole, harnessConfig);
   }
