@@ -463,6 +463,29 @@ export async function projectConfigSetPipelineCommand(
   }
 }
 
+// ADR-051 / TR_027 — regenerate `.pr_agent.toml` from the project's
+// current HARNESS.json and push to the default branch.
+export async function projectConfigPushPrAgentConfigCommand(
+  options: BaseOptions = {},
+): Promise<void> {
+  const ctx = await openClient(options);
+  if (!ctx) return;
+  const { client, projectId, projectName, serverUrl } = ctx;
+  try {
+    const res = await client.pushPrAgentConfig(projectId);
+    blank();
+    if (res.data.changed) {
+      console.log(c.success(`✓ .pr_agent.toml regenerated + pushed for ${projectName}`));
+      if (res.data.commitSha) console.log(c.dim(`  commit ${res.data.commitSha.slice(0, 8)}`));
+    } else {
+      console.log(c.dim(`.pr_agent.toml already up-to-date — no commit needed`));
+    }
+    blank();
+  } catch (err) {
+    handleErr(err, serverUrl, 'Failed to push .pr_agent.toml');
+  }
+}
+
 // ─── members ─────────────────────────────────────────────────────────────────
 
 export async function projectMembersListCommand(options: BaseOptions = {}): Promise<void> {

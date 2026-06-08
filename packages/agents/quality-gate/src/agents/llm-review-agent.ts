@@ -1,4 +1,12 @@
 /**
+ * @deprecated TR_027 / ADR-051 — replaced by CodiumAI PR-Agent for
+ * GitHub Actions pipelines. Retained as a fallback for `noop`,
+ * Azure DevOps, GitLab CI, and Jenkins pipeline adapters, and for
+ * projects that explicitly disable PR-Agent. The gate orchestrator
+ * skips this agent when
+ * `HARNESS.json.prAgent.enabled === true` AND
+ * `HARNESS.json.pipeline.adapter === 'github-actions'`.
+ *
  * LLM review agent — qualitative code review.
  *
  * Sends the artifact set to the platform LLM with a structured-output

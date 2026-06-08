@@ -17,7 +17,7 @@
  *   - Audit records (GP-002) are written for create + init-harness
  */
 
-import { mkdtemp, rm, writeFile, mkdir } from 'fs/promises';
+import { mkdtemp, rm, writeFile, mkdir, readFile } from 'fs/promises';
 import { join, dirname } from 'path';
 import { tmpdir } from 'os';
 import { simpleGit, type SimpleGit } from 'simple-git';
@@ -25,12 +25,13 @@ import type { FastifyInstance } from 'fastify';
 import {
   getRepositories, createContextLogger,
   resolveProjectCredential, encryptSecret,
-  type ProjectRecord,
+  type ProjectRecord, type HarnessConfig,
 } from '@gestalt/core';
 import { requireRole, checkProjectMembership } from '../auth/middleware';
 import { getMasterKey } from '../secrets/index';
 import { loadTemplate, resolveTemplatesDir } from '../templates/engine';
 import { generateStackConfig } from '../templates/stack-config';
+import { generatePrAgentToml } from '../templates/pr-agent-toml';
 import { applyPipelinePatch } from './project-config';
 import { emitLiveEvent } from '../events';
 
@@ -713,6 +714,25 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
           await writeFile(fullPath, file.content, 'utf8');
         }
 
+        // ADR-051 / TR_027 — render `.pr_agent.toml` from the
+        // freshly-written HARNESS.json so PR-Agent's review focus
+        // tracks the project's architectural rules from day one.
+        // Best-effort: a parse failure logs a warning and ships
+        // an empty-rules toml so PR-Agent still works (just with
+        // its defaults).
+        try {
+          const harnessJsonPath = join(workDir, 'HARNESS.json');
+          const harnessRaw = await readFile(harnessJsonPath, 'utf8');
+          const harnessConfig = JSON.parse(harnessRaw) as HarnessConfig;
+          const tomlContent = generatePrAgentToml(harnessConfig);
+          await writeFile(join(workDir, '.pr_agent.toml'), tomlContent, 'utf8');
+        } catch (err) {
+          log.warn(
+            { projectId: project.id, err: err instanceof Error ? err.message : String(err) },
+            '.pr_agent.toml generation skipped — falling back to PR-Agent defaults',
+          );
+        }
+
         // Commit author identity — pinned so commits are clearly machine-made.
         await repo.addConfig('user.name', 'Gestalt Platform');
         await repo.addConfig('user.email', 'platform@gestalt.local');
@@ -747,6 +767,90 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
           error: 'Failed to initialise harness',
           // surface the underlying message so the operator can debug, but
           // never include the cloneUrl (it carries the token).
+          details: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+      }
+    },
+  );
+
+  // ADR-051 / TR_027 —
+  // POST /projects/:id/push-pr-agent-config — clone, regenerate
+  // `.pr_agent.toml` from the project's current HARNESS.json, commit,
+  // push. Operators run this after editing HARNESS.json rules so
+  // PR-Agent's review focus tracks.
+  app.post<{ Params: { id: string } }>(
+    '/projects/:id/push-pr-agent-config',
+    { preHandler: requireRole('operator') },
+    async (request, reply) => {
+      if (!request.user) return reply.code(401).send({ error: 'Authentication required' });
+      if (!await checkProjectMembership(reply, request.user.id, request.user.role, request.params.id, 'project-admin')) return;
+
+      const { projects, audit } = getRepositories();
+      const project = await projects.findById(request.params.id);
+      if (!project) return reply.code(404).send({ error: 'Project not found' });
+
+      const token = await resolveProjectCredential(project);
+      if (!token) {
+        return reply.code(400).send({
+          error: 'Project has no Git credential on file; re-register the project',
+          code: 'NO_CREDENTIAL',
+        });
+      }
+
+      const workDir = await mkdtemp(join(tmpdir(), `gestalt-praa-${crypto.randomUUID()}-`));
+      try {
+        const cloneUrl = authenticatedGitUrl(project.gitUrl, token);
+        await simpleGit().clone(cloneUrl, workDir, ['--depth=1']);
+
+        const harnessRaw = await readFile(join(workDir, 'HARNESS.json'), 'utf8').catch(() => '');
+        if (!harnessRaw) {
+          return reply.code(400).send({
+            error: 'No HARNESS.json on the project default branch — run `gestalt init` first',
+          });
+        }
+        let harnessConfig: HarnessConfig;
+        try {
+          harnessConfig = JSON.parse(harnessRaw) as HarnessConfig;
+        } catch (err) {
+          return reply.code(400).send({
+            error: 'HARNESS.json failed to parse',
+            details: err instanceof Error ? err.message : String(err),
+          });
+        }
+        const tomlContent = generatePrAgentToml(harnessConfig);
+        await writeFile(join(workDir, '.pr_agent.toml'), tomlContent, 'utf8');
+
+        const repo: SimpleGit = simpleGit(workDir);
+        await repo.addConfig('user.name', 'Gestalt Platform');
+        await repo.addConfig('user.email', 'platform@gestalt.local');
+        await repo.add(['.pr_agent.toml']);
+        const status = await repo.status();
+        if (status.files.length === 0) {
+          return reply.send({ data: { changed: false } });
+        }
+        const commit = await repo.commit('chore: regenerate .pr_agent.toml from HARNESS.json [gestalt]');
+        await repo.push('origin', project.defaultBranch);
+
+        await audit.append({
+          actor: request.user.id,
+          action: 'project.pr-agent-config-pushed',
+          entityType: 'projects',
+          entityId: project.id,
+          correlationId: request.correlationId,
+          metadata: {
+            name: project.name,
+            commitSha: commit.commit,
+            branch: project.defaultBranch,
+            ip: request.ip,
+          },
+        });
+        return reply.send({ data: { changed: true, commitSha: commit.commit } });
+      } catch (err) {
+        log.error({ err, projectId: project.id }, 'push-pr-agent-config failed');
+        return reply.code(500).send({
+          error: 'Failed to push .pr_agent.toml',
           details: err instanceof Error ? err.message : String(err),
         });
       } finally {

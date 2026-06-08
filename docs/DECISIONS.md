@@ -1597,10 +1597,33 @@ not evaluation logic.
 **Status:** Accepted
 
 **Decision:** The custom LLM review-agent is replaced by
-CodiumAI PR-Agent running as a GitHub Actions step on every
-Gestalt PR. PR-Agent posts its review as a PR comment.
-Gestalt's pipeline-agent reads the verdict and routes
-accordingly.
+CodiumAI PR-Agent invoked SERVER-SIDE inside the Gestalt
+container via `executeScript`, immediately after CI passes
+and before the gate dispatches. PR-Agent posts its review
+as a PR comment; pipeline-agent reads the verdict back from
+the PR via the GitHub API and routes the cycle accordingly.
+
+**Final architecture — direct pipeline invocation:**
+
+PR-Agent runs as a direct `executeScript` call within
+Gestalt's deploy-orchestrator after CI passes. **No GitHub
+Actions step. No webhook. No separate Docker service. No
+GitHub Secrets for LLM keys.**
+
+LLM credentials are resolved from Gestalt's registry at
+invocation time and passed to PR-Agent via subprocess
+environment variables. PR-Agent never sees Gestalt's vault
+or registry directly — it receives the resolved credentials
+for that specific invocation only.
+
+This means:
+- LLM keys stay in Gestalt's vault.
+- Data residency is maintained (Azure OpenAI / Ollama /
+  vLLM / OpenAI proxies all work via the same env-var
+  mapping inside `runPrAgentReview`).
+- No new infrastructure components.
+- PR-Agent replaces review-agent at the same pipeline
+  position (post-CI / pre-gate) with the same interface.
 
 **Rationale:** PR-Agent is battle-tested, understands PR diff
 context natively, and is actively maintained. Our custom
@@ -1612,29 +1635,45 @@ without platform code changes.
 
 **Consequences:**
 
+- PR-Agent is installed in the server's Docker image via
+  `pip install pr-agent` (same layer as Aider — TR_014).
+- `runPrAgentReview` in
+  `packages/agents/deploy/src/adapters/pr-agent-adapter.ts`
+  invokes `python -m pr_agent.cli --pr-url <PR> review` via
+  `executeScript`. LLM credentials + GitHub PAT are passed
+  as subprocess env vars; PR-Agent reads them directly.
+- The deploy-orchestrator's `maybeRunPrAgentAndRoute`
+  helper triggers PR-Agent inside a fresh shallow clone of
+  the project repo so `.pr_agent.toml` (committed at the
+  repo root) drives PR-Agent's project-specific focus.
 - `review-agent` is removed from the gate step list whenever
   `pipeline.adapter === 'github-actions'` AND
-  `prAgent.enabled === true`.
+  `prAgent.enabled === true`. `llm-review-agent.ts` is
+  retained as a fallback for `noop`, Azure DevOps, GitLab,
+  and Jenkins adapters and projects that explicitly disable
+  PR-Agent. A `@deprecated` comment at the top of the file
+  flags it.
 - `.pr_agent.toml` is generated from `HARNESS.json` at
   `gestalt init` time and committed to the project repo
   alongside `AGENTS.md` / `agents.yaml` / `HARNESS.json`.
-- `pipeline-agent` reads PR-Agent's verdict from the PR
-  review status via the GitHub API (`PipelineAdapter.
-  getPrAgentVerdict()` + `getPrAgentComment()`). On
-  `changes-requested` the comment body is passed to the
-  self-healing diagnostician as `technicalDetail` — same
-  pattern as CI annotations (TR_024). The LLM picks
-  `action: retry | fix-intent | escalate` per ADR-050.
-- `llm-review-agent.ts` stays in the codebase as a fallback
-  for `noop`, Azure DevOps, and GitLab adapters and projects
-  that explicitly disable PR-Agent. A deprecation comment
-  at the top of the file flags it.
+- `pipeline-agent` (via the deploy-orchestrator) reads
+  PR-Agent's verdict from the PR review status via the
+  GitHub API (`PipelineAdapter.getPrAgentVerdict()` +
+  `getPrAgentComment()`). On `changes-requested` the comment
+  body is passed to the self-healing diagnostician as
+  `technicalDetail` — same pattern as CI annotations
+  (TR_024). The LLM picks `action: retry | fix-intent |
+  escalate` per ADR-050.
 - New optional `HARNESS.json.prAgent` block with `enabled`,
   `blockOnChangesRequested`, `pendingTimeoutSeconds`.
-- New CLI command `gestalt project config push-pr-agent-config`
-  regenerates and commits `.pr_agent.toml` after `HARNESS.json`
-  rule edits.
-- Template version bumps reflect PR-Agent rollout (0.11.0 → 0.12.0).
+- New CLI command `gestalt project config
+  push-pr-agent-config` regenerates and commits
+  `.pr_agent.toml` after `HARNESS.json` rule edits.
+- New `review-requested-changes` value on `FailureType` +
+  `AlertType` + a seeded `platform_self_healing_config`
+  row (migration 027).
+- Template version bumps reflect PR-Agent rollout
+  (0.11.0 → 0.12.0 → 0.13.0 → 0.14.0).
 
 **Operator control surface:** PR-Agent's review focus comes
 from `HARNESS.json.agentConfig['review-agent'].rules` +

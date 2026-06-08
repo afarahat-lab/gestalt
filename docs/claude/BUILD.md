@@ -18,7 +18,7 @@ docker-compose logs -f server
 |---|---|
 | `pnpm -r build` | ✅ clean (13 packages) |
 | `docker-compose up -d` | ✅ healthy (server / postgres / redis) |
-| Migrations applied | 026 (latest: `026_intent_parent`) |
+| Migrations applied | 027 (latest: `027_self_healing_pr_agent`) |
 | Server reachable | `http://localhost:3000/health` returns 200 |
 | Dashboard | served at `http://localhost:3000/app/` |
 
@@ -53,6 +53,33 @@ None blocking the build. Areas to keep in mind:
 ---
 
 ## Pending operator actions
+
+### TR_027 — PR-Agent replaces review-agent (ADR-051)
+
+CodiumAI PR-Agent invoked server-side via `executeScript` after CI
+passes. No webhook, no CI step, no GitHub Secrets for LLM keys —
+LLM credentials forwarded per invocation via subprocess env vars.
+Dockerfile installs PR-Agent in its own venv (`/opt/pr-agent`)
+isolated from Aider's because of incompatible litellm versions;
+PATH shims (`/usr/local/bin/{aider,pr-agent}`) keep call sites
+unchanged. New `prAgent` block on HarnessConfig + `.pr_agent.toml`
+generated from HARNESS rules at init time (regeneratable via
+`gestalt project config push-pr-agent-config`). Gate orchestrator
+skips review-agent when prAgent.enabled + adapter=github-actions;
+constraint-agent still runs. `changes-requested` routes through
+self-healing's `fix-intent` path via new failure type
+`review-requested-changes` (migration 027). Template 0.12.0 →
+0.14.0. Live verified end-to-end on trackeros PR #81: Aider 6s →
+CI pass → PR-Agent 23.5s → verdict `none` → gate (constraint-agent
+only) → deploy. Wall-clock 2m 04s.
+
+**Operator action:** Existing projects can adopt PR-Agent by
+adding `prAgent: { enabled: true, blockOnChangesRequested: true,
+pendingTimeoutSeconds: 30 }` to HARNESS.json + a self-healing-agent
+rule for `review-requested-changes`. Absent → review-agent fallback
+path still runs (llm-review-agent.ts kept as `@deprecated` but
+functional). trackeros migrated as part of the verify cycle
+(commits pending push).
 
 ### ADRs 053–055 — Tool integration roadmap
 
@@ -225,61 +252,18 @@ agentConfig entries to existing projects' `HARNESS.json` to
 opt in. trackeros has been migrated as part of the verify
 cycle (commit `3fc936fe` on `main`).
 
-### ADRs 042–049 — Platform/operator split and related principles codified
+### Historical (TR_020 / TR_021 / ADRs 042–049)
 
-Documentation-only session. Eight ADRs appended to
-`docs/DECISIONS.md`: ADR-042 (LLM guidance prose lives in
-HARNESS.json + agents.yaml, never `.ts`), ADR-043 (Aider opt-in
-backend), ADR-044 (gpt-4o for gate, gpt-4o-mini for code-gen),
-ADR-045 (evidence requirement — every finding needs a
-`quotedLine`), ADR-046 (LLM-driven script execution for gate
-verification — no hardcoded script commands), ADR-047 (CI/CD
-owns runtime verification; gate owns architectural review —
-extends ADR-041), ADR-048 (LLM-driven retry routing via
-`SelfHealingDiagnosis.retryTaskType`, no hardcoded dispatch
-maps), ADR-049 (architecture agent uses phased consultation —
-`designFeature()` + `designPhase()` — not single-call full
-design). No platform code change; no migrations.
-
-**Operator action:** None. ADRs are read-only contracts the
-platform already honours.
-
-### TR_021 — Externalise gate-agent verificationGuidance to HARNESS.json
-
-Refactor: STEP 1-5 verification protocol lifted from
-`llm-review-agent.ts` into
-`HARNESS.json.agentConfig[role].verificationGuidance`. Platform
-mechanics (evidence requirement, severity ceiling, JSON schema,
-parser-level dropUnevidencedFindings, ABSOLUTE_MAX_RETRIES) stay
-in code. constraint-agent gained the configurable section "for
-free" via the shared `renderHarnessAgentRules` helper. Template
-bumped 0.6.0 → 0.7.0. Two trackeros cycles deployed
-single-round (PR #55 pre-commit no-regression + PR #56
-post-commit prompt-render verified). No new migrations.
-
-### TR_020 — First clean github-actions deploy
-
-trackeros's first `Status: ✓ deployed` against the real
-`github-actions` adapter: 1m 58s, single round, PR #54
-squash-merged. Four fixes: console.log rule scope, retryCount
-threading, CI trigger dedupe (3→1), executeScript stripped +
-"trust CI" prompt. Template bumped 0.5.0 → 0.6.0.
-
-**Resolved (structurally) by TR_021:**
-- ~~LOW — TR_020: extend "trust CI" rule to constraint-agent~~ —
-  now a one-line edit to
-  `agentConfig['constraint-agent'].verificationGuidance` in
-  HARNESS.json; no platform code change required.
+Rotated to `sessions/archive/`. See `docs/DECISIONS.md` for ADRs
+and the archive for the full narratives.
 
 ### Carryovers (TR_019 / TR_018 / TR_014)
 
 - **MEDIUM — TR_019:** `gestalt init` should scaffold a
-  `.gitignore` + align jest/ts-jest/@types/jest versions with
-  TypeScript. trackeros's jest@27 + TS@5 mismatch was latent
-  under `noop` and only surfaced when CI ran jest.
+  `.gitignore` + align jest/ts-jest/@types/jest with TypeScript.
 - **LOW — TR_019:** Template `{{ciSetupSteps}}` for Node/npm
-  should include `--legacy-peer-deps` on `npm install` until the
-  upstream npm arborist `Link.matches` bug is fixed.
+  should include `--legacy-peer-deps` until the upstream npm
+  arborist `Link.matches` bug is fixed.
 - **LOW — TR_019:** Add a `tsc --noEmit` sanity check on
   scaffolded tests in `gestalt init`.
 - **HIGH — TR_018:** Restore TR_010 mandatory `executeScript
@@ -287,15 +271,6 @@ threading, CI trigger dedupe (3→1), executeScript stripped +
 - **MEDIUM — TR_014:** Aider token-spend capture. Parse
   `Tokens: N sent / M received` from Aider's stdout and surface
   as `tokens_used` on the execution row.
-
-### Recent trackeros operator commits (already pushed)
-
-- `13223d29` (TR_021) — HARNESS.json `verificationGuidance`
-  arrays added to constraint-agent + review-agent blocks.
-- `f926e840` (TR_020) — agents.yaml review-agent tools stripped
-  + trust-CI prompt extension.
-- `99a48c73` (TR_020) — HARNESS.json console.log rewording +
-  gestalt.yml pull_request trigger removed.
 
 ### Platform state caveats (unchanged)
 

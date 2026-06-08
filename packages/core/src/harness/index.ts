@@ -205,6 +205,33 @@ export interface HarnessConfig {
      */
     maxPhaseRetries?: number;
   };
+  /**
+   * TR_027 / ADR-051 — CodiumAI PR-Agent integration. When the
+   * project's `pipeline.adapter === 'github-actions'` AND
+   * `prAgent.enabled === true`, pipeline-agent reads PR-Agent's
+   * review verdict from the PR before dispatching the gate, and
+   * the gate skips the legacy `review-agent` step. Self-healing
+   * handles `changes-requested` verdicts via the existing
+   * fix-intent action vocabulary.
+   *
+   * `.pr_agent.toml` is generated at `gestalt init` time from
+   * `agentConfig['review-agent'].rules` +
+   * `agentConfig['constraint-agent'].rules` and committed to the
+   * project repo. Operators regenerate it via
+   * `gestalt project config push-pr-agent-config` after editing
+   * HARNESS.json.
+   *
+   * `pendingTimeoutSeconds` bounds the deploy-orchestrator's
+   * "PR-Agent review hasn't posted yet" re-poll loop. Default 90s.
+   * `blockOnChangesRequested` defaults to true; setting it false
+   * lets the cycle proceed to gate even on a `changes-requested`
+   * verdict (useful for advisory PR-Agent installs).
+   */
+  prAgent?: {
+    enabled: boolean;
+    blockOnChangesRequested?: boolean;
+    pendingTimeoutSeconds?: number;
+  };
 }
 
 // ─── Context snapshot (what agents receive) ───────────────────────────────────

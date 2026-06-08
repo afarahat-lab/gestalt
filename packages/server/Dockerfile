@@ -66,16 +66,35 @@ WORKDIR /app
 # for clone / commit / push (ADR-032). `openssh-client` is needed for SSH
 # remotes (HTTPS+PAT still works without it but most operators use both).
 # `python3` + `py3-pip` ship Aider (TR_014) — opt-in code-generation
-# backend per project via HARNESS.json.codeGeneration.backend.
+# backend per project via HARNESS.json.codeGeneration.backend — AND
+# pr-agent (TR_027 / ADR-051) — server-side LLM PR reviewer
+# invoked via `executeScript` after CI passes.
 # `--break-system-packages` is required on Alpine 3.20+ because PEP 668
 # treats the system Python as externally-managed; we own the image
 # entirely so the override is safe here. Aider depends on tree-sitter
 # which has C extensions — build-base + python3-dev are installed
 # temporarily for the pip build, then removed via `apk del` in the
 # same layer so the runtime image doesn't grow with compilers.
+# TR_027 — Aider and PR-Agent both depend on `litellm` but at
+# incompatible versions (PR-Agent's litellm has exception classes
+# Aider's exceptions adapter doesn't recognise — Aider crashes at
+# import time). Each app runs in its own venv so their dep graphs
+# don't collide. We shim two CLI entry points onto $PATH so the
+# rest of the platform calls them unchanged.
 RUN apk add --no-cache git openssh-client python3 py3-pip \
-    && apk add --no-cache --virtual .aider-build-deps build-base python3-dev \
-    && pip3 install --no-cache-dir --break-system-packages aider-chat \
+    && apk add --no-cache --virtual .aider-build-deps build-base python3-dev gfortran openblas-dev \
+    # Aider in its own venv at /opt/aider
+    && python3 -m venv /opt/aider \
+    && /opt/aider/bin/pip install --no-cache-dir --prefer-binary aider-chat \
+    && ln -sf /opt/aider/bin/aider /usr/local/bin/aider \
+    # PR-Agent in its own venv at /opt/pr-agent
+    && python3 -m venv /opt/pr-agent \
+    && /opt/pr-agent/bin/pip install --no-cache-dir --prefer-binary pr-agent \
+    # Shim: `python -m pr_agent.cli` resolves to the pr-agent venv's
+    # interpreter so the platform's `executeScript` call uses the
+    # right deps without setting PATH/PYTHONPATH at the call site.
+    && printf '#!/bin/sh\nexec /opt/pr-agent/bin/python -m pr_agent.cli "$@"\n' > /usr/local/bin/pr-agent \
+    && chmod +x /usr/local/bin/pr-agent \
     && apk del .aider-build-deps
 
 # Install pnpm globally via npm rather than corepack — corepack caches

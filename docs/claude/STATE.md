@@ -4,9 +4,9 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-08 (after TR_026 — strict ADR-050 enforcement on file-change detection. Platform parsing of Aider's stdout DELETED: `parseAiderChangedFiles` removed, `filesChanged` field removed from `AiderResult`, `--yes-always` replaces `--yes`. Aider-code-agent now asks `git status --porcelain` (an AGENT using a tool, per ADR-050) to discover what Aider wrote and emit code artifacts. Planning-orchestrator's TR_025 git-diff fallback DELETED; phase-evaluator-agent now uses `executeScript("git diff origin/main...origin/<branch>")` itself with the branch context the orchestrator passes. New PER_ROLE_DEFAULTS entries for the three planning agents (architecture / planner / phase-evaluator) so executeScript is available out of the box. Template 0.11.0 → 0.12.0. **Live verified**: feature `7d77f659` — Aider's writes (leave.model.ts + leave.model.test.ts) now make it end-to-end into the PR commit (`ce3f3721`); phase-evaluator's verdict text quotes the HARNESS.json git-diff rule verbatim. Full multi-phase completion still blocked by trackeros's stale leave.repository.ts (operator state from earlier auto-merged cycles) — captured as TR_027 follow-up.)
+**Last updated:** 2026-06-08 (after TR_027 — replaced custom review-agent with CodiumAI PR-Agent invoked server-side via executeScript after CI passes. ADR-051. No webhook, no CI step, no GitHub Secrets for LLM keys — credentials forwarded per invocation via subprocess env vars. Dockerfile installs PR-Agent in its own venv (`/opt/pr-agent`) isolated from Aider's (`/opt/aider`) because of incompatible litellm versions; PATH shims keep call sites unchanged. New `prAgent` block on HarnessConfig; `.pr_agent.toml` generated from HARNESS rules at init + via new `gestalt project config push-pr-agent-config` command. Deploy orchestrator's `maybeRunPrAgentAndRoute()` runs PR-Agent, polls verdict via GitHub PR-Reviews/Comments API (recognises `pr-agent[bot]` / `codiumai-pr-agent[bot]` / `qodo-merge-pro[bot]` logins), routes `changes-requested` through self-healing's existing fix-intent path (new failure type `review-requested-changes`, migration 027). Gate orchestrator skips review-agent when prAgent.enabled && adapter=github-actions; constraint-agent still runs in parallel. llm-review-agent.ts `@deprecated` but kept for non-GH adapters. Template 0.12.0 → 0.14.0. **Live verified end-to-end on trackeros PR #81**: Aider 6s → CI pass → PR-Agent 23.5s → verdict `none` → gate (constraint-agent only) → deploy. Wall-clock 2m 04s.)
 **Repo:** https://github.com/afarahat-lab/gestalt
-**Migrations:** 026 (latest: `026_intent_parent`)
+**Migrations:** 027 (latest: `027_self_healing_pr_agent`)
 
 ---
 
@@ -16,7 +16,7 @@ the `sessions/archive/` files (everything older)._
 
 - All 13 buildable packages compile (`pnpm -r build`).
 - `docker-compose up -d` brings server + postgres + redis healthy.
-- All 26 migrations apply on first start.
+- All 27 migrations apply on first start.
 - Server reachable on `http://localhost:3000`; `/health` returns 200;
   protected routes return 401 without a JWT.
 - Dashboard SPA served at `/app/*`; shareable deep-link URLs work.
@@ -27,16 +27,36 @@ the `sessions/archive/` files (everything older)._
 
 - **generate** — intent → design → context → lint-config → code → test;
   custom agents in `agents.yaml` interleave via `runs_after`.
-- **quality-gate** — constraint-agent + review-agent (both LLM,
-  ADR-041 — gate runs AFTER CI, not before pr-agent). Gate clones
-  the PR branch, checks it out, and reads source files directly
-  from the working tree (`readFromBranch: true`). On pass dispatches
-  `deploy:promotion` (staging); on fail forwards `resumeOnBranch`
-  so the retry leg pushes to the same PR. Verdict:
-  `pass` / `fail` (auto-retry) / `escalate` (GP_BREACH).
-  Max gate retries: 3. Pre-CI lint/security/test-runner stubs
-  deleted — CI uses the project's own ESLint / Vitest / Semgrep
-  via the comprehensive `gestalt.yml` workflow template.
+- **quality-gate** — constraint-agent (always) + review-agent
+  (only on non-github-actions adapters or when `prAgent.enabled`
+  is false). ADR-041 — gate runs AFTER CI, not before pr-agent.
+  ADR-051 — when `prAgent.enabled && pipeline.adapter ===
+  'github-actions'`, the gate skips review-agent because
+  PR-Agent already reviewed the PR server-side between CI-pass
+  and gate-dispatch. Gate clones the PR branch, checks it out,
+  and reads source files directly from the working tree
+  (`readFromBranch: true`). On pass dispatches `deploy:promotion`
+  (staging); on fail forwards `resumeOnBranch` so the retry leg
+  pushes to the same PR. Verdict: `pass` / `fail` (auto-retry) /
+  `escalate` (GP_BREACH). Max gate retries: 3. Pre-CI lint/
+  security/test-runner stubs deleted — CI uses the project's own
+  ESLint / Vitest / Semgrep via the comprehensive `gestalt.yml`
+  workflow template.
+- **PR-Agent (ADR-051)** — CodiumAI PR-Agent invoked server-side
+  by deploy-orchestrator between CI-pass and gate-dispatch as a
+  subprocess (`/opt/pr-agent` venv via `pr-agent --pr_url=...
+  review`). Receives Gestalt's resolved LLM credentials (Azure /
+  OpenAI / Ollama) + project PAT via subprocess env vars for that
+  one invocation only — never sees the vault or the registry.
+  Posts a "PR Reviewer Guide" comment on the PR. pipeline-agent
+  polls verdict via `GitHubActionsAdapter.getPrAgentVerdict` for
+  up to 30s; `approved`/`none` → proceed to gate;
+  `changes-requested` → invoke self-healing's `fix-intent` path
+  via failure type `review-requested-changes` (migration 027).
+  `.pr_agent.toml` generated at init time from HARNESS rules
+  drives per-project review focus; regeneratable via
+  `gestalt project config push-pr-agent-config`. Best-effort
+  on subprocess failure (warns + proceeds).
 - **deploy** — pr-agent → pipeline-agent → promotion-agent
   (staging → production). `PipelineAdapter` interface;
   `GitHubActionsAdapter` + `NoOpPipelineAdapter` implemented.
@@ -219,6 +239,27 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
+### TR_027 — PR-Agent replaces review-agent (ADR-051)
+
+CodiumAI PR-Agent invoked server-side via `executeScript` after CI
+passes; replaces Gestalt's custom review-agent on the github-actions
+adapter. No CI step, no webhook, no GitHub Secrets for LLM keys —
+credentials forwarded per invocation via subprocess env vars.
+PR-Agent runs in `/opt/pr-agent` venv (isolated from Aider's
+`/opt/aider` because of incompatible litellm versions);
+`/usr/local/bin/pr-agent` is a shell shim. Verdict polled via
+GitHub PR-Reviews/Comments API; `changes-requested` routes through
+self-healing's `fix-intent` mechanism (new failure type
+`review-requested-changes`, migration 027). `.pr_agent.toml`
+generated from HARNESS rules at init time. New
+`gestalt project config push-pr-agent-config` for harness updates.
+Gate orchestrator skips review-agent under prAgent.enabled +
+github-actions; constraint-agent still runs. llm-review-agent.ts
+`@deprecated` (kept for non-GH adapters). Template 0.12.0 →
+0.14.0. Live verified on trackeros PR #81: Aider 6s → CI pass →
+PR-Agent 23.5s → verdict `none` → gate (constraint-agent only) →
+deploy. Wall-clock 2m 04s.
+
 ### TR_026 — Remove platform file-change detection (ADR-050 enforcement)
 
 The platform no longer parses Aider's stdout or computes
@@ -295,27 +336,13 @@ pre-existing code-agent issue; the planning loop correctly marked
 the phase failed and the feature blocked). Template bumped
 0.7.0 → 0.8.0.
 
-### TR_021 — Externalise verificationGuidance to HARNESS.json
+### Historical (TR_020 / TR_021)
 
-Refactor (kept brief; see `sessions/RECENT.md` for the full
-narrative). Lifted project-specific "HOW to verify before
-flagging" hints out of `llm-review-agent.ts` and into
-`HARNESS.json.agentConfig[role].verificationGuidance`. PLANNING_LAYER
-extended the same helper to render three more sub-section types
-(phaseScopingRules, evaluationCriteria, architectureGuidance).
-Template went 0.6.0 → 0.7.0 → 0.8.0.
-
-### TR_020 — Real GitHub Actions deploy works end-to-end
-
-trackeros's first `Status: ✓ deployed` against the real
-`github-actions` adapter — 1m 58s, single round, PR #54
-squash-merged. See `docs/claude/TEST_REPORT_020.md`.
-
-### Resolved by TR_020 (kept brief)
-
-Gate retry budget threading + ABSOLUTE_MAX_RETRIES + CI dedupe
-all resolved. See `docs/claude/TEST_REPORT_020.md` for the full
-diff.
+Rotated to `sessions/archive/`. TR_020 was trackeros's first
+clean `Status: ✓ deployed` on the real `github-actions` adapter
+(PR #54, 1m 58s). TR_021 externalised verificationGuidance to
+HARNESS.json. See `docs/claude/TEST_REPORT_020.md` and the
+archive for the full diffs.
 
 ### Active follow-ups (carryover or NEW)
 
@@ -331,87 +358,51 @@ diff.
   "Files changed: 0" silent failure — now caught by git
   status in `discoverAiderWrites`. The Aider stdout
   pathology is bypassed entirely.
-- **(MEDIUM — NEW from TR_025)** Cascade-depth brake
-  code-path verified at build/typecheck only; the
-  MAX_FIX_INTENT_DEPTH escalation path has not been
-  exercised on a live cascade. A targeted test (force-fail
-  a fix-intent's CI twice) would close this.
-- **~~(HIGH — NEW from TR_024)~~ RESOLVED by TR_025**
-  (structurally — depth ceiling in place).
-- **(HIGH — NEW from TR_024)** Cascading fix-intent prevention.
-  Each fix-intent failing CI triggers ANOTHER fix-intent (the
-  diagnostician keeps choosing `action: fix-intent`). Need to
-  track chain depth on `parent_intent_id` and force escalation
-  when depth ≥ 2. Captured as TR_025.
-- **(MEDIUM — NEW from TR_024)** `collectCiTechnicalDetail` is
-  github-only. Azure DevOps / GitLab CI adapters silently
-  return undefined and the diagnostician loses the actual
-  error text.
-- **(LOW — NEW from TR_024)** Dashboard could render the full
-  fix-intent chain on `IntentDetail` (today shows only direct
-  parent / direct child).
-- **(HIGH — NEW from TR_022)** Aider DTO-field hallucination —
-  Aider's generated repository / service code references fields
-  not present on the DTO (e.g. `Property 'employeeId' does not
-  exist on type 'CreateLeaveRequestDto'`). Three consecutive
-  attempts on the leave-management feature's phase 1 all
-  produced the same class of error; the retry budget bailed
-  cleanly, but the feature didn't progress. Either extend the
+- **(LOW — TR_027)** PR-Agent verdict-poll budget (30s, 6×5s)
+  is fixed in code; could be threaded into HARNESS.json's
+  `prAgent.pendingTimeoutSeconds` (field already exists in the
+  type).
+- **(LOW — TR_027)** `chat-latest` works as a litellm model
+  alias because OpenAI resolves it at the API edge. Other
+  providers (Anthropic, Ollama) need their own alias semantics —
+  document as a known constraint of per-project LLM choice.
+- **(MEDIUM — TR_025)** Cascade-depth brake escalation path
+  (MAX_FIX_INTENT_DEPTH) only verified at build/typecheck; a
+  targeted force-fail-twice test would close it.
+- **(MEDIUM — TR_024)** `collectCiTechnicalDetail` is GH-only.
+  Azure DevOps / GitLab adapters silently lose the actual error
+  text.
+- **(LOW — TR_024)** Dashboard could render the full fix-intent
+  chain on IntentDetail (today: direct parent/child only).
+- **(HIGH — TR_022)** Aider DTO-field hallucination — generated
+  code references fields not present on the DTO. Either extend
   code-agent prompt with a "READ the DTO file first" rule or
-  require model + repository in the same Aider call. Tracked
-  as TR_023.
-- **(LOW — NEW from TR_022)** `readMaxPhaseRetries` re-clones
-  HARNESS.json on every failure dispatch. Cheap (~250ms) but
-  could be cached per-feature for the lifecycle.
-- **~~(MEDIUM — PLANNING_LAYER)~~ RESOLVED by TR_022.**
-  Phase failure → feature blocked was too eager. Now bounded
-  by `planner.maxPhaseRetries` (default 2) and verified live
-  on feature `1a5dcfc5`.
-- **~~(MEDIUM — PLANNING_LAYER)~~ RESOLVED by TR_022.**
-  Original Aider `resolveJsonModule` failure mode addressed
-  in trackeros tsconfig + template default code-agent rule.
-- **~~(LOW — PLANNING_LAYER)~~ RESOLVED by TR_022.** Per-phase
-  architecture review verified live on feature `37799ea9`.
-- **(LOW — NEW from PLANNING_LAYER)** The orchestrator stores
-  phase scope adjustments under `feature_phases.result.pendingScopeAdjustment`
-  and the next `planning:phase` reads them when assembling the
-  intent text. The scope itself never overwrites the original
-  `scope` column — by design, so the planner's first draft stays
-  visible to operators. Consider a dedicated `scope_history` array
-  if operators need a full history.
-- **(LOW — NEW from TR_021)** Consider migrating the
-  `consistencySection` block (cross-artifact checks:
-  test-framework match, import resolution, @types/* coverage,
-  test-file placement) out of `llm-review-agent.ts`'s
-  `buildReviewPrompt` into HARNESS.json verificationGuidance.
-  Borderline platform-mechanic / project-specific; works fine
-  in code today but a non-Node project might want to tune it.
-- **(LOW — NEW from TR_021, structurally addressed)** The TR_020
-  "extend trust-CI to constraint-agent" item is now a one-line
-  edit to `agentConfig['constraint-agent'].verificationGuidance`
-  in HARNESS.json. Not added in TR_021 because constraint-agent
-  doesn't currently hit the hallucination; documented here so
-  the next regression can be fixed without a code change.
-- **(MEDIUM — TR_019, still relevant)** `gestalt init` should
-  scaffold a `.gitignore` + align jest/ts-jest/@types/jest
-  versions with TypeScript. trackeros's jest@27 + TS@5 mismatch
-  was latent under `noop`; same scaffolding should align Node 22.
-- **(LOW — TR_019, still relevant)** Template
-  `{{ciSetupSteps}}` for Node/npm should add `--legacy-peer-deps`
-  on `npm install` until the upstream npm arborist
-  `Link.matches` bug is fixed.
-- **(LOW — TR_019, still relevant)** Add a `tsc --noEmit` sanity
-  check on scaffolded tests in `gestalt init`.
+  require model + repository in the same Aider call. Tracked as
+  TR_023.
+- **(LOW — TR_022)** `readMaxPhaseRetries` re-clones HARNESS.json
+  on every failure dispatch; cacheable per-feature.
+- **(LOW — PLANNING_LAYER)** Phase scope adjustments stored under
+  `feature_phases.result.pendingScopeAdjustment`. Consider a
+  dedicated `scope_history` array if operators need full history.
+- **(LOW — TR_021)** Consider migrating `consistencySection`
+  cross-artifact checks out of `llm-review-agent.ts` into
+  HARNESS.json verificationGuidance (borderline platform-mechanic).
+- **(MEDIUM — TR_019)** `gestalt init` should scaffold a
+  `.gitignore` + align jest/ts-jest/@types/jest with TypeScript.
+- **(LOW — TR_019)** Template `{{ciSetupSteps}}` for Node/npm
+  should add `--legacy-peer-deps` until the upstream npm
+  arborist bug is fixed.
+- **(LOW — TR_019)** Add a `tsc --noEmit` sanity check on
+  scaffolded tests in `gestalt init`.
 
 ### Carryovers (TR_018 / TR_014)
 
-- **(HIGH — TR_018)** Restore the TR_010 mandatory `executeScript
-  tsc --noEmit` code-agent rule on trackeros's HARNESS.json. CI's
-  `Compile` step catches the same errors post-hoc but the rule
-  catches them pre-emit during Aider's generation.
+- **(HIGH — TR_018)** Restore TR_010 mandatory `executeScript tsc
+  --noEmit` code-agent rule on trackeros's HARNESS.json. Pre-emit
+  during Aider's generation (CI catches the same post-hoc).
 - **(MEDIUM — TR_014)** Aider token-spend visibility. Parse
-  `Tokens: N sent / M received` from Aider's stdout. code-agent
-  rows still show 0 tokens across all rounds.
+  `Tokens: N sent / M received` from stdout. code-agent rows
+  still show 0 tokens.
 
 ### Tool integration roadmap
 

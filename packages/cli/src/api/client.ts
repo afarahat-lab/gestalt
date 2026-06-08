@@ -877,6 +877,14 @@ export class GestaltApiClient {
     return this.patch(`/projects/${projectId}/config/pipeline`, patch);
   }
 
+  // ADR-051 / TR_027 — regenerate `.pr_agent.toml` from the
+  // project's current HARNESS.json and push to the default branch.
+  async pushPrAgentConfig(
+    projectId: string,
+  ): Promise<{ data: { changed: boolean; commitSha?: string } }> {
+    return this.post(`/projects/${projectId}/push-pr-agent-config`, {});
+  }
+
   async patchAgentsConfig(
     projectId: string,
     agents: Record<string, Partial<EditableAgentConfig>>,

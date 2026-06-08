@@ -242,6 +242,26 @@ async function loadHarnessStack(projectRoot: string): Promise<GateHarnessConfig[
 }
 
 /**
+ * TR_027 / ADR-051 — true when the project has opted into PR-Agent
+ * AND the pipeline adapter supports the integration. In that case
+ * the gate skips its own LLM review-agent step (PR-Agent has
+ * already posted its review and pipeline-agent has already routed
+ * `changes-requested` through self-healing).
+ */
+async function shouldSkipReviewAgent(projectRoot: string): Promise<boolean> {
+  try {
+    const raw = await readFile(join(projectRoot, 'HARNESS.json'), 'utf8');
+    const parsed = JSON.parse(raw) as {
+      pipeline?: { adapter?: string };
+      prAgent?: { enabled?: boolean };
+    };
+    return parsed.prAgent?.enabled === true && parsed.pipeline?.adapter === 'github-actions';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * ADR-041 — file extensions the gate considers "source code" when
  * loading the post-CI artifact set from the PR branch. Languages the
  * platform supports today; new languages should be added here when
@@ -455,11 +475,24 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
     // back `agent.lastPrompt` / `agent.lastLlmResponse` /
     // `agent.lastModelUsed` after the call to thread them into the
     // observability wrapper's execution-log persistence.
-    const reviewAgent = new ReviewAgent();
+    //
+    // TR_027 / ADR-051 — skip review-agent when PR-Agent already
+    // posted its review and pipeline-agent has already routed
+    // `changes-requested` through self-healing. constraint-agent
+    // still runs (architectural-rule enforcement is not in
+    // PR-Agent's scope).
+    const skipReview = await shouldSkipReviewAgent(workDir);
+    if (skipReview) {
+      childLog.info(
+        { workDir },
+        'ADR-051 — PR-Agent enabled; gate skipping review-agent (constraint-agent still runs)',
+      );
+    }
+    const reviewAgent = skipReview ? null : new ReviewAgent();
 
-    // Run constraint + review in parallel. Each step persists its own
-    // agent_executions row and emits its own SSE events; concurrency is
-    // safe because each owns its own DB rows.
+    // Run constraint + (optionally) review in parallel. Each step
+    // persists its own agent_executions row and emits its own SSE
+    // events; concurrency is safe because each owns its own DB rows.
     // TEST_REPORT_005 — constraint-agent now does a Stage-2 LLM
     // judgment pass. Forward the singleton's lastPrompt /
     // lastLlmResponse / lastModelUsed / lastTokensUsed onto the
@@ -468,71 +501,78 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
     // (it's stateless apart from the per-run `lastTokensUsed`
     // accumulator which `runJudgment` resets on entry).
     const constraintAgent = getConstraintAgentInstance();
+    const constraintPromise = runWithObservability(
+      'constraint-agent',
+      'gate:constraint',
+      correlationId,
+      payload.intentId,
+      async () => {
+        const r = await runConstraintAgent(gateTask);
+        const decorated = r as unknown as {
+          lastPrompt?: string;
+          llmResponse?: string;
+          modelUsed?: string;
+          tokensUsed?: number;
+        };
+        if (constraintAgent.lastPrompt) decorated.lastPrompt = constraintAgent.lastPrompt;
+        if (constraintAgent.lastLlmResponse) decorated.llmResponse = constraintAgent.lastLlmResponse;
+        if (constraintAgent.lastModelUsed) decorated.modelUsed = constraintAgent.lastModelUsed;
+        if (constraintAgent.lastTokensUsed > 0) decorated.tokensUsed = constraintAgent.lastTokensUsed;
+        // TEST_REPORT_005 evolution — constraint-agent now drives a
+        // tool-use loop (executeScript / readFile / searchFiles).
+        // Forward the call log so the dashboard's tool-call panel
+        // shows what the LLM actually ran.
+        if (constraintAgent.lastToolCallLog.length > 0) {
+          (decorated as unknown as { toolCalls?: typeof constraintAgent.lastToolCallLog }).toolCalls =
+            constraintAgent.lastToolCallLog;
+        }
+        return r;
+      },
+      childLog,
+    );
+
+    const reviewPromise: Promise<GateAgentResult | null> = reviewAgent
+      ? runWithObservability(
+          'review-agent',
+          'gate:review',
+          correlationId,
+          payload.intentId,
+          async () => {
+            const r = await reviewAgent.review(gateTask);
+            // Side-effect: persist the markdown review artifact so the
+            // operator can read the prose feedback alongside the signals.
+            if (r.reviewArtifact) {
+              const { artifacts } = getRepositories();
+              await artifacts.save(r.reviewArtifact as unknown as Artifact);
+            }
+            // Forward the instance-captured prompt / response / model
+            // to the observability wrapper. These were on the
+            // `runLlmReviewAgent` result before the BaseLLMAgent
+            // refactor; now they're on the agent instance.
+            if (reviewAgent.lastPrompt) r.lastPrompt = reviewAgent.lastPrompt;
+            if (reviewAgent.lastLlmResponse) r.llmResponse = reviewAgent.lastLlmResponse;
+            if (reviewAgent.lastModelUsed) r.modelUsed = reviewAgent.lastModelUsed;
+            // Fix D — surface the BaseLLMAgent's accumulated token
+            // count so `agent_executions.tokens_used` is non-zero for
+            // the review-agent row.
+            if (reviewAgent.lastTokensUsed > 0) {
+              (r as unknown as { tokensUsed?: number }).tokensUsed = reviewAgent.lastTokensUsed;
+            }
+            return r;
+          },
+          childLog,
+        )
+      : Promise.resolve(null);
+
     const [constraintRes, reviewRes] = await Promise.all([
-      runWithObservability(
-        'constraint-agent',
-        'gate:constraint',
-        correlationId,
-        payload.intentId,
-        async () => {
-          const r = await runConstraintAgent(gateTask);
-          const decorated = r as unknown as {
-            lastPrompt?: string;
-            llmResponse?: string;
-            modelUsed?: string;
-            tokensUsed?: number;
-          };
-          if (constraintAgent.lastPrompt) decorated.lastPrompt = constraintAgent.lastPrompt;
-          if (constraintAgent.lastLlmResponse) decorated.llmResponse = constraintAgent.lastLlmResponse;
-          if (constraintAgent.lastModelUsed) decorated.modelUsed = constraintAgent.lastModelUsed;
-          if (constraintAgent.lastTokensUsed > 0) decorated.tokensUsed = constraintAgent.lastTokensUsed;
-          // TEST_REPORT_005 evolution — constraint-agent now drives a
-          // tool-use loop (executeScript / readFile / searchFiles).
-          // Forward the call log so the dashboard's tool-call panel
-          // shows what the LLM actually ran.
-          if (constraintAgent.lastToolCallLog.length > 0) {
-            (decorated as unknown as { toolCalls?: typeof constraintAgent.lastToolCallLog }).toolCalls =
-              constraintAgent.lastToolCallLog;
-          }
-          return r;
-        },
-        childLog,
-      ),
-      runWithObservability(
-        'review-agent',
-        'gate:review',
-        correlationId,
-        payload.intentId,
-        async () => {
-          const r = await reviewAgent.review(gateTask);
-          // Side-effect: persist the markdown review artifact so the
-          // operator can read the prose feedback alongside the signals.
-          if (r.reviewArtifact) {
-            const { artifacts } = getRepositories();
-            await artifacts.save(r.reviewArtifact as unknown as Artifact);
-          }
-          // Forward the instance-captured prompt / response / model
-          // to the observability wrapper. These were on the
-          // `runLlmReviewAgent` result before the BaseLLMAgent
-          // refactor; now they're on the agent instance.
-          if (reviewAgent.lastPrompt) r.lastPrompt = reviewAgent.lastPrompt;
-          if (reviewAgent.lastLlmResponse) r.llmResponse = reviewAgent.lastLlmResponse;
-          if (reviewAgent.lastModelUsed) r.modelUsed = reviewAgent.lastModelUsed;
-          // Fix D — surface the BaseLLMAgent's accumulated token
-          // count so `agent_executions.tokens_used` is non-zero for
-          // the review-agent row.
-          if (reviewAgent.lastTokensUsed > 0) {
-            (r as unknown as { tokensUsed?: number }).tokensUsed = reviewAgent.lastTokensUsed;
-          }
-          return r;
-        },
-        childLog,
-      ),
+      constraintPromise,
+      reviewPromise,
     ]);
 
+    const agentResults = reviewRes ? [constraintRes, reviewRes] : [constraintRes];
     const result = synthesiseGateResult(
       correlationId,
-      [constraintRes, reviewRes],
+      agentResults,
       startedAt,
     );
 

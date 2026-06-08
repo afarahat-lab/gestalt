@@ -112,6 +112,7 @@ import {
   projectConfigShowCommand, projectConfigSetAgentCommand,
   projectConfigAddCustomAgentCommand, projectConfigRemoveCustomAgentCommand,
   projectConfigSetToolsCommand, projectConfigSetPipelineCommand,
+  projectConfigPushPrAgentConfigCommand,
   projectMembersListCommand, projectMembersAddCommand,
   projectMembersRemoveCommand, projectMembersRoleCommand,
   projectMembersAssignGroupCommand, projectMembersRemoveGroupCommand,
@@ -386,6 +387,19 @@ projectConfig
     await projectConfigSetPipelineCommand({
       server: opts.server, project: opts.project,
       adapter: opts.adapter, autoMerge: opts.autoMerge, mergeMethod: opts.mergeMethod,
+    }).catch(fatalError);
+  });
+
+// ADR-051 / TR_027 — regenerate `.pr_agent.toml` from the project's
+// current HARNESS.json and push to the default branch.
+projectConfig
+  .command('push-pr-agent-config')
+  .description('Regenerate .pr_agent.toml from HARNESS.json rules and push to the project default branch (ADR-051)')
+  .option('--server <url>', 'Server URL (one-shot override for this invocation)')
+  .option('--project <name>', 'Project name (defaults to current project)')
+  .action(async (opts: { server?: string; project?: string }) => {
+    await projectConfigPushPrAgentConfigCommand({
+      server: opts.server, project: opts.project,
     }).catch(fatalError);
   });
 

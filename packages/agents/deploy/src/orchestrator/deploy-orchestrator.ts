@@ -30,6 +30,7 @@ import {
   createWorker, dispatch, getRepositories,
   createContextLogger, emitLiveEvent, QUEUE_NAMES,
   runSelfHealingLoop, resolveProjectCredential,
+  getLLMClientForModel,
 } from '@gestalt/core';
 import type {
   TaskMessage, TaskResult, QueueConfig, TaskPriority,
@@ -43,6 +44,13 @@ import type { PipelineAgentSelfHealingHints } from '../agents/pipeline-agent';
 import { runPromotionAgent } from '../agents/promotion-agent';
 import type { PromotionAgentSelfHealingHints } from '../agents/promotion-agent';
 import { PipelineAdapterAuthError } from '../adapters/pipeline-adapter';
+import { GitHubActionsAdapter } from '../adapters/github-actions-adapter';
+import { runPrAgentReview } from '../adapters/pr-agent-adapter';
+import { authenticatedGitUrl } from '../agents/util';
+import { mkdtemp, rm } from 'fs/promises';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import { simpleGit } from 'simple-git';
 
 const log = createContextLogger({ module: 'deploy-orchestrator' });
 
@@ -291,6 +299,35 @@ async function handleDeployTask(
           startedAt,
         );
       }
+      // ADR-051 / TR_027 — when the project enables PR-Agent on a
+      // github-actions pipeline, INVOKE PR-Agent server-side via
+      // executeScript (the Gestalt container has it pip-installed
+      // alongside Aider), then poll the PR for the resulting review
+      // verdict and route on it.
+      //
+      // Branches by verdict:
+      //   - 'approved' | 'none'   → proceed to gate (existing flow)
+      //   - 'changes-requested'   → route through self-healing with
+      //                             PR-Agent's comment as
+      //                             technicalDetail; the LLM picks
+      //                             retry / fix-intent / escalate
+      //                             per ADR-050.
+      // LLM credentials come from Gestalt's registry and are passed
+      // to PR-Agent via subprocess env. No GitHub Secret required.
+      const prAgentDisposition = await maybeRunPrAgentAndRoute({
+        projectId: payload.projectId,
+        prNumber: payload.prNumber,
+        prUrl: payload.prUrl,
+        correlationId,
+        intentId: payload.intentId,
+        childLog,
+      });
+      if (prAgentDisposition === 'changes-requested-routed') {
+        return buildTaskResult(message, 'completed', startedAt);
+      }
+      // 'proceed' — approved, none, or PR-Agent errored. Fall through
+      // to the existing gate dispatch.
+
       // ADR-041 — CI passed; dispatch the LLM quality gate to
       // review the code on the PR branch. Gate runs constraint-agent
       // + review-agent against the actual committed source files
@@ -855,4 +892,230 @@ async function collectCiTechnicalDetail(
     );
     return undefined;
   }
+}
+
+/**
+ * TR_027 / ADR-051 — server-side PR-Agent invocation.
+ *
+ * After CI passes, runs PR-Agent against the PR via
+ * `runPrAgentReview` (executeScript subprocess inside the
+ * Gestalt container), then polls the PR for the resulting review
+ * verdict and decides what the deploy-orchestrator should do next.
+ *
+ * Returns one of:
+ *   - 'proceed'                  → caller dispatches gate as usual
+ *                                  (PR-Agent disabled, errored, or
+ *                                  posted an `approved` verdict)
+ *   - 'changes-requested-routed' → self-healing has been
+ *                                  dispatched with the PR-Agent
+ *                                  comment as `technicalDetail`;
+ *                                  caller should NOT dispatch the gate
+ *
+ * Never throws — every error path returns 'proceed' so a flaky
+ * PR-Agent install or LLM endpoint never blocks the cycle.
+ */
+const PR_AGENT_VERDICT_POLL_MAX = 6;
+const PR_AGENT_VERDICT_POLL_INTERVAL_MS = 5_000;
+
+async function maybeRunPrAgentAndRoute(args: {
+  projectId: string;
+  prNumber: number;
+  prUrl: string;
+  correlationId: string;
+  intentId: string;
+  childLog: ReturnType<typeof createContextLogger>;
+}): Promise<'proceed' | 'changes-requested-routed'> {
+  const { projectId, prNumber, prUrl, correlationId, intentId, childLog } = args;
+  try {
+    const { projects, platformLlms } = getRepositories();
+    const project = await projects.findById(projectId);
+    if (!project) return 'proceed';
+
+    // Read HARNESS.json once via the GitHub Raw API. Cheaper than a
+    // clone; same source of truth.
+    const harness = await readHarnessJsonViaApi(project, childLog);
+    const prAgentCfg = harness?.prAgent;
+    if (!prAgentCfg?.enabled) {
+      // Project hasn't opted into PR-Agent — proceed to gate. The
+      // gate's review-agent fallback handles architectural review.
+      return 'proceed';
+    }
+    const adapterType = harness?.pipeline?.adapter;
+    if (adapterType !== 'github-actions') {
+      // PR-Agent currently only integrates with github-actions
+      // (PR-URL semantics differ on GitLab / Bitbucket).
+      return 'proceed';
+    }
+
+    const token = await resolveProjectCredential(project);
+    if (!token) return 'proceed';
+
+    const repoMatch = project.gitUrl.match(/github\.com[:/]([^/]+)\/([^/.]+)(?:\.git)?$/);
+    if (!repoMatch) return 'proceed';
+    const [, owner, repo] = repoMatch;
+
+    // Resolve LLM credentials from the platform registry via the
+    // standard client. Same resolution path Aider uses (TR_014):
+    // the client owns vault-secret-vs-env-var decryption so PR-Agent
+    // never touches the master key directly. Future iterations can
+    // route a role-specific entry via agents.yaml; today we use the
+    // platform default.
+    const defaultLlm = await platformLlms.findDefault();
+    if (!defaultLlm) {
+      childLog.warn(
+        { prNumber },
+        'No platform default LLM — skipping PR-Agent run, proceeding to gate',
+      );
+      return 'proceed';
+    }
+    let modelString: string;
+    let baseUrl: string;
+    let apiKey: string;
+    try {
+      const client = await getLLMClientForModel(defaultLlm.modelString);
+      modelString = client.getModel();
+      baseUrl = client.getBaseUrl();
+      apiKey = client.getApiKey();
+    } catch (err) {
+      childLog.warn(
+        { err: err instanceof Error ? err.message : String(err), prNumber },
+        'Could not resolve LLM client for PR-Agent — proceeding to gate',
+      );
+      return 'proceed';
+    }
+    if (!apiKey) {
+      childLog.warn(
+        { prNumber, llm: defaultLlm.name },
+        'LLM client returned no API key — proceeding to gate',
+      );
+      return 'proceed';
+    }
+
+    // PR-Agent reads .pr_agent.toml from cwd. Clone shallow to a
+    // temp dir; the toml committed at the project root flows through.
+    const workDir = await mkdtemp(join(tmpdir(), `gestalt-pr-agent-${correlationId}-`));
+    try {
+      const cloneUrl = authenticatedGitUrl(project.gitUrl, token);
+      await simpleGit().clone(cloneUrl, workDir, ['--depth=1']);
+
+      const reviewResult = await runPrAgentReview({
+        prUrl,
+        projectRoot: workDir,
+        llmRecord: {
+          modelString,
+          baseUrl,
+          apiShape: defaultLlm.apiShape,
+          provider: defaultLlm.provider,
+        },
+        apiKey,
+        githubToken: token,
+        timeoutMs: (prAgentCfg.pendingTimeoutSeconds ?? 60) * 1000,
+        correlationId,
+      });
+
+      if (reviewResult.exitCode !== 0) {
+        childLog.warn(
+          {
+            prNumber,
+            exitCode: reviewResult.exitCode,
+            timedOut: reviewResult.timedOut,
+            stderrPrefix: reviewResult.error.slice(0, 300),
+          },
+          'PR-Agent exited non-zero — proceeding to gate without verdict',
+        );
+        return 'proceed';
+      }
+      childLog.info(
+        { prNumber, durationMs: reviewResult.durationMs },
+        'PR-Agent review complete',
+      );
+    } finally {
+      await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+
+    // PR-Agent posts its review asynchronously via GitHub API. Poll
+    // for the verdict to land.
+    const adapter = new GitHubActionsAdapter({
+      token,
+      owner,
+      repo,
+      workflowFile: 'gestalt.yml',
+    });
+    let verdict: 'approved' | 'changes-requested' | 'pending' | 'none' = 'pending';
+    for (let i = 0; i < PR_AGENT_VERDICT_POLL_MAX; i++) {
+      verdict = await adapter.getPrAgentVerdict({ projectId, prNumber });
+      if (verdict === 'approved' || verdict === 'changes-requested') break;
+      if (verdict === 'none' && i >= 2) break;
+      await sleep(PR_AGENT_VERDICT_POLL_INTERVAL_MS);
+    }
+    childLog.info({ prNumber, verdict }, 'PR-Agent verdict resolved');
+
+    if (verdict === 'changes-requested') {
+      const comment = await adapter.getPrAgentComment({ projectId, prNumber });
+      const healing = await attemptSelfHealingForDeploy({
+        intentId,
+        correlationId,
+        failureType: 'review-requested-changes',
+        failureSummary: 'PR-Agent requested changes on the pull request',
+        technicalDetail: comment.slice(0, 4000),
+        alertContextExtras: {
+          prNumber,
+          adapter: 'github-actions',
+          source: 'pr-agent',
+        },
+        childLog,
+      });
+      if (!healing.retryDispatched && !healing.pendingFix) {
+        await transitionIntent(intentId, correlationId, 'failed');
+      }
+      return 'changes-requested-routed';
+    }
+
+    // 'approved' | 'pending' (timed-out) | 'none' (PR-Agent didn't
+    // post anything observable) — proceed to gate.
+    return 'proceed';
+  } catch (err) {
+    childLog.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'maybeRunPrAgentAndRoute threw — proceeding to gate',
+    );
+    return 'proceed';
+  }
+}
+
+
+/**
+ * TR_027 — read HARNESS.json from a project's default branch via
+ * the GitHub Raw API. Lighter than a clone (one HTTP request); used
+ * to check the `prAgent` block before deciding whether to query
+ * PR-Agent's verdict. Returns null on any failure path.
+ */
+async function readHarnessJsonViaApi(
+  project: { gitUrl: string; defaultBranch: string },
+  childLog: ReturnType<typeof createContextLogger>,
+): Promise<import('@gestalt/core').HarnessConfig | null> {
+  try {
+    const m = project.gitUrl.match(/github\.com[:/]([^/]+)\/([^/.]+)(?:\.git)?$/);
+    if (!m) return null;
+    const [, owner, repo] = m;
+    // raw.githubusercontent.com serves the file directly without
+    // requiring auth on public repos. For private repos we'd need to
+    // add the token; the projects we care about for PR-Agent are
+    // either public or carry the token via the resolver. Best-effort.
+    const url = `https://raw.githubusercontent.com/${owner}/${repo}/${project.defaultBranch}/HARNESS.json`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const text = await res.text();
+    return JSON.parse(text) as import('@gestalt/core').HarnessConfig;
+  } catch (err) {
+    childLog.debug(
+      { err: err instanceof Error ? err.message : String(err) },
+      'readHarnessJsonViaApi failed',
+    );
+    return null;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
 }

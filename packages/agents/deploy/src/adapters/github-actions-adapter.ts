@@ -215,6 +215,65 @@ export class GitHubActionsAdapter implements PipelineAdapter {
     return { merged: data.merged, sha: data.sha };
   }
 
+  /**
+   * TR_027 / ADR-051 — read PR-Agent's review verdict from the
+   * latest bot review on `prNumber`. PR-Agent's bot login varies
+   * between deployments (`pr-agent[bot]` for the GitHub app,
+   * `codiumai-pr-agent[bot]` for older installs); we accept both.
+   *
+   * Non-fatal on all error paths — the orchestrator treats `none`
+   * as "PR-Agent didn't run" and falls back to the gate.
+   */
+  async getPrAgentVerdict(params: {
+    projectId: string;
+    prNumber: number;
+  }): Promise<'approved' | 'changes-requested' | 'pending' | 'none'> {
+    void params.projectId;
+    try {
+      const reviews = await this.listPrReviews(params.prNumber);
+      const latest = pickLatestPrAgentReview(reviews);
+      if (!latest) return 'none';
+      if (latest.state === 'APPROVED') return 'approved';
+      if (latest.state === 'CHANGES_REQUESTED') return 'changes-requested';
+      // COMMENTED / DISMISSED / PENDING / unknown — treat as pending
+      // (the verdict isn't final yet).
+      return 'pending';
+    } catch {
+      return 'none';
+    }
+  }
+
+  /**
+   * TR_027 / ADR-051 — fetch the body of every PR-Agent review on
+   * the PR. Capped at 3 KB total so the self-healing diagnostician's
+   * context window stays bounded.
+   */
+  async getPrAgentComment(params: {
+    projectId: string;
+    prNumber: number;
+  }): Promise<string> {
+    void params.projectId;
+    try {
+      const reviews = await this.listPrReviews(params.prNumber);
+      return reviews
+        .filter((r) => isPrAgentLogin(r.user?.login))
+        .map((r) => r.body ?? '')
+        .filter((s) => s.length > 0)
+        .join('\n\n')
+        .slice(0, 3000);
+    } catch {
+      return '';
+    }
+  }
+
+  private async listPrReviews(prNumber: number): Promise<PrReview[]> {
+    const res = await this.fetch(
+      `${GITHUB_API}/repos/${this.owner}/${this.repo}/pulls/${prNumber}/reviews?per_page=50`,
+    );
+    if (!res.ok) return [];
+    return (await res.json()) as PrReview[];
+  }
+
   async promoteToEnvironment(params: {
     correlationId: string;
     environment: 'staging' | 'production';
@@ -333,4 +392,40 @@ export class GitHubActionsAdapter implements PipelineAdapter {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+/**
+ * TR_027 / ADR-051 — minimal shape of GitHub's PR review object.
+ * Only the fields we actually read.
+ */
+interface PrReview {
+  user?: { login?: string };
+  state?: string;
+  body?: string;
+  submitted_at?: string;
+}
+
+const PR_AGENT_LOGINS = new Set([
+  'pr-agent[bot]',
+  'codiumai-pr-agent[bot]',
+  'qodo-merge-pro[bot]',
+]);
+
+function isPrAgentLogin(login: string | undefined): boolean {
+  return !!login && PR_AGENT_LOGINS.has(login);
+}
+
+/**
+ * Returns the most recently submitted PR-Agent review, if any.
+ * Reviews submitted before/without `submitted_at` sort last.
+ */
+function pickLatestPrAgentReview(reviews: PrReview[]): PrReview | null {
+  const filtered = reviews.filter((r) => isPrAgentLogin(r.user?.login));
+  if (filtered.length === 0) return null;
+  filtered.sort((a, b) => {
+    const ta = a.submitted_at ? new Date(a.submitted_at).getTime() : 0;
+    const tb = b.submitted_at ? new Date(b.submitted_at).getTime() : 0;
+    return tb - ta;
+  });
+  return filtered[0] ?? null;
 }

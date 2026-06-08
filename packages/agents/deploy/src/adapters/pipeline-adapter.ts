@@ -80,6 +80,37 @@ export interface PipelineAdapter {
     commitTitle?: string;
     commitMessage?: string;
   }): Promise<{ merged: boolean; sha: string }>;
+
+  /**
+   * TR_027 / ADR-051 — read the latest review verdict posted by
+   * CodiumAI PR-Agent (or a future equivalent bot) on `prNumber`.
+   *
+   *   - 'approved'           → PR-Agent gave a thumbs-up
+   *   - 'changes-requested'  → PR-Agent flagged issues
+   *   - 'pending'            → the review hasn't been posted yet
+   *   - 'none'               → PR-Agent isn't configured / there
+   *                            is no bot review on the PR
+   *
+   * Optional on the interface so non-GitHub adapters (NoOp, Azure,
+   * GitLab) can implement when they have an equivalent integration.
+   * When absent or returning 'none', pipeline-agent dispatches the
+   * gate as if PR-Agent never ran.
+   */
+  getPrAgentVerdict?(params: {
+    projectId: string;
+    prNumber: number;
+  }): Promise<'approved' | 'changes-requested' | 'pending' | 'none'>;
+
+  /**
+   * TR_027 / ADR-051 — fetch the body of PR-Agent's most recent
+   * review on `prNumber` so the self-healing diagnostician can read
+   * the actual feedback. Capped at ~3 KB by the implementation.
+   * Empty string when PR-Agent isn't configured or has no review.
+   */
+  getPrAgentComment?(params: {
+    projectId: string;
+    prNumber: number;
+  }): Promise<string>;
 }
 
 export type PipelineAdapterType =

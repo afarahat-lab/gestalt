@@ -20,14 +20,17 @@
 # build / lint / integration test / deploy commands.
 
 name: gestalt
-# TR_020 — one CI run per Aider push.
-#   - `push` triggers CI on every Gestalt branch commit (the
-#     bread-and-butter pre-gate quality check).
-#   - `workflow_dispatch` is retained ONLY for promotion-agent's
-#     staging / production deploy invocation (different
-#     `inputs.environment` value than CI).
-# `pull_request` removed pre-TR_020 (duplicated the push trigger,
-# tripled CI minutes in TR_019).
+# TR_020 — one CI run per Aider push for the build/test/lint/scan
+# quality job. PR-Agent (ADR-051 / TR_027) runs SERVER-SIDE inside
+# the Gestalt container via `executeScript` after CI passes —
+# Gestalt's own LLM credentials drive it, and `.pr_agent.toml`
+# committed to the project repo carries the project-specific
+# review focus. No CI step or repo secret required.
+#   - `push`             triggers `quality` (build / test / lint /
+#                        security) on every Gestalt branch commit.
+#   - `workflow_dispatch` retained ONLY for promotion-agent's
+#                        staging / production deploy invocation
+#                        (different `inputs.environment` value).
 on:
   push:
     branches: ['gestalt/**']

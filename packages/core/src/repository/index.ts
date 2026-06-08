@@ -1348,7 +1348,14 @@ export type AlertType =
    * through self-healing so a misbehaving custom agent doesn't
    * silently block the cycle. Migration 020.
    */
-  | 'custom-agent-failure';
+  | 'custom-agent-failure'
+  /**
+   * TR_027 / ADR-051 — PR-Agent posted a `CHANGES_REQUESTED`
+   * review on the PR. CI may have passed; the verdict comes
+   * from PR-Agent's review comment, which is forwarded to the
+   * self-healing diagnostician as `technicalDetail`.
+   */
+  | 'review-requested-changes';
 
 export type AlertRequiredAction =
   | 'provide-clarification'

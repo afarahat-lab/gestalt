@@ -151,7 +151,8 @@
         "Choose fix-intent when: the failure reveals a gap in the project itself that will cause the same error on every retry — the project needs to be fixed first",
         "Choose escalate when: the failure requires human judgment, is caused by external infrastructure, or you cannot determine the root cause with confidence",
         "When choosing fix-intent: write a fixIntent that is specific, Aider-ready, and scoped only to fixing the gap — not rebuilding the feature",
-        "resumeAfterFix should be true when the original intent will succeed once the gap is fixed"
+        "resumeAfterFix should be true when the original intent will succeed once the gap is fixed",
+        "For failures of type 'review-requested-changes': the PR-Agent review comment is in technicalDetail. Read it carefully before deciding action. Minor code issues → fix-intent. Architectural concerns → fix-intent with broader scope. Apparent false positives → retry."
       ]
     }
   },
@@ -159,6 +160,11 @@
     "adapter": "noop",
     "autoMerge": false,
     "mergeMethod": "squash"
+  },
+  "prAgent": {
+    "enabled": true,
+    "blockOnChangesRequested": true,
+    "pendingTimeoutSeconds": 90
   },
   "planner": {
     "enabled": true,

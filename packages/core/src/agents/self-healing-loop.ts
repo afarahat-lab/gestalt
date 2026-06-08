@@ -216,7 +216,16 @@ export type FailureType =
   | 'pipeline-timeout'
   | 'deploy-error'
   | 'maintenance-error'
-  | 'custom-agent-failure';
+  | 'custom-agent-failure'
+  /**
+   * TR_027 / ADR-051 — PR-Agent posted a `CHANGES_REQUESTED`
+   * review on the PR. CI itself may have passed; the verdict
+   * comes from the AI code reviewer. The PR-Agent comment body
+   * is forwarded as `technicalDetail` so the LLM diagnostician
+   * can read the actual feedback and pick the right action
+   * (`retry` / `fix-intent` / `escalate`) per ADR-050.
+   */
+  | 'review-requested-changes';
 
 /**
  * The payload the loop needs to drive a retry / escalation. The
@@ -917,13 +926,14 @@ async function escalateToHuman(
 }
 
 const TITLE_TEMPLATES: Record<FailureType, string> = {
-  'generate-error':       'Generate failure',
-  'gate-max-retries':     'Quality gate exhausted retries',
-  'pipeline-failed':      'CI pipeline failed',
-  'pipeline-timeout':     'CI pipeline timed out',
-  'deploy-error':         'Deploy failure',
-  'maintenance-error':    'Maintenance run failure',
-  'custom-agent-failure': 'Custom agent failure',
+  'generate-error':            'Generate failure',
+  'gate-max-retries':          'Quality gate exhausted retries',
+  'pipeline-failed':           'CI pipeline failed',
+  'pipeline-timeout':          'CI pipeline timed out',
+  'deploy-error':              'Deploy failure',
+  'maintenance-error':         'Maintenance run failure',
+  'custom-agent-failure':      'Custom agent failure',
+  'review-requested-changes':  'PR-Agent requested changes',
 };
 
 function buildAlertTitle(
