@@ -505,7 +505,7 @@ async function handlePlanningEvaluate(
   correlationId: string,
   childLog: ReturnType<typeof createContextLogger>,
 ): Promise<void> {
-  const { features, projects, artifacts } = getRepositories();
+  const { features, projects } = getRepositories();
   const feature = await features.findById(payload.featureId);
   if (!feature) throw new Error(`Feature ${payload.featureId} not found`);
   const phase = (await features.listPhases(feature.id)).find((p) => p.id === payload.phaseId);
@@ -562,16 +562,14 @@ async function handlePlanningEvaluate(
     return;
   }
 
-  // Phase deployed — assemble the list of files the phase actually
-  // built. TR_025 — the artifacts table only carries `design`-type
-  // artifacts (intent-spec, design-spec, aider-output); Aider's
-  // own file writes never land there. So the LLM was always seeing
-  // "no files built = failure". We compute the real file list
-  // post-clone by diffing the phase's PR branch against the
-  // project's default branch.
-  let builtFilePaths: string[] = [];
+  // TR_026 — the orchestrator no longer detects which files the
+  // phase wrote. Per ADR-050 that's the phase-evaluator-agent's
+  // job: it has `executeScript` in its tools and runs `git diff`
+  // itself against the cloned work-dir. The orchestrator's
+  // responsibility is to pass the right BRANCH NAMES as context;
+  // the agent decides what to do with them.
 
-  // Look up the intent's branchName for the diff (pr-agent persists it).
+  // Look up the intent's branchName so the agent can diff it.
   const phaseIntent = phase.intentId
     ? await getRepositories().intents.findById(phase.intentId).catch(() => null)
     : null;
@@ -586,72 +584,14 @@ async function handlePlanningEvaluate(
     const repo = simpleGit(workDir);
     try { await repo.checkout(project.defaultBranch); } catch { /* */ }
 
-    // Diff: the phase's PR branch against the default branch. If
-    // auto-merge already squashed the PR back into main, the branch
-    // is gone — fall back to inspecting the most recent commits on
-    // default for files mentioning the intent's correlation id.
+    // Fetch the phase branch into the clone so `git diff` can see
+    // both refs when the agent runs `executeScript`. Best-effort —
+    // when auto-merge has squashed and deleted the branch, the
+    // agent's git diff against `origin/<defaultBranch>` will simply
+    // show the merged commit's diff instead.
     if (phaseIntent?.branchName) {
-      try {
-        await repo.fetch('origin', phaseIntent.branchName).catch(() => undefined);
-        const diff = await repo.diff([
-          '--name-only',
-          `origin/${project.defaultBranch}`,
-          `origin/${phaseIntent.branchName}`,
-        ]).catch(() => '');
-        builtFilePaths = diff.split('\n').map((s) => s.trim()).filter((s) => s.length > 0 && !s.startsWith('.gestalt/'));
-      } catch (err) {
-        childLog.warn(
-          { err: err instanceof Error ? err.message : String(err) },
-          'PR-branch diff failed — trying merged-commit fallback',
-        );
-      }
+      await repo.fetch('origin', phaseIntent.branchName).catch(() => undefined);
     }
-    // Fallback: read the most recent commits on default whose
-    // subject includes the intent correlation id (pr-agent +
-    // auto-merge stamps the squash commit with the correlation
-    // prefix). Limited to 5 commits to keep this cheap.
-    if (builtFilePaths.length === 0 && phaseIntent?.correlationId) {
-      try {
-        const log = await repo.log({
-          format: { hash: '%H', subject: '%s' },
-          maxCount: 5,
-        });
-        const corrPrefix = phaseIntent.correlationId.slice(0, 8);
-        for (const entry of log.all) {
-          if (entry.subject.includes(corrPrefix)) {
-            const files = await repo.show([
-              '--name-only',
-              '--pretty=format:',
-              entry.hash,
-            ]).catch(() => '');
-            builtFilePaths = files.split('\n').map((s) => s.trim()).filter((s) => s.length > 0 && !s.startsWith('.gestalt/'));
-            break;
-          }
-        }
-      } catch (err) {
-        childLog.warn(
-          { err: err instanceof Error ? err.message : String(err) },
-          'Merged-commit fallback failed — proceeding with empty file list',
-        );
-      }
-    }
-    // Final fallback: the legacy artifacts-table read. Keeps the
-    // pre-TR_025 behaviour for the (rare) case where neither
-    // branchName nor a stamped commit exists. Filter widened to
-    // include test artifacts too.
-    if (builtFilePaths.length === 0 && phaseIntent) {
-      try {
-        const arts = await artifacts.findByCorrelationId(phaseIntent.correlationId);
-        builtFilePaths = arts
-          .filter((a) => a.type === 'code' || a.type === 'test')
-          .map((a) => a.path);
-      } catch { /* */ }
-    }
-
-    childLog.info(
-      { phaseIndex: phase.phaseIndex, builtFileCount: builtFilePaths.length },
-      'phase-evaluator: resolved built file list',
-    );
 
     let harnessConfig: HarnessConfig | null = null;
     try {
@@ -663,8 +603,16 @@ async function handlePlanningEvaluate(
       .filter((p) => p.phaseIndex > phase.phaseIndex);
 
     const evaluation: PhaseEvaluation = await new PhaseEvaluatorAgent().evaluatePhase(
-      feature, phase, builtFilePaths, remaining,
-      workDir, harnessConfig, correlationId,
+      feature,
+      phase,
+      {
+        defaultBranch: project.defaultBranch,
+        phaseBranch: phaseIntent?.branchName ?? null,
+      },
+      remaining,
+      workDir,
+      harnessConfig,
+      correlationId,
     );
 
     await features.updatePhaseStatus(phase.id, 'deployed');

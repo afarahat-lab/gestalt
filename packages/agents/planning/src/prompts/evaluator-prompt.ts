@@ -3,35 +3,35 @@
  *
  * This file contains ONLY platform mechanics:
  *   - Role / goal framing (from agents.yaml)
- *   - Project context injection (feature, phase, deployed artifacts,
- *     remaining phases)
+ *   - Branch-name context (the agent uses git itself to read diffs)
  *   - Calls into `renderHarnessAgentRules` for HARNESS.json content
- *     (evaluationCriteria + rules)
+ *     (rules + evaluationCriteria)
  *   - The JSON response schema (platform contract)
  *
- * Evaluation criteria ("Success: ..." / "Escalate: ...") come from
- * `HARNESS.json.agentConfig['phase-evaluator-agent'].evaluationCriteria`
- * — they are NOT hardcoded here.
+ * TR_026 — the platform NO LONGER pre-computes the list of files
+ * the phase wrote. Per ADR-050 that's the agent's job: it has
+ * `executeScript` in its tool set and runs `git diff` against the
+ * branches the orchestrator passes here. Evaluation criteria
+ * ("Success: ..." / "Escalate: ...") still come from
+ * `HARNESS.json.agentConfig['phase-evaluator-agent']` — not hardcoded.
  */
 
 import type {
   AgentConfig, HarnessConfig, FeatureRecord, FeaturePhaseRecord,
 } from '@gestalt/core';
 import { renderHarnessAgentRules } from '@gestalt/core';
+import type { PhaseBranchContext } from '../agents/phase-evaluator-agent';
 
 export function buildPhaseEvaluationPrompt(
   feature: FeatureRecord,
   completedPhase: FeaturePhaseRecord,
-  builtFilePaths: string[],
+  branchContext: PhaseBranchContext,
   remainingPhases: FeaturePhaseRecord[],
   agentCfg: AgentConfig,
   harnessConfig: HarnessConfig | null,
 ): string {
   const harnessSection = renderHarnessAgentRules('phase-evaluator-agent', harnessConfig);
   const extensions = agentCfg.promptExtensions ?? [];
-  const builtBlock = builtFilePaths.length
-    ? builtFilePaths.map((p) => `  - ${p}`).join('\n')
-    : '  (no file paths reported)';
   const remainingBlock = remainingPhases.length
     ? remainingPhases.map((p, i) =>
         `  ${i + 1}. ${p.title} — ${oneLine(p.scope)}`,
@@ -50,8 +50,9 @@ export function buildPhaseEvaluationPrompt(
     `Title: ${completedPhase.title}`,
     `Planned scope: ${oneLine(completedPhase.scope)}`,
     '',
-    '### Files actually built in this phase',
-    builtBlock,
+    '## Branch context (for your git diff)',
+    `Default branch: ${branchContext.defaultBranch}`,
+    `Phase branch:   ${branchContext.phaseBranch ?? '(none — pr-agent did not persist a branch)'}`,
     '',
     '## Remaining phases (not yet started)',
     remainingBlock,
@@ -61,17 +62,35 @@ export function buildPhaseEvaluationPrompt(
       : '',
     '',
     '## Task',
-    'Evaluate the completed phase against its plan. Compare the built',
-    'files against what was planned. If the built code differs from',
-    'the plan but is still correct, that is acceptable — adjust the',
-    'remaining phases instead of failing the verdict.',
+    'You have `executeScript` available. Use it to run git against the',
+    'cloned working directory and discover what the phase actually built.',
+    'A typical command:',
+    '',
+    '```sh',
+    branchContext.phaseBranch
+      ? `git diff origin/${branchContext.defaultBranch}...origin/${branchContext.phaseBranch} --name-status`
+      : `git log -1 --name-status origin/${branchContext.defaultBranch}`,
+    '```',
+    '',
+    'Read the output and decide:',
+    '- If git shows files matching the phase scope AND they meet the',
+    '  success criteria → verdict: "success".',
+    '- If git shows files that differ from the plan but are still',
+    '  correct → verdict: "partial" and emit adjustments for the',
+    '  remaining phases.',
+    '- If git shows zero files (e.g. Aider exited cleanly but wrote',
+    '  nothing) OR shows files unrelated to the phase scope →',
+    '  verdict: "escalate".',
+    '',
+    'Quote the git output (or a representative snippet) in the',
+    '`summary` field so operators can see your evidence.',
     '',
     'Return ONLY a single JSON object — no preamble, no markdown fences:',
     '',
     '```json',
     '{',
     '  "verdict": "success" | "partial" | "escalate",',
-    '  "summary": "one-line overall verdict",',
+    '  "summary": "one-line overall verdict, citing git evidence",',
     '  "adjustments": [',
     '    {',
     '      "phaseTitle": "Title of a REMAINING phase that needs updating",',

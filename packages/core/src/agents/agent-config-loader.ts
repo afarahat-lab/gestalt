@@ -212,6 +212,35 @@ export const PER_ROLE_DEFAULTS: Record<string, AgentConfig> = {
     promptExtensions: [],
     tools: { ...CONTEXT_FIXER_TOOLS },
   },
+  // ─── Planning layer (migration 024 / TR_026) ───────────────────
+  // The planning agents need read-only file tools to inspect the
+  // cloned repo, plus executeScript so phase-evaluator-agent can
+  // run git diff against the phase branch — TR_026 moved file-list
+  // detection from platform code to the agent itself.
+  'architecture-agent': {
+    role: 'Senior software architect',
+    goal: 'Produce high-level architecture designs and per-phase technical specifications',
+    llm: { temperature: 0.1, maxTokens: 3000 },
+    promptExtensions: [],
+    tools: { ...ALL_FILE_TOOLS },
+  },
+  'planner-agent': {
+    role: 'Technical project planner',
+    goal: 'Decompose a feature into ordered, independently deployable phases',
+    llm: { temperature: 0.1, maxTokens: 3000 },
+    promptExtensions: [],
+    tools: { ...ALL_FILE_TOOLS },
+  },
+  'phase-evaluator-agent': {
+    role: 'Technical delivery reviewer',
+    goal: 'Evaluate what was actually built in a completed phase and recommend adjustments',
+    llm: { temperature: 0.1, maxTokens: 2000 },
+    promptExtensions: [],
+    // TR_026 — executeScript so the agent can run git diff against
+    // the cloned repo. Without it the prompt's "run git diff"
+    // instruction would fail and the agent would have no evidence.
+    tools: { ...ALL_FILE_TOOLS_WITH_SCRIPT },
+  },
 };
 
 function fallbackFor(agentRole: string): AgentConfig {

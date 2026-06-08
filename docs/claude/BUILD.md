@@ -54,6 +54,45 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_026 — Remove platform file-change detection (ADR-050 enforcement)
+
+ADR-050 enforcement: the platform must NOT detect, parse, or
+interpret which files changed. Two surgical removals plus an
+agent-side replacement.
+
+- **AiderAdapter**: `parseAiderChangedFiles` deleted,
+  `filesChanged` removed from `AiderResult`. `--yes-always`
+  replaces `--yes` to prevent mid-session confirmation hangs.
+- **AiderCodeAgent**: new `discoverAiderWrites` helper runs
+  `git status --porcelain` in the work-dir and emits each
+  changed file as a code artifact. An AGENT calling git —
+  not platform code parsing Aider stdout.
+- **Phase-evaluator-agent**: 3-stage TR_025 fallback deleted.
+  Agent signature changed to take `branchContext`; prompt
+  rewritten to instruct it to run `git diff` via
+  executeScript. Switched to `callLLMWithTools` so the
+  tool-use loop fires.
+- **PER_ROLE_DEFAULTS** in `agent-config-loader.ts` extended
+  with the three planning agents so executeScript is
+  available out of the box.
+- **HARNESS.json + agents.yaml** updated on template +
+  trackeros: phase-evaluator-agent rules + evaluationCriteria
+  rewritten with verbatim git-diff guidance.
+- **Template bumped 0.11.0 → 0.12.0**.
+
+Verified live: feature `7d77f659` Phase 1 PR commit
+`ce3f3721` contains the real code files (`leave.model.ts` +
+test). Phase-evaluator's verdict text quotes the
+HARNESS.json git-diff rule, confirming the agent followed
+the new path. Full feature completion blocked by
+pre-existing trackeros operator state (stale
+`leave.repository.ts` from earlier auto-merged cycles) —
+captured as TR_027.
+
+**Operator action:** None. Pure platform changes (plus the
+trackeros HARNESS.json edit committed by the verification
+cycle as `897bcf06`).
+
 ### TR_025 — Cascade-depth brake + phase-evaluator file-list fix
 
 Two surgical hardening fixes (no migration):

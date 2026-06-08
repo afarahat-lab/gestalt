@@ -212,8 +212,15 @@ agents:
       model: ~
       temperature: 0.1
       max_tokens: 2000
+    tools:
+      # TR_026 — executeScript is mandatory: the agent runs `git diff`
+      # against the phase branch itself to discover what was built.
+      # The platform no longer pre-computes the file list. Read-only
+      # file tools support the agent's evidence-gathering follow-ups.
+      builtin: [executeScript, readFile, searchFiles, listDirectory, getFileTree]
     prompt_extensions:
-      - "Base your evaluation on the actual files built — not on what was planned"
+      - "Always run git diff via executeScript before forming a verdict — that is your evidence"
+      - "Base your evaluation on the actual files git reports — not on what was planned"
       - "If the implementation differs from the plan but is still correct, that is acceptable — adjust the plan, not the verdict"
       - "Only escalate to human if the phase produced code that is fundamentally incompatible with the remaining phases"
       - "Adjustments to remaining phases should update file paths, interface names, and import statements to match what was actually built"

@@ -128,14 +128,19 @@
     },
     "phase-evaluator-agent": {
       "rules": [
-        "Evaluate based on actual built files, not planned files",
-        "Adjust remaining phase scopes to use actual file paths, not planned paths",
-        "Only escalate when architectural incompatibility cannot be resolved by adjusting remaining phases"
+        "Before evaluating a phase, run executeScript with 'git diff origin/<defaultBranch>...origin/<phaseBranch> --name-status' to get the actual list of files changed. Use this as your evidence of what was built.",
+        "If the git diff returns empty output, the phase wrote no files. Escalate with reason: 'Aider completed but wrote 0 files (confirmed by git diff)'.",
+        "If the git diff returns files, evaluate them against the phase scope to determine success.",
+        "Never rely on artifact metadata or Aider stdout to determine what files were created — git diff is the only source of truth.",
+        "Evaluate based on actual built files, not planned files.",
+        "Adjust remaining phase scopes to use actual file paths, not planned paths.",
+        "Only escalate when architectural incompatibility cannot be resolved by adjusting remaining phases."
       ],
       "evaluationCriteria": [
-        "Success: the phase's success criteria are met AND the code compiles AND CI passed.",
-        "Partial success: some criteria met, remaining phases can compensate — adjust their scope and continue.",
-        "Escalate: the built code is architecturally incompatible with the remaining phases AND self-healing cannot fix it.",
+        "Success: git diff shows files matching the phase scope AND those files meet the success criteria.",
+        "Escalate — zero files: git diff is empty despite Aider reporting success.",
+        "Escalate — wrong files: git diff shows files unrelated to the phase scope.",
+        "Partial: some expected files present, adjust remaining phases and continue.",
         "When adjusting remaining phases: update exact file paths to match what was actually created, update interface names if they changed, update import paths if module structure differed from plan."
       ]
     },

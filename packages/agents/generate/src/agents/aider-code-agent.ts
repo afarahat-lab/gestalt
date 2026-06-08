@@ -5,17 +5,21 @@
  * `HARNESS.json.codeGeneration.backend === 'aider'`. Same
  * orchestrator contract — extends `BaseLLMAgent`, owns
  * `lastPrompt` / `lastLlmResponse` / `lastModelUsed` for the
- * dashboard's accordion, returns an `AgentResult` with a `code`
- * artifact for every file Aider wrote.
+ * dashboard's accordion, returns an `AgentResult`.
  *
  * Operationally different from the Gestalt-native code-agent:
  *   - Does not call the LLM directly. Aider does.
  *   - Does not produce JSON. Aider's narrative stdout becomes the
  *     "llm_response" the orchestrator persists.
- *   - Reads the Aider-written files back from the cycle's cloned
- *     work-dir so they land as artifacts in the DB exactly like
- *     code-agent output. The gate sees them; pr-agent writes them
- *     into its own clone for push.
+ *   - Edits files directly in the cycle's cloned work-dir.
+ *     pr-agent's `git add -A` captures everything Aider wrote.
+ *
+ * TR_026 — the platform NO LONGER parses Aider's stdout to know
+ * which files were written. Per ADR-050 that's the downstream
+ * agents' job (gate review-agent, phase-evaluator-agent), using
+ * `git diff` via `executeScript`. The only artifact this agent
+ * emits is the narrative (design type) so the IntentDetail panel
+ * can render Aider's session log.
  *
  * Test files are produced inline by Aider in the same session — the
  * orchestrator skips the test-agent step for Aider-backed projects.
@@ -23,6 +27,7 @@
 
 import { readFile } from 'fs/promises';
 import { join } from 'path';
+import { simpleGit } from 'simple-git';
 import type { AgentTask, AgentResult, GeneratedArtifact } from '../types';
 import { BaseLLMAgent } from './base-llm-agent';
 import { getLLMClientForModel, createContextLogger, getRepositories } from '@gestalt/core';
@@ -104,21 +109,14 @@ export class AiderCodeAgent extends BaseLLMAgent {
       };
     }
 
-    // Aider wrote files directly to the work-dir. Read them back as
-    // artifacts so the gate + deploy layers see them. Files Aider
-    // listed but that don't exist on disk (race / parse error)
-    // surface as a warning — they're omitted from the artifact set
-    // and the gate will see what made it.
-    const artifacts = await readWrittenFiles(
-      result.filesChanged,
-      projectRoot,
-      correlationId,
-    );
+    // TR_026 — the agent asks git (not Aider's stdout) what files
+    // changed. ADR-050: LLM evaluates, platform routes, AGENTS use
+    // git as a tool. Aider's stdout is treated as narrative only.
+    // `git status --porcelain` enumerates everything Aider touched
+    // in the work-dir without us having to parse natural-language
+    // "Applied edit to..." lines.
+    const codeArtifacts = await discoverAiderWrites(projectRoot, correlationId);
 
-    // Surface Aider's narrative as a design-type artifact so it's
-    // visible in the IntentDetail panel alongside the generated
-    // code. Path includes a short correlation prefix so re-runs
-    // don't collide.
     const narrativeArtifact: GeneratedArtifact = {
       id: crypto.randomUUID(),
       correlationId,
@@ -132,17 +130,16 @@ export class AiderCodeAgent extends BaseLLMAgent {
     log.info(
       {
         correlationId,
-        filesReported: result.filesChanged.length,
-        filesPersisted: artifacts.length,
+        filesFromGit: codeArtifacts.length,
         durationMs: result.durationMs,
       },
-      'Aider code generation complete',
+      'Aider code generation complete — file list resolved via git',
     );
 
     return {
       agentRole: 'code-agent',
       status: 'completed',
-      artifacts: [...artifacts, narrativeArtifact],
+      artifacts: [...codeArtifacts, narrativeArtifact],
       signals: [],
       tokensUsed: 0,
       durationMs: Date.now() - startedAt,
@@ -191,40 +188,65 @@ async function loadLatestDesignSpec(correlationId: string): Promise<string | nul
   }
 }
 
-async function readWrittenFiles(
-  paths: string[],
-  projectRoot: string,
+/**
+ * TR_026 — discover the files Aider wrote by asking git, not by
+ * parsing Aider's stdout. Aider runs with `--no-git` so it doesn't
+ * commit anything, which means every change shows up as either
+ * untracked (`?? path`) or modified (` M path`) in
+ * `git status --porcelain`. We read each one and emit it as a code
+ * artifact — the orchestrator persists it, pr-agent writes it into
+ * its own clone, gate reads it.
+ *
+ * `.gestalt/` paths are excluded — the narrative artifact emits
+ * those from a separate code path and they aren't part of the
+ * generated source.
+ *
+ * Best-effort: a missing or unreadable file logs a warning and is
+ * omitted from the artifact set. The gate sees what made it.
+ */
+async function discoverAiderWrites(
+  workDir: string,
   correlationId: string,
 ): Promise<GeneratedArtifact[]> {
+  const git = simpleGit(workDir);
+  let status: Awaited<ReturnType<typeof git.status>>;
+  try {
+    status = await git.status();
+  } catch (err) {
+    log.warn(
+      { correlationId, err: err instanceof Error ? err.message : String(err) },
+      'git status failed in Aider work-dir — no code artifacts emitted',
+    );
+    return [];
+  }
+
+  // Untracked (created) + modified + renamed `to` paths. Aider may
+  // have written multiple, including deeply nested ones.
+  const candidates = new Set<string>([
+    ...status.not_added,
+    ...status.created,
+    ...status.modified,
+    ...status.renamed.map((r) => r.to),
+  ]);
+
   const artifacts: GeneratedArtifact[] = [];
-  for (const relPath of paths) {
-    // Aider sometimes prefixes paths with `./` or includes trailing
-    // commentary like " (new)". Normalise before reading.
-    const cleaned = relPath
-      .replace(/^\.\//, '')
-      .replace(/\s+\(new\)$/i, '')
-      .replace(/\s+\(modified\)$/i, '')
-      .trim();
-    if (cleaned.length === 0) continue;
+  for (const relPath of candidates) {
+    if (!relPath || relPath.startsWith('.gestalt/')) continue;
     try {
-      const content = await readFile(join(projectRoot, cleaned), 'utf8');
+      const content = await readFile(join(workDir, relPath), 'utf8');
       artifacts.push({
         id: crypto.randomUUID(),
         correlationId,
         type: 'code',
-        path: cleaned,
+        path: relPath,
         content,
         producedBy: 'code-agent',
         createdAt: new Date(),
       });
     } catch (err) {
       log.warn(
-        {
-          correlationId,
-          path: cleaned,
-          err: err instanceof Error ? err.message : String(err),
-        },
-        'Aider reported writing a file but it was not readable — skipping',
+        { correlationId, path: relPath, err: err instanceof Error ? err.message : String(err) },
+        'git reported a changed file that could not be read — skipping',
       );
     }
   }
@@ -232,15 +254,14 @@ async function readWrittenFiles(
 }
 
 function renderAiderNarrative(
-  result: { output: string; filesChanged: string[]; durationMs: number; exitCode: number },
+  result: { output: string; durationMs: number; exitCode: number },
   message: string,
 ): string {
-  const lines = [
+  return [
     '# Aider session',
     '',
     `**Exit code:** ${result.exitCode}`,
     `**Duration:** ${result.durationMs}ms`,
-    `**Files changed:** ${result.filesChanged.length}`,
     '',
     '## Prompt sent to Aider',
     '',
@@ -254,14 +275,5 @@ function renderAiderNarrative(
     result.output || '(no stdout)',
     '```',
     '',
-  ];
-  if (result.filesChanged.length > 0) {
-    lines.push('## Files written');
-    lines.push('');
-    for (const p of result.filesChanged) {
-      lines.push(`- ${p}`);
-    }
-    lines.push('');
-  }
-  return lines.join('\n');
+  ].join('\n');
 }

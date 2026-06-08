@@ -3,6 +3,200 @@
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+### Session 2026-06-08 — Claude Code (TR_026: remove platform file-change detection — Aider stdout parsing deleted, phase-evaluator uses git diff via executeScript)
+
+ADR-050 enforcement: the platform must NOT detect, parse, or
+interpret which files changed. That's the agent's job, using
+git as a tool. Two surgical changes plus one regression patch.
+
+What changed (code):
+
+- **`packages/agents/generate/src/adapters/aider-adapter.ts`** —
+  `parseAiderChangedFiles` deleted entirely. `filesChanged`
+  field removed from `AiderResult`. `--yes` flag promoted to
+  `--yes-always` so Aider's interactive confirmation prompts
+  never hang on a TTY-less server.
+- **`packages/agents/generate/src/agents/aider-code-agent.ts`** —
+  reading `result.filesChanged` removed. The agent now asks
+  `git status --porcelain` in the Aider work-dir (via new
+  `discoverAiderWrites` helper) and emits each changed file
+  as a `type: 'code'` artifact. This keeps pr-agent's
+  artifact-driven push path working — pr-agent runs in its
+  own clone and needs the artifact set to know what to write.
+  The agent (NOT the platform) is the one calling git.
+- **`packages/core/src/agents/agent-config-loader.ts`** —
+  `PER_ROLE_DEFAULTS` extended with three planning roles
+  (architecture-agent / planner-agent / phase-evaluator-agent).
+  phase-evaluator-agent gets `ALL_FILE_TOOLS_WITH_SCRIPT` by
+  default so `executeScript` is available out of the box for
+  the git-diff path.
+- **`packages/agents/planning/src/agents/phase-evaluator-agent.ts`** —
+  `evaluatePhase` signature changed: `builtFilePaths: string[]`
+  replaced with `branchContext: { defaultBranch, phaseBranch }`.
+  The agent now uses `callLLMWithTools` (was `callLLM`) so
+  the tool-use loop runs.
+- **`packages/agents/planning/src/prompts/evaluator-prompt.ts`** —
+  prompt rewritten to instruct the agent to run
+  `git diff origin/<defaultBranch>...origin/<phaseBranch>
+  --name-status` via executeScript and reason about the output.
+  The "Files actually built" pre-computed block is gone.
+- **`packages/agents/planning/src/orchestrator/planning-orchestrator.ts`** —
+  the 3-stage built-file resolution helper from TR_025
+  (PR-branch diff → merged-commit scan → artifacts-table read)
+  deleted. The orchestrator only fetches the phase branch
+  into the clone so `git diff` can see both refs; the agent
+  does the rest.
+
+What changed (HARNESS.json + template):
+
+- **`HARNESS.json.agentConfig.phase-evaluator-agent.rules`** —
+  four new rules (template + trackeros) instructing the agent
+  to run `git diff` BEFORE forming a verdict, and to use git
+  output as the only source of truth for what was built.
+  Verbatim text matches the brief.
+- **`HARNESS.json.agentConfig.phase-evaluator-agent.evaluationCriteria`** —
+  rewritten with explicit git-diff-derived verdicts ("Escalate
+  — zero files: git diff is empty despite Aider reporting
+  success", etc.).
+- **agents.yaml template** — phase-evaluator-agent gains an
+  explicit `tools.builtin: [executeScript, readFile,
+  searchFiles, listDirectory, getFileTree]` block + a
+  prompt extension reinforcing "always run git diff before
+  forming a verdict".
+- **Template bumped 0.11.0 → 0.12.0**.
+
+Live verification on trackeros:
+
+- Feature `427978a6` (first attempt, post-TR_026): planner
+  produced a 7-phase plan. Phase 1 dispatched.
+  - Phase-evaluator-agent verdict: `"Aider completed but wrote 0
+    files (confirmed by git diff)"` — quoted the HARNESS.json
+    rule verbatim, confirming it followed the git-diff path.
+  - PR commit (`88c72d4b`) contained ONLY `.gestalt/*`
+    metadata files. The platform had correctly not invented
+    files Aider didn't write. ✓ TR_026's "no Aider-stdout
+    interpretation" verified.
+  - Surfaced an unintended regression: with TR_026's removal
+    of code artifacts in AiderCodeAgent, pr-agent (which uses
+    artifacts to write files into its own separate clone)
+    pushed nothing. The fix in `discoverAiderWrites` (git
+    status in the agent, not stdout parsing) landed before
+    the second test cycle.
+
+- Feature `7d77f659` (post-regression patch): same 7-phase
+  plan.
+  - Phase 1's PR commit (`ce3f3721`) now contains
+    `src/modules/leave/leave.model.ts` + `tests/unit/leave.model.test.ts`
+    + `.gestalt/*` ✓ Aider's writes survive end-to-end.
+  - CI failed with `TS2339 Property 'createdAt' does not exist
+    on type 'LeaveRequest'` because trackeros's main carries a
+    stale `leave.repository.ts` from prior auto-merged TR_025
+    cycles that references model fields the new phase-1 model
+    doesn't declare. Pre-existing operator state pollution —
+    not a TR_026 regression.
+  - TR_022 retry budget exercised end-to-end: phase-retry 1/2,
+    phase-retry 2/2, then `phase-failed after 2 retries —
+    feature blocked`. The autonomous failure path is intact.
+  - Self-healing-agent (TR_024) chose `action: 'retry'` over
+    `action: 'fix-intent'` for all three CI failures. A
+    reasonable LLM call — the error reads like "code mistake"
+    not "systemic gap" — but the systemic gap (stale
+    repository.ts on main) is what's actually blocking.
+
+What this VERIFIES architecturally:
+
+- Aider stdout parsing in the platform: GONE ✓
+- Phase-evaluator-agent calls executeScript with git diff
+  before forming a verdict ✓ (the verdict text quotes the
+  HARNESS.json rule)
+- pr-agent gets the right file inventory via the
+  agent-side git inquiry ✓
+- The platform passes only branch NAMES as context; the agent
+  decides what to do with them ✓
+
+What this DOES NOT VERIFY (TR_027):
+
+- Full multi-phase feature autonomous completion. Blocked
+  by trackeros's stale `leave.repository.ts` from earlier
+  auto-merged cycles. The TR_025 cleanup needs to be done
+  again, OR the planner needs to put model+repository in
+  the same phase (TR_023's rule) reliably.
+- Self-healing-agent choosing `action: 'fix-intent'` for the
+  stale-file-on-main case. Today it picks `retry`.
+
+Decisions made:
+
+- **Agent uses git, platform doesn't.** AiderCodeAgent calling
+  `simpleGit(workDir).status()` to find changed files is an
+  AGENT using a tool — explicitly permitted by ADR-050. The
+  platform's parseAiderChangedFiles parser (which was
+  interpreting natural-language "Applied edit to..." lines)
+  is the violation that's removed.
+- **Code artifacts stay in the artifact set.** pr-agent
+  fundamentally needs an artifact set to write into its own
+  clone — it doesn't share the generate orchestrator's
+  work-dir, which is deleted in `finally`. So
+  AiderCodeAgent still emits code artifacts; it just sources
+  them from git rather than from Aider's stdout.
+- **`--yes-always` not `--yes`.** Aider 0.86 sometimes
+  injects "Apply this edit?" mid-session. `--yes-always` is
+  the stronger form that never prompts.
+- **Did NOT clean trackeros's stale leave.repository.ts** in
+  this session. The TR_025 cleanup was already done; the
+  pollution returned from a later auto-merged cycle. The
+  recurring nature suggests a planner-level fix (TR_023's
+  rule, more strictly enforced) or a self-healing-agent
+  improvement is the right next move, not another manual
+  cleanup.
+
+Pending follow-ups (NEW from TR_026):
+
+- **(HIGH — NEW from TR_026 / TR_027)** Stale repository files
+  on trackeros main keep returning from auto-merged Phase 1
+  cycles. Either the planner must reliably put model+
+  repository in the same phase (TR_023's rule with stricter
+  enforcement), or self-healing-agent needs to recognise
+  "TS error in file Aider didn't write this cycle = systemic
+  gap" and choose fix-intent. Most cycles loop in this state.
+- **(MEDIUM — NEW from TR_026)** TR_022's MAX_PHASE_RETRIES
+  is 2 by default. For long-running features the retry budget
+  could be bumped per-feature via planner-emitted hints, but
+  today it's a single number for the whole feature.
+- **(LOW — NEW from TR_026)** The phase-evaluator-agent's
+  tool-call log isn't persisted to `agent_executions`
+  because the planning orchestrator calls the agent
+  directly (not through `runWithObservability`). The
+  evaluator's git diff output is therefore not visible to
+  operators after the fact.
+
+Carryover follow-ups (status updates):
+
+- **~~(HIGH — TR_025)~~ STRUCTURALLY RESOLVED by TR_026.**
+  Phase-evaluator file-list detection — the 3-stage fallback
+  is gone; the agent owns the discovery.
+- **(STILL OPEN — HIGH)** Aider `--yes-always` may not be
+  enough on all Aider versions. Need to validate on Aider
+  >= 0.86 (live), other versions still TBD.
+
+Build status: `pnpm -r build` clean across all 13 packages.
+No new migration. Template auto-refreshed at boot:
+`version: "0.12.0"`. Server `/health` 200 throughout.
+
+trackeros operator commits in this session:
+- `897bcf06` — HARNESS.json: phase-evaluator-agent git-diff
+  rules + evaluationCriteria.
+
+trackeros planning-loop commits (auto-merged):
+- `88c72d4b` — Phase 1 (pre-discoverAiderWrites — only
+  .gestalt/ artifacts)
+- `b336fdd7`, `a0481470` — PLAN.md updates per feature
+- `ce3f3721` — Phase 1 (post-discoverAiderWrites — contains
+  the actual code files Aider wrote)
+
+PLAN.md content for the verification feature:
+https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
+
+---
 ### Session 2026-06-08 — Claude Code (TR_025: cascade-depth brake + planning evaluator file-list fix — autonomous loop verified phase 1 → auto-dispatch phase 2 on the leave management feature)
 
 Follow-up to TR_024. Two surgical fixes plus a live test of the
@@ -352,179 +546,6 @@ Migration 026 applied at boot. Template auto-refreshed to
 PRs #62–#68 from the verification cascade closed with
 `--delete-branch`. trackeros operator commits in this session:
 `1a4fe16e` (HARNESS + agents.yaml self-healing-agent block).
-
----
-### Session 2026-06-07 — Claude Code (TR_022: scaffolding fixes + phase retry budget + per-phase architecture verification — full planning loop live-tested on leave management feature)
-
-Follow-up to PLANNING_LAYER. Three fixes plus four verification
-runs against trackeros to confirm the planning loop is fully
-operational under real CI.
-
-What changed (code):
-
-- **Migration 025** — `ALTER TABLE feature_phases ADD COLUMN
-  retry_count INTEGER NOT NULL DEFAULT 0`. Existing rows
-  start at 0 so the semantics on the next cycle match
-  pre-TR_022 behaviour exactly.
-- **`@gestalt/core`** — `HarnessConfig.planner` gains optional
-  `maxPhaseRetries` (default 2 — one initial attempt + 2
-  retries = 3 total per phase). `FeaturePhaseRecord` gains
-  `retryCount: number`. `FeatureRepository` gains
-  `incrementPhaseRetry(phaseId): Promise<number>`. Postgres
-  impl plus Oracle/MSSQL throw-stubs all updated.
-- **`@gestalt/agents-planning`** — `handlePlanningEvaluate`'s
-  failure branch rewritten. Instead of immediately marking the
-  feature blocked, the orchestrator reads
-  `planner.maxPhaseRetries` via a fast shallow-clone helper
-  (`readMaxPhaseRetries` — appended at the bottom of
-  `planning-orchestrator.ts`), compares to `phase.retryCount`,
-  and either dispatches a fresh `planning:phase` for the same
-  phase (logged as `phase-retry`) or transitions to
-  `phase-failed` with budget exhausted. The retry uses the
-  same phase row — same scope, same architecture notes — so
-  the next-round Aider sees identical inputs.
-- **`packages/server/src/templates/stack-config.ts`** —
-  `buildStackPrompt` extended with a TypeScript-specific
-  paragraph instructing the LLM to include the JSON-import rule
-  in `agentPromptExtensions`. `parseStackConfig` defensively
-  injects the rule (via the new `TS_JSON_IMPORT_RULE` const)
-  whenever `language === 'TypeScript'` and the LLM forgot it.
-  `DEFAULT_AGENT_PROMPT_EXTENSIONS` updated so the failure-
-  default path also carries the rule.
-- **Template (`templates/corporate-ops-web-mobile/harness/HARNESS.json`)** —
-  `planner.maxPhaseRetries: 2` added; `agentConfig.code-agent.rules`
-  gains the JSON-import rule. Template bumped 0.8.0 → 0.9.0.
-
-trackeros operator commits (already on `main`):
-
-- `a7494aaa` — tsconfig.json `resolveJsonModule` +
-  `allowSyntheticDefaultImports`; HARNESS.json
-  `code-agent.rules` JSON-import rule; planner block bumped
-  to `{maxPhasesPerFeature: 10, maxFilesPerPhase: 5,
-  architectureReviewPerPhase: false, maxPhaseRetries: 2}`.
-- `b99e1716` — revert of the temporary
-  `architectureReviewPerPhase: true` test toggle.
-
-Live verification matrix:
-
-| Check (from brief) | Verified? | Evidence |
-|---|---|---|
-| architecture-agent runs | ✓ | Feature `1a5dcfc5`: log entry `architecture-designed Feature architecture: 4 module(s), 2 recommended phase(s)` at 19:12:53 |
-| PLAN.md committed to repo | ✓ | trackeros commit `ebd5bbdf` |
-| docs/ARCHITECTURE.md updated | ✓ | "Leave Management Module" section appended in same commit |
-| Phase 1 intent submitted automatically | ✓ | Plan log `phase-submitted [phase 1] … intent 8f93f513` at 19:13:10 |
-| **TR_022 — retry budget honoured** | ✓ | Plan log shows `phase-retry 1/2` at 19:16:22 and `phase-retry 2/2` at 19:19:41 before `phase-failed after 2 retries` at 19:22:44 |
-| **TR_022 — per-phase architecture review fires when opted in** | ✓ | Feature `37799ea9` (test-only flag flip): log entry `phase-architecture-designed [phase 1] Phase 1 architecture: 1 interface(s), 3 criteria` at 19:24:59 between `plan-built` and `phase-submitted` |
-| CI passes after tsconfig fix | ✗ partial | The TS5083 `resolveJsonModule` class is fixed (no longer flagged). New failures are property-mismatch errors in Aider's generated code (e.g. `Property 'employeeId' does not exist on type 'CreateLeaveRequestDto'`) — a pre-existing code-agent / Aider problem, not a tsconfig issue |
-| Phase 1 deploys | ✗ | Blocked by the Aider issue above |
-| Phase evaluator runs | ✗ | Only runs on successful deploy — guarded by design |
-| Phase 2 submitted | ✗ | Same reason |
-| `gestalt feature show <id>` renders progress correctly | ✓ | Three live polls in this session, including the retry events |
-
-The brief's primary verification target — the **autonomous
-planning loop with retry budget** — passed every check. The
-secondary target (clean deploy through CI) is gated on the
-Aider behaviour follow-up, captured below.
-
-PLAN.md produced for the leave-management feature
-(5 phases, 4 modules, 3 domain entities):
-
-```markdown
-# PLAN.md — Leave management module
-
-## Modules
-- **leave** (`src/modules/leave`)
-- **balance** (`src/modules/balance`)
-- **policy** (`src/modules/policy`)
-- **employee** (`src/modules/employee`)
-
-## Domain entities
-- **LeaveRequest** — id, employeeId, type, startDate,
-  endDate, status, managerId, managerComment, createdAt
-- **LeaveBalance** — employeeId, leaveType, totalDays,
-  usedDays, year
-- **LeavePolicy** — id, leaveType, defaultDaysPerYear,
-  maxConsecutiveDays, requiresApproval, createdAt
-
-## Phases
-1. Create leave model
-2. Implement leave request submission (depends on Phase 1)
-3. Implement leave request approval (depends on Phase 2)
-4. Create leave balance management (depends on Phase 1)
-5. Implement leave policy configuration
-```
-
-Full PLAN.md text in trackeros `main`:
-https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
-(commit `ebd5bbdf`).
-
-Decisions made:
-
-- **`readMaxPhaseRetries` does its own shallow clone** rather
-  than hoisting harness-read above the failure check. Cleaner
-  separation — the retry branch never touches the (larger)
-  evaluate-clone path. Cost: ~250ms per failure dispatch on a
-  small repo; acceptable for an error path.
-- **Retry preserves the original `scope` column** and
-  re-dispatches the same `planning:phase` payload. The phase
-  row's `scope` / `architecture` are the plan — the retry
-  should not mutate the plan, just give Aider another swing
-  at it. Operators who want a "smart retry" with a refined
-  scope can use the existing `pendingScopeAdjustment`
-  mechanism the evaluator already populates.
-- **Per-phase architecture verified via a test-flip + revert**
-  rather than left permanently enabled on trackeros. The flag
-  multiplies architecture-agent cost N-fold per feature; the
-  default `false` is the right operator choice on trackeros's
-  budget. The verification proved the code path runs; the
-  flag is now safe to flip true on any project that wants it.
-- **`maxPhaseRetries: 0`** was used during the per-phase
-  architecture verification cycle so the test feature didn't
-  burn the retry budget on unrelated Aider failures while
-  proving the architecture flag's behaviour. Reverted with
-  the architecture flag in the same revert commit.
-
-Pending follow-ups (NEW from TR_022):
-
-- **(HIGH)** Aider generates code that references fields not
-  present on the DTO (e.g. `employeeId`, `reason`, reason on
-  `CreateLeaveRequestDto`). Three consecutive attempts on
-  Phase 1 all produced the same class of error. Either
-  (a) extend the code-agent prompt with a "before writing a
-  service / repository, READ the DTO file and only reference
-  the fields you see there" rule, or (b) require Aider to
-  emit the model + repository in the same call so the model
-  is in its context when writing the repository. Captured as
-  TR_023 work.
-- **(LOW)** `readMaxPhaseRetries` could cache HARNESS.json
-  per feature for the duration of a feature lifecycle —
-  today it re-clones on every failure dispatch.
-
-Carryover follow-ups (status updates):
-
-- **(RESOLVED by TR_022)** PLANNING_LAYER's MEDIUM follow-up:
-  "phase failure → feature blocked is too eager" — now
-  bounded by `planner.maxPhaseRetries`.
-- **(RESOLVED by TR_022)** PLANNING_LAYER's LOW follow-up:
-  per-phase architecture pass not yet live-verified —
-  verified via feature `37799ea9`.
-- **(STILL OPEN — NEW HIGH)** TR_023 — Aider DTO-field
-  hallucination (described above).
-- **(STILL OPEN — HIGH)** TR_018/020: restore TR_010
-  mandatory `executeScript tsc --noEmit` code-agent rule on
-  trackeros's HARNESS.json. Would catch this class of error
-  pre-emit.
-- **(STILL OPEN — MEDIUM)** TR_014: Aider token-spend
-  capture in `agent_executions.tokens_used`.
-
-Build status: `pnpm -r build` clean across all 13 packages.
-Migration 025 applied at boot. Template auto-refreshed:
-`version: "0.9.0"`. Server `/health` 200 throughout.
-Stale trackeros PRs #49–52, #57 closed with
-`--delete-branch` per the brief. New trackeros PRs from this
-session (#58–#62) all closed automatically by the gate-
-failure path or remain open under the blocked feature — not
-worth closing individually until the Aider fix lands.
 
 
 ---

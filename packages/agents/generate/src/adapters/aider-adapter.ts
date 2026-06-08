@@ -14,12 +14,20 @@
  *   is also set as a belt-and-braces guard for older Aider
  *   versions that auto-commit even with --no-git.
  *
- *   --yes is mandatory. Aider is interactive by default; the server
- *   has no TTY.
+ *   --yes-always is mandatory. Aider is interactive by default;
+ *   the server has no TTY. TR_026 raised this from `--yes` to
+ *   `--yes-always` to prevent silent hangs on confirmation prompts
+ *   Aider sometimes inserts mid-session.
  *
  *   Credentials are forwarded as OPENAI_API_KEY + OPENAI_API_BASE
  *   environment variables (extraEnv to executeScript) — never via
  *   command-line flags, which would leak into the process listing.
+ *
+ * TR_026 — the platform NO LONGER parses Aider's stdout to detect
+ * which files changed. Per ADR-050 that is the agent's job, using
+ * git (via `executeScript`) on the actual repo. The `filesChanged`
+ * field on this result was deleted; downstream agents read the
+ * truth from git, not from Aider's narrative.
  */
 
 import { executeScript } from '@gestalt/core';
@@ -30,11 +38,6 @@ export interface AiderResult {
   output: string;
   /** Aider's stderr — populated on failure. */
   error: string;
-  /**
-   * Files Aider reported writing — parsed from its stdout. May be
-   * empty even on success if Aider determined no changes were needed.
-   */
-  filesChanged: string[];
   exitCode: number;
   durationMs: number;
   timedOut: boolean;
@@ -66,15 +69,18 @@ export async function runAider(
     .replace(/\$/g, '\\$')
     .replace(/`/g, '\\`');
 
-  // --yes      — no interactive prompts; the server is headless.
-  // --no-git   — pr-agent owns every git op (clone / commit / push).
-  // --model    — model string forwarded from the platform LLM
-  //              registry; uses the same routing as the rest of the
-  //              code-agent path.
-  // --message  — single-shot prompt; Aider exits after applying.
+  // --yes-always — TR_026: never prompt for confirmation. Aider
+  //                sometimes injects mid-session prompts ("Apply
+  //                this change?") that hang on a TTY-less server.
+  //                `--yes-always` is the stronger form of `--yes`.
+  // --no-git     — pr-agent owns every git op (clone / commit / push).
+  // --model      — model string forwarded from the platform LLM
+  //                registry; uses the same routing as the rest of
+  //                the code-agent path.
+  // --message    — single-shot prompt; Aider exits after applying.
   const command = [
     'aider',
-    '--yes',
+    '--yes-always',
     '--no-git',
     `--model "${modelString}"`,
     `--message "${escapedMessage}"`,
@@ -90,32 +96,8 @@ export async function runAider(
     success: result.exitCode === 0,
     output: result.stdout,
     error: result.stderr,
-    filesChanged: parseAiderChangedFiles(result.stdout),
     exitCode: result.exitCode,
     durationMs: result.durationMs,
     timedOut: result.timedOut,
   };
-}
-
-/**
- * Parse paths Aider reported writing/modifying from its stdout.
- *
- * Aider's output format varies slightly by version. The regex below
- * accepts the common forms — "Wrote path/to/file", "Created ...",
- * "Modified ...", and "Updated ..." — case-insensitive on the verb.
- * Lines without one of these prefixes are ignored.
- *
- * Duplicates collapsed (Aider sometimes prints the same path twice
- * when it edits a file across multiple SEARCH/REPLACE blocks).
- */
-export function parseAiderChangedFiles(output: string): string[] {
-  const files = new Set<string>();
-  const re = /^(?:Wrote|Created|Updated|Modified|Edited|Applied edit to)\s+(.+?)\s*$/i;
-  for (const line of output.split('\n')) {
-    const match = re.exec(line.trim());
-    if (match && match[1]) {
-      files.add(match[1].trim());
-    }
-  }
-  return Array.from(files);
 }

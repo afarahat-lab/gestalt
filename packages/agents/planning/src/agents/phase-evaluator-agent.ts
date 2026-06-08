@@ -6,6 +6,12 @@
  * The evaluation criteria come from
  * `HARNESS.json.agentConfig['phase-evaluator-agent'].evaluationCriteria`
  * + `agents.yaml`'s `prompt_extensions` — NOT hardcoded here.
+ *
+ * TR_026 — the agent now uses `executeScript` to run git commands
+ * directly against the cycle's cloned work-dir and read the file
+ * diff itself. The platform no longer pre-computes the file list;
+ * it only passes the branch names as context. Per ADR-050: LLM
+ * evaluates evidence, platform routes the verdict.
  */
 
 import {
@@ -18,6 +24,19 @@ import { buildPhaseEvaluationPrompt } from '../prompts/evaluator-prompt';
 import type { PhaseEvaluation } from '../types';
 
 const log = createContextLogger({ module: 'phase-evaluator-agent' });
+
+/**
+ * TR_026 — branch context the orchestrator passes to the agent.
+ * The agent uses these names verbatim in its `git diff` calls via
+ * `executeScript`. `phaseBranch` is null only on the rare case the
+ * intent never received a branchName (e.g. pr-agent failed before
+ * persisting it); the agent handles that case by reporting via
+ * its own evidence-quoting.
+ */
+export interface PhaseBranchContext {
+  defaultBranch: string;
+  phaseBranch: string | null;
+}
 
 export class PhaseEvaluatorAgent extends BaseLLMAgent {
   constructor() { super('phase-evaluator-agent'); }
@@ -32,7 +51,7 @@ export class PhaseEvaluatorAgent extends BaseLLMAgent {
   async evaluatePhase(
     feature: FeatureRecord,
     completedPhase: FeaturePhaseRecord,
-    builtFilePaths: string[],
+    branchContext: PhaseBranchContext,
     remainingPhases: FeaturePhaseRecord[],
     projectRoot: string,
     harnessConfig: HarnessConfig | null,
@@ -41,11 +60,22 @@ export class PhaseEvaluatorAgent extends BaseLLMAgent {
     this.lastTokensUsed = 0;
     const agentCfg = await loadAgentConfig(projectRoot, 'phase-evaluator-agent');
     const prompt = buildPhaseEvaluationPrompt(
-      feature, completedPhase, builtFilePaths, remainingPhases,
+      feature, completedPhase, branchContext, remainingPhases,
       agentCfg, harnessConfig,
     );
-    const raw = await this.callLLM(prompt, agentCfg, correlationId);
-    return parsePhaseEvaluation(raw, correlationId);
+    // TR_026 — the evaluator now runs in the tool-use loop with
+    // `executeScript` available so it can call git itself. The
+    // tool list comes from `agents.yaml.phase-evaluator-agent.tools`
+    // (operator-tunable per ADR-042) or the per-role default in
+    // `PER_ROLE_DEFAULTS` (which includes executeScript so the
+    // git-diff path works out of the box).
+    const { response } = await this.callLLMWithTools(
+      prompt,
+      agentCfg,
+      projectRoot,
+      correlationId,
+    );
+    return parsePhaseEvaluation(response, correlationId);
   }
 }
 

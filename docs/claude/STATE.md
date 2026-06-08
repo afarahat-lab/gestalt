@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-08 (after TR_025 — two surgical fixes to the autonomous planning loop. `MAX_FIX_INTENT_DEPTH=2` + `getFixIntentChainDepth` walker in `self-healing-loop.ts` close TR_024's cascading-fix-intent runaway. Planning-orchestrator's phase-evaluator file-list rewritten to use `git diff origin/<defaultBranch>..origin/<phase.branchName>` instead of the artifacts table — Aider's code writes never landed there, so the evaluator was previously always escalating with `builtFilePaths: []`. **Live verified**: feature `eed75889` (Leave management module) on clean trackeros — Phase 1 deployed cleanly (3 files built), evaluator verdict `success`, Phase 2 **auto-dispatched** — proving the autonomous loop. Phase 2 hit a separate Aider quirk (chat output had code, `Files changed: 0`); captured as TR_026 follow-up. trackeros operator cleanup commit `cd27ed17` removed the stale TEST_REPORT_011 leave/ seed.)
+**Last updated:** 2026-06-08 (after TR_026 — strict ADR-050 enforcement on file-change detection. Platform parsing of Aider's stdout DELETED: `parseAiderChangedFiles` removed, `filesChanged` field removed from `AiderResult`, `--yes-always` replaces `--yes`. Aider-code-agent now asks `git status --porcelain` (an AGENT using a tool, per ADR-050) to discover what Aider wrote and emit code artifacts. Planning-orchestrator's TR_025 git-diff fallback DELETED; phase-evaluator-agent now uses `executeScript("git diff origin/main...origin/<branch>")` itself with the branch context the orchestrator passes. New PER_ROLE_DEFAULTS entries for the three planning agents (architecture / planner / phase-evaluator) so executeScript is available out of the box. Template 0.11.0 → 0.12.0. **Live verified**: feature `7d77f659` — Aider's writes (leave.model.ts + leave.model.test.ts) now make it end-to-end into the PR commit (`ce3f3721`); phase-evaluator's verdict text quotes the HARNESS.json git-diff rule verbatim. Full multi-phase completion still blocked by trackeros's stale leave.repository.ts (operator state from earlier auto-merged cycles) — captured as TR_027 follow-up.)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 026 (latest: `026_intent_parent`)
 
@@ -219,28 +219,43 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
-### TR_025 — Cascade-depth brake + phase-evaluator file-list fix
+### TR_026 — Remove platform file-change detection (ADR-050 enforcement)
 
-Two fixes to harden the autonomous planning loop:
+The platform no longer parses Aider's stdout or computes
+file-change diffs. Agents discover changes via git.
 
-- **`MAX_FIX_INTENT_DEPTH = 2`** in `self-healing-loop.ts`.
-  Before submitting a fix-intent, the loop walks
-  `parent_intent_id` upward; when depth ≥ 2 it
-  force-escalates instead of cascading. ADR-050 intact —
-  the LLM still chooses the action; platform enforces the
-  ceiling.
-- **Phase-evaluator's built-file list** now sourced from
-  `git diff` against the PR branch rather than the
-  artifacts table (which only ever held `design`-type rows
-  for Aider-codegen projects). Three-stage fallback:
-  PR-branch diff → merged-commit scan → legacy
-  artifacts-table read.
+- **AiderAdapter**: `parseAiderChangedFiles` deleted,
+  `filesChanged` removed from `AiderResult`, `--yes` →
+  `--yes-always`.
+- **AiderCodeAgent**: new `discoverAiderWrites` helper runs
+  `git status --porcelain` in the Aider work-dir and emits
+  the changed files as code artifacts. The AGENT calls git
+  (per ADR-050); the platform never interprets natural
+  language.
+- **Phase-evaluator-agent**: signature changed to take
+  `branchContext: { defaultBranch, phaseBranch }`; prompt
+  rewritten to instruct the agent to run `git diff` via
+  executeScript; switched to `callLLMWithTools` so the
+  tool-use loop runs.
+- **PER_ROLE_DEFAULTS** extended with architecture-agent /
+  planner-agent / phase-evaluator-agent so executeScript is
+  available out of the box for the planning layer.
+- **HARNESS.json + agents.yaml** updated on template +
+  trackeros with the new git-diff-only rules.
 
-**Live verified**: feature `eed75889` Phase 1 deployed
-successfully and Phase 2 auto-dispatched. Phase 2 failed
-on a separate Aider issue (TR_026 follow-up). The
-autonomous planning loop is proven end-to-end for the
-phase-1-to-phase-2 transition.
+**Live verified**: feature `7d77f659` — Aider's writes
+(`leave.model.ts` + test) now make it into the PR commit
+end-to-end. Phase-evaluator's verdict text quotes the
+HARNESS.json git-diff rule, confirming the agent followed
+the new path. Full feature completion still blocked by
+trackeros's stale `leave.repository.ts` from earlier cycles.
+
+### TR_025 — Cascade-depth brake + phase-evaluator file-list (RESOLVED structurally by TR_026)
+
+The TR_025 file-list logic was platform code interpreting git
+output — TR_026 deleted it and gave the work to the agent.
+The cascade-depth brake (`MAX_FIX_INTENT_DEPTH = 2`) stays
+in `self-healing-loop.ts`.
 
 ### TR_024 — Autonomous systemic gap detection (migration 026)
 
@@ -304,13 +319,18 @@ diff.
 
 ### Active follow-ups (carryover or NEW)
 
-- **(HIGH — NEW from TR_025/TR_026)** Aider "Files changed: 0"
-  silent failure. On Phase 2 of the leave-management
-  verification, Aider's chat output contained valid
-  LeaveService code but reported zero file writes. Need
-  to detect this pattern (parse `aider-output.md` for
-  `Files changed: 0` AND non-empty chat code blocks) and
-  surface as a TEST_FAILURE signal so self-healing fires.
+- **(HIGH — NEW from TR_026/TR_027)** Stale repository files
+  on trackeros main keep returning from earlier auto-merged
+  Phase 1 cycles. Either planner must reliably put model+
+  repository in the same phase (TR_023's rule enforced),
+  or self-healing-agent needs to recognise "TS error in
+  file Aider didn't write this cycle = systemic gap" and
+  choose fix-intent. Today every cycle on trackeros loops
+  in this state.
+- **~~(HIGH — TR_025/TR_026)~~ RESOLVED by TR_026.** Aider's
+  "Files changed: 0" silent failure — now caught by git
+  status in `discoverAiderWrites`. The Aider stdout
+  pathology is bypassed entirely.
 - **(MEDIUM — NEW from TR_025)** Cascade-depth brake
   code-path verified at build/typecheck only; the
   MAX_FIX_INTENT_DEPTH escalation path has not been
