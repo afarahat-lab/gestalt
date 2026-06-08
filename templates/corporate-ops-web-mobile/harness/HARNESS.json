@@ -123,7 +123,9 @@
         "Always mention existing files the phase depends on by exact path so Aider reads them before generating.",
         "Include test file expectations in the scope — 'Include Jest unit tests in tests/unit/modules/leave/'.",
         "Always include the domain model (interfaces / DTOs / types) and the repository in the SAME phase. Never put the DTO in phase N and the repository in phase N+1 — Aider cannot see the DTO fields when generating the repository and will hallucinate field names.",
-        "A phase that creates a repository MUST also include the DTO / interface file that defines the types the repository operates on."
+        "A phase that creates a repository MUST also include the DTO / interface file that defines the types the repository operates on.",
+        "Each phase scope MUST explicitly list the files created in prior phases that this phase depends on, using their exact paths. Example: 'This phase depends on src/modules/leave/leave.model.ts from Phase 1 — read it before generating any code that references its types.' Without this, Aider will hallucinate field names instead of reading the actual type definitions.",
+        "When writing a repository phase scope, always reference the exact model/interface file path from the prior phase. Never assume Aider knows what types exist."
       ]
     },
     "phase-evaluator-agent": {
@@ -134,7 +136,8 @@
         "Never rely on artifact metadata or Aider stdout to determine what files were created — git diff is the only source of truth.",
         "Evaluate based on actual built files, not planned files.",
         "Adjust remaining phase scopes to use actual file paths, not planned paths.",
-        "Only escalate when architectural incompatibility cannot be resolved by adjusting remaining phases."
+        "Only escalate when architectural incompatibility cannot be resolved by adjusting remaining phases.",
+        "When adjusting remaining phase scopes after a partial success, always update the scope to include the exact file paths of files created in the completed phase. Replace generic references like 'leave.model.ts' with full paths like 'src/modules/leave/leave.model.ts'."
       ],
       "evaluationCriteria": [
         "Success: git diff shows files matching the phase scope AND those files meet the success criteria.",
