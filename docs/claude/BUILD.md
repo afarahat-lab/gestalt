@@ -54,6 +54,29 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_029 — Planner+evaluator prior-phase path rules (template 0.15.0)
+
+Two new `agentConfig.planner-agent.phaseScopingRules` items and
+one `agentConfig.phase-evaluator-agent.rules` item added,
+requiring per-phase explicit prior-file-path lists and full-path
+replacement when adjusting scopes after a partial verdict.
+Template bumped 0.14.0 → 0.15.0. Pure HARNESS edit — no platform
+code change, no migration.
+
+Planner-side verified end-to-end on the re-submitted
+leave-management feature: PLAN.md `Phase 2` carries the exact
+`src/modules/leave/leave.model.ts` + `leave.repository.ts`
+paths the planner was instructed to include. Phase 1 deployed
+in ~3 minutes (PR #88). Phase 2 still blocked by Aider
+code-agent reading discipline — captured as two NEW HIGH
+follow-ups in STATE.md (code-agent prompt mandate + architecture-
+agent context scoping).
+
+**Operator action:** Existing projects can adopt the new rules
+by merging them into `HARNESS.json.agentConfig.planner-agent.phaseScopingRules`
+and `agentConfig.phase-evaluator-agent.rules`. trackeros migrated
+as part of this session (commit `cf35c03b`).
+
 ### TR_028 — Full planning-loop re-test (TEST_REPORT_028.md)
 
 Milestone test on the leave-management feature, verifying every

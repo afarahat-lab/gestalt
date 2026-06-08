@@ -4,7 +4,9 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-08 (after TR_028 — milestone planning-loop re-test on the leave-management feature, verifying every TR_020 through TR_027 mechanism end-to-end in a single 19-min autonomous cycle. Phase 1 (model) deployed cleanly (Aider 5s → CI pass → PR-Agent 27s → verdict `none` → gate (constraint-agent only) → squash-merge, ~2m 44s). Phase 2 (repository) hit the known TR_023 Aider DTO-drift issue: repository code references model fields that don't exist (`leaveType` vs deployed `leaveTypeId`; `totalDays/usedDays/year` vs deployed `balance`). Self-healing's diagnostician correctly chose `action: 'retry'` for the first two cycles, then `action: 'fix-intent'` on the third (systemic gap detected). Fix-intent child dispatched + deployed in ~2m 25s (Aider 4s → CI pass → PR-Agent 24s → deploy → onSuccessDispatch envelope fired → parent resumed). But the fix-intent prompt didn't include a file path; Aider wrote a stray `/leave.model.ts` at repo root that tsc never resolves. Parent Phase 2 resumed → failed → planner retry budget exhausted → feature `blocked` at 1/4 phases. Two NEW HIGH follow-ups: (1) promoted TR_023 — planner must put model+repository in same phase OR code-agent must read existing model first; (2) self-healing fix-intent prompt enrichment — must include the failing import path and existing field shape. Architecture-agent / planner-agent / phase-evaluator-agent / PR-Agent / self-healing fix-intent + onSuccessDispatch / cascade-depth brake / phase retry budget all VERIFIED working as designed. TEST_REPORT_028.md in `docs/claude/`.)
+**Last updated:** 2026-06-09 (after TR_029 — added explicit "include prior-phase file paths in scope text" rules to `planner-agent.phaseScopingRules` + `phase-evaluator-agent.rules` to fix the TR_028 Aider DTO-drift blocker. Template 0.14.0 → 0.15.0. **Planner-side change verified end-to-end** — Phase 2's scope on the re-submitted leave-management feature explicitly cites `src/modules/leave/leave.model.ts` + `leave.repository.ts` by full path; Phase 1 correctly bundled model+repository (TR_023 rule honoured). Phase 1 deployed cleanly (PR #88, ~3m). **Aider-side gap surfaced**: even with the scope text explicitly saying "depends on src/modules/leave/leave.model.ts", Aider's Phase 2 service code hallucinated against the deployed Phase 1 files (`ILeaveRepository` vs `LeaveRepository`, `LeaveRequest.leaveType` vs `leaveTypeId`, imports of non-scheduled sibling modules `../balance/`, `../employee/`). 6 Aider runs across 3 phase attempts; self-healing chose pure `retry` every time (not fix-intent). Feature blocked at 1/4 phases. Two new HIGH follow-ups: (1) code-agent prompt must mandate readFile() on every cited path before generating; (2) architecture-agent's high-level module list is leaking into code-agent context and Aider imports from un-scheduled sibling modules.) Last full session report at `docs/claude/TEST_REPORT_028.md`; TR_028 is the prior milestone for end-to-end machinery.
+
+**Earlier (TR_028) — milestone planning-loop re-test on the leave-management feature, verifying every TR_020 through TR_027 mechanism end-to-end in a single 19-min autonomous cycle. Phase 1 (model) deployed cleanly (Aider 5s → CI pass → PR-Agent 27s → verdict `none` → gate (constraint-agent only) → squash-merge, ~2m 44s). Phase 2 (repository) hit the known TR_023 Aider DTO-drift issue: repository code references model fields that don't exist (`leaveType` vs deployed `leaveTypeId`; `totalDays/usedDays/year` vs deployed `balance`). Self-healing's diagnostician correctly chose `action: 'retry'` for the first two cycles, then `action: 'fix-intent'` on the third (systemic gap detected). Fix-intent child dispatched + deployed in ~2m 25s (Aider 4s → CI pass → PR-Agent 24s → deploy → onSuccessDispatch envelope fired → parent resumed). But the fix-intent prompt didn't include a file path; Aider wrote a stray `/leave.model.ts` at repo root that tsc never resolves. Parent Phase 2 resumed → failed → planner retry budget exhausted → feature `blocked` at 1/4 phases. Two NEW HIGH follow-ups: (1) promoted TR_023 — planner must put model+repository in same phase OR code-agent must read existing model first; (2) self-healing fix-intent prompt enrichment — must include the failing import path and existing field shape. Architecture-agent / planner-agent / phase-evaluator-agent / PR-Agent / self-healing fix-intent + onSuccessDispatch / cascade-depth brake / phase retry budget all VERIFIED working as designed. TEST_REPORT_028.md in `docs/claude/`.)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 027 (latest: `027_self_healing_pr_agent`)
 
@@ -239,6 +241,26 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
+### TR_029 — Planner+evaluator prior-phase path rules (HARNESS only)
+
+Two `phaseScopingRules` items and one `phase-evaluator-agent`
+rule added to mandate explicit prior-phase file paths in scope
+text. Template 0.14.0 → 0.15.0. **Planner-side verified
+end-to-end** on the re-submitted leave-management feature:
+PLAN.md `Phase 2` cites `src/modules/leave/leave.model.ts` +
+`leave.repository.ts` by full path; Phase 1 correctly bundled
+model+repository (TR_023 rule honoured this time); Phase 1
+deployed in ~3 minutes through Aider → CI → PR-Agent → gate
+(PR #88). **Aider-side gap surfaced**: even with the scope text
+explicitly saying "depends on src/modules/leave/leave.model.ts",
+Aider hallucinated `ILeaveRepository` (vs `LeaveRepository`),
+`LeaveRequest.leaveType` (vs `leaveTypeId`), and imports from
+non-scheduled `../balance/` `../employee/` modules. 6 Aider runs
+× 3 phase attempts; self-healing chose `retry` every time; feature
+blocked at 1/4 phases. The fix in this session is partial; the
+deeper fix is in the new HIGH follow-ups below (code-agent prompt
++ architecture-agent context scoping).
+
 ### TR_028 — Full planning-loop re-test (TEST_REPORT_028.md)
 
 Milestone test on the leave-management feature. Every TR_020
@@ -361,15 +383,49 @@ archive for the full diffs.
 
 ### Active follow-ups (carryover or NEW)
 
+- **(HIGH — NEW from TR_029)** Aider code-agent prompt must
+  mandate `readFile()` on every path mentioned in the phase
+  scope BEFORE generating any code. TR_029 verified the
+  planner now emits prior-phase paths verbatim ("This phase
+  depends on src/modules/leave/leave.model.ts"), but Aider
+  receives this text and proceeds to generate without
+  reading the cited files. Result: hallucinated symbol names
+  (`ILeaveRepository` vs deployed `LeaveRepository`) and field
+  names (`leaveType` vs deployed `leaveTypeId`). Options:
+  (a) extend HARNESS `code-agent.rules` with a "Before
+  writing any code, call readFile on every path mentioned
+  under 'Depends on:' in the scope" rule; (b) pre-fetch
+  cited-path contents and inline them in the code-agent
+  prompt assembler; (c) use Aider's `--read` flag for
+  explicit file-list injection.
+- **(HIGH — NEW from TR_029)** Architecture-agent's
+  high-level module list ("Modules: leave / balance /
+  policy / employee — each owns these files...") leaks into
+  Phase N's code-agent context. Aider treats it as ground
+  truth and tries to import from sibling modules the
+  planner never scheduled (e.g. `../balance/balance.model`,
+  `../employee/employee.model`). Either (a) scope the
+  code-agent context strictly to the planner's phase
+  description (exclude architecture-agent's broader output),
+  or (b) the planner's scope text must explicitly say "DO
+  NOT import from modules outside this phase's file list".
+- **(MEDIUM — NEW from TR_029)** Self-healing's `retry` vs
+  `fix-intent` routing decision is opaque to operators. In
+  TR_028 the diagnostician chose `fix-intent` for an Aider-
+  quality failure; in TR_029 it chose `retry` every time on
+  a similar failure pattern. Decision is LLM-driven
+  (ADR-050) so variance is expected, but the `technicalDetail`
+  field populated by `collectCiTechnicalDetail` should be
+  surfaced on the alert page so operators can see the
+  diagnostician's reasoning chain.
 - **(HIGH — NEW from TR_028, promotes TR_023)** Planner must
   reliably put `model + repository` in the same phase, OR
   code-agent prompt must mandate "READ the imported model
-  file before writing the repository". The leave-management
-  feature in TR_028 blocked at Phase 2 because Phase 1 wrote
-  the model in isolation and every Phase 2 Aider run drifted
-  to different field names. Self-healing's `fix-intent`
-  routing handled it but the prompt quality wasn't enough
-  to make the fix stick.
+  file before writing the repository". Partially addressed
+  by TR_029 — the planner now bundles model+repo, but
+  Aider still doesn't read the model when writing the
+  service in the next phase. The "READ the imported model"
+  half of this item is now the TR_029 follow-up above.
 - **(HIGH — NEW from TR_028)** Self-healing fix-intent prompt
   enrichment. When the diagnostician chooses `fix-intent` it
   should include the exact failing import path + the deployed
