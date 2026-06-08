@@ -18,7 +18,7 @@ docker-compose logs -f server
 |---|---|
 | `pnpm -r build` | ✅ clean (13 packages) |
 | `docker-compose up -d` | ✅ healthy (server / postgres / redis) |
-| Migrations applied | 025 (latest: `025_feature_phase_retry`) |
+| Migrations applied | 026 (latest: `026_intent_parent`) |
 | Server reachable | `http://localhost:3000/health` returns 200 |
 | Dashboard | served at `http://localhost:3000/app/` |
 
@@ -53,6 +53,43 @@ None blocking the build. Areas to keep in mind:
 ---
 
 ## Pending operator actions
+
+### TR_024 — Autonomous systemic gap detection (migration 026)
+
+Self-healing diagnostician can now choose between **retry /
+fix-intent / escalate**. When it picks `fix-intent` it writes an
+Aider-ready intent the platform submits as a separate generate
+cycle, links via `parent_intent_id`, and persists an
+`on_success_dispatch` envelope that resumes the parent after
+the fix's production promotion. Per ADR-050: no hardcoded
+failure-pattern matching anywhere.
+
+- **Migration 026** — `intents.parent_intent_id` (UUID FK
+  `ON DELETE SET NULL`) + `intents.on_success_dispatch`
+  (JSONB). NULL on every existing intent.
+- **`HarnessAgentConfig.self-healing-agent`** added to both
+  the template and trackeros: six rules covering the action
+  vocabulary + fix-intent quality bar.
+- **agents.yaml self-healing-agent block** in template (uses
+  platform default model). trackeros overrides `model:
+  chat-latest`. The LLM registry handles the
+  `apiShape: 'responses'` wire-shape — agent code untouched.
+- **`collectCiTechnicalDetail`** (deploy-orchestrator) —
+  fetches the failed CI run's GitHub Actions annotations and
+  passes them to the diagnostician as `technicalDetail`.
+  github-actions only today.
+- **Dashboard panels**: 🔧 Auto-fix intent (on `source: 'self-
+  healing-fix'` intents); ⏳ Awaiting auto-fix (on parents with
+  in-flight fix children).
+- **Template bumped 0.10.0 → 0.11.0**.
+
+**Operator action:** Existing projects can adopt the
+self-healing-agent rules + agents.yaml block by editing their
+own HARNESS.json + agents.yaml. Absent → diagnostician uses
+the platform default LLM (no agents.yaml override needed
+when the platform default is already chat-latest or similar).
+trackeros migrated as part of the verify cycle (commit
+`1a4fe16e` on `main`).
 
 ### TR_022 — Scaffolding fixes + phase retry budget (migration 025)
 

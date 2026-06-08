@@ -4,9 +4,9 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-07 (after TR_022 — scaffolding fixes + phase retry budget + live re-test of the planning loop on a 5-phase feature. Migration 025 adds `feature_phases.retry_count`. `HarnessConfig.planner` gains `maxPhaseRetries` (default 2). `handlePlanningEvaluate` rewritten: on phase failure, re-dispatches `planning:phase` for the same phase until the budget is exhausted; only then marks the feature blocked. trackeros tsconfig.json gets `resolveJsonModule` + `allowSyntheticDefaultImports`; HARNESS.json + template get a `no require() for JSON imports` code-agent rule. Template 0.8.0 → 0.9.0. **Live verified**: feature `1a5dcfc5` (leave management, 5 phases) exercised the retry budget end-to-end (3 attempts on phase 1, all failing on Aider DTO-field hallucination — not a planning bug); feature `37799ea9` (test flag flip) proved the per-phase architecture pass fires when `architectureReviewPerPhase: true`. PLAN.md content at https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md.)
+**Last updated:** 2026-06-08 (after TR_024 — autonomous systemic gap detection. SelfHealingAgent gains `action: 'retry' | 'fix-intent' | 'escalate'`. When the LLM decides a failure reveals a SYSTEMIC GAP in the project (config flag, missing dep, broken scaffold), it writes a complete Aider-ready `fixIntent`. The platform submits it as a separate high-priority generate cycle linked via `parent_intent_id`. The original intent parks in `waiting-for-clarification` and resumes when the fix's production promotion fires its persisted `on_success_dispatch` envelope. Migration 026 adds the two columns. Per ADR-050 there is NO hardcoded failure-pattern matching — the `action` field is the sole routing decision. trackeros's self-healing-agent now resolves to `chat-latest` via `agents.yaml`; the platform LLM registry handles the `apiShape: 'responses'` wire-shape. New `collectCiTechnicalDetail` helper passes the failed CI run's annotations to the diagnostician so it can see real error text. Template bumped 0.10.0 → 0.11.0. **Live verified**: intent `587befaa` (Add /metrics endpoint with prom-client) → CI failed (TS2307 Cannot find module) → diagnostician picked `action: fix-intent` → child intent `2e3c46ab` created with `source: 'self-healing-fix'`, `parent_intent_id`, and `on_success_dispatch` populated. Dashboard renders the new 🔧 Auto-fix and ⏳ Awaiting auto-fix panels. Cascading-fix-intent prevention captured as TR_025 follow-up.)
 **Repo:** https://github.com/afarahat-lab/gestalt
-**Migrations:** 025 (latest: `025_feature_phase_retry`)
+**Migrations:** 026 (latest: `026_intent_parent`)
 
 ---
 
@@ -16,7 +16,7 @@ the `sessions/archive/` files (everything older)._
 
 - All 13 buildable packages compile (`pnpm -r build`).
 - `docker-compose up -d` brings server + postgres + redis healthy.
-- All 25 migrations apply on first start.
+- All 26 migrations apply on first start.
 - Server reachable on `http://localhost:3000`; `/health` returns 200;
   protected routes return 401 without a JWT.
 - Dashboard SPA served at `/app/*`; shareable deep-link URLs work.
@@ -219,6 +219,21 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
+### TR_024 — Autonomous systemic gap detection (migration 026)
+
+Self-healing diagnostician extended with `action: 'retry' |
+'fix-intent' | 'escalate'`. When the LLM picks `fix-intent` it
+writes a complete Aider-ready intent text; the platform submits
+it as a separate `source: 'self-healing-fix'` cycle, links via
+`parent_intent_id`, and persists an `on_success_dispatch`
+envelope. After production promotion, the deploy-orchestrator
+dispatches the envelope verbatim to resume the parent.
+ADR-050 — the `action` field is the SOLE routing decision; no
+hardcoded failure-pattern matching anywhere. Live verified on
+trackeros with a prom-client missing-dependency intent —
+self-healing correctly chose `fix-intent` and submitted a child
+intent. Template 0.10.0 → 0.11.0.
+
 ### PLANNING_LAYER — Autonomous feature decomposition (migration 024)
 
 New `@gestalt/agents-planning` package + `planning:start` / `planning:phase`
@@ -266,6 +281,18 @@ diff.
 
 ### Active follow-ups (carryover or NEW)
 
+- **(HIGH — NEW from TR_024)** Cascading fix-intent prevention.
+  Each fix-intent failing CI triggers ANOTHER fix-intent (the
+  diagnostician keeps choosing `action: fix-intent`). Need to
+  track chain depth on `parent_intent_id` and force escalation
+  when depth ≥ 2. Captured as TR_025.
+- **(MEDIUM — NEW from TR_024)** `collectCiTechnicalDetail` is
+  github-only. Azure DevOps / GitLab CI adapters silently
+  return undefined and the diagnostician loses the actual
+  error text.
+- **(LOW — NEW from TR_024)** Dashboard could render the full
+  fix-intent chain on `IntentDetail` (today shows only direct
+  parent / direct child).
 - **(HIGH — NEW from TR_022)** Aider DTO-field hallucination —
   Aider's generated repository / service code references fields
   not present on the DTO (e.g. `Property 'employeeId' does not

@@ -180,6 +180,74 @@ export function IntentDetail() {
           </div>
         </Card>
 
+        {/* TR_024 — fix intent backlink. Renders on intents the
+            self-healing agent spawned to repair a systemic gap. */}
+        {intent.source === 'self-healing-fix' && intent.parentIntentId && (
+          <Card style={{ borderColor: 'var(--accent, #6f42c1)' }}>
+            <div style={{ padding: '16px' }}>
+              <p style={{ fontSize: '13px', fontFamily: 'var(--font-mono)',
+                marginBottom: '6px' }}>
+                🔧 Auto-fix intent
+              </p>
+              <p style={{ fontSize: '13px', color: 'var(--text-secondary)',
+                marginBottom: '8px' }}>
+                Submitted automatically by self-healing to fix a systemic gap.
+              </p>
+              <p style={{ fontSize: '13px' }}>
+                Original intent:{' '}
+                <a
+                  href={`/app/intents/${intent.parentIntentId}`}
+                  style={{ color: 'var(--accent, #6f42c1)', textDecoration: 'underline' }}
+                >
+                  #{intent.parentIntentId.slice(0, 8)}
+                </a>
+                {' ↗'}
+              </p>
+              <p style={{ fontSize: '12px', color: 'var(--text-secondary)',
+                marginTop: '6px' }}>
+                After this deploys, the original will resume automatically.
+              </p>
+            </div>
+          </Card>
+        )}
+
+        {/* TR_024 — awaiting-auto-fix panel. Renders on parent
+            intents whose self-healing-fix child is still in flight. */}
+        {intent.awaitingFixIntentId && (
+          <Card style={{ borderColor: 'var(--amber)' }}>
+            <div style={{ padding: '16px' }}>
+              <p style={{ fontSize: '13px', fontFamily: 'var(--font-mono)',
+                color: 'var(--amber)', marginBottom: '6px' }}>
+                ⏳ Awaiting auto-fix
+              </p>
+              <p style={{ fontSize: '13px', color: 'var(--text-secondary)',
+                marginBottom: '8px' }}>
+                Self-healing detected a systemic gap and submitted a fix intent.
+              </p>
+              {intent.lastResumeContext?.diagnosis && (
+                <p style={{ fontSize: '12px', color: 'var(--text-secondary)',
+                  marginBottom: '8px', fontStyle: 'italic' }}>
+                  {intent.lastResumeContext.diagnosis}
+                </p>
+              )}
+              <p style={{ fontSize: '13px' }}>
+                Fix intent:{' '}
+                <a
+                  href={`/app/intents/${intent.awaitingFixIntentId}`}
+                  style={{ color: 'var(--amber)', textDecoration: 'underline' }}
+                >
+                  #{intent.awaitingFixIntentId.slice(0, 8)}
+                </a>
+                {' ↗'}
+              </p>
+              <p style={{ fontSize: '12px', color: 'var(--text-secondary)',
+                marginTop: '6px' }}>
+                Will resume automatically after the fix deploys.
+              </p>
+            </div>
+          </Card>
+        )}
+
         {/* Clarification input */}
         {needsClarification && (
           <Card style={{ borderColor: 'var(--amber)' }}>

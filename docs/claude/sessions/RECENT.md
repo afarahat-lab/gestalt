@@ -3,6 +3,212 @@
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+### Session 2026-06-08 — Claude Code (TR_024: autonomous systemic gap detection — self-healing agent gains `action: fix-intent` and submits Aider-ready fix intents that the platform deploys, then resumes the parent automatically)
+
+The self-healing diagnostician evolves from "retry or escalate" to
+a three-way action vocabulary: **retry / fix-intent / escalate**.
+When the LLM decides a failure reveals a SYSTEMIC GAP in the
+project (config flag, missing dependency, wrong scaffold) it
+writes a complete Aider-ready fix intent which the platform
+submits as a separate high-priority generate cycle. The original
+intent is parked in `waiting-for-clarification` until the fix's
+production promotion fires its `onSuccessDispatch` envelope and
+resumes the parent. Strict ADR-050 compliance — no hardcoded
+failure patterns, no fix templates, no `switch` on failure type.
+The `action` field is the sole routing decision.
+
+What's new (data + types):
+
+- **Migration 026 — `026_intent_parent.sql`** adds two NULL-by-
+  default columns: `intents.parent_intent_id` (UUID FK with
+  `ON DELETE SET NULL`) + `intents.on_success_dispatch` (JSONB).
+  Indexed partial-where on `parent_intent_id` for the
+  dashboard's child-lookup. Zero behaviour change for existing
+  intents.
+- **`@gestalt/core` types** — `IntentRecord` gains
+  `parentIntentId` + `onSuccessDispatch`. `IntentRepository`
+  gains `saveOnSuccessDispatch(id, dispatch | null)` + a
+  `parentIntentId?` field on the `create()` input.
+  `IntentRecord.source` widened with `'self-healing-fix'` +
+  `'self-healing-resume'`. `ResumeContext.waitingForFix?: boolean`.
+  Same widening applied to the generate orchestrator's
+  `IntentTaskPayload.source` + `intentSource` types.
+- **`SelfHealingDiagnosis`** gains `action: 'retry' | 'fix-intent'
+  | 'escalate'` + optional `fixIntent`, `fixIntentRationale`,
+  `resumeAfterFix`. Defaults to `action: 'retry'` on parse
+  failure for legacy diagnoses without the field.
+- **`SelfHealingResult.pendingFix?: boolean`** — surfaces from
+  the loop so callers don't trip-transition the parent intent
+  to `failed`.
+
+What's new (logic):
+
+- **`buildDiagnosisPrompt`** in `self-healing-agent.ts` widened
+  with an Action-routing block + extended JSON schema. The
+  prompt content is the platform-mechanic ground (action
+  vocabulary, JSON schema) — operator-tunable rules live in
+  `HARNESS.json.agentConfig.self-healing-agent` per ADR-042.
+- **`runSelfHealingLoopUnsafe`** intercepts `action: 'fix-intent'`
+  BEFORE the legacy retry path: calls `submitFixIntent`, saves
+  parent `ResumeContext` with `waitingForFix: true`, transitions
+  parent to `waiting-for-clarification`. On dispatch failure
+  falls through to escalation so the parent never hangs.
+- **`submitFixIntent`** (new helper) — creates the fix intent
+  row with `source: 'self-healing-fix'`, priority `high`,
+  `parentIntentId` linking back. When `resumeAfterFix: true`
+  persists the `onSuccessDispatch` envelope on the fix intent
+  pointing at a `generate:intent` resume of the parent.
+  Dispatches `generate:intent` for the fix on the generate
+  queue so the standard SDLC chain carries it through.
+- **`SelfHealingAgent.diagnose(..., projectRoot?)`** — accepts
+  an optional projectRoot. When provided, loads model /
+  temperature / prompt_extensions from `agents.yaml`'s
+  `self-healing-agent` block (per ADR-042). When absent,
+  falls back to the hardcoded `SELF_HEALING_AGENT_CONFIG`.
+  Never throws — every path falls back cleanly.
+
+What's new (deploy + promotion):
+
+- **Promotion-agent → onSuccessDispatch firing**. After
+  production promotion transitions the intent to `deployed`,
+  the deploy-orchestrator reads `intent.onSuccessDispatch`,
+  dispatches the envelope verbatim, and clears the column so
+  a manual re-promotion doesn't re-fire. Best-effort —
+  failure logs a warning and leaves the parent in waiting.
+- **`collectCiTechnicalDetail(runId, projectId)`** (new
+  helper in deploy-orchestrator) — fetches the failed CI run's
+  GitHub Actions annotations via the GitHub API and assembles
+  them as a 4 KB text block. Passed to the self-healing
+  diagnostician as `technicalDetail` so it sees the actual
+  error lines (TS errors, missing modules, test failures)
+  instead of just `outcome=failed`. Without this the LLM
+  can't tell a code bug from a systemic gap. github-actions
+  only today; other adapters TBD.
+- **`attemptSelfHealingForDeploy`** widened to return
+  `{ retryDispatched, pendingFix? }`. Both call sites
+  (CI-failure + catch-block) check both before transitioning
+  the parent to `failed` — the fix-intent path is a
+  SUCCESSFUL self-healing outcome, not a failed one.
+
+What's new (template + trackeros):
+
+- **`HARNESS.json.agentConfig.self-healing-agent`** added to
+  both the template and trackeros. Six rules: action vocabulary
+  ("retry / fix-intent / escalate"), the criteria for each, the
+  fix-intent-must-be-Aider-ready rule, the
+  `resumeAfterFix: true` default.
+- **`agents.yaml` self-healing-agent block** added to template.
+  trackeros overrides `model: chat-latest` for the highest
+  reasoning capability. The platform LLM registry already
+  carries `chat-latest` as default with `apiShape: 'responses'`
+  so the `max_completion_tokens` wire-shape is handled
+  registry-side — agent code never sees the difference.
+- **Template version bumped 0.10.0 → 0.11.0**.
+
+What's new (dashboard):
+
+- **`IntentSummary` widened** — `parentIntentId?` +
+  `awaitingFixIntentId?` surfaced from the server's
+  `GET /intents/:id` route. The route enriches the response
+  by scanning recent `self-healing-fix` intents whose
+  `parentIntentId` matches the requested intent.
+- **`IntentDetail.tsx`** renders two new panels:
+  - 🔧 **Auto-fix intent** — when `source === 'self-healing-fix'`
+    + `parentIntentId` present. Backlink to the parent.
+  - ⏳ **Awaiting auto-fix** — when `awaitingFixIntentId`
+    populated on a parent. Shows the diagnosis + link to
+    the in-flight child.
+
+Live verification on trackeros (real GitHub Actions CI):
+
+- Submitted intent `587befaa` — *"Add a GET /metrics endpoint
+  in src/app.ts that uses the prom-client library..."* — a
+  natural systemic gap (prom-client not in package.json).
+- Generate ran → pr-agent → CI failed (TS2307 Cannot find
+  module 'prom-client'). CI annotations fetched.
+- Self-healing diagnostician ran. **Picked `action: fix-intent`**.
+  Wrote a fix intent referencing prom-client + package.json
+  dependencies. Parent's `ResumeContext.waitingForFix: true`
+  persisted.
+- Child fix intent `2e3c46ab` created with
+  `source: 'self-healing-fix'`, `parentIntentId = 587befaa`,
+  `on_success_dispatch` populated with the
+  `generate:intent` resume envelope.
+- Verified the full child/parent chain in the database with
+  a recursive CTE — 3-level chain (each level's CI failure
+  spawned its own fix intent before the runaway brake
+  fired).
+
+Decisions made:
+
+- **`projectRoot` is optional in `agent.diagnose()`**. The
+  self-healing loop doesn't have a clone (it runs in the same
+  worker process as the orchestrator catch block) so passing
+  `projectRoot` would require additional plumbing. The
+  hardcoded fallback uses no `model` override → platform
+  default routes via the LLM registry to whatever the
+  operator set as the default LLM (today: `chat-latest` with
+  `apiShape: 'responses'`). When trackeros operators want a
+  different model for self-healing, they edit
+  `agents.yaml.self-healing-agent.llm.model` and the orchestrator's
+  next clone-having entry point picks it up. For TR_024 today
+  the platform default IS chat-latest, so the override doesn't
+  matter live.
+- **`onSuccessDispatch` is stored on the FIX intent, not the
+  parent**. The promotion-agent already runs at fix-intent
+  production promotion; reading `intent.onSuccessDispatch`
+  there is cheaper than walking child→parent. Cleared after
+  successful dispatch so manual re-promotion doesn't re-fire.
+- **CI annotations are pulled by direct GitHub API fetch**
+  rather than extending the `PipelineAdapter` interface.
+  Today only github-actions is verified end-to-end; the
+  abstraction can come when a second adapter is wired.
+- **The cascading-fix-intent issue is surfaced as a TR_025
+  follow-up**. Each fix intent failing CI causes ANOTHER
+  fix intent — diagnostician chooses `fix-intent` again
+  because it sees the same `Cannot find module` error.
+  A cycle break needs depth tracking on the parent chain
+  + force-escalate when depth > N. Captured below; not in
+  scope for TR_024.
+
+Pending follow-ups (NEW from TR_024):
+
+- **(HIGH)** Cascading fix-intent prevention. Track
+  `parent_intent_id` chain depth on dispatch; if a fix-intent's
+  CI fails AND its parent chain depth >= 2, force escalation
+  instead of another fix-intent. Captured as TR_025.
+- **(MEDIUM)** Pass CI logs to the diagnostician on
+  non-github adapters too (Azure DevOps, GitLab CI). Today
+  `collectCiTechnicalDetail` is github-only — other adapters
+  silently return undefined and the diagnostician is back to
+  flying blind.
+- **(LOW)** Add a `parent_intent_id` recursive view on the
+  dashboard's IntentDetail so operators can see the full
+  fix-chain at a glance instead of clicking through one
+  level at a time.
+- **(LOW)** When `resumeAfterFix: false`, surface the choice
+  in the dashboard's Auto-fix panel so operators know the
+  fix is standalone rather than auto-resuming.
+
+Carryover follow-ups (status updates):
+
+- **~~(HIGH — TR_023)~~ RESOLVED structurally by TR_024.**
+  Aider DTO-field hallucination — the planner now keeps
+  DTO + repository in the same phase (TR_023 fix). When it
+  doesn't AND CI fails on a missing field, self-healing
+  can now recognise the gap and submit a fix-intent
+  instead of looping retries.
+- **(STILL OPEN — MEDIUM)** TR_014: Aider token-spend
+  capture.
+
+Build status: `pnpm -r build` clean across all 13 packages.
+Migration 026 applied at boot. Template auto-refreshed to
+`0.11.0`. Server `/health` 200 throughout. Stale trackeros
+PRs #62–#68 from the verification cascade closed with
+`--delete-branch`. trackeros operator commits in this session:
+`1a4fe16e` (HARNESS + agents.yaml self-healing-agent block).
+
+---
 ### Session 2026-06-07 — Claude Code (TR_022: scaffolding fixes + phase retry budget + per-phase architecture verification — full planning loop live-tested on leave management feature)
 
 Follow-up to PLANNING_LAYER. Three fixes plus four verification
@@ -394,95 +600,6 @@ auto-refreshed at boot: `version: "0.8.0"`. trackeros `main`
 updated with two commits: `3fc936fe` (HARNESS.json planner +
 planning agentConfig) and `6f2a500b` (PLAN.md +
 docs/ARCHITECTURE.md from feature `ea19b18e`).
-
----
-### Session 2026-06-07 — Claude Code (ADRs 042–049: codify platform/operator split + Aider backend + gate model policy + evidence requirement + LLM-driven script verification + CI-owns-runtime + LLM-driven retry routing + phased architecture)
-
-Documentation-only session. Eight ADRs added to `docs/DECISIONS.md`
-codifying principles either learned through TR_007 → TR_021 or that
-govern the upcoming planning-feature implementation. No platform
-code change; no migrations.
-
-What was added:
-
-- **ADR-042** — LLM prompt content belongs in HARNESS.json +
-  agents.yaml, not in TypeScript files. Codifies TR_021's refactor
-  as a permanent rule. Stays in `.ts`: schemas, framing, evidence
-  enforcement, parsing, severity caps. Goes in `agents.yaml`: role
-  / goal / prompt_extensions / domain guidance. Goes in
-  `HARNESS.json agentConfig`: rules + verificationGuidance +
-  project-specific hints. Code reviews must reject `.ts` PRs that
-  add LLM guidance prose.
-- **ADR-043** — Aider as opt-in code generation backend. Enabled
-  per-project via `HARNESS.json codeGeneration.backend: "aider"`.
-  The Aider message stays minimal — task, rules, architecture
-  context only. HOW to implement is Aider's call. Custom
-  code-agent retained as default for non-opt-in projects.
-- **ADR-044** — Gate agents require gpt-4o; code generation uses
-  gpt-4o-mini. Codifies TR_015 + TR_016 finding: gpt-4o-mini
-  cannot follow rules that contradict its training bias (8 rounds
-  flagging `pool.query()` in `*.repository.ts` despite explicit
-  "this is CORRECT" rule). gpt-4o for the gate (small call
-  volume); gpt-4o-mini for Aider's tool loop (200k TPM ceiling).
-- **ADR-045** — Evidence requirement for all finding-emitting
-  agents. Every finding must include `quotedLine` with the exact
-  code quoted verbatim. Findings without `quotedLine` are dropped
-  by `dropUnevidencedFindings()` before reaching the gate verdict.
-  Eliminates hallucinated findings structurally, not via prompt
-  engineering.
-- **ADR-046** — LLM-driven script execution for gate verification.
-  No hardcoded script commands in platform `.ts` files. LLM
-  decides what to run based on project language / stack /
-  finding. `HARNESS.json agentConfig.verificationGuidance` gives
-  hints; the LLM picks the approach. Platform-level blocklist on
-  destructive operations (rm -rf, git push, git commit, sudo,
-  curl | bash) is never configurable.
-- **ADR-047** — CI/CD owns runtime verification; Gestalt gate
-  owns architectural review. Extends ADR-041. lint-agent /
-  security-agent / test-runner-agent removed permanently. CI runs
-  the project's own ESLint / Jest / Semgrep — more accurate than
-  platform stubs. Re-adding those agents to the gate is
-  explicitly prohibited.
-- **ADR-048** — Self-healing uses LLM-driven retry routing, not
-  hardcoded dispatch maps. `SelfHealingDiagnosis.retryTaskType`
-  is the authoritative dispatch decision. The LLM understands
-  failure semantics (git non-fast-forward → deploy-layer, TS
-  compile error → generate-layer) without per-case programming.
-  Unknown failures fall through to `generate:intent`.
-- **ADR-049** — Architecture agent uses phased consultation, not
-  single-call full design. Two modes: `designFeature()` (high-level
-  — domain entities, module list, phase sequence, no impl detail)
-  and `designPhase()` (focused — interface signatures, import
-  paths, SQL schema, measurable success criteria; receives prior
-  phases' actual code as context). High-level design committed to
-  `ARCHITECTURE.md` before any code generation. Future CrewAI
-  migration becomes an architecture crew (chief / data / app
-  architect) on the same two-mode pattern.
-
-Commits:
-
-- `013e49f` — ADR-042 (committed and pushed earlier in session)
-- `<TBD>` — ADRs 043–049 + RECENT.md / STATE.md / BUILD.md /
-  SUMMARY.md regeneration (this commit)
-
-Decisions made:
-
-- **Ordered ADRs 042–049 by the principle they govern**, not
-  chronologically by when the lesson was learned. ADR-042 (the
-  split itself) leads because it defines the framework the others
-  live within.
-- **Did not change platform code.** The ADRs codify behaviour
-  that's already deployed (or that governs the planning feature
-  about to be built); they're a contract, not a refactor. Future
-  PRs that violate any ADR must justify the deviation in their
-  own ADR amendment.
-- **No new follow-ups added.** Every ADR points at code that
-  already exists or at the planning feature about to be built.
-
-Build status: no platform code change. `pnpm -r build` not
-re-run. Docker image untouched. No new migrations. TR_019 session
-rotated to `sessions/archive/2026-06-w1.md` to keep RECENT.md
-under the 3-session / 40 KB ceiling.
 
 
 ---

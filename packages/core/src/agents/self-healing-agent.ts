@@ -21,6 +21,7 @@
 
 import { BaseLLMAgent } from './base-llm-agent';
 import type { AgentConfig } from './agent-config';
+import { loadAgentConfig } from './agent-config-loader';
 import { extractJsonObject } from './json-extract';
 import { createContextLogger } from '../logger/index';
 
@@ -74,10 +75,64 @@ export type SelfHealingRetryTaskType =
   | 'deploy:promote'
   | 'none';
 
+/**
+ * TR_024 (ADR-050) — the diagnostician's routing decision.
+ *
+ *   - 'retry'      → re-dispatch the original intent on
+ *                    `retryTaskType`. Default for code / deploy
+ *                    failures that a fresh cycle can fix.
+ *   - 'fix-intent' → the failure reveals a SYSTEMIC GAP in the
+ *                    project (config, scaffolding, dependency).
+ *                    The LLM writes a self-contained Aider-ready
+ *                    intent (`fixIntent`) that gets submitted as
+ *                    a separate high-priority generate cycle.
+ *                    The parent intent resumes automatically
+ *                    after the fix's production deploys.
+ *   - 'escalate'   → human judgment required.
+ *
+ * The action is the SOLE routing decision — no `switch` on
+ * failure type, no regex on the error string. The LLM evaluates
+ * the failure context and picks the action.
+ */
+export type SelfHealingAction = 'retry' | 'fix-intent' | 'escalate';
+
 export interface SelfHealingDiagnosis {
   diagnosis: string;
   rootCause: string;
   suggestedFix: string;
+  /**
+   * TR_024 — the diagnostician's routing decision. See
+   * `SelfHealingAction` for semantics. Defaults to 'retry' on
+   * parse failure to preserve pre-TR_024 behaviour for legacy
+   * diagnoses that don't emit the new field.
+   */
+  action: SelfHealingAction;
+  /**
+   * TR_024 — when `action === 'fix-intent'`, the complete
+   * Aider-ready Gestalt intent text that resolves the systemic
+   * gap. Submitted as a separate intent with
+   * `source: 'self-healing-fix'`, priority high, and
+   * `parent_intent_id` pointing back at the original. Absent /
+   * null when action is 'retry' or 'escalate'.
+   */
+  fixIntent?: string;
+  /**
+   * TR_024 — operator-facing rationale shown in the dashboard's
+   * "Awaiting auto-fix" panel and used as the
+   * `[Auto-fix pending] …` prefix on the original intent's
+   * resume context. One short paragraph.
+   */
+  fixIntentRationale?: string;
+  /**
+   * TR_024 — when true, the platform stores an
+   * `onSuccessDispatch` envelope on the fix intent so that
+   * after its production promotion the original intent
+   * automatically resumes. When false the fix intent is a
+   * standalone change and the operator handles resume manually.
+   * Defaults to `true` on parse — the common case is "fix the
+   * gap, then continue".
+   */
+  resumeAfterFix?: boolean;
   /**
    * TR_013 — the specific error message, signal, or artifact detail
    * that grounds the diagnosis. Optional (softer than the
@@ -159,12 +214,23 @@ export class SelfHealingAgent extends BaseLLMAgent {
     ctx: SelfHealingContext,
     correlationId: string,
     confidenceThreshold: 'high' | 'medium' | 'low' = 'medium',
+    /**
+     * TR_024 — when provided, the agent loads its model / temperature
+     * / prompt_extensions from `<projectRoot>/agents.yaml`'s
+     * `self-healing-agent` block. When absent (the common path before
+     * TR_024 — the loop has no clone), falls back to the hard-coded
+     * SELF_HEALING_AGENT_CONFIG. ADR-050 + ADR-042: operators select
+     * the model (e.g. `chat-latest` for the most capable reasoning)
+     * via agents.yaml without touching this file.
+     */
+    projectRoot?: string,
   ): Promise<SelfHealingDiagnosis> {
+    const agentConfig = await resolveSelfHealingAgentConfig(projectRoot);
     const prompt = this.buildDiagnosisPrompt(ctx);
 
     let raw: string;
     try {
-      raw = await this.callLLM(prompt, SELF_HEALING_AGENT_CONFIG, correlationId);
+      raw = await this.callLLM(prompt, agentConfig, correlationId);
     } catch (err) {
       log.warn(
         { err, correlationId, failureType: ctx.failureType },
@@ -300,12 +366,53 @@ UNRECOVERABLE PLATFORM ERRORS → shouldRetry: false IMMEDIATELY (no retry)
     shouldRetry: false, confidence: "high", retryTaskType: "none"
     These are operator-only fixes — never burn a retry on them.
 
+## Action routing (TR_024 — ADR-050)
+
+Pick exactly one ACTION. The platform's routing logic is a
+direct deterministic consequence of YOUR decision — there is no
+hardcoded failure-pattern matching. Choose:
+
+- "retry"      — the failure is in the generated code or a
+  deployment step. A fresh attempt with adjusted context will
+  fix it. This is the default. Set shouldRetry=true and pick
+  retryTaskType.
+
+- "fix-intent" — the failure reveals a GAP IN THE PROJECT that
+  will cause the same error on every retry. The project itself
+  needs to be fixed FIRST. Examples: tsconfig missing a flag,
+  package.json missing a dependency, a scaffold file with the
+  wrong shape, an environment variable not wired up.
+  When you pick this action you MUST also produce a
+  fixIntent — a complete, self-contained Aider-ready Gestalt
+  intent text that fixes the gap. The platform submits it as a
+  separate high-priority generate cycle; the original intent
+  resumes automatically after the fix deploys (if
+  resumeAfterFix=true).
+
+- "escalate"   — the failure requires human judgment, is
+  caused by external infrastructure (network, credentials,
+  upstream service), or you cannot determine the root cause
+  with confidence. Set shouldRetry=false and retryTaskType=none.
+
+When writing a fixIntent:
+- It must be a complete, self-contained Gestalt intent — Aider
+  reads it verbatim
+- It must reference exact file paths
+- It must be narrow in scope — fix ONLY the gap, not the
+  surrounding feature
+- It will be submitted as source self-healing-fix with
+  priority high
+
 ## Your task
 Return ONLY a JSON object — no preamble, no markdown fences:
 {
   "diagnosis": "What went wrong",
   "rootCause": "Underlying technical reason",
+  "action": "retry|fix-intent|escalate",
   "suggestedFix": "Specific actionable fix description",
+  "fixIntent": "if action=fix-intent: complete Aider-ready intent text. Omit / null otherwise.",
+  "fixIntentRationale": "if action=fix-intent: one paragraph explaining why this fix is needed and what it prevents. Omit / null otherwise.",
+  "resumeAfterFix": true,
   "evidenceQuote": "verbatim error/signal text that grounds the diagnosis (empty if none)",
   "updatedIntentText": "Reframed intent if needed (optional)",
   "confidence": "high|medium|low",
@@ -319,7 +426,9 @@ Return ONLY a JSON object — no preamble, no markdown fences:
 Set shouldRetry=false and retryTaskType="none" when:
 - The failure is infrastructure/credentials — code cannot fix it
 - You cannot determine the root cause from available context
-- The same error has clearly appeared multiple times without progress`,
+- The same error has clearly appeared multiple times without progress
+- action is "fix-intent" (the fix-intent is the recovery, not a retry of the parent)
+- action is "escalate"`,
     ];
     return sections.filter(Boolean).join('\n\n');
   }
@@ -347,10 +456,34 @@ Set shouldRetry=false and retryTaskType="none" when:
           'SelfHealingAgent diagnosis missing evidenceQuote — accepted, but ungrounded',
         );
       }
+      // TR_024 — action routes the loop. Pre-TR_024 diagnoses
+      // didn't emit this field; we infer the action from the legacy
+      // shouldRetry flag so older deployments keep working without a
+      // schema migration on the LLM side.
+      const inferredAction: SelfHealingAction =
+        parsed.action === 'fix-intent' || parsed.action === 'escalate' || parsed.action === 'retry'
+          ? parsed.action
+          : parsed.shouldRetry === false
+            ? 'escalate'
+            : 'retry';
+      const fixIntent =
+        typeof parsed.fixIntent === 'string' && parsed.fixIntent.trim() !== ''
+          ? parsed.fixIntent
+          : undefined;
+      const fixIntentRationale =
+        typeof parsed.fixIntentRationale === 'string' && parsed.fixIntentRationale.trim() !== ''
+          ? parsed.fixIntentRationale
+          : undefined;
+      const resumeAfterFix =
+        typeof parsed.resumeAfterFix === 'boolean' ? parsed.resumeAfterFix : true;
       return {
         diagnosis: typeof parsed.diagnosis === 'string' ? parsed.diagnosis : 'Unknown failure',
         rootCause: typeof parsed.rootCause === 'string' ? parsed.rootCause : 'Unknown',
         suggestedFix: typeof parsed.suggestedFix === 'string' ? parsed.suggestedFix : 'Manual review required',
+        action: inferredAction,
+        fixIntent,
+        fixIntentRationale,
+        resumeAfterFix,
         evidenceQuote,
         updatedIntentText:
           typeof parsed.updatedIntentText === 'string' && parsed.updatedIntentText.trim() !== ''
@@ -432,16 +565,48 @@ function isRetryTaskType(value: unknown): value is SelfHealingRetryTaskType {
   );
 }
 
+/**
+ * TR_024 — resolve the LLM config for the self-healing agent.
+ *
+ *   - `projectRoot` provided + `agents.yaml` has a
+ *     `self-healing-agent` block → operator's choice wins (model,
+ *     temperature, max_tokens, prompt_extensions).
+ *   - `projectRoot` provided + block absent → loader returns the
+ *     platform default (which has no entry yet today, but
+ *     loadAgentConfig falls through cleanly).
+ *   - `projectRoot` absent → the hard-coded SELF_HEALING_AGENT_CONFIG
+ *     is the safe fallback for callers that have no clone (e.g.
+ *     the auto-resolve path inside the loop).
+ *
+ * Never throws — every failure falls through to the hardcoded
+ * config. `runSelfHealingLoop`'s "NEVER throws" guarantee depends
+ * on this.
+ */
+async function resolveSelfHealingAgentConfig(projectRoot?: string): Promise<AgentConfig> {
+  if (!projectRoot) return SELF_HEALING_AGENT_CONFIG;
+  try {
+    return await loadAgentConfig(projectRoot, 'self-healing-agent');
+  } catch (err) {
+    log.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'loadAgentConfig(self-healing-agent) threw — using hard-coded fallback',
+    );
+    return SELF_HEALING_AGENT_CONFIG;
+  }
+}
+
 function safeDefaultDiagnosis(reason: string): SelfHealingDiagnosis {
   return {
     diagnosis: `Could not produce a diagnosis — ${reason}`,
     rootCause: 'Unknown',
     suggestedFix: 'Manual review required',
+    // Safe-default: escalate. With no diagnosis we cannot pick a
+    // retry queue OR write a sensible fix intent.
+    action: 'escalate',
     confidence: 'low',
     shouldRetry: false,
     skipAgents: [],
     focusFiles: [],
-    // Safe-default: cannot retry automatically.
     retryTaskType: 'none',
     retryPayloadHints: {},
   };

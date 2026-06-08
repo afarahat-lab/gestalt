@@ -81,7 +81,7 @@ interface IntentTaskPayload {
   clarification?: string;
   ambiguityId?: string;
   resume?: boolean;
-  source?: 'human' | 'maintenance-agent' | 'pipeline-feedback' | 'self-healing' | 'auto-resolved' | 'operator-resume';
+  source?: 'human' | 'maintenance-agent' | 'pipeline-feedback' | 'self-healing' | 'auto-resolved' | 'operator-resume' | 'self-healing-fix' | 'self-healing-resume';
   /**
    * Pipeline-feedback resume flow. When set, the orchestrator
    * checks out this branch after the per-cycle clone so the
@@ -211,7 +211,7 @@ async function handleIntentTask(
     // `payload.source` is the DISPATCH source (which is the same on
     // a fresh submit but flips to `pipeline-feedback` on the resume
     // leg). We prefer payload.source for resume context.
-    const intentSource: 'human' | 'maintenance-agent' | 'pipeline-feedback' | 'self-healing' | 'auto-resolved' | 'operator-resume' =
+    const intentSource: 'human' | 'maintenance-agent' | 'pipeline-feedback' | 'self-healing' | 'auto-resolved' | 'operator-resume' | 'self-healing-fix' | 'self-healing-resume' =
       payload.source ?? intentRecord.source;
 
     project = await projects.findById(projectId);
@@ -587,7 +587,7 @@ async function handleIntentTask(
  * the flag and skipping the gate dispatch).
  */
 interface DrivePlanOptions {
-  intentSource: 'human' | 'maintenance-agent' | 'pipeline-feedback' | 'self-healing' | 'auto-resolved' | 'operator-resume';
+  intentSource: 'human' | 'maintenance-agent' | 'pipeline-feedback' | 'self-healing' | 'auto-resolved' | 'operator-resume' | 'self-healing-fix' | 'self-healing-resume';
   clarification?: string;
   /**
    * ADR-039 — per-cycle MCP client cache. Keyed by `serverName`.

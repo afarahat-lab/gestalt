@@ -57,12 +57,38 @@ export interface IntentSummary {
   correlationId: string;
   text: string;
   status: IntentStatus;
-  source: 'human' | 'maintenance-agent';
+  /**
+   * TR_024 — `self-healing-fix` marks intents the self-healing
+   * diagnostician spawned to repair a systemic gap;
+   * `self-healing-resume` marks parent intents the platform
+   * re-dispatched after their fix-intent deployed.
+   */
+  source:
+    | 'human'
+    | 'maintenance-agent'
+    | 'self-healing'
+    | 'self-healing-fix'
+    | 'self-healing-resume'
+    | 'auto-resolved'
+    | 'operator-resume'
+    | 'pipeline-feedback';
   priority: 'critical' | 'high' | 'normal' | 'low';
   createdAt: string;   // ISO string
   updatedAt: string;
   agentCount: number;
   signalCount: number;
+  /**
+   * TR_024 — populated on `source: 'self-healing-fix'` rows; the
+   * parent intent's id. The dashboard renders a backlink and the
+   * "Auto-fix intent" badge.
+   */
+  parentIntentId?: string | null;
+  /**
+   * TR_024 — populated on parent intents whose fix child is still
+   * deploying. The dashboard renders the "Awaiting auto-fix" panel
+   * and the link to the child fix intent.
+   */
+  awaitingFixIntentId?: string | null;
 }
 
 // ─── Intent detail ────────────────────────────────────────────────────────────
@@ -94,6 +120,18 @@ export interface IntentDetail extends IntentSummary {
   artifacts: ArtifactSummary[];
   gateResult: GateResultSummary | null;
   deploymentStatus: DeploymentStatus | null;
+  /**
+   * TR_024 — populated by the GET /intents/:id route when the
+   * intent is parked in `waiting-for-clarification` because
+   * self-healing submitted a fix intent. Drives the "Awaiting
+   * auto-fix" panel.
+   */
+  lastResumeContext?: {
+    waitingForFix?: boolean;
+    diagnosis?: string;
+    rootCause?: string;
+    operatorFeedback?: string;
+  } | null;
 }
 
 // ─── Signals ──────────────────────────────────────────────────────────────────

@@ -245,12 +245,42 @@ export async function registerIntentRoutes(app: FastifyInstance): Promise<void> 
         artifacts.findByCorrelationId(intent.correlationId),
       ]);
 
+      // TR_024 — enrich with the active child fix intent (if any).
+      // Scan the project's recent intents for a row whose
+      // `parentIntentId` points at this intent and whose status is
+      // non-terminal. Bounded to 50 recent intents — cheaper than
+      // adding a dedicated repository method, and a fix intent's
+      // lifecycle is short relative to the project's history.
+      let awaitingFixIntentId: string | null = null;
+      try {
+        const recent = await intents.list({
+          projectId: intent.projectId,
+          source: 'self-healing-fix',
+          limit: 50,
+          offset: 0,
+        });
+        const active = recent.records.find(
+          (r) =>
+            r.parentIntentId === intent.id
+            && r.status !== 'deployed'
+            && r.status !== 'failed'
+            && r.status !== 'escalated',
+        );
+        if (active) awaitingFixIntentId = active.id;
+      } catch (err) {
+        log.warn(
+          { err, intentId: intent.id },
+          'awaitingFixIntentId enrichment failed — continuing without it',
+        );
+      }
+
       return reply.send({
         data: {
           ...intent,
           agentExecutions,
           signals: intentSignals,
           artifacts: intentArtifacts,
+          awaitingFixIntentId,
         },
       });
     },

@@ -201,6 +201,16 @@ export interface SelfHealingResult {
    * `failed` so the alert has a waiting state.
    */
   autoResolved: boolean;
+  /**
+   * TR_024 — true when the diagnostician picked `action: 'fix-intent'`
+   * and the loop successfully dispatched a child fix intent. The
+   * parent intent is left in `waiting-for-clarification` (with
+   * `lastResumeContext.waitingForFix: true`) and resumes when the
+   * fix's production promotion fires `onSuccessDispatch`. The
+   * orchestrator MUST NOT transition the parent to `failed` or
+   * dispatch a retry — the resume is the fix-intent's responsibility.
+   */
+  pendingFix?: boolean;
 }
 
 /**
@@ -433,6 +443,113 @@ async function runSelfHealingLoopUnsafe(
     config.confidenceThreshold,
   );
 
+  // TR_024 (ADR-050) — action routes the loop. The LLM evaluates the
+  // failure context and picks 'retry' / 'fix-intent' / 'escalate'.
+  // There is NO hardcoded failure-pattern matching here — the action
+  // field is the sole routing decision.
+  if (diagnosis.action === 'fix-intent' && (diagnosis.fixIntent ?? '').trim() !== '') {
+    log.info(
+      {
+        correlationId: payload.correlationId,
+        failureType: payload.failureType,
+        rationale: (diagnosis.fixIntentRationale ?? '').slice(0, 120),
+        fixIntent: diagnosis.fixIntent!.slice(0, 100),
+        confidence: diagnosis.confidence,
+      },
+      'Self-healing: systemic gap detected — submitting fix intent',
+    );
+
+    try {
+      await submitFixIntent({
+        fixIntent: diagnosis.fixIntent!,
+        fixIntentRationale: diagnosis.fixIntentRationale,
+        originalIntentId: payload.intentId,
+        projectId: payload.projectId,
+        resumeAfterFix: diagnosis.resumeAfterFix ?? true,
+      });
+
+      const resumeContextForParent: ResumeContext = {
+        operatorFeedback: `[Auto-fix pending] ${diagnosis.fixIntentRationale ?? diagnosis.diagnosis}`,
+        failureType: payload.failureType,
+        failureSummary: context.failureSummary,
+        priorSignals: signals.map((s) => ({
+          type: s.type,
+          message: s.message,
+          sourceAgent: s.sourceAgent,
+          severity: s.severity,
+        })),
+        priorArtifactPaths: context.priorArtifactPaths,
+        attemptNumber: currentAttempt,
+        feedbackProvidedAt: new Date().toISOString(),
+        autoHealed: true,
+        diagnosis: diagnosis.diagnosis,
+        rootCause: diagnosis.rootCause,
+        waitingForFix: true,
+      };
+      await repos.intents.saveResumeContext(payload.intentId, resumeContextForParent);
+
+      eventBus.emit({
+        type: 'intent.status-changed',
+        correlationId: payload.correlationId,
+        payload: {
+          intentId: payload.intentId,
+          status: 'waiting-for-clarification',
+          reason: 'awaiting-auto-fix',
+        },
+        timestamp: new Date().toISOString(),
+      });
+      // Park the parent in waiting-for-clarification so the
+      // dashboard shows the "Awaiting auto-fix" panel.
+      // Best-effort — a failed transition shouldn't roll back the
+      // dispatched fix intent.
+      try {
+        await repos.intents.updateStatus(payload.intentId, 'waiting-for-clarification');
+      } catch (err) {
+        log.warn(
+          { err, intentId: payload.intentId },
+          'Parent intent status transition failed — fix intent already dispatched',
+        );
+      }
+
+      return {
+        shouldRetry: false,
+        diagnosis,
+        escalated: false,
+        autoResolved: false,
+        pendingFix: true,
+      };
+    } catch (err) {
+      // Fix-intent dispatch failed (e.g. queue down, repo lookup
+      // failed). Fall through to the existing escalation path so the
+      // parent doesn't hang.
+      log.warn(
+        { err, correlationId: payload.correlationId },
+        'submitFixIntent failed — escalating',
+      );
+      const cleanDiagnosis = stripTrailingPunctuation(diagnosis.diagnosis);
+      const autoResolved = await escalateToHuman(
+        payload,
+        context,
+        signals,
+        `Diagnosis: ${cleanDiagnosis}. Confidence: ${diagnosis.confidence}. ` +
+        `fix-intent dispatch failed — falling back to human review.`,
+      );
+      return { shouldRetry: false, diagnosis, escalated: true, autoResolved };
+    }
+  }
+
+  if (diagnosis.action === 'escalate') {
+    const cleanDiagnosis = stripTrailingPunctuation(diagnosis.diagnosis);
+    const autoResolved = await escalateToHuman(
+      payload,
+      context,
+      signals,
+      `Diagnosis: ${cleanDiagnosis}. Confidence: ${diagnosis.confidence}. action: escalate`,
+    );
+    return { shouldRetry: false, diagnosis, escalated: true, autoResolved };
+  }
+
+  // action === 'retry' (or legacy diagnosis with no action field).
   // 'none' is the LLM's "I can't fix this" marker — semantically
   // identical to shouldRetry: false. The two checks are equivalent
   // after the LLM's confidence-threshold downgrade, but we honour
@@ -845,6 +962,113 @@ async function attemptAutoResolveAlert(
 }
 
 /**
+ * TR_024 — submit a self-healing fix intent as a separate generate
+ * cycle. Called when the diagnostician picked `action: 'fix-intent'`.
+ *
+ * Two-step process per migration 026:
+ *   1. INSERT the new intent row with `source: 'self-healing-fix'`,
+ *      priority high, and `parent_intent_id` pointing at the
+ *      original intent.
+ *   2. When `resumeAfterFix` is true, persist the resume-dispatch
+ *      envelope on the FIX intent (NOT the parent). The promotion-
+ *      agent reads this column after the fix's production promotion
+ *      and dispatches the envelope verbatim — typically a
+ *      `generate:intent` with `source: 'self-healing-resume'` against
+ *      the original intent id.
+ *   3. Dispatch `generate:intent` for the fix on the generate queue
+ *      so the standard SDLC chain (generate → gate → deploy →
+ *      promotion) carries it through.
+ *
+ * Throws on infrastructure failure (DB / queue) — the loop catches
+ * and falls back to human escalation so the parent doesn't hang.
+ */
+async function submitFixIntent(params: {
+  fixIntent: string;
+  fixIntentRationale?: string;
+  originalIntentId: string;
+  projectId: string;
+  resumeAfterFix: boolean;
+}): Promise<void> {
+  const repos = getRepositories();
+  const fixIntentId = crypto.randomUUID();
+  const fixCorrelationId = crypto.randomUUID();
+
+  const fixIntent = await repos.intents.create({
+    id: fixIntentId,
+    correlationId: fixCorrelationId,
+    projectId: params.projectId,
+    text: params.fixIntent,
+    status: 'pending',
+    source: 'self-healing-fix',
+    priority: 'high',
+    parentIntentId: params.originalIntentId,
+  });
+
+  if (params.resumeAfterFix) {
+    // Envelope shape mirrors the existing `generate:intent` BullMQ
+    // payload. The promotion-agent dispatches it verbatim — unknown
+    // keys are silently ignored by downstream handlers, so future
+    // additions are forward-compat.
+    const resumeEnvelope: Record<string, unknown> = {
+      type: 'generate:intent',
+      payload: {
+        intentId: params.originalIntentId,
+        projectId: params.projectId,
+        source: 'self-healing-resume',
+        fixIntentId,
+      },
+    };
+    await repos.intents.saveOnSuccessDispatch(fixIntentId, resumeEnvelope);
+  }
+
+  await repos.intents.updateStatus(fixIntentId, 'generating');
+  eventBus.emit({
+    type: 'intent.created',
+    correlationId: fixCorrelationId,
+    payload: {
+      intentId: fixIntentId,
+      text: params.fixIntent.slice(0, 200),
+      priority: 'high',
+      source: 'self-healing-fix',
+      parentIntentId: params.originalIntentId,
+    },
+    timestamp: new Date().toISOString(),
+  });
+
+  await dispatch(
+    {
+      id: crypto.randomUUID(),
+      correlationId: fixCorrelationId,
+      type: 'generate:intent',
+      sourceAgent: 'self-healing-agent',
+      targetAgent: 'orchestrator',
+      priority: 'high',
+      payload: {
+        intentId: fixIntentId,
+        projectId: params.projectId,
+        text: params.fixIntent,
+        source: 'self-healing-fix',
+        parentIntentId: params.originalIntentId,
+      },
+      createdAt: new Date(),
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    },
+    getQueueConfig(),
+  );
+
+  log.info(
+    {
+      fixIntentId,
+      originalIntentId: params.originalIntentId,
+      resumeAfterFix: params.resumeAfterFix,
+      rationalePrefix: (params.fixIntentRationale ?? '').slice(0, 80),
+    },
+    'Fix intent dispatched — original will resume on success',
+  );
+  void fixIntent;
+}
+
+/**
  * Re-export used by orchestrator-side code that needs to widen its
  * own failure-source union to include the self-healing variants.
  */
@@ -854,7 +1078,9 @@ export type ResumeSource =
   | 'pipeline-feedback'
   | 'self-healing'
   | 'auto-resolved'
-  | 'operator-resume';
+  | 'operator-resume'
+  | 'self-healing-fix'
+  | 'self-healing-resume';
 
 /**
  * Skip-agent helper for orchestrators. Returns true when the

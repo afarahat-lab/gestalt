@@ -19,12 +19,17 @@ export class PostgresIntentRepository implements IntentRepository {
   }
 
   async create(
-    intent: Omit<IntentRecord, 'createdAt' | 'updatedAt' | 'resolvedAt'>,
+    intent: Omit<IntentRecord, 'createdAt' | 'updatedAt' | 'resolvedAt'> & { parentIntentId?: string | null },
   ): Promise<IntentRecord> {
     const db = getDb();
+    // TR_024 (migration 026) — accept optional parentIntentId on
+    // create so self-healing-fix children carry the link from the
+    // first INSERT. Regular intents pass undefined and the column
+    // stays NULL.
+    const parentIntentId = intent.parentIntentId ?? null;
     const [row] = await db<IntentRecord[]>`
       INSERT INTO intents (
-        id, correlation_id, project_id, text, status, source, priority
+        id, correlation_id, project_id, text, status, source, priority, parent_intent_id
       ) VALUES (
         ${intent.id},
         ${intent.correlationId},
@@ -32,7 +37,8 @@ export class PostgresIntentRepository implements IntentRepository {
         ${intent.text},
         ${intent.status},
         ${intent.source},
-        ${intent.priority}
+        ${intent.priority},
+        ${parentIntentId}
       )
       RETURNING *
     `;
@@ -275,6 +281,23 @@ export class PostgresIntentRepository implements IntentRepository {
       SET last_resume_context = ${db.json(
         context as unknown as Parameters<typeof db.json>[0],
       )},
+          updated_at = NOW()
+      WHERE id = ${id}
+    `;
+    if (result.count === 0) throw new Error(`Intent ${id} not found`);
+  }
+
+  async saveOnSuccessDispatch(
+    id: string,
+    payload: Record<string, unknown> | null,
+  ): Promise<void> {
+    const db = getDb();
+    const jsonValue = payload === null
+      ? null
+      : db.json(payload as unknown as Parameters<typeof db.json>[0]);
+    const result = await db`
+      UPDATE intents
+      SET on_success_dispatch = ${jsonValue},
           updated_at = NOW()
       WHERE id = ${id}
     `;

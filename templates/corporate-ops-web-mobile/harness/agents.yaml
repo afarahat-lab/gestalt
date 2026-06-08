@@ -218,6 +218,24 @@ agents:
       - "Only escalate to human if the phase produced code that is fundamentally incompatible with the remaining phases"
       - "Adjustments to remaining phases should update file paths, interface names, and import statements to match what was actually built"
 
+  # ── Self-healing diagnostician (TR_024 — migration 020/026) ──
+  # Decides what to do when a cycle fails — retry, submit a fix
+  # intent for a systemic gap, or escalate. Per ADR-050 the
+  # routing decision lives with the LLM, not the platform code.
+  # Operators tune the model (chat-latest recommended for the
+  # best reasoning) + persona; rules live in HARNESS.json's
+  # `agentConfig.self-healing-agent` block.
+  self-healing-agent:
+    role: "Autonomous failure analyst and recovery coordinator"
+    goal: "Analyse failures and decide the correct recovery action: retry with fixes, submit a fix intent for systemic gaps, or escalate to human"
+    llm:
+      model: ~        # set to "chat-latest" (registered in platform LLMs with apiShape: 'responses') for best reasoning
+      temperature: 0.0
+      max_tokens: 2000
+    prompt_extensions:
+      - "Always ground your diagnosis in the actual error output — do not infer failures not evidenced in the provided context"
+      - "A fix-intent is only appropriate when retrying the same intent would produce the same failure"
+
 
 # ─── Custom agents (ADR-037) ─────────────────────────────────────────────────
 # Project-specific LLM agents that run after the framework generate agents

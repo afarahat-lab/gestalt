@@ -74,7 +74,8 @@
         "Generated code must compile without errors. Verify with executeScript before returning.",
         "All imports must resolve to files that exist in the project or are declared in package.json.",
         "You MUST run a compile/lint check via executeScript before emitting the final files. This is not optional.",
-        "Do not use require() for JSON imports — import them using ES module syntax with resolveJsonModule enabled in tsconfig."
+        "Do not use require() for JSON imports — import them using ES module syntax with resolveJsonModule enabled in tsconfig.",
+        "Before generating any repository, service, or controller code, read the DTO and interface files it will use. Never reference a field on a type without confirming it exists in the type definition."
       ]
     },
     "review-agent": {
@@ -111,15 +112,18 @@
       "rules": [
         "Maximum 5 files per phase",
         "Each phase must be independently deployable through CI and the gate",
-        "Phases must be ordered by dependency — never reference a file from a future phase"
+        "Phases must be ordered by dependency — never reference a file from a future phase",
+        "Domain model files (*.model.ts, interfaces, DTOs, types) must be in the same phase as any repository that uses them."
       ],
       "phaseScopingRules": [
         "GOOD scope: 'Create src/modules/leave/leave.model.ts with TypeScript interfaces for LeaveRequest and CreateLeaveRequestDto. Import LeaveType, LeaveStatus from src/shared/types/index.ts which already exists.' — specific, concrete, references real paths.",
         "BAD scope: 'Build the leave module' — too broad, Aider will lose context.",
-        "GOOD scope: 'Create src/modules/leave/leave.repository.ts implementing ILeaveRepository from leave.model.ts. Use Pool from src/shared/db/connection.ts. Implement 5 methods: createRequest, findById, findByEmployeeId, findPendingByManagerId, updateStatus.' — single concern, exact file references.",
+        "GOOD scope: 'Create src/modules/leave/leave.model.ts AND src/modules/leave/leave.repository.ts together. Define LeaveRequest, CreateLeaveRequestDto in the model file. Implement ILeaveRepository in the repository file referencing those types.' — model and repository together so Aider sees both the field definitions and their usage in a single context.",
         "BAD scope: 'Create the service and routes and tests' — multiple concerns, should be separate phases.",
         "Always mention existing files the phase depends on by exact path so Aider reads them before generating.",
-        "Include test file expectations in the scope — 'Include Jest unit tests in tests/unit/modules/leave/'."
+        "Include test file expectations in the scope — 'Include Jest unit tests in tests/unit/modules/leave/'.",
+        "Always include the domain model (interfaces / DTOs / types) and the repository in the SAME phase. Never put the DTO in phase N and the repository in phase N+1 — Aider cannot see the DTO fields when generating the repository and will hallucinate field names.",
+        "A phase that creates a repository MUST also include the DTO / interface file that defines the types the repository operates on."
       ]
     },
     "phase-evaluator-agent": {
@@ -133,6 +137,16 @@
         "Partial success: some criteria met, remaining phases can compensate — adjust their scope and continue.",
         "Escalate: the built code is architecturally incompatible with the remaining phases AND self-healing cannot fix it.",
         "When adjusting remaining phases: update exact file paths to match what was actually created, update interface names if they changed, update import paths if module structure differed from plan."
+      ]
+    },
+    "self-healing-agent": {
+      "rules": [
+        "Your primary job is to decide the correct ACTION: retry, fix-intent, or escalate",
+        "Choose retry when: the failure is in the generated code logic, a deployment step, or a transient error that a fresh attempt would resolve",
+        "Choose fix-intent when: the failure reveals a gap in the project itself that will cause the same error on every retry — the project needs to be fixed first",
+        "Choose escalate when: the failure requires human judgment, is caused by external infrastructure, or you cannot determine the root cause with confidence",
+        "When choosing fix-intent: write a fixIntent that is specific, Aider-ready, and scoped only to fixing the gap — not rebuilding the feature",
+        "resumeAfterFix should be true when the original intent will succeed once the gap is fixed"
       ]
     }
   },

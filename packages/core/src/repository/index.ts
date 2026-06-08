@@ -58,7 +58,8 @@ export interface IntentRecord {
    * iterations may persist these on the intent row directly.
    */
   source: 'human' | 'maintenance-agent' | 'self-healing'
-       | 'auto-resolved' | 'operator-resume' | 'pipeline-feedback';
+       | 'auto-resolved' | 'operator-resume' | 'pipeline-feedback'
+       | 'self-healing-fix' | 'self-healing-resume';
   priority: 'critical' | 'high' | 'normal' | 'low';
   createdAt: Date;
   updatedAt: Date;
@@ -91,6 +92,29 @@ export interface IntentRecord {
    * resumed. Migration 020.
    */
   lastResumeContext: ResumeContext | null;
+  /**
+   * TR_024 (migration 026) — self-healing fix-intent linkage.
+   *
+   *   - `parentIntentId`     null on regular intents. Populated on
+   *     fix-intents the self-healing diagnostician spawned
+   *     (`source: 'self-healing-fix'`) to point at the intent whose
+   *     failure motivated the fix. The original intent is also
+   *     pause-and-resume-able through this link — see
+   *     `onSuccessDispatch`.
+   *
+   *   - `onSuccessDispatch`  null on regular intents. Populated on
+   *     fix-intents that should automatically resume the parent
+   *     after they deploy. Stored as the verbatim BullMQ task
+   *     envelope; promotion-agent reads it after production
+   *     promotion succeeds and dispatches it onto the queue.
+   *     The dispatching layer treats unknown keys as forward-compat.
+   *
+   * Both columns are NULL on every existing intent — zero
+   * behaviour change for intents that don't participate in the
+   * fix-intent flow.
+   */
+  parentIntentId: string | null;
+  onSuccessDispatch: Record<string, unknown> | null;
 }
 
 /**
@@ -151,6 +175,14 @@ export interface ResumeContext {
    * agents handle absence the same as `{}`.
    */
   retryPayloadHints?: Record<string, unknown>;
+  /**
+   * TR_024 — set by the self-healing loop when the diagnostician's
+   * action was `fix-intent`. The dashboard renders an "Awaiting auto-
+   * fix" state and the orchestrator skips re-dispatching the parent
+   * until the child fix intent's promotion-agent fires the parent's
+   * `onSuccessDispatch`.
+   */
+  waitingForFix?: boolean;
 }
 
 /**
@@ -181,7 +213,7 @@ export interface IntentListFilters {
 }
 
 export interface IntentRepository extends BaseRepository {
-  create(intent: Omit<IntentRecord, 'createdAt' | 'updatedAt' | 'resolvedAt' | 'clarification' | 'branchName' | 'prNumber' | 'prUrl' | 'attemptCount' | 'lastResumeContext'>): Promise<IntentRecord>;
+  create(intent: Omit<IntentRecord, 'createdAt' | 'updatedAt' | 'resolvedAt' | 'clarification' | 'branchName' | 'prNumber' | 'prUrl' | 'attemptCount' | 'lastResumeContext' | 'parentIntentId' | 'onSuccessDispatch'> & { parentIntentId?: string | null }): Promise<IntentRecord>;
   findById(id: string): Promise<IntentRecord | null>;
   findByCorrelationId(correlationId: string): Promise<IntentRecord | null>;
   updateStatus(id: string, status: IntentStatus): Promise<IntentRecord>;
@@ -211,6 +243,14 @@ export interface IntentRepository extends BaseRepository {
    * path) before the retry dispatch. Migration 020.
    */
   saveResumeContext(id: string, context: ResumeContext): Promise<void>;
+  /**
+   * TR_024 (migration 026) — persist the BullMQ task envelope the
+   * promotion-agent should dispatch after this intent's production
+   * deploy succeeds. Used by the self-healing fix-intent flow to
+   * resume the parent intent automatically once the fix lands.
+   * Idempotent — last write wins. Pass `null` to clear.
+   */
+  saveOnSuccessDispatch(id: string, dispatch: Record<string, unknown> | null): Promise<void>;
   /**
    * Atomically bumps `intents.attempt_count` and returns the new
    * value. Read on the next dispatch by `runSelfHealingLoop` to

@@ -29,7 +29,7 @@
 import {
   createWorker, dispatch, getRepositories,
   createContextLogger, emitLiveEvent, QUEUE_NAMES,
-  runSelfHealingLoop,
+  runSelfHealingLoop, resolveProjectCredential,
 } from '@gestalt/core';
 import type {
   TaskMessage, TaskResult, QueueConfig, TaskPriority,
@@ -255,12 +255,23 @@ async function handleDeployTask(
           result.outcome.kind === 'failed' ? result.outcome.reason
           : result.outcome.kind === 'cancelled' ? 'CI run cancelled'
           : 'CI run did not complete within timeout';
+        // TR_024 — surface the CI failure detail to the diagnostician
+        // as `technicalDetail` so it can decide between 'retry',
+        // 'fix-intent', and 'escalate' based on the actual error
+        // text, not just the outcome kind. ADR-050: the LLM gets the
+        // full evidence and routes.
+        const ciTechnicalDetail = await collectCiTechnicalDetail(
+          result.outcome.runId,
+          payload.projectId,
+          childLog,
+        );
         const healing = await attemptSelfHealingForDeploy({
           intentId: payload.intentId,
           correlationId,
           failureType,
           failureSummary:
             `CI pipeline outcome=${result.outcome.kind} for run ${result.outcome.runId}. ${reason}`,
+          technicalDetail: ciTechnicalDetail,
           alertContextExtras: {
             runId: result.outcome.runId,
             pipelineStatus: result.outcome.pipelineStatus,
@@ -268,10 +279,17 @@ async function handleDeployTask(
           },
           childLog,
         });
-        if (!healing.retryDispatched) {
+        if (!healing.retryDispatched && !healing.pendingFix) {
           await transitionIntent(payload.intentId, correlationId, 'failed');
         }
-        return buildTaskResult(message, healing.retryDispatched ? 'completed' : 'failed', startedAt);
+        // TR_024 — pendingFix is a SUCCESSFUL self-healing outcome
+        // (a fix intent was submitted on the parent's behalf), so
+        // mark the task `completed` rather than `failed`.
+        return buildTaskResult(
+          message,
+          (healing.retryDispatched || healing.pendingFix) ? 'completed' : 'failed',
+          startedAt,
+        );
       }
       // ADR-041 — CI passed; dispatch the LLM quality gate to
       // review the code on the PR branch. Gate runs constraint-agent
@@ -365,6 +383,54 @@ async function handleDeployTask(
       } else {
         // Production promotion complete → intent is fully deployed.
         await transitionIntent(payload.intentId, correlationId, 'deployed');
+
+        // TR_024 — fire onSuccessDispatch for self-healing fix
+        // intents. The fix intent stored a verbatim BullMQ envelope
+        // on its row when it was created; the loop's promotion is
+        // the trigger to dispatch it. Best-effort — a failed
+        // dispatch logs a warning and leaves the parent intent in
+        // `waiting-for-clarification` so the operator can resolve
+        // manually. We do NOT fail the deploy result on this path.
+        try {
+          const intent = await getRepositories().intents.findById(payload.intentId);
+          const env = intent?.onSuccessDispatch;
+          if (env && typeof env === 'object') {
+            const taskType = (env as { type?: unknown }).type;
+            const taskPayload = (env as { payload?: unknown }).payload;
+            if (
+              typeof taskType === 'string'
+              && taskPayload && typeof taskPayload === 'object'
+            ) {
+              childLog.info(
+                {
+                  intentId: payload.intentId,
+                  onSuccessDispatchType: taskType,
+                  parentIntentId: (taskPayload as Record<string, unknown>)['intentId'] ?? null,
+                },
+                'Fix deployed — resuming original intent via onSuccessDispatch',
+              );
+              await dispatch({
+                id: crypto.randomUUID(),
+                correlationId,
+                type: taskType as TaskMessage['type'],
+                sourceAgent: 'promotion-agent',
+                targetAgent: 'orchestrator',
+                priority: 'high',
+                payload: taskPayload as Record<string, unknown>,
+                createdAt: new Date(),
+                expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+              } as TaskMessage, queueConfigFromEnv());
+              // Clear after dispatch so a re-promotion (e.g. operator
+              // manual rerun) doesn't re-fire.
+              await getRepositories().intents.saveOnSuccessDispatch(payload.intentId, null);
+            }
+          }
+        } catch (err) {
+          childLog.warn(
+            { err, intentId: payload.intentId },
+            'onSuccessDispatch failed — parent intent left in waiting state',
+          );
+        }
       }
       return buildTaskResult(message, 'completed', startedAt);
     }
@@ -391,14 +457,14 @@ async function handleDeployTask(
         failureSummary: `Deploy orchestrator threw on ${type}`,
         technicalDetail: err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500),
         childLog,
-      }).catch(() => ({ retryDispatched: false }));
-      if (!healing.retryDispatched) {
+      }).catch(() => ({ retryDispatched: false, pendingFix: false }));
+      if (!healing.retryDispatched && !healing.pendingFix) {
         await transitionIntent(payload.intentId, correlationId, 'failed').catch(() => undefined);
       }
-      // Don't re-throw when self-healing dispatched a retry — the
-      // new cycle is already queued; throwing would tell BullMQ to
-      // retry the original job. Return a TaskResult instead.
-      if (healing.retryDispatched) {
+      // Don't re-throw when self-healing dispatched a retry OR a
+      // fix intent — the new cycle is already queued. Throwing
+      // would tell BullMQ to retry the original job.
+      if (healing.retryDispatched || healing.pendingFix) {
         return buildTaskResult(message, 'completed', startedAt);
       }
     }
@@ -611,7 +677,7 @@ async function attemptSelfHealingForDeploy(args: {
   technicalDetail?: string;
   alertContextExtras?: Record<string, unknown>;
   childLog: ReturnType<typeof createContextLogger>;
-}): Promise<{ retryDispatched: boolean }> {
+}): Promise<{ retryDispatched: boolean; pendingFix?: boolean }> {
   const { intentId, correlationId, failureType, failureSummary, technicalDetail, alertContextExtras, childLog } = args;
   try {
     const repos = getRepositories();
@@ -672,9 +738,121 @@ async function attemptSelfHealingForDeploy(args: {
       childLog.info({ failureType }, 'Deploy self-healing auto-resolved escalated alert');
       return { retryDispatched: true };
     }
+    // TR_024 — fix-intent path. The loop dispatched a child fix intent
+    // and parked the parent in waiting-for-clarification. Surface
+    // pendingFix so the caller skips the `transitionIntent(..., 'failed')`
+    // step — the parent is alive, awaiting its fix.
+    if (result.pendingFix) {
+      childLog.info({ failureType }, 'Deploy self-healing: fix intent dispatched — parent parked, no retry');
+      return { retryDispatched: false, pendingFix: true };
+    }
     return { retryDispatched: false };
   } catch (err) {
     childLog.warn({ err, failureType }, 'Deploy self-healing loop threw — falling through to failed');
     return { retryDispatched: false };
+  }
+}
+
+/**
+ * TR_024 — collect the failed CI run's annotations as a single
+ * compact text block to pass to the self-healing diagnostician as
+ * `technicalDetail`. The diagnostician needs the actual error
+ * lines (TypeScript errors, missing module messages, test
+ * failures) to decide between 'retry' and 'fix-intent' — without
+ * them it sees only "CI pipeline outcome=failed" and defaults to
+ * retry.
+ *
+ * Best-effort: any failure (missing PAT, GitHub API rate limit,
+ * non-github adapter) returns undefined and the diagnostician
+ * proceeds with whatever signals + summary it has.
+ *
+ * Today only github-actions is wired; other adapters (Azure, GitLab)
+ * will need their own equivalent.
+ */
+async function collectCiTechnicalDetail(
+  runId: string | undefined,
+  projectId: string | undefined,
+  childLog: ReturnType<typeof createContextLogger>,
+): Promise<string | undefined> {
+  if (!runId || !projectId) return undefined;
+  try {
+    const { projects } = getRepositories();
+    const project = await projects.findById(projectId);
+    if (!project) return undefined;
+    const token = await resolveProjectCredential(project);
+    if (!token) return undefined;
+
+    // Parse owner / repo from the git URL.
+    const m = project.gitUrl.match(/github\.com[:/]([^/]+)\/([^/.]+)(?:\.git)?$/);
+    if (!m) return undefined;
+    const [, owner, repo] = m;
+
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'gestalt-platform',
+    };
+
+    // 1. List jobs for the run.
+    const jobsResp = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}/jobs?per_page=20`,
+      { headers },
+    );
+    if (!jobsResp.ok) {
+      childLog.debug(
+        { runId, status: jobsResp.status },
+        'collectCiTechnicalDetail: jobs API call failed',
+      );
+      return undefined;
+    }
+    const jobsBody = (await jobsResp.json()) as {
+      jobs?: Array<{ id: number; name: string; conclusion: string | null; check_run_url?: string }>;
+    };
+    const failedJobs = (jobsBody.jobs ?? []).filter(
+      (j) => j.conclusion === 'failure' || j.conclusion === 'cancelled',
+    );
+    if (failedJobs.length === 0) return undefined;
+
+    // 2. For each failed job, fetch its annotations (line-level errors).
+    const parts: string[] = [];
+    for (const job of failedJobs.slice(0, 3)) {
+      try {
+        const annResp = await fetch(
+          `https://api.github.com/repos/${owner}/${repo}/check-runs/${job.id}/annotations?per_page=30`,
+          { headers },
+        );
+        if (!annResp.ok) continue;
+        const annotations = (await annResp.json()) as Array<{
+          path?: string;
+          start_line?: number;
+          annotation_level?: string;
+          message?: string;
+          title?: string;
+        }>;
+        const failureAnns = annotations.filter(
+          (a) => a.annotation_level === 'failure' || a.annotation_level === 'error',
+        );
+        if (failureAnns.length === 0) continue;
+        parts.push(`### Job: ${job.name} (${job.conclusion})`);
+        for (const ann of failureAnns.slice(0, 10)) {
+          const location = ann.path
+            ? `${ann.path}${ann.start_line ? `:${ann.start_line}` : ''}`
+            : '(no location)';
+          const title = ann.title ? `[${ann.title}] ` : '';
+          parts.push(`- ${title}${location} — ${(ann.message ?? '').slice(0, 400)}`);
+        }
+      } catch {
+        // Skip this job — continue with others.
+      }
+    }
+    if (parts.length === 0) return undefined;
+    return parts.join('\n').slice(0, 4000);
+  } catch (err) {
+    childLog.debug(
+      { err: err instanceof Error ? err.message : String(err) },
+      'collectCiTechnicalDetail threw — proceeding without annotations',
+    );
+    return undefined;
   }
 }
