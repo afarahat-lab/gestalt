@@ -40,3 +40,6 @@ master.key
 # Auth fixtures (Session — corporate identity)
 auth.config.json
 krb5.keytab
+
+# Claude Code runtime artifacts
+.claude/
