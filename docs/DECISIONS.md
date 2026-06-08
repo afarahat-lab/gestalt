@@ -1588,3 +1588,162 @@ replaced. If the block is a direct consequence of a previous
 LLM decision (e.g. dispatching to the queue named in
 `diagnosis.retryTaskType`), it is acceptable routing logic,
 not evaluation logic.
+
+---
+
+## ADR-051 — CodiumAI PR-Agent replaces the custom review-agent
+
+**Date:** 2026-06
+**Status:** Accepted
+
+**Decision:** The custom LLM review-agent is replaced by
+CodiumAI PR-Agent running as a GitHub Actions step on every
+Gestalt PR. PR-Agent posts its review as a PR comment.
+Gestalt's pipeline-agent reads the verdict and routes
+accordingly.
+
+**Rationale:** PR-Agent is battle-tested, understands PR diff
+context natively, and is actively maintained. Our custom
+review-agent required significant prompt engineering to avoid
+false positives across TR_011 through TR_016. PR-Agent's
+custom-instructions feature allows `HARNESS.json` rules to
+drive its review focus — maintaining operator configurability
+without platform code changes.
+
+**Consequences:**
+
+- `review-agent` is removed from the gate step list whenever
+  `pipeline.adapter === 'github-actions'` AND
+  `prAgent.enabled === true`.
+- `.pr_agent.toml` is generated from `HARNESS.json` at
+  `gestalt init` time and committed to the project repo
+  alongside `AGENTS.md` / `agents.yaml` / `HARNESS.json`.
+- `pipeline-agent` reads PR-Agent's verdict from the PR
+  review status via the GitHub API (`PipelineAdapter.
+  getPrAgentVerdict()` + `getPrAgentComment()`). On
+  `changes-requested` the comment body is passed to the
+  self-healing diagnostician as `technicalDetail` — same
+  pattern as CI annotations (TR_024). The LLM picks
+  `action: retry | fix-intent | escalate` per ADR-050.
+- `llm-review-agent.ts` stays in the codebase as a fallback
+  for `noop`, Azure DevOps, and GitLab adapters and projects
+  that explicitly disable PR-Agent. A deprecation comment
+  at the top of the file flags it.
+- New optional `HARNESS.json.prAgent` block with `enabled`,
+  `blockOnChangesRequested`, `pendingTimeoutSeconds`.
+- New CLI command `gestalt project config push-pr-agent-config`
+  regenerates and commits `.pr_agent.toml` after `HARNESS.json`
+  rule edits.
+- Template version bumps reflect PR-Agent rollout (0.11.0 → 0.12.0).
+
+**Operator control surface:** PR-Agent's review focus comes
+from `HARNESS.json.agentConfig['review-agent'].rules` +
+`agentConfig['constraint-agent'].rules` flattened into
+`.pr_agent.toml`'s `[pr_reviewer].extra_instructions`. The
+single source of truth for "what counts as a violation in
+this project" remains HARNESS.json — PR-Agent is a renderer.
+
+**What this does NOT do:** PR-Agent does not replace
+`constraint-agent`. The gate's constraint check still runs
+the architectural-rule pass against the diff. PR-Agent
+covers code-review concerns (style, structure, common
+pitfalls); constraint-agent covers project-specific
+architectural invariants.
+
+---
+
+## ADR-053 — Qodo Gen replaces the custom test-agent
+
+**Date:** 2026-06
+**Status:** Accepted — pending implementation
+
+**Decision:** Qodo Gen (CodiumAI) replaces the custom
+test-agent in the generate layer. It analyses generated
+implementation files and produces comprehensive unit tests,
+mocks, and edge cases. Supports local LLM backends
+(Ollama, vLLM) for data residency compliance.
+
+**Rationale:** Same principle as ADR-051 (PR-Agent) — use a
+proven, actively maintained tool rather than a custom LLM
+agent for a well-defined task. Qodo Gen is from the same
+vendor as PR-Agent, creating a consistent CodiumAI integration
+pattern across the quality layer.
+
+> Note: ADR-052 (external scanner webhook →
+> MaintenanceIntent pattern) is referenced by ADR-055 but has
+> not yet been authored. The next session that touches that
+> code should backfill the ADR.
+
+**Consequences:**
+- test-agent is deprecated in the generate layer.
+- Qodo Gen runs via `executeScript` after Aider generates
+  implementation files. Same integration pattern as Aider
+  (ADR-043).
+- The generate orchestrator skips test-agent when
+  `HARNESS.json codeGeneration.testBackend = 'qodo'`.
+- Qodo Gen must be installed in the server Docker image
+  (npm package or binary, per Qodo's distribution).
+
+---
+
+## ADR-054 — SWE-agent handles bug-fix maintenance intents
+
+**Date:** 2026-06
+**Status:** Accepted — pending implementation
+
+**Decision:** Princeton's SWE-agent handles `MaintenanceIntent`s
+of type `bug-fix`. Given a bug report or failing test,
+SWE-agent reproduces the error, writes a failing test, fixes
+the code, and verifies the fix. The fix goes through Gestalt's
+CI and gate pipeline before deploying — SWE-agent does not
+bypass the quality gate.
+
+**Rationale:** SWE-agent's strength is understanding bug
+context from issue descriptions and reproducing failures.
+Aider's strength is implementing known changes. They solve
+different problems in the maintenance layer; routing bug-fix
+intents to SWE-agent and feature intents to Aider plays each
+tool to its strengths.
+
+**Consequences:**
+- A new `MaintenanceIntentType: 'bug-fix'` routes to
+  SWE-agent instead of Aider.
+- The fix still flows through the generate orchestrator's
+  quality gate + deploy chain — SWE-agent's output is treated
+  as a code artifact, not as a deploy.
+- **Prerequisite:** verify SWE-agent self-hosted support for
+  Azure OpenAI and Ollama backends before implementation
+  begins. Cloud-only SWE-agent is incompatible with the GCC/
+  MENA data residency requirement.
+
+---
+
+## ADR-055 — K8sGPT feeds a future Kubernetes operations layer
+
+**Date:** 2026-06
+**Status:** Accepted — pending implementation
+
+**Decision:** K8sGPT (CNCF project) will scan Kubernetes
+clusters and feed findings to Gestalt's maintenance layer via
+webhook. Gestalt converts findings to `MaintenanceIntent`s,
+Aider fixes K8s manifests in the project repo, CI validates,
+and changes deploy autonomously through the existing pipeline.
+
+**Rationale:** K8sGPT is a CNCF project with enterprise
+credibility, long-term maintenance guarantees, and native
+support for local LLM backends (Ollama, LocalAI) — cluster
+telemetry never leaves the infrastructure. Directly addresses
+enterprise operations teams in the GCC/MENA target market.
+
+**Consequences:**
+- Requires a new Kubernetes operations layer in the platform
+  (separate from the existing maintenance layer's app-level
+  observability).
+- Uses the same webhook → `MaintenanceIntent` → pipeline
+  pattern established for external scanners (ADR-052).
+- New `MaintenanceIntentType: 'k8s-config'` carries the
+  K8sGPT finding + suggested manifest fix; Aider applies the
+  manifest change in the project's `k8s/` or `deploy/`
+  directory.
+- CI must include a `kubectl apply --dry-run=server` step
+  to validate manifest changes before deploy.

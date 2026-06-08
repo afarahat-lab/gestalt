@@ -54,6 +54,30 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### ADRs 053–055 — Tool integration roadmap
+
+Documentation-only session. Three ADRs appended to
+`docs/DECISIONS.md` capturing strategic tool integrations
+agreed in the design chat: ADR-053 (Qodo Gen replaces
+test-agent in the generate layer), ADR-054 (SWE-agent handles
+bug-fix MaintenanceIntents), ADR-055 (K8sGPT feeds a future
+Kubernetes operations layer via webhook → MaintenanceIntent).
+A new `### Tool integration roadmap` section under
+`STATE.md` "Active follow-ups" documents priority order plus
+ruled-out alternatives (Bloop.ai — archived; OpenHands —
+competitor; GitHub Spec Kit — not self-hostable). All three
+ADRs are **Accepted — pending implementation**; no code
+change, no migration.
+
+Cross-reference note: ADR-052 (external scanner webhook →
+MaintenanceIntent pattern) is referenced by ADR-055 but has
+not yet been authored. Backfill when the next session touches
+that code. ADR-051 (PR-Agent) was authored alongside this
+session.
+
+**Operator action:** None. ADRs are forward-looking contracts;
+implementation will land in a later session.
+
 ### TR_026 — Remove platform file-change detection (ADR-050 enforcement)
 
 ADR-050 enforcement: the platform must NOT detect, parse, or

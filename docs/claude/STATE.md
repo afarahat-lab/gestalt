@@ -413,6 +413,72 @@ diff.
   `Tokens: N sent / M received` from Aider's stdout. code-agent
   rows still show 0 tokens across all rounds.
 
+### Tool integration roadmap
+
+These integrations are agreed and recorded here so future
+Claude Code sessions know the intent. Implement in priority order
+after current work stabilises.
+
+**Priority 1 — Qodo Gen (test generation)**
+Replace the custom test-agent with Qodo Gen (by CodiumAI,
+same vendor as PR-Agent). Qodo Gen analyses generated code
+and produces comprehensive unit tests, mocks, and edge cases.
+Supports local models via Ollama/vLLM — compatible with
+enterprise data residency requirements.
+Integration path: run via executeScript after Aider generates
+implementation files. Same pattern as Aider integration.
+ADR candidate: "Qodo Gen replaces test-agent in generate layer"
+(ADR-053 — Accepted, pending implementation).
+
+**Priority 2 — SWE-agent (bug fixing)**
+Princeton's autonomous bug-fixing agent. Given a bug report,
+it reproduces the error, writes a failing test, fixes the code,
+and verifies the fix. Complement to Gestalt's maintenance layer.
+Integration path: dispatch SWE-agent for bug-fix MaintenanceIntents
+instead of Aider. Fix still goes through Gestalt CI + gate pipeline.
+Prerequisite: verify self-hosted support for Azure OpenAI / Ollama backends.
+ADR candidate: "SWE-agent handles bug-fix maintenance intents"
+(ADR-054 — Accepted, pending implementation).
+
+**Priority 3 — K8sGPT (Kubernetes operations layer)**
+CNCF project that scans Kubernetes clusters, diagnoses failing
+pods, crash loops, and misconfigured ingress in plain English.
+Native support for Ollama and LocalAI — cluster telemetry
+never leaves the infrastructure. Directly addresses enterprise
+operations teams in the GCC/MENA target market.
+Integration path: K8sGPT webhook → Gestalt maintenance layer
+webhook endpoint → MaintenanceIntent → Aider fixes K8s manifests
+→ CI validates → deploys.
+Requires: new Kubernetes operations layer in the platform.
+ADR candidate: "K8sGPT feeds Gestalt Kubernetes operations layer"
+(ADR-055 — Accepted, pending implementation).
+
+**Deferred — Sourcegraph (code search for drift-agent)**
+Self-hosted code intelligence platform with MCP server.
+Intended to replace executeScript/ripgrep for drift-agent
+and alignment-agent when codebase scale demands it.
+Integration path: add Sourcegraph service to docker-compose.yml,
+register MCP server in platform_mcp_servers, give drift-agent
+and alignment-agent access via agents.yaml.
+Prerequisite: current executeScript/ast-grep approach is
+sufficient at trackeros scale. Revisit when project codebases
+exceed ~100 files.
+ADR candidate: "Sourcegraph provides semantic code search for maintenance agents"
+
+**Ruled out — Bloop.ai**
+BloopAI/bloop repository archived January 2, 2025. Company
+pivoted to a different product. Do not use.
+
+**Ruled out — OpenHands (formerly OpenDevin)**
+General-purpose autonomous agent — competitor to Gestalt's
+planning layer, not a complement. Lacks governance, quality
+gate, audit trails, and enterprise identity integration.
+
+**Ruled out (for now) — GitHub Spec Kit**
+Not self-hostable — blocked for GCC/MENA enterprise customers
+with data residency requirements. Revisit if self-hosted option
+becomes available.
+
 ### Architecture follow-ups (all LOW unless marked)
 
 Pruned to top items; see `sessions/archive/` for the full

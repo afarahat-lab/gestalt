@@ -63,6 +63,18 @@ ADR to respect; read the canonical file to know **why**._
   high-level then per-phase
 - **ADR-050** — All evaluation and routing decisions made by LLM —
   no hardcoded decision logic
+- **ADR-051** — CodiumAI PR-Agent replaces the custom review-agent
+  on github-actions pipelines; review-agent stays as fallback
+- **ADR-053** — Qodo Gen replaces test-agent in generate layer
+  (accepted, pending implementation)
+- **ADR-054** — SWE-agent handles bug-fix maintenance intents
+  (accepted, pending implementation)
+- **ADR-055** — K8sGPT feeds Gestalt Kubernetes operations layer
+  (accepted, pending implementation)
+
+> ADR-052 (external scanner webhook → MaintenanceIntent pattern)
+> is referenced by ADR-054–055 but has not yet been authored —
+> backfill when the next session touches that code.
 
 ---
 

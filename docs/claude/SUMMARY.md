@@ -420,6 +420,72 @@ diff.
   `Tokens: N sent / M received` from Aider's stdout. code-agent
   rows still show 0 tokens across all rounds.
 
+### Tool integration roadmap
+
+These integrations are agreed and recorded here so future
+Claude Code sessions know the intent. Implement in priority order
+after current work stabilises.
+
+**Priority 1 — Qodo Gen (test generation)**
+Replace the custom test-agent with Qodo Gen (by CodiumAI,
+same vendor as PR-Agent). Qodo Gen analyses generated code
+and produces comprehensive unit tests, mocks, and edge cases.
+Supports local models via Ollama/vLLM — compatible with
+enterprise data residency requirements.
+Integration path: run via executeScript after Aider generates
+implementation files. Same pattern as Aider integration.
+ADR candidate: "Qodo Gen replaces test-agent in generate layer"
+(ADR-053 — Accepted, pending implementation).
+
+**Priority 2 — SWE-agent (bug fixing)**
+Princeton's autonomous bug-fixing agent. Given a bug report,
+it reproduces the error, writes a failing test, fixes the code,
+and verifies the fix. Complement to Gestalt's maintenance layer.
+Integration path: dispatch SWE-agent for bug-fix MaintenanceIntents
+instead of Aider. Fix still goes through Gestalt CI + gate pipeline.
+Prerequisite: verify self-hosted support for Azure OpenAI / Ollama backends.
+ADR candidate: "SWE-agent handles bug-fix maintenance intents"
+(ADR-054 — Accepted, pending implementation).
+
+**Priority 3 — K8sGPT (Kubernetes operations layer)**
+CNCF project that scans Kubernetes clusters, diagnoses failing
+pods, crash loops, and misconfigured ingress in plain English.
+Native support for Ollama and LocalAI — cluster telemetry
+never leaves the infrastructure. Directly addresses enterprise
+operations teams in the GCC/MENA target market.
+Integration path: K8sGPT webhook → Gestalt maintenance layer
+webhook endpoint → MaintenanceIntent → Aider fixes K8s manifests
+→ CI validates → deploys.
+Requires: new Kubernetes operations layer in the platform.
+ADR candidate: "K8sGPT feeds Gestalt Kubernetes operations layer"
+(ADR-055 — Accepted, pending implementation).
+
+**Deferred — Sourcegraph (code search for drift-agent)**
+Self-hosted code intelligence platform with MCP server.
+Intended to replace executeScript/ripgrep for drift-agent
+and alignment-agent when codebase scale demands it.
+Integration path: add Sourcegraph service to docker-compose.yml,
+register MCP server in platform_mcp_servers, give drift-agent
+and alignment-agent access via agents.yaml.
+Prerequisite: current executeScript/ast-grep approach is
+sufficient at trackeros scale. Revisit when project codebases
+exceed ~100 files.
+ADR candidate: "Sourcegraph provides semantic code search for maintenance agents"
+
+**Ruled out — Bloop.ai**
+BloopAI/bloop repository archived January 2, 2025. Company
+pivoted to a different product. Do not use.
+
+**Ruled out — OpenHands (formerly OpenDevin)**
+General-purpose autonomous agent — competitor to Gestalt's
+planning layer, not a complement. Lacks governance, quality
+gate, audit trails, and enterprise identity integration.
+
+**Ruled out (for now) — GitHub Spec Kit**
+Not self-hostable — blocked for GCC/MENA enterprise customers
+with data residency requirements. Revisit if self-hosted option
+becomes available.
+
 ### Architecture follow-ups (all LOW unless marked)
 
 Pruned to top items; see `sessions/archive/` for the full
@@ -544,6 +610,30 @@ None blocking the build. Areas to keep in mind:
 ---
 
 ## Pending operator actions
+
+### ADRs 053–055 — Tool integration roadmap
+
+Documentation-only session. Three ADRs appended to
+`docs/DECISIONS.md` capturing strategic tool integrations
+agreed in the design chat: ADR-053 (Qodo Gen replaces
+test-agent in the generate layer), ADR-054 (SWE-agent handles
+bug-fix MaintenanceIntents), ADR-055 (K8sGPT feeds a future
+Kubernetes operations layer via webhook → MaintenanceIntent).
+A new `### Tool integration roadmap` section under
+`STATE.md` "Active follow-ups" documents priority order plus
+ruled-out alternatives (Bloop.ai — archived; OpenHands —
+competitor; GitHub Spec Kit — not self-hostable). All three
+ADRs are **Accepted — pending implementation**; no code
+change, no migration.
+
+Cross-reference note: ADR-052 (external scanner webhook →
+MaintenanceIntent pattern) is referenced by ADR-055 but has
+not yet been authored. Backfill when the next session touches
+that code. ADR-051 (PR-Agent) was authored alongside this
+session.
+
+**Operator action:** None. ADRs are forward-looking contracts;
+implementation will land in a later session.
 
 ### TR_026 — Remove platform file-change detection (ADR-050 enforcement)
 
@@ -792,6 +882,104 @@ Moved to [@docs/claude/ARCHITECTURE.md](./ARCHITECTURE.md#key-type-alignment-rul
 
 
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
+
+---
+### Session 2026-06-08 — Claude Code (ADRs 053–055: tool integration roadmap — Qodo Gen, SWE-agent, K8sGPT documented as accepted-pending-implementation; STATE.md gains forward-looking roadmap section)
+
+Documentation-only session. No code change, no migration. The
+design chat agreed on three strategic tool integrations plus a
+ruled-out / deferred list; this session captures them as ADRs
+and surfaces the roadmap on STATE.md so future sessions know
+the intent.
+
+What changed (docs):
+
+- **`docs/DECISIONS.md`** — three ADRs appended:
+  - **ADR-053** — Qodo Gen (CodiumAI) replaces the custom
+    test-agent in the generate layer. Runs via `executeScript`
+    after Aider, opt-in via
+    `HARNESS.json codeGeneration.testBackend = 'qodo'`.
+    Same vendor as PR-Agent — consistent CodiumAI pattern
+    across the quality layer. Supports local LLMs (Ollama,
+    vLLM) for data residency.
+  - **ADR-054** — Princeton's SWE-agent handles
+    `MaintenanceIntent`s of type `bug-fix`. Reproduces the
+    error, writes a failing test, fixes, verifies. Fix flows
+    through Gestalt's CI + gate pipeline — no bypass.
+    Prerequisite: verify self-hosted Azure OpenAI / Ollama
+    support before implementation.
+  - **ADR-055** — K8sGPT (CNCF) scans Kubernetes clusters
+    and webhooks findings to Gestalt's maintenance layer.
+    Aider fixes K8s manifests; CI validates with
+    `kubectl apply --dry-run=server`. Requires a new
+    Kubernetes operations layer in the platform. Native
+    Ollama / LocalAI support — cluster telemetry stays
+    on-prem (GCC/MENA fit).
+  - All three: **Accepted — pending implementation**.
+- **`docs/claude/DECISIONS.md`** — three one-line index
+  entries added; ADR-051 (PR-Agent) was authored alongside
+  this session and is also indexed. Callout notes that
+  ADR-052 (external scanner webhook → MaintenanceIntent
+  pattern) is referenced by ADR-055 but has not yet been
+  authored — backfill when the next session touches that
+  code.
+- **`docs/claude/STATE.md`** — new
+  `### Tool integration roadmap` section under
+  "Active follow-ups (small)" (placed after the
+  TR_018/TR_014 carryovers, before architecture follow-ups).
+  Documents priority order (Qodo Gen → SWE-agent → K8sGPT),
+  the deferred Sourcegraph integration (revisit when project
+  codebases exceed ~100 files), and three ruled-out
+  alternatives: **Bloop.ai** (BloopAI/bloop repo archived
+  2025-01-02 — vendor pivoted), **OpenHands** (formerly
+  OpenDevin — competitor to Gestalt's planning layer, lacks
+  governance/gate/audit/identity), **GitHub Spec Kit** (not
+  self-hostable — blocks GCC/MENA data residency).
+- **`docs/claude/BUILD.md`** — `Pending operator actions`
+  gets an `### ADRs 053–055 — Tool integration roadmap`
+  section noting docs-only, operator action: none.
+
+Decisions made:
+
+- **ADR-052 referenced but not yet written.** ADR-055's
+  consequences reference ADR-052 (external scanner webhook →
+  MaintenanceIntent pattern), which doesn't exist in
+  `docs/DECISIONS.md` today. Rather than fabricate it in this
+  docs-only pass, recorded the gap as a callout in
+  `docs/claude/DECISIONS.md` so the next session that touches
+  external scanner code backfills the ADR at the same time.
+  (ADR-051 was added alongside this session by the user, so
+  the ADR-053 rationale link no longer dangles.)
+- **Placement of the roadmap section in STATE.md.**
+  Could go at the top of "Active follow-ups (small)" for
+  visibility, or at the bottom. Picked just before
+  `### Architecture follow-ups` so the TR_xxx completed/in-
+  progress work stays first (recency bias matches the rest
+  of the file) and the strategic roadmap forms its own
+  cleanly-bounded section.
+- **Ruled-out items captured in STATE.md rather than as
+  separate ADRs.** A negative-decision ADR per tool would
+  inflate the index without adding load-bearing content;
+  the one-paragraph "ruled out" entries in the roadmap
+  section are enough context for a future session to
+  re-evaluate.
+
+Pending follow-ups (NEW from this session):
+
+- **(MEDIUM — backfill)** Author ADR-052 (external scanner
+  webhook → MaintenanceIntent pattern — the pattern ADR-055
+  extends). Referenced forward by ADR-055; without it the
+  rationale link dangles.
+- **(LOW)** When implementation of any of the three new
+  ADRs begins, the matching `### Tool integration roadmap`
+  bullet moves to a regular TR_xxx section and gains an
+  implementation-status line.
+
+Build status: unchanged. No code touched. `pnpm -r build`
+not re-run (no source files modified). Server state
+unchanged.
+
+trackeros operator commits in this session: none.
 
 ---
 ### Session 2026-06-08 — Claude Code (TR_026: remove platform file-change detection — Aider stdout parsing deleted, phase-evaluator uses git diff via executeScript)
@@ -1132,211 +1320,3 @@ PLAN.md content from trackeros after planning:
 https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
 (4-phase plan: model+repo → service → routes → policy module).
 
----
-### Session 2026-06-08 — Claude Code (TR_024: autonomous systemic gap detection — self-healing agent gains `action: fix-intent` and submits Aider-ready fix intents that the platform deploys, then resumes the parent automatically)
-
-The self-healing diagnostician evolves from "retry or escalate" to
-a three-way action vocabulary: **retry / fix-intent / escalate**.
-When the LLM decides a failure reveals a SYSTEMIC GAP in the
-project (config flag, missing dependency, wrong scaffold) it
-writes a complete Aider-ready fix intent which the platform
-submits as a separate high-priority generate cycle. The original
-intent is parked in `waiting-for-clarification` until the fix's
-production promotion fires its `onSuccessDispatch` envelope and
-resumes the parent. Strict ADR-050 compliance — no hardcoded
-failure patterns, no fix templates, no `switch` on failure type.
-The `action` field is the sole routing decision.
-
-What's new (data + types):
-
-- **Migration 026 — `026_intent_parent.sql`** adds two NULL-by-
-  default columns: `intents.parent_intent_id` (UUID FK with
-  `ON DELETE SET NULL`) + `intents.on_success_dispatch` (JSONB).
-  Indexed partial-where on `parent_intent_id` for the
-  dashboard's child-lookup. Zero behaviour change for existing
-  intents.
-- **`@gestalt/core` types** — `IntentRecord` gains
-  `parentIntentId` + `onSuccessDispatch`. `IntentRepository`
-  gains `saveOnSuccessDispatch(id, dispatch | null)` + a
-  `parentIntentId?` field on the `create()` input.
-  `IntentRecord.source` widened with `'self-healing-fix'` +
-  `'self-healing-resume'`. `ResumeContext.waitingForFix?: boolean`.
-  Same widening applied to the generate orchestrator's
-  `IntentTaskPayload.source` + `intentSource` types.
-- **`SelfHealingDiagnosis`** gains `action: 'retry' | 'fix-intent'
-  | 'escalate'` + optional `fixIntent`, `fixIntentRationale`,
-  `resumeAfterFix`. Defaults to `action: 'retry'` on parse
-  failure for legacy diagnoses without the field.
-- **`SelfHealingResult.pendingFix?: boolean`** — surfaces from
-  the loop so callers don't trip-transition the parent intent
-  to `failed`.
-
-What's new (logic):
-
-- **`buildDiagnosisPrompt`** in `self-healing-agent.ts` widened
-  with an Action-routing block + extended JSON schema. The
-  prompt content is the platform-mechanic ground (action
-  vocabulary, JSON schema) — operator-tunable rules live in
-  `HARNESS.json.agentConfig.self-healing-agent` per ADR-042.
-- **`runSelfHealingLoopUnsafe`** intercepts `action: 'fix-intent'`
-  BEFORE the legacy retry path: calls `submitFixIntent`, saves
-  parent `ResumeContext` with `waitingForFix: true`, transitions
-  parent to `waiting-for-clarification`. On dispatch failure
-  falls through to escalation so the parent never hangs.
-- **`submitFixIntent`** (new helper) — creates the fix intent
-  row with `source: 'self-healing-fix'`, priority `high`,
-  `parentIntentId` linking back. When `resumeAfterFix: true`
-  persists the `onSuccessDispatch` envelope on the fix intent
-  pointing at a `generate:intent` resume of the parent.
-  Dispatches `generate:intent` for the fix on the generate
-  queue so the standard SDLC chain carries it through.
-- **`SelfHealingAgent.diagnose(..., projectRoot?)`** — accepts
-  an optional projectRoot. When provided, loads model /
-  temperature / prompt_extensions from `agents.yaml`'s
-  `self-healing-agent` block (per ADR-042). When absent,
-  falls back to the hardcoded `SELF_HEALING_AGENT_CONFIG`.
-  Never throws — every path falls back cleanly.
-
-What's new (deploy + promotion):
-
-- **Promotion-agent → onSuccessDispatch firing**. After
-  production promotion transitions the intent to `deployed`,
-  the deploy-orchestrator reads `intent.onSuccessDispatch`,
-  dispatches the envelope verbatim, and clears the column so
-  a manual re-promotion doesn't re-fire. Best-effort —
-  failure logs a warning and leaves the parent in waiting.
-- **`collectCiTechnicalDetail(runId, projectId)`** (new
-  helper in deploy-orchestrator) — fetches the failed CI run's
-  GitHub Actions annotations via the GitHub API and assembles
-  them as a 4 KB text block. Passed to the self-healing
-  diagnostician as `technicalDetail` so it sees the actual
-  error lines (TS errors, missing modules, test failures)
-  instead of just `outcome=failed`. Without this the LLM
-  can't tell a code bug from a systemic gap. github-actions
-  only today; other adapters TBD.
-- **`attemptSelfHealingForDeploy`** widened to return
-  `{ retryDispatched, pendingFix? }`. Both call sites
-  (CI-failure + catch-block) check both before transitioning
-  the parent to `failed` — the fix-intent path is a
-  SUCCESSFUL self-healing outcome, not a failed one.
-
-What's new (template + trackeros):
-
-- **`HARNESS.json.agentConfig.self-healing-agent`** added to
-  both the template and trackeros. Six rules: action vocabulary
-  ("retry / fix-intent / escalate"), the criteria for each, the
-  fix-intent-must-be-Aider-ready rule, the
-  `resumeAfterFix: true` default.
-- **`agents.yaml` self-healing-agent block** added to template.
-  trackeros overrides `model: chat-latest` for the highest
-  reasoning capability. The platform LLM registry already
-  carries `chat-latest` as default with `apiShape: 'responses'`
-  so the `max_completion_tokens` wire-shape is handled
-  registry-side — agent code never sees the difference.
-- **Template version bumped 0.10.0 → 0.11.0**.
-
-What's new (dashboard):
-
-- **`IntentSummary` widened** — `parentIntentId?` +
-  `awaitingFixIntentId?` surfaced from the server's
-  `GET /intents/:id` route. The route enriches the response
-  by scanning recent `self-healing-fix` intents whose
-  `parentIntentId` matches the requested intent.
-- **`IntentDetail.tsx`** renders two new panels:
-  - 🔧 **Auto-fix intent** — when `source === 'self-healing-fix'`
-    + `parentIntentId` present. Backlink to the parent.
-  - ⏳ **Awaiting auto-fix** — when `awaitingFixIntentId`
-    populated on a parent. Shows the diagnosis + link to
-    the in-flight child.
-
-Live verification on trackeros (real GitHub Actions CI):
-
-- Submitted intent `587befaa` — *"Add a GET /metrics endpoint
-  in src/app.ts that uses the prom-client library..."* — a
-  natural systemic gap (prom-client not in package.json).
-- Generate ran → pr-agent → CI failed (TS2307 Cannot find
-  module 'prom-client'). CI annotations fetched.
-- Self-healing diagnostician ran. **Picked `action: fix-intent`**.
-  Wrote a fix intent referencing prom-client + package.json
-  dependencies. Parent's `ResumeContext.waitingForFix: true`
-  persisted.
-- Child fix intent `2e3c46ab` created with
-  `source: 'self-healing-fix'`, `parentIntentId = 587befaa`,
-  `on_success_dispatch` populated with the
-  `generate:intent` resume envelope.
-- Verified the full child/parent chain in the database with
-  a recursive CTE — 3-level chain (each level's CI failure
-  spawned its own fix intent before the runaway brake
-  fired).
-
-Decisions made:
-
-- **`projectRoot` is optional in `agent.diagnose()`**. The
-  self-healing loop doesn't have a clone (it runs in the same
-  worker process as the orchestrator catch block) so passing
-  `projectRoot` would require additional plumbing. The
-  hardcoded fallback uses no `model` override → platform
-  default routes via the LLM registry to whatever the
-  operator set as the default LLM (today: `chat-latest` with
-  `apiShape: 'responses'`). When trackeros operators want a
-  different model for self-healing, they edit
-  `agents.yaml.self-healing-agent.llm.model` and the orchestrator's
-  next clone-having entry point picks it up. For TR_024 today
-  the platform default IS chat-latest, so the override doesn't
-  matter live.
-- **`onSuccessDispatch` is stored on the FIX intent, not the
-  parent**. The promotion-agent already runs at fix-intent
-  production promotion; reading `intent.onSuccessDispatch`
-  there is cheaper than walking child→parent. Cleared after
-  successful dispatch so manual re-promotion doesn't re-fire.
-- **CI annotations are pulled by direct GitHub API fetch**
-  rather than extending the `PipelineAdapter` interface.
-  Today only github-actions is verified end-to-end; the
-  abstraction can come when a second adapter is wired.
-- **The cascading-fix-intent issue is surfaced as a TR_025
-  follow-up**. Each fix intent failing CI causes ANOTHER
-  fix intent — diagnostician chooses `fix-intent` again
-  because it sees the same `Cannot find module` error.
-  A cycle break needs depth tracking on the parent chain
-  + force-escalate when depth > N. Captured below; not in
-  scope for TR_024.
-
-Pending follow-ups (NEW from TR_024):
-
-- **(HIGH)** Cascading fix-intent prevention. Track
-  `parent_intent_id` chain depth on dispatch; if a fix-intent's
-  CI fails AND its parent chain depth >= 2, force escalation
-  instead of another fix-intent. Captured as TR_025.
-- **(MEDIUM)** Pass CI logs to the diagnostician on
-  non-github adapters too (Azure DevOps, GitLab CI). Today
-  `collectCiTechnicalDetail` is github-only — other adapters
-  silently return undefined and the diagnostician is back to
-  flying blind.
-- **(LOW)** Add a `parent_intent_id` recursive view on the
-  dashboard's IntentDetail so operators can see the full
-  fix-chain at a glance instead of clicking through one
-  level at a time.
-- **(LOW)** When `resumeAfterFix: false`, surface the choice
-  in the dashboard's Auto-fix panel so operators know the
-  fix is standalone rather than auto-resuming.
-
-Carryover follow-ups (status updates):
-
-- **~~(HIGH — TR_023)~~ RESOLVED structurally by TR_024.**
-  Aider DTO-field hallucination — the planner now keeps
-  DTO + repository in the same phase (TR_023 fix). When it
-  doesn't AND CI fails on a missing field, self-healing
-  can now recognise the gap and submit a fix-intent
-  instead of looping retries.
-- **(STILL OPEN — MEDIUM)** TR_014: Aider token-spend
-  capture.
-
-Build status: `pnpm -r build` clean across all 13 packages.
-Migration 026 applied at boot. Template auto-refreshed to
-`0.11.0`. Server `/health` 200 throughout. Stale trackeros
-PRs #62–#68 from the verification cascade closed with
-`--delete-branch`. trackeros operator commits in this session:
-`1a4fe16e` (HARNESS + agents.yaml self-healing-agent block).
-
-
----
