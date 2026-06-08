@@ -54,6 +54,31 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_028 — Full planning-loop re-test (TEST_REPORT_028.md)
+
+Milestone test on the leave-management feature, verifying every
+TR_020 through TR_027 mechanism in a single 19-minute autonomous
+cycle. Phase 1 (model) deployed cleanly. Phase 2 (repository)
+hit the known TR_023 Aider DTO-drift; self-healing's
+diagnostician correctly chose `retry` then `fix-intent`;
+fix-intent child deployed via the `onSuccessDispatch` envelope
+in ~2m 25s. But the fix-intent prompt lacked path specificity
+so Aider wrote a stray repo-root `/leave.model.ts` that tsc
+never resolves. Parent Phase 2 resumed → failed again → planner
+retry budget exhausted → feature blocked at 1/4 phases. Two new
+HIGH follow-ups captured: (1) promoted TR_023 — planner must
+keep model+repository in same phase OR code-agent must read
+existing model first; (2) self-healing fix-intent prompt
+enrichment — must include the failing import path and existing
+field shape. Architecture-agent / planner-agent /
+phase-evaluator-agent / PR-Agent / self-healing + onSuccessDispatch /
+cascade-depth brake / phase retry budget all verified.
+
+**Operator action:** None on the platform. trackeros next
+planner cycle should be prefaced by `git rm leave.model.ts`
+(the stray repo-root file fix-intent created). Full
+per-phase log at `docs/claude/TEST_REPORT_028.md`.
+
 ### TR_027 — PR-Agent replaces review-agent (ADR-051)
 
 CodiumAI PR-Agent invoked server-side via `executeScript` after CI

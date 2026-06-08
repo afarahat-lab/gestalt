@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-08 (after TR_027 — replaced custom review-agent with CodiumAI PR-Agent invoked server-side via executeScript after CI passes. ADR-051. No webhook, no CI step, no GitHub Secrets for LLM keys — credentials forwarded per invocation via subprocess env vars. Dockerfile installs PR-Agent in its own venv (`/opt/pr-agent`) isolated from Aider's (`/opt/aider`) because of incompatible litellm versions; PATH shims keep call sites unchanged. New `prAgent` block on HarnessConfig; `.pr_agent.toml` generated from HARNESS rules at init + via new `gestalt project config push-pr-agent-config` command. Deploy orchestrator's `maybeRunPrAgentAndRoute()` runs PR-Agent, polls verdict via GitHub PR-Reviews/Comments API (recognises `pr-agent[bot]` / `codiumai-pr-agent[bot]` / `qodo-merge-pro[bot]` logins), routes `changes-requested` through self-healing's existing fix-intent path (new failure type `review-requested-changes`, migration 027). Gate orchestrator skips review-agent when prAgent.enabled && adapter=github-actions; constraint-agent still runs in parallel. llm-review-agent.ts `@deprecated` but kept for non-GH adapters. Template 0.12.0 → 0.14.0. **Live verified end-to-end on trackeros PR #81**: Aider 6s → CI pass → PR-Agent 23.5s → verdict `none` → gate (constraint-agent only) → deploy. Wall-clock 2m 04s.)
+**Last updated:** 2026-06-08 (after TR_028 — milestone planning-loop re-test on the leave-management feature, verifying every TR_020 through TR_027 mechanism end-to-end in a single 19-min autonomous cycle. Phase 1 (model) deployed cleanly (Aider 5s → CI pass → PR-Agent 27s → verdict `none` → gate (constraint-agent only) → squash-merge, ~2m 44s). Phase 2 (repository) hit the known TR_023 Aider DTO-drift issue: repository code references model fields that don't exist (`leaveType` vs deployed `leaveTypeId`; `totalDays/usedDays/year` vs deployed `balance`). Self-healing's diagnostician correctly chose `action: 'retry'` for the first two cycles, then `action: 'fix-intent'` on the third (systemic gap detected). Fix-intent child dispatched + deployed in ~2m 25s (Aider 4s → CI pass → PR-Agent 24s → deploy → onSuccessDispatch envelope fired → parent resumed). But the fix-intent prompt didn't include a file path; Aider wrote a stray `/leave.model.ts` at repo root that tsc never resolves. Parent Phase 2 resumed → failed → planner retry budget exhausted → feature `blocked` at 1/4 phases. Two NEW HIGH follow-ups: (1) promoted TR_023 — planner must put model+repository in same phase OR code-agent must read existing model first; (2) self-healing fix-intent prompt enrichment — must include the failing import path and existing field shape. Architecture-agent / planner-agent / phase-evaluator-agent / PR-Agent / self-healing fix-intent + onSuccessDispatch / cascade-depth brake / phase retry budget all VERIFIED working as designed. TEST_REPORT_028.md in `docs/claude/`.)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 027 (latest: `027_self_healing_pr_agent`)
 
@@ -239,6 +239,21 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
+### TR_028 — Full planning-loop re-test (TEST_REPORT_028.md)
+
+Milestone test on the leave-management feature. Every TR_020
+through TR_027 platform mechanism verified working end-to-end
+in a single 19-minute autonomous cycle. Phase 1 deployed
+cleanly through architecture-agent → planner-agent → PLAN.md
+commit → Aider → CI → PR-Agent → gate (constraint-agent only,
+ADR-051 skip) → promotion. Phase 2 hit the known TR_023 Aider
+DTO-drift; self-healing's diagnostician routed retry → retry →
+**fix-intent** as designed; fix-intent child deployed in
+~2m 25s with `onSuccessDispatch` envelope resuming the parent;
+but the fix-intent prompt lacked path specificity so Aider
+landed a stray repo-root file. Feature blocked at 1/4 phases.
+Full report at `docs/claude/TEST_REPORT_028.md`.
+
 ### TR_027 — PR-Agent replaces review-agent (ADR-051)
 
 CodiumAI PR-Agent invoked server-side via `executeScript` after CI
@@ -346,6 +361,36 @@ archive for the full diffs.
 
 ### Active follow-ups (carryover or NEW)
 
+- **(HIGH — NEW from TR_028, promotes TR_023)** Planner must
+  reliably put `model + repository` in the same phase, OR
+  code-agent prompt must mandate "READ the imported model
+  file before writing the repository". The leave-management
+  feature in TR_028 blocked at Phase 2 because Phase 1 wrote
+  the model in isolation and every Phase 2 Aider run drifted
+  to different field names. Self-healing's `fix-intent`
+  routing handled it but the prompt quality wasn't enough
+  to make the fix stick.
+- **(HIGH — NEW from TR_028)** Self-healing fix-intent prompt
+  enrichment. When the diagnostician chooses `fix-intent` it
+  should include the exact failing import path + the deployed
+  model's actual field shape in the child intent text. TR_028's
+  fix-intent dispatched a "Define type X with properties A, B,
+  C" prompt without saying WHERE to put the file. Aider wrote
+  a stray `/leave.model.ts` at repo root that tsc never
+  resolves, so the resumed parent failed identically.
+- **(MEDIUM — NEW from TR_028)** Phase-evaluator's `partial`
+  verdict + scope adjustments work — PLAN.md gets updated —
+  but the adjustments don't feed back into the planner's
+  "phase grouping" decisions. If the evaluator notices "Phase
+  1 only created the model, repository still needed", it
+  could merge model+repository into one phase rather than
+  annotating the next.
+- **(LOW — NEW from TR_028)** The fix-intent flow logs "Fix
+  deployed — resuming original intent via onSuccessDispatch"
+  but doesn't emit a clear "parent resumed → Aider running"
+  message at the resume point. Operators see two `Running
+  Aider` log lines back-to-back and have to correlate by
+  intent ID.
 - **(HIGH — NEW from TR_026/TR_027)** Stale repository files
   on trackeros main keep returning from earlier auto-merged
   Phase 1 cycles. Either planner must reliably put model+

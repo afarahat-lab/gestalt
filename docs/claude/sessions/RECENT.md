@@ -3,6 +3,200 @@
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+### Session 2026-06-08 — Claude Code (TR_028: full planning loop re-test with PR-Agent on leave-management feature — autonomous machinery verified end-to-end; Phase 2 blocked by known TR_023 Aider DTO-drift)
+
+Milestone test (per the brief): submit the leave management
+feature to trackeros and verify the full planning loop runs
+autonomously with PR-Agent, fix-intent self-healing, git-based
+file detection, and phase evaluation all wired together.
+
+Pre-flight (Step 1 + Step 2 of the brief):
+
+- main was already at `8f17ef9` from the prior session — no
+  branch merge needed. `pnpm -r build` clean; `docker compose
+  ps` showed server / postgres / redis healthy. `/health` 200.
+- trackeros main carried no stale `src/modules/leave/`
+  directory (the brief's Step 2 cleanup was already current).
+  Closed three pre-existing stranded PRs: #78 (earlier leave
+  Phase 1), #53 (old health check), #48 (old scaffold).
+- HARNESS.json verified: `planner.maxPhasesPerFeature: 10`,
+  `maxFilesPerPhase: 5`, `maxPhaseRetries: 2`,
+  `prAgent.enabled: true`, `pendingTimeoutSeconds: 90`.
+
+Feature submission (Step 3):
+
+- `gestalt feature submit "Build the leave management
+  module..."` returned feature `e9240cb6-0533-4e0d-a372-
+  f13e297debdd`, status `planning`.
+- architecture-agent ran at 20:27:53, planner-agent at
+  20:28:01 — both clean.
+- Planner emitted 4 phases: model / repository / service /
+  routes. PLAN.md committed to trackeros main + `_Adjustment:_`
+  annotations added by phase-evaluator's `partial` verdict on
+  Phase 1.
+
+Per-phase timeline:
+
+- **Phase 1 (model) — `94f1c8b7` → PR #82 → ✓ deployed.**
+  Aider 5s → CI pass → PR-Agent 27s → verdict `none` → gate
+  (constraint-agent only, ADR-051 skip) → squash-merged
+  20:31:04. Wall-clock submit-to-deploy ~2m 44s. PR-Agent's
+  "PR Reviewer Guide" comment confirmed on the PR.
+- **Phase 2 (repository) — three attempts × 2 self-healing
+  retries each, plus 1 fix-intent cycle — feature blocked.**
+
+The autonomous machinery exercised exactly as designed:
+
+- Phase 2 attempt 1 (`af45fd70` / PR #83) — CI failed on
+  `TS2339 Property 'leaveType' does not exist on LeaveRequest`.
+  Self-healing chose `retry` → retry failed → escalated as
+  "retry introduced new violations" → planner-level retry
+  fired (1/2).
+- Phase 2 attempt 2 (`f777f69a` / PR #84) — same TS2339
+  family of errors. Same retry-then-escalate cycle. Planner
+  retry 2/2 fired.
+- Phase 2 attempt 3 (`13d7ac9c` / PR #85) — same failure
+  pattern. At 20:40:57 the self-healing-agent diagnostician
+  chose **`action: 'fix-intent'`** ("systemic gap detected").
+  Parent intent parked; child intent `53347035` dispatched
+  with `source: 'self-healing-fix'`, `parent_intent_id` →
+  13d7ac9c.
+- **Fix-intent child — `53347035` → PR #86 → ✓ deployed.**
+  Aider 4s → CI pass → PR-Agent 24s → verdict `none` → gate
+  → squash-merged 20:43:18. Wall-clock fix-dispatch →
+  fix-deployed → parent resumed ~2m 25s. `onSuccessDispatch`
+  envelope fired at 20:43:22 — "Fix deployed — resuming
+  original intent via onSuccessDispatch".
+- **Parent Phase 2 resumed → also failed.** Aider's next
+  generation drifted to a different mismatched field set
+  (`totalDays / usedDays / year` on LeaveBalance). Self-
+  healing burned another retry pair. 20:46:53 — "Phase retry
+  budget exhausted — marking phase failed and feature
+  blocked".
+
+Final state: feature `e9240cb6` status `blocked`, 1/4 phases
+deployed. Phases 3 + 4 not reached. Total wall-clock submission
+→ blocked: ~19 minutes.
+
+Root cause:
+
+- **Aider DTO drift between phases — the known TR_023
+  follow-up.** Phase 1's `src/modules/leave/leave.model.ts`
+  defines `LeaveRequest.leaveTypeId` + `LeaveBalance.balance`.
+  Every Phase 2 Aider run wrote a repository referencing
+  DIFFERENT field names (`leaveType`, `totalDays`, `usedDays`,
+  `year`). Aider isn't reading the existing model before
+  writing the repository.
+- **Fix-intent prompt quality gap — NEW from TR_028.** The
+  diagnostician correctly chose `fix-intent` and dispatched a
+  well-formed-sounding intent ("Define the LeaveBalance type
+  to include properties: remainingLeaves, usedLeaves,
+  totalLeaves"). But the prompt didn't include the file path
+  the repository was importing from. Aider wrote a stray
+  `/leave.model.ts` at the **repository root**, not at
+  `src/modules/leave/leave.model.ts`. tsc never picked it up.
+  PR #86 merged cleanly because the new isolated file
+  compiles fine; the failing Phase 2 import still resolves
+  to the old Phase 1 model. So the resumed Phase 2 failed
+  identically to before the fix-intent.
+
+What this VERIFIES architecturally (every TR_020–TR_027
+mechanism actually fired in this single 19-min cycle):
+
+- ✅ architecture-agent → planner-agent → PLAN.md commit
+- ✅ TR_026 git-based file discovery via
+  `AiderCodeAgent.discoverAiderWrites`
+- ✅ TR_027 PR-Agent server-side invocation in /opt/pr-agent
+  venv with per-call LLM creds — TWO clean runs on PRs #82
+  and #86, both posted the "PR Reviewer Guide" comment
+- ✅ ADR-051 gate skip: review-agent omitted, constraint-
+  agent ran in parallel
+- ✅ TR_026 phase-evaluator-agent calling git diff via
+  executeScript (`partial` verdict emitted on Phase 1
+  with 3 scope adjustments)
+- ✅ Phase 2 event-bus auto-dispatch after Phase 1 deploy
+- ✅ Self-healing diagnostician routing between `retry` and
+  `fix-intent` (TR_024 + ADR-050)
+- ✅ TR_024 fix-intent dispatch with `parent_intent_id`
+  linkage + `onSuccessDispatch` envelope + parent resume
+- ✅ TR_025 cascade-depth brake (`MAX_FIX_INTENT_DEPTH = 2`)
+  — chain depth stayed at 1, no runaway
+- ✅ TR_022 planner phase retry budget honoured (3 attempts
+  total = 1 initial + 2 retries)
+
+What this DOES NOT verify:
+
+- ❌ End-to-end multi-phase autonomous completion. Phases 3
+  + 4 never dispatched.
+- ❌ Fix-intent prompt quality. The routing decision was
+  correct; the resulting child prompt was too vague.
+
+Test cleanup:
+
+- Closed stranded Phase 2 PRs #83, #84, #85, #87 with
+  `--delete-branch`.
+- PR #86 (fix-intent's stray `/leave.model.ts` at repo root)
+  left merged; it doesn't break anything because tsc never
+  loads it, but trackeros's next planner cycle should be
+  prefaced with a `git rm leave.model.ts` cleanup.
+- TEST_REPORT_028.md committed in `docs/claude/` with the
+  full per-phase log, root-cause analysis, and a cost
+  envelope.
+
+Pending follow-ups (NEW from TR_028):
+
+- **(HIGH — promotes TR_023)** Aider DTO/repository drift
+  remains the single hardest blocker for end-to-end
+  autonomous feature completion. Either (a) extend
+  code-agent's prompt with a mandatory "READ the imported
+  model file before writing the repository" pre-step, or
+  (b) require the planner to put `model + repository` in
+  the same phase. The existing TR_023 rule isn't being
+  enforced by the planner — Phase 1 ran model in isolation,
+  Phase 2 ran repository in isolation.
+- **(HIGH — NEW)** Self-healing fix-intent prompt
+  enrichment. When choosing `fix-intent`, the diagnostician
+  should include the exact failing import path and the
+  deployed model's actual field shape. The TR_028 fix-intent
+  dispatched a path-less "Define type X with properties A,
+  B, C" prompt; Aider made the simplest interpretation and
+  landed a stray root-level file.
+- **(MEDIUM — NEW)** Phase-evaluator's `partial` verdict
+  + scope adjustments work — PLAN.md was updated — but
+  the adjustments don't feed back into the planner's
+  "phase grouping" decisions. If the evaluator notices
+  "Phase 1 only created the model, repository still
+  needed", it could merge "model + repository" into one
+  phase rather than annotating Phase 2.
+- **(LOW — NEW)** The fix-intent flow logs "Fix deployed
+  — resuming original intent via onSuccessDispatch" but
+  doesn't emit a clear "parent resumed → Aider running"
+  message at the resume point. Operators see two
+  `Running Aider` log lines back-to-back and have to
+  correlate by intent ID.
+
+Carryover follow-ups (status updates):
+
+- **(STILL OPEN — HIGH)** TR_023 / TR_028 Aider DTO drift —
+  PROMOTED to a TR_028-priority blocker.
+- **(STILL OPEN — HIGH)** TR_018/020: restore TR_010
+  mandatory `executeScript tsc --noEmit` code-agent rule
+  on trackeros's HARNESS.json. Would have caught Phase 2's
+  TS errors pre-emit before Aider committed each round.
+- **(STILL OPEN — MEDIUM)** TR_014: Aider token-spend
+  capture in `agent_executions.tokens_used` — TR_028's
+  cost envelope had to be order-of-magnitude estimated
+  because code-agent rows still show 0 tokens.
+
+Build status: unchanged from TR_027. `pnpm -r build` not
+re-run (no source files modified). Server state unchanged.
+Docker image unchanged.
+
+trackeros operator commits in this session: none (the
+test only writes via the autonomous loop — PRs #82 (Phase 1
+deployed) and #86 (fix-intent deployed)).
+
+---
 ### Session 2026-06-08 — Claude Code (TR_027 / ADR-051: PR-Agent replaces review-agent — server-side direct invocation; venv isolation; verified end-to-end on trackeros PR #81)
 
 Brief: replace Gestalt's custom review-agent with CodiumAI
@@ -306,198 +500,4 @@ not re-run (no source files modified). Server state
 unchanged.
 
 trackeros operator commits in this session: none.
-
----
-### Session 2026-06-08 — Claude Code (TR_026: remove platform file-change detection — Aider stdout parsing deleted, phase-evaluator uses git diff via executeScript)
-
-ADR-050 enforcement: the platform must NOT detect, parse, or
-interpret which files changed. That's the agent's job, using
-git as a tool. Two surgical changes plus one regression patch.
-
-What changed (code):
-
-- **`packages/agents/generate/src/adapters/aider-adapter.ts`** —
-  `parseAiderChangedFiles` deleted entirely. `filesChanged`
-  field removed from `AiderResult`. `--yes` flag promoted to
-  `--yes-always` so Aider's interactive confirmation prompts
-  never hang on a TTY-less server.
-- **`packages/agents/generate/src/agents/aider-code-agent.ts`** —
-  reading `result.filesChanged` removed. The agent now asks
-  `git status --porcelain` in the Aider work-dir (via new
-  `discoverAiderWrites` helper) and emits each changed file
-  as a `type: 'code'` artifact. This keeps pr-agent's
-  artifact-driven push path working — pr-agent runs in its
-  own clone and needs the artifact set to know what to write.
-  The agent (NOT the platform) is the one calling git.
-- **`packages/core/src/agents/agent-config-loader.ts`** —
-  `PER_ROLE_DEFAULTS` extended with three planning roles
-  (architecture-agent / planner-agent / phase-evaluator-agent).
-  phase-evaluator-agent gets `ALL_FILE_TOOLS_WITH_SCRIPT` by
-  default so `executeScript` is available out of the box for
-  the git-diff path.
-- **`packages/agents/planning/src/agents/phase-evaluator-agent.ts`** —
-  `evaluatePhase` signature changed: `builtFilePaths: string[]`
-  replaced with `branchContext: { defaultBranch, phaseBranch }`.
-  The agent now uses `callLLMWithTools` (was `callLLM`) so
-  the tool-use loop runs.
-- **`packages/agents/planning/src/prompts/evaluator-prompt.ts`** —
-  prompt rewritten to instruct the agent to run
-  `git diff origin/<defaultBranch>...origin/<phaseBranch>
-  --name-status` via executeScript and reason about the output.
-  The "Files actually built" pre-computed block is gone.
-- **`packages/agents/planning/src/orchestrator/planning-orchestrator.ts`** —
-  the 3-stage built-file resolution helper from TR_025
-  (PR-branch diff → merged-commit scan → artifacts-table read)
-  deleted. The orchestrator only fetches the phase branch
-  into the clone so `git diff` can see both refs; the agent
-  does the rest.
-
-What changed (HARNESS.json + template):
-
-- **`HARNESS.json.agentConfig.phase-evaluator-agent.rules`** —
-  four new rules (template + trackeros) instructing the agent
-  to run `git diff` BEFORE forming a verdict, and to use git
-  output as the only source of truth for what was built.
-  Verbatim text matches the brief.
-- **`HARNESS.json.agentConfig.phase-evaluator-agent.evaluationCriteria`** —
-  rewritten with explicit git-diff-derived verdicts ("Escalate
-  — zero files: git diff is empty despite Aider reporting
-  success", etc.).
-- **agents.yaml template** — phase-evaluator-agent gains an
-  explicit `tools.builtin: [executeScript, readFile,
-  searchFiles, listDirectory, getFileTree]` block + a
-  prompt extension reinforcing "always run git diff before
-  forming a verdict".
-- **Template bumped 0.11.0 → 0.12.0**.
-
-Live verification on trackeros:
-
-- Feature `427978a6` (first attempt, post-TR_026): planner
-  produced a 7-phase plan. Phase 1 dispatched.
-  - Phase-evaluator-agent verdict: `"Aider completed but wrote 0
-    files (confirmed by git diff)"` — quoted the HARNESS.json
-    rule verbatim, confirming it followed the git-diff path.
-  - PR commit (`88c72d4b`) contained ONLY `.gestalt/*`
-    metadata files. The platform had correctly not invented
-    files Aider didn't write. ✓ TR_026's "no Aider-stdout
-    interpretation" verified.
-  - Surfaced an unintended regression: with TR_026's removal
-    of code artifacts in AiderCodeAgent, pr-agent (which uses
-    artifacts to write files into its own separate clone)
-    pushed nothing. The fix in `discoverAiderWrites` (git
-    status in the agent, not stdout parsing) landed before
-    the second test cycle.
-
-- Feature `7d77f659` (post-regression patch): same 7-phase
-  plan.
-  - Phase 1's PR commit (`ce3f3721`) now contains
-    `src/modules/leave/leave.model.ts` + `tests/unit/leave.model.test.ts`
-    + `.gestalt/*` ✓ Aider's writes survive end-to-end.
-  - CI failed with `TS2339 Property 'createdAt' does not exist
-    on type 'LeaveRequest'` because trackeros's main carries a
-    stale `leave.repository.ts` from prior auto-merged TR_025
-    cycles that references model fields the new phase-1 model
-    doesn't declare. Pre-existing operator state pollution —
-    not a TR_026 regression.
-  - TR_022 retry budget exercised end-to-end: phase-retry 1/2,
-    phase-retry 2/2, then `phase-failed after 2 retries —
-    feature blocked`. The autonomous failure path is intact.
-  - Self-healing-agent (TR_024) chose `action: 'retry'` over
-    `action: 'fix-intent'` for all three CI failures. A
-    reasonable LLM call — the error reads like "code mistake"
-    not "systemic gap" — but the systemic gap (stale
-    repository.ts on main) is what's actually blocking.
-
-What this VERIFIES architecturally:
-
-- Aider stdout parsing in the platform: GONE ✓
-- Phase-evaluator-agent calls executeScript with git diff
-  before forming a verdict ✓ (the verdict text quotes the
-  HARNESS.json rule)
-- pr-agent gets the right file inventory via the
-  agent-side git inquiry ✓
-- The platform passes only branch NAMES as context; the agent
-  decides what to do with them ✓
-
-What this DOES NOT VERIFY (TR_027):
-
-- Full multi-phase feature autonomous completion. Blocked
-  by trackeros's stale `leave.repository.ts` from earlier
-  auto-merged cycles. The TR_025 cleanup needs to be done
-  again, OR the planner needs to put model+repository in
-  the same phase (TR_023's rule) reliably.
-- Self-healing-agent choosing `action: 'fix-intent'` for the
-  stale-file-on-main case. Today it picks `retry`.
-
-Decisions made:
-
-- **Agent uses git, platform doesn't.** AiderCodeAgent calling
-  `simpleGit(workDir).status()` to find changed files is an
-  AGENT using a tool — explicitly permitted by ADR-050. The
-  platform's parseAiderChangedFiles parser (which was
-  interpreting natural-language "Applied edit to..." lines)
-  is the violation that's removed.
-- **Code artifacts stay in the artifact set.** pr-agent
-  fundamentally needs an artifact set to write into its own
-  clone — it doesn't share the generate orchestrator's
-  work-dir, which is deleted in `finally`. So
-  AiderCodeAgent still emits code artifacts; it just sources
-  them from git rather than from Aider's stdout.
-- **`--yes-always` not `--yes`.** Aider 0.86 sometimes
-  injects "Apply this edit?" mid-session. `--yes-always` is
-  the stronger form that never prompts.
-- **Did NOT clean trackeros's stale leave.repository.ts** in
-  this session. The TR_025 cleanup was already done; the
-  pollution returned from a later auto-merged cycle. The
-  recurring nature suggests a planner-level fix (TR_023's
-  rule, more strictly enforced) or a self-healing-agent
-  improvement is the right next move, not another manual
-  cleanup.
-
-Pending follow-ups (NEW from TR_026):
-
-- **(HIGH — NEW from TR_026 / TR_027)** Stale repository files
-  on trackeros main keep returning from auto-merged Phase 1
-  cycles. Either the planner must reliably put model+
-  repository in the same phase (TR_023's rule with stricter
-  enforcement), or self-healing-agent needs to recognise
-  "TS error in file Aider didn't write this cycle = systemic
-  gap" and choose fix-intent. Most cycles loop in this state.
-- **(MEDIUM — NEW from TR_026)** TR_022's MAX_PHASE_RETRIES
-  is 2 by default. For long-running features the retry budget
-  could be bumped per-feature via planner-emitted hints, but
-  today it's a single number for the whole feature.
-- **(LOW — NEW from TR_026)** The phase-evaluator-agent's
-  tool-call log isn't persisted to `agent_executions`
-  because the planning orchestrator calls the agent
-  directly (not through `runWithObservability`). The
-  evaluator's git diff output is therefore not visible to
-  operators after the fact.
-
-Carryover follow-ups (status updates):
-
-- **~~(HIGH — TR_025)~~ STRUCTURALLY RESOLVED by TR_026.**
-  Phase-evaluator file-list detection — the 3-stage fallback
-  is gone; the agent owns the discovery.
-- **(STILL OPEN — HIGH)** Aider `--yes-always` may not be
-  enough on all Aider versions. Need to validate on Aider
-  >= 0.86 (live), other versions still TBD.
-
-Build status: `pnpm -r build` clean across all 13 packages.
-No new migration. Template auto-refreshed at boot:
-`version: "0.12.0"`. Server `/health` 200 throughout.
-
-trackeros operator commits in this session:
-- `897bcf06` — HARNESS.json: phase-evaluator-agent git-diff
-  rules + evaluationCriteria.
-
-trackeros planning-loop commits (auto-merged):
-- `88c72d4b` — Phase 1 (pre-discoverAiderWrites — only
-  .gestalt/ artifacts)
-- `b336fdd7`, `a0481470` — PLAN.md updates per feature
-- `ce3f3721` — Phase 1 (post-discoverAiderWrites — contains
-  the actual code files Aider wrote)
-
-PLAN.md content for the verification feature:
-https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
 
