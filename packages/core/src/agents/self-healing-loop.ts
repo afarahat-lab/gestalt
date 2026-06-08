@@ -75,6 +75,64 @@ export function isUnrecoverableError(message: string | undefined | null): boolea
 }
 
 /**
+ * TR_025 — maximum allowed depth of `parent_intent_id` chain
+ * BEFORE the platform refuses to spawn another fix-intent.
+ *
+ * Depth 0 = a human-submitted (or planning-submitted) intent has
+ *           no parent. The diagnostician is free to pick fix-intent.
+ * Depth 1 = the intent is itself a fix-intent (its parent is the
+ *           original). Still allowed to spawn another fix-intent
+ *           if its own CI uncovers a different gap.
+ * Depth 2 = the intent is a fix-of-a-fix. The diagnostician's next
+ *           "fix-intent" decision is force-escalated to a human
+ *           alert instead.
+ *
+ * Rationale: ADR-050 says the LLM owns the action choice. The
+ * platform doesn't override the choice; it sets a hard ceiling on
+ * recursion in the same spirit as MAX_GATE_RETRIES (which the LLM
+ * doesn't get to override either). TR_024's verification cycle
+ * observed a 3-deep runaway when the same CI error repeated
+ * across attempts — this brake closes that loop.
+ */
+const MAX_FIX_INTENT_DEPTH = 2;
+
+/**
+ * TR_025 — walk the `parent_intent_id` chain upward from
+ * `intentId` and return its depth. 0 means the intent has no
+ * parent (it's a human / planning submission). 1 means it's a
+ * fix-intent of an original. Higher values mean fix-of-fix.
+ *
+ * Bounded to 10 hops as a safety belt against an accidental
+ * parent_intent_id cycle in the DB — the FK + ON DELETE SET NULL
+ * shouldn't permit one, but a defensive cap costs nothing.
+ *
+ * NEVER throws — every error path logs and returns the depth
+ * walked so far, so the loop continues making sensible decisions.
+ */
+async function getFixIntentChainDepth(
+  intentId: string,
+  repos: ReturnType<typeof getRepositories>,
+): Promise<number> {
+  let depth = 0;
+  let currentId: string | null = intentId;
+  while (depth < 10 && currentId) {
+    try {
+      const intent = await repos.intents.findById(currentId);
+      if (!intent?.parentIntentId) break;
+      depth += 1;
+      currentId = intent.parentIntentId;
+    } catch (err) {
+      log.warn(
+        { err: err instanceof Error ? err.message : String(err), intentId: currentId },
+        'getFixIntentChainDepth lookup failed — returning walked-so-far depth',
+      );
+      break;
+    }
+  }
+  return depth;
+}
+
+/**
  * Fix G — strip trailing punctuation (period, exclamation, question
  * mark) + whitespace from the diagnosis before concatenating with
  * `Confidence:`. The LLM frequently terminates with a period, and
@@ -448,6 +506,36 @@ async function runSelfHealingLoopUnsafe(
   // There is NO hardcoded failure-pattern matching here — the action
   // field is the sole routing decision.
   if (diagnosis.action === 'fix-intent' && (diagnosis.fixIntent ?? '').trim() !== '') {
+    // TR_025 — cascade-depth brake. A fix-intent shouldn't itself
+    // spawn another fix-intent more than once. Without this bound,
+    // each CI failure on a fix-intent causes the diagnostician to
+    // pick fix-intent again, and the parent_intent_id chain grows
+    // indefinitely (TR_024 verification cycle observed a 3-deep
+    // runaway). ADR-050 stays intact — the LLM still decides what
+    // ACTION to take; the platform only enforces a hard ceiling
+    // on chain depth, identical in spirit to MAX_GATE_RETRIES.
+    const chainDepth = await getFixIntentChainDepth(payload.intentId, repos);
+    if (chainDepth >= MAX_FIX_INTENT_DEPTH) {
+      log.warn(
+        {
+          correlationId: payload.correlationId,
+          intentId: payload.intentId,
+          chainDepth,
+          maxDepth: MAX_FIX_INTENT_DEPTH,
+        },
+        'Fix-intent chain depth limit reached — escalating instead of cascading',
+      );
+      const cleanDiagnosis = stripTrailingPunctuation(diagnosis.diagnosis);
+      const autoResolved = await escalateToHuman(
+        payload,
+        context,
+        signals,
+        `Fix-intent chain exceeded depth ${MAX_FIX_INTENT_DEPTH}. ` +
+        `Diagnosis: ${cleanDiagnosis}. Manual intervention required.`,
+      );
+      return { shouldRetry: false, diagnosis, escalated: true, autoResolved };
+    }
+
     log.info(
       {
         correlationId: payload.correlationId,
@@ -455,6 +543,7 @@ async function runSelfHealingLoopUnsafe(
         rationale: (diagnosis.fixIntentRationale ?? '').slice(0, 120),
         fixIntent: diagnosis.fixIntent!.slice(0, 100),
         confidence: diagnosis.confidence,
+        chainDepth,
       },
       'Self-healing: systemic gap detected — submitting fix intent',
     );

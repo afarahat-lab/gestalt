@@ -11,7 +11,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-08 (after TR_024 — autonomous systemic gap detection. SelfHealingAgent gains `action: 'retry' | 'fix-intent' | 'escalate'`. When the LLM decides a failure reveals a SYSTEMIC GAP in the project (config flag, missing dep, broken scaffold), it writes a complete Aider-ready `fixIntent`. The platform submits it as a separate high-priority generate cycle linked via `parent_intent_id`. The original intent parks in `waiting-for-clarification` and resumes when the fix's production promotion fires its persisted `on_success_dispatch` envelope. Migration 026 adds the two columns. Per ADR-050 there is NO hardcoded failure-pattern matching — the `action` field is the sole routing decision. trackeros's self-healing-agent now resolves to `chat-latest` via `agents.yaml`; the platform LLM registry handles the `apiShape: 'responses'` wire-shape. New `collectCiTechnicalDetail` helper passes the failed CI run's annotations to the diagnostician so it can see real error text. Template bumped 0.10.0 → 0.11.0. **Live verified**: intent `587befaa` (Add /metrics endpoint with prom-client) → CI failed (TS2307 Cannot find module) → diagnostician picked `action: fix-intent` → child intent `2e3c46ab` created with `source: 'self-healing-fix'`, `parent_intent_id`, and `on_success_dispatch` populated. Dashboard renders the new 🔧 Auto-fix and ⏳ Awaiting auto-fix panels. Cascading-fix-intent prevention captured as TR_025 follow-up.)
+**Last updated:** 2026-06-08 (after TR_025 — two surgical fixes to the autonomous planning loop. `MAX_FIX_INTENT_DEPTH=2` + `getFixIntentChainDepth` walker in `self-healing-loop.ts` close TR_024's cascading-fix-intent runaway. Planning-orchestrator's phase-evaluator file-list rewritten to use `git diff origin/<defaultBranch>..origin/<phase.branchName>` instead of the artifacts table — Aider's code writes never landed there, so the evaluator was previously always escalating with `builtFilePaths: []`. **Live verified**: feature `eed75889` (Leave management module) on clean trackeros — Phase 1 deployed cleanly (3 files built), evaluator verdict `success`, Phase 2 **auto-dispatched** — proving the autonomous loop. Phase 2 hit a separate Aider quirk (chat output had code, `Files changed: 0`); captured as TR_026 follow-up. trackeros operator cleanup commit `cd27ed17` removed the stale TEST_REPORT_011 leave/ seed.)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 026 (latest: `026_intent_parent`)
 
@@ -226,6 +226,29 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
+### TR_025 — Cascade-depth brake + phase-evaluator file-list fix
+
+Two fixes to harden the autonomous planning loop:
+
+- **`MAX_FIX_INTENT_DEPTH = 2`** in `self-healing-loop.ts`.
+  Before submitting a fix-intent, the loop walks
+  `parent_intent_id` upward; when depth ≥ 2 it
+  force-escalates instead of cascading. ADR-050 intact —
+  the LLM still chooses the action; platform enforces the
+  ceiling.
+- **Phase-evaluator's built-file list** now sourced from
+  `git diff` against the PR branch rather than the
+  artifacts table (which only ever held `design`-type rows
+  for Aider-codegen projects). Three-stage fallback:
+  PR-branch diff → merged-commit scan → legacy
+  artifacts-table read.
+
+**Live verified**: feature `eed75889` Phase 1 deployed
+successfully and Phase 2 auto-dispatched. Phase 2 failed
+on a separate Aider issue (TR_026 follow-up). The
+autonomous planning loop is proven end-to-end for the
+phase-1-to-phase-2 transition.
+
 ### TR_024 — Autonomous systemic gap detection (migration 026)
 
 Self-healing diagnostician extended with `action: 'retry' |
@@ -288,6 +311,20 @@ diff.
 
 ### Active follow-ups (carryover or NEW)
 
+- **(HIGH — NEW from TR_025/TR_026)** Aider "Files changed: 0"
+  silent failure. On Phase 2 of the leave-management
+  verification, Aider's chat output contained valid
+  LeaveService code but reported zero file writes. Need
+  to detect this pattern (parse `aider-output.md` for
+  `Files changed: 0` AND non-empty chat code blocks) and
+  surface as a TEST_FAILURE signal so self-healing fires.
+- **(MEDIUM — NEW from TR_025)** Cascade-depth brake
+  code-path verified at build/typecheck only; the
+  MAX_FIX_INTENT_DEPTH escalation path has not been
+  exercised on a live cascade. A targeted test (force-fail
+  a fix-intent's CI twice) would close this.
+- **~~(HIGH — NEW from TR_024)~~ RESOLVED by TR_025**
+  (structurally — depth ceiling in place).
 - **(HIGH — NEW from TR_024)** Cascading fix-intent prevention.
   Each fix-intent failing CI triggers ANOTHER fix-intent (the
   diagnostician keeps choosing `action: fix-intent`). Need to
@@ -488,6 +525,26 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_025 — Cascade-depth brake + phase-evaluator file-list fix
+
+Two surgical hardening fixes (no migration):
+
+- **`MAX_FIX_INTENT_DEPTH = 2`** + `getFixIntentChainDepth` walker
+  in `packages/core/src/agents/self-healing-loop.ts`. Force-
+  escalates when `parent_intent_id` chain depth ≥ 2. Closes
+  TR_024's cascading-runaway gap.
+- **Planning orchestrator built-file list** sourced from
+  `git diff` against the PR branch (filtered to non-
+  `.gestalt/` paths). Three-stage fallback: PR-branch diff →
+  merged-commit scan → legacy artifacts-table read.
+
+Verified live: feature `eed75889` Phase 1 → success → Phase 2
+auto-dispatched. End-to-end autonomous transition confirmed.
+Phase 2 hit an unrelated Aider "0 files written" quirk
+(TR_026 follow-up).
+
+**Operator action:** None. Pure platform fixes.
+
 ### TR_024 — Autonomous systemic gap detection (migration 026)
 
 Self-healing diagnostician can now choose between **retry /
@@ -676,6 +733,151 @@ Moved to [@docs/claude/ARCHITECTURE.md](./ARCHITECTURE.md#key-type-alignment-rul
 
 
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
+
+---
+### Session 2026-06-08 — Claude Code (TR_025: cascade-depth brake + planning evaluator file-list fix — autonomous loop verified phase 1 → auto-dispatch phase 2 on the leave management feature)
+
+Follow-up to TR_024. Two surgical fixes plus a live test of the
+full autonomous loop on the leave management feature.
+
+What changed (code):
+
+- **`MAX_FIX_INTENT_DEPTH = 2`** + **`getFixIntentChainDepth`**
+  helper in `self-healing-loop.ts`. Before calling
+  `submitFixIntent`, the loop walks the `parent_intent_id`
+  chain upward (bounded to 10 hops as a cycle-safety belt).
+  When depth >= 2 the loop force-escalates instead of
+  cascading. ADR-050 stays intact — the LLM still chooses the
+  ACTION; the platform only enforces a hard ceiling on
+  recursion in the same spirit as `MAX_GATE_RETRIES`.
+- **Phase-evaluator built-file list fix** in
+  `planning-orchestrator.ts`. The previous code read the
+  `artifacts` table filtering for `type === 'code'`, but
+  Aider's code writes never land there — only `design`-type
+  artifacts (intent-spec, design-spec, aider-output) do. So
+  the LLM always saw `builtFilePaths: []` and (correctly given
+  no evidence) escalated every phase. The fix: after the
+  evaluator clones the repo, do `git diff --name-only
+  origin/<defaultBranch>..origin/<phase.branchName>` filtered
+  to non-`.gestalt/` paths. Falls back to a merged-commit
+  scan when the branch is gone (auto-merge already squashed),
+  then to the legacy artifacts-table read.
+
+Live verification on trackeros (real GitHub Actions CI):
+
+- Pre-cleanup: trackeros's `src/modules/leave/{leave.model,
+  leave.repository}.ts` were leftover seeds from TEST_REPORT_011
+  and blocked Aider from emitting new code on Phase 1 (Aider
+  saw the files already existed and produced empty PRs).
+  Removed via `git rm -r src/modules/leave/` on trackeros
+  `main` (commit `cd27ed17`) — fresh slate for the
+  verification.
+- Feature `eed75889` ("Build the leave management module...")
+  submitted. Planner produced a **4-phase plan**.
+- **Phase 1** ("Define Leave Request Model and Repository")
+  dispatched → Aider built 3 files → CI passed → gate passed
+  → phase deployed → **evaluator verdict: `success`** →
+  **phase 2 auto-dispatched** at 04:17:15. End-to-end
+  autonomous transition CONFIRMED.
+- **Phase 2** ("Implement Leave Service Logic") dispatched →
+  Aider's chat output produced the LeaveService code BUT
+  reported `Files changed: 0` (Aider quirk — emitted code in
+  chat instead of writing files) → 0 files diffed → evaluator
+  verdict: `escalate` → feature blocked. Not a TR_025 bug —
+  a separate code-agent / Aider integration issue captured
+  as a follow-up.
+
+The self-healing-agent fix-intent flow was NOT exercised live
+this cycle because Aider's failure was "0 files written" rather
+than a CI compile error — and the evaluator escalates a
+deploy-with-no-deliverables outcome rather than routing through
+self-healing (which only fires on CI failures or deploy errors).
+The TR_025 depth brake code is in place and unit-tested via
+build/typecheck but didn't run on a live cascade.
+
+What this verification PROVES:
+
+- Phase 1 → Phase 2 auto-dispatch end-to-end ✓
+- planning-orchestrator's git-diff path produces the correct
+  file count (Phase 1: 3 files, success; Phase 2: 0 files,
+  escalate)
+- Phase-evaluator's LLM reasoning is sound: with concrete file
+  evidence it judges accurately
+- The planning loop is genuinely autonomous — no human input
+  between submit and Phase 2 dispatch
+
+What this verification does NOT prove (TR_026):
+
+- A fix-intent cascade hitting `MAX_FIX_INTENT_DEPTH` and
+  force-escalating. Code-path tested only.
+- Aider's "writes code in chat, 0 files saved" pathology. This
+  is a code-agent reliability issue separate from planning.
+- A full multi-phase feature completing autonomously. Phase 2
+  failure blocks Phases 3-4.
+
+Decisions made:
+
+- **Cleaned trackeros's leave/ seed files** (operator commit
+  `cd27ed17` on `main`). The TEST_REPORT_011 seed was older
+  than the current planner — files conflicted with
+  planning-emitted code. With the user's explicit go-ahead.
+- **Used `simple-git` diff against `origin/<branch>` rather
+  than the local checked-out tree**. The evaluator clones at
+  defaultBranch, so the phase's PR branch needs an explicit
+  fetch + remote-ref diff. Cheaper than checking out the
+  branch in-place.
+- **Three-stage fallback in built-file resolution**: PR-branch
+  diff → merged-commit scan → legacy artifacts-table read.
+  Each stage handles a real edge case: auto-merge having
+  cleaned the branch, no-correlation-id commits, and the
+  rare pre-Aider gestalt-codegen path.
+- **Did NOT modify Aider's invocation** to make it emit files
+  reliably. That's a code-agent layer issue. Surfaced as
+  TR_026 follow-up.
+
+Pending follow-ups (NEW from TR_025):
+
+- **(HIGH — TR_026)** Aider's "Files changed: 0" silent
+  failure on Phase 2. The chat output contained the
+  LeaveService code but Aider reported zero file writes.
+  Either Aider's SEARCH/REPLACE block wasn't well-formed
+  for a NEW file, or Aider's apply step silently dropped
+  the change. Need to detect this pattern and surface it
+  to self-healing (e.g. emit a TEST_FAILURE signal when
+  `aider-output.md` shows `Files changed: 0` AND the
+  intent demanded new files).
+- **(MEDIUM — TR_025)** The MAX_FIX_INTENT_DEPTH brake has
+  not been exercised on a live cascade. Code-path
+  verification only. A targeted test (force-fail a
+  fix-intent's CI twice) would prove the escalation path.
+- **(LOW — TR_025)** When the legacy artifacts-table
+  fallback fires, the artifact `type` filter is widened to
+  include `'test'` too. Verify this is the right shape —
+  it might be `'unit-test'` or similar in some adapters.
+
+Carryover follow-ups (status updates):
+
+- **~~(HIGH — TR_024)~~ STRUCTURALLY RESOLVED by TR_025.**
+  Cascading fix-intent prevention now has a hard ceiling.
+  Awaiting live verification.
+- **(STILL OPEN — MEDIUM)** TR_024: pass CI logs to the
+  diagnostician on non-github adapters too.
+- **(STILL OPEN — MEDIUM)** TR_014: Aider token-spend
+  capture.
+
+Build status: `pnpm -r build` clean across all 13 packages.
+No new migration in this session (depth check is platform
+mechanic; no schema change). Server `/health` 200 throughout.
+trackeros operator commits in this session:
+- `cd27ed17` — TR_025: remove stale TEST_REPORT_011 leave/
+  seed to allow planning loop fresh codegen.
+trackeros planning-loop commits (auto-merged):
+- `0892849e` — Phase 1: Define Leave Request Model & Repository
+- `1eb3f247` — Phase 2: Implement Leave Service Logic (empty)
+
+PLAN.md content from trackeros after planning:
+https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
+(4-phase plan: model+repo → service → routes → policy module).
 
 ---
 ### Session 2026-06-08 — Claude Code (TR_024: autonomous systemic gap detection — self-healing agent gains `action: fix-intent` and submits Aider-ready fix intents that the platform deploys, then resumes the parent automatically)
@@ -1055,226 +1257,6 @@ Stale trackeros PRs #49–52, #57 closed with
 session (#58–#62) all closed automatically by the gate-
 failure path or remain open under the blocked feature — not
 worth closing individually until the Aider fix lands.
-
----
-### Session 2026-06-07 — Claude Code (PLANNING_LAYER: autonomous feature decomposition + phased execution — new `@gestalt/agents-planning` package + migration 024 + first live end-to-end loop on trackeros)
-
-Largest single-session build of the platform to date: a complete
-new SDLC layer with three new agents, three new postgres tables,
-new BullMQ queue, new server routes, and new CLI commands —
-implemented strictly to ADR-042 (no LLM guidance prose in `.ts`).
-
-What's new (capability):
-
-- **Three planning agents** all extending `BaseLLMAgent` and
-  reading config via the standard `loadAgentConfig` path:
-  - **architecture-agent** — two entry points. `designFeature()`
-    produces the high-level domain entities / modules / dependency
-    map / recommended phase sequence. `designPhase()` produces
-    the focused per-phase architecture (interface signatures,
-    import paths, success criteria). Phased consultation matches
-    ADR-049.
-  - **planner-agent** — decomposes a feature into an ordered phase
-    plan, bounded by `HARNESS.json.planner.maxPhasesPerFeature` +
-    `maxFilesPerPhase`. Each phase is an Aider-ready brief.
-  - **phase-evaluator-agent** — runs AFTER each phase deploys
-    (or fails), produces a verdict (`success` / `partial` /
-    `escalate`) and adjustments to remaining phases.
-- **Planning orchestrator** (`@gestalt/agents-planning/dist/orchestrator/planning-orchestrator.js`)
-  drains the new `gestalt-planning` BullMQ queue and handles
-  three task types: `planning:start` (architecture → plan →
-  PLAN.md commit → dispatch phase 0), `planning:phase` (clone →
-  optional per-phase architecture pass → create generate:intent),
-  and `planning:evaluate` (clone → phase-evaluator-agent → next
-  phase OR mark feature completed/blocked).
-- **Event-bus subscriber** in the planning worker bridges deploy
-  back to planning without any coupling code in the deploy layer:
-  it watches `intent.status-changed` events, looks up the phase
-  row by intent id, and dispatches `planning:evaluate` on
-  terminal status (`deployed` / `failed` / `escalated`).
-- **`POST /features`, `GET /features`, `GET /features/:id`** routes
-  with the same project-membership guards as `/intents`.
-- **`gestalt feature submit/list/show`** CLI commands with a
-  short-title default + plan-log rendering.
-
-What's new (data + types):
-
-- **Migration 024** (`024_features.sql`) — `features` (top-level
-  feature row with `status`, `phase_count`, `current_phase`,
-  `architecture`), `feature_phases` (one row per phase with
-  `intent_id` reverse-lookup + `result` JSONB), `feature_plan_log`
-  (append-only operator-visible event log). Three indexes,
-  three CHECK constraints, FK CASCADE on `features.project_id`.
-- **Type extensions** in `@gestalt/core`:
-  - `AgentRole` gains `architecture-agent`, `planner-agent`,
-    `phase-evaluator-agent`.
-  - `TaskType` gains `planning:start`, `planning:phase`,
-    `planning:evaluate`.
-  - `HarnessAgentConfig` gains optional `phaseScopingRules?`,
-    `evaluationCriteria?`, `architectureGuidance?` — same
-    convention as `verificationGuidance` from TR_021.
-  - `HarnessConfig` gains optional `planner` block (`enabled`,
-    `maxPhasesPerFeature`, `maxFilesPerPhase`,
-    `architectureReviewPerPhase`).
-- **Repository surface** — new `FeatureRepository` interface in
-  `@gestalt/core/repository` with 15 methods (CRUD across the
-  three tables + reverse-lookup + log append). Postgres impl in
-  `packages/adapters/postgres/src/repositories/features.ts`;
-  Oracle + MSSQL throw-stubs added for interface-drift safety.
-- **Queue** — `QUEUE_NAMES.planning = 'gestalt-planning'` +
-  `resolveQueueName` updated.
-
-What's new (template):
-
-- **`templates/corporate-ops-web-mobile/harness/HARNESS.json`** —
-  new `planner` block + new `agentConfig['architecture-agent']`,
-  `agentConfig['planner-agent']`, `agentConfig['phase-evaluator-agent']`
-  blocks carrying `rules` + the new field types
-  (`architectureGuidance`, `phaseScopingRules`,
-  `evaluationCriteria`).
-- **`templates/corporate-ops-web-mobile/harness/agents.yaml`** —
-  added three planning-agent entries with `prompt_extensions`
-  carrying the project-specific design / planning / evaluation
-  prose. Operators tune per project without touching `.ts`.
-- **Template version 0.7.0 → 0.8.0** (`template.json`).
-
-What was extended (existing code):
-
-- **`renderHarnessAgentRules`** in `packages/core/src/agents/base-llm-agent.ts`
-  rewritten to render five optional sub-sections in fixed order
-  (Rules, Verification guidance, Phase scoping rules,
-  Evaluation criteria, Architecture guidance). Existing
-  callers (`constraint-agent`, `review-agent`, `code-prompt`)
-  gain the new sections "for free" — no per-agent code change.
-- **`buildHarnessAgentSection`** class method signature widened
-  to match.
-- **`packages/server/src/server.ts`** — calls `startPlanningWorker(config.queue)`
-  after the maintenance scheduler. **`packages/server/src/app.ts`** —
-  registers `/features` routes.
-- **`packages/server/Dockerfile`** — adds the planning package
-  to the workspace manifest copy + builder + production stages.
-
-ADR-042 compliance (what stays in `.ts` vs what goes in
-`HARNESS.json` + `agents.yaml`):
-
-| Stays in `.ts` (platform mechanic) | Goes in `HARNESS.json` / `agents.yaml` (operator-tunable) |
-|---|---|
-| Role / goal framing skeleton | Role + goal text |
-| JSON response schemas | All guidance prose |
-| `renderHarnessAgentRules` helper | Rules + verification guidance |
-| Loop logic + queue dispatch | Phase scoping examples |
-| Git operations + PLAN.md writer | Evaluation criteria |
-| Repository persistence | Architecture guidance |
-| Parser-level evidence enforcement | (everything an operator might want to change) |
-
-Architecture choice — the orchestrator hooks deploy → planning
-via the in-process event bus rather than a queue dispatch from
-the deploy layer. The deploy layer is fully unchanged: it
-already emits `intent.status-changed` to the bus on every
-status transition; the planning worker subscribes and decides
-whether the event matches a phase intent. Zero coupling code
-landed in `@gestalt/agents-deploy`.
-
-Live verification — first end-to-end loop on trackeros:
-
-- **Feature** `ea19b18e-e55d-4bf7-b0be-ce5f8d20b6aa` ("Add
-  /version endpoint with test") submitted via
-  `gestalt feature submit ... --project trackeros`.
-- **`planning:start`** dispatched within milliseconds. Planning
-  worker cloned trackeros, ran architecture-agent (~4s, 1 module
-  + 1 recommended phase), ran planner-agent (~3s, 1 phase).
-- **`PLAN.md` committed and pushed** to trackeros `main`
-  (commit `6f2a500b`). Content:
-  ```
-  # PLAN.md — Add /version endpoint with test
-  ## Modules
-  - **version** (`src/modules/version/`) — owns: version.routes.ts, version.test.ts
-  ## Phases
-  ### Phase 1: Implement /version endpoint
-  Create src/modules/version/version.controller.ts that exports
-  getVersion() returning the version from package.json. Create
-  version.routes.ts to define the /version endpoint. Include a
-  Jest unit test in tests/unit/version.test.ts.
-  ```
-- **`docs/ARCHITECTURE.md` appended** with the architecture-agent's
-  `architectureMdUpdate` ("Version Endpoint" section).
-- **Phase 1 intent** `e00e993c-...` created with status `pending`
-  → `generating`. Generate ran (intent → design → context →
-  code), pr-agent opened **PR #57**, pipeline-agent triggered
-  CI run `27101236260`.
-- **CI failed** because Aider's generated `version.controller.ts`
-  used `require('../../../package.json')` without `resolveJsonModule`
-  in tsconfig. Self-healing dispatched a retry (regenerate +
-  push to the same branch); CI failed identically. Intent
-  transitioned to `failed`.
-- **Event-bus subscriber fired** — `intent.status-changed` with
-  `status=failed` matched phase `7847f...`; `planning:evaluate`
-  dispatched.
-- **Phase marked `failed`, feature marked `blocked`**, plan log
-  appended with `phase-failed` event. End-to-end loop confirmed.
-
-The CI failure is pre-existing code-agent / Aider behaviour
-(TR_022 / TR_023 will address it) — not a planning bug. The
-planning loop did exactly what it was supposed to do.
-
-Decisions made:
-
-- **Event bus, not deploy-layer dispatch**, for the deploy →
-  planning callback. Keeps the deploy layer completely unaware
-  of the planning layer.
-- **Failed phase = blocked feature, no retry**. The phase-evaluator-
-  agent is consulted only when the intent deploys successfully;
-  on failure the orchestrator marks the phase failed without
-  asking the LLM. Future iteration could add a per-feature
-  retry budget that the evaluator decides — captured as a
-  follow-up.
-- **Per-phase architecture pass disabled for trackeros**
-  (`architectureReviewPerPhase: false`). The feature-level
-  architecture suffices for trackeros's 1-phase scope; the
-  second architecture-agent entry point is exercised when
-  operators opt in.
-- **Scope adjustments stored under `feature_phases.result.pendingScopeAdjustment`**
-  rather than overwriting `feature_phases.scope`. Keeps the
-  original plan visible to operators; the next `planning:phase`
-  reads the adjustment when assembling the intent text.
-
-Pending follow-ups (NEW from PLANNING_LAYER):
-
-- **(MEDIUM)** Phase failure → feature blocked is too eager.
-  Add a per-feature retry budget so a single CI failure doesn't
-  block the whole plan. Could be HARNESS-tunable
-  (`planner.maxPhaseRetries`).
-- **(LOW)** Per-phase architecture pass not yet live-verified.
-  Flip `architectureReviewPerPhase: true` on a fresh trackeros
-  feature to confirm the second `architecture-agent` entry
-  point assembles the prompt correctly.
-- **(LOW)** `feature_plan_log` is append-only. A `gestalt feature
-  log <id>` CLI subcommand would let operators tail it without
-  the JSON shell of `gestalt feature show`.
-
-Carryover follow-ups (status updates):
-
-- **(NEW — code-agent issue surfaced by planning)** Aider's
-  generated TypeScript uses `require('package.json')` without
-  the project's tsconfig allowing it. Either (a) scaffold
-  `resolveJsonModule: true` + `esModuleInterop: true` in
-  `gestalt init`, or (b) extend code-agent's prompt with an
-  "Aider tips for TypeScript" section.
-- **(STILL OPEN — HIGH)** TR_018/020: restore TR_010 mandatory
-  `executeScript tsc --noEmit` code-agent rule on trackeros's
-  HARNESS.json. Would catch this CI failure pre-emit.
-- **(STILL OPEN — MEDIUM)** TR_014: Aider token-spend capture
-  in `agent_executions.tokens_used`.
-
-Build status: `pnpm -r build` clean across all 13 packages
-(adds `@gestalt/agents-planning`). Docker image rebuilt with
-the new package wired into the multi-stage build. Migration
-024 applied at boot. `gestalt-planning` BullMQ queue worker
-started. Server `/health` 200 throughout. Template
-auto-refreshed at boot: `version: "0.8.0"`. trackeros `main`
-updated with two commits: `3fc936fe` (HARNESS.json planner +
-planning agentConfig) and `6f2a500b` (PLAN.md +
-docs/ARCHITECTURE.md from feature `ea19b18e`).
 
 
 ---

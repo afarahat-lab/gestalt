@@ -54,6 +54,26 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_025 — Cascade-depth brake + phase-evaluator file-list fix
+
+Two surgical hardening fixes (no migration):
+
+- **`MAX_FIX_INTENT_DEPTH = 2`** + `getFixIntentChainDepth` walker
+  in `packages/core/src/agents/self-healing-loop.ts`. Force-
+  escalates when `parent_intent_id` chain depth ≥ 2. Closes
+  TR_024's cascading-runaway gap.
+- **Planning orchestrator built-file list** sourced from
+  `git diff` against the PR branch (filtered to non-
+  `.gestalt/` paths). Three-stage fallback: PR-branch diff →
+  merged-commit scan → legacy artifacts-table read.
+
+Verified live: feature `eed75889` Phase 1 → success → Phase 2
+auto-dispatched. End-to-end autonomous transition confirmed.
+Phase 2 hit an unrelated Aider "0 files written" quirk
+(TR_026 follow-up).
+
+**Operator action:** None. Pure platform fixes.
+
 ### TR_024 — Autonomous systemic gap detection (migration 026)
 
 Self-healing diagnostician can now choose between **retry /

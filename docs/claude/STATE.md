@@ -4,7 +4,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-08 (after TR_024 — autonomous systemic gap detection. SelfHealingAgent gains `action: 'retry' | 'fix-intent' | 'escalate'`. When the LLM decides a failure reveals a SYSTEMIC GAP in the project (config flag, missing dep, broken scaffold), it writes a complete Aider-ready `fixIntent`. The platform submits it as a separate high-priority generate cycle linked via `parent_intent_id`. The original intent parks in `waiting-for-clarification` and resumes when the fix's production promotion fires its persisted `on_success_dispatch` envelope. Migration 026 adds the two columns. Per ADR-050 there is NO hardcoded failure-pattern matching — the `action` field is the sole routing decision. trackeros's self-healing-agent now resolves to `chat-latest` via `agents.yaml`; the platform LLM registry handles the `apiShape: 'responses'` wire-shape. New `collectCiTechnicalDetail` helper passes the failed CI run's annotations to the diagnostician so it can see real error text. Template bumped 0.10.0 → 0.11.0. **Live verified**: intent `587befaa` (Add /metrics endpoint with prom-client) → CI failed (TS2307 Cannot find module) → diagnostician picked `action: fix-intent` → child intent `2e3c46ab` created with `source: 'self-healing-fix'`, `parent_intent_id`, and `on_success_dispatch` populated. Dashboard renders the new 🔧 Auto-fix and ⏳ Awaiting auto-fix panels. Cascading-fix-intent prevention captured as TR_025 follow-up.)
+**Last updated:** 2026-06-08 (after TR_025 — two surgical fixes to the autonomous planning loop. `MAX_FIX_INTENT_DEPTH=2` + `getFixIntentChainDepth` walker in `self-healing-loop.ts` close TR_024's cascading-fix-intent runaway. Planning-orchestrator's phase-evaluator file-list rewritten to use `git diff origin/<defaultBranch>..origin/<phase.branchName>` instead of the artifacts table — Aider's code writes never landed there, so the evaluator was previously always escalating with `builtFilePaths: []`. **Live verified**: feature `eed75889` (Leave management module) on clean trackeros — Phase 1 deployed cleanly (3 files built), evaluator verdict `success`, Phase 2 **auto-dispatched** — proving the autonomous loop. Phase 2 hit a separate Aider quirk (chat output had code, `Files changed: 0`); captured as TR_026 follow-up. trackeros operator cleanup commit `cd27ed17` removed the stale TEST_REPORT_011 leave/ seed.)
 **Repo:** https://github.com/afarahat-lab/gestalt
 **Migrations:** 026 (latest: `026_intent_parent`)
 
@@ -219,6 +219,29 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
+### TR_025 — Cascade-depth brake + phase-evaluator file-list fix
+
+Two fixes to harden the autonomous planning loop:
+
+- **`MAX_FIX_INTENT_DEPTH = 2`** in `self-healing-loop.ts`.
+  Before submitting a fix-intent, the loop walks
+  `parent_intent_id` upward; when depth ≥ 2 it
+  force-escalates instead of cascading. ADR-050 intact —
+  the LLM still chooses the action; platform enforces the
+  ceiling.
+- **Phase-evaluator's built-file list** now sourced from
+  `git diff` against the PR branch rather than the
+  artifacts table (which only ever held `design`-type rows
+  for Aider-codegen projects). Three-stage fallback:
+  PR-branch diff → merged-commit scan → legacy
+  artifacts-table read.
+
+**Live verified**: feature `eed75889` Phase 1 deployed
+successfully and Phase 2 auto-dispatched. Phase 2 failed
+on a separate Aider issue (TR_026 follow-up). The
+autonomous planning loop is proven end-to-end for the
+phase-1-to-phase-2 transition.
+
 ### TR_024 — Autonomous systemic gap detection (migration 026)
 
 Self-healing diagnostician extended with `action: 'retry' |
@@ -281,6 +304,20 @@ diff.
 
 ### Active follow-ups (carryover or NEW)
 
+- **(HIGH — NEW from TR_025/TR_026)** Aider "Files changed: 0"
+  silent failure. On Phase 2 of the leave-management
+  verification, Aider's chat output contained valid
+  LeaveService code but reported zero file writes. Need
+  to detect this pattern (parse `aider-output.md` for
+  `Files changed: 0` AND non-empty chat code blocks) and
+  surface as a TEST_FAILURE signal so self-healing fires.
+- **(MEDIUM — NEW from TR_025)** Cascade-depth brake
+  code-path verified at build/typecheck only; the
+  MAX_FIX_INTENT_DEPTH escalation path has not been
+  exercised on a live cascade. A targeted test (force-fail
+  a fix-intent's CI twice) would close this.
+- **~~(HIGH — NEW from TR_024)~~ RESOLVED by TR_025**
+  (structurally — depth ceiling in place).
 - **(HIGH — NEW from TR_024)** Cascading fix-intent prevention.
   Each fix-intent failing CI triggers ANOTHER fix-intent (the
   diagnostician keeps choosing `action: fix-intent`). Need to

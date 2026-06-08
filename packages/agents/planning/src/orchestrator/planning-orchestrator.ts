@@ -562,21 +562,19 @@ async function handlePlanningEvaluate(
     return;
   }
 
-  // Phase deployed — fetch the artifact paths from the intent
-  // correlation id, then run phase-evaluator-agent.
+  // Phase deployed — assemble the list of files the phase actually
+  // built. TR_025 — the artifacts table only carries `design`-type
+  // artifacts (intent-spec, design-spec, aider-output); Aider's
+  // own file writes never land there. So the LLM was always seeing
+  // "no files built = failure". We compute the real file list
+  // post-clone by diffing the phase's PR branch against the
+  // project's default branch.
   let builtFilePaths: string[] = [];
-  if (phase.intentId) {
-    try {
-      const { intents } = getRepositories();
-      const intent = await intents.findById(phase.intentId);
-      if (intent) {
-        const arts = await artifacts.findByCorrelationId(intent.correlationId);
-        builtFilePaths = arts.filter((a) => a.type === 'code').map((a) => a.path);
-      }
-    } catch (err) {
-      childLog.warn({ err }, 'Could not fetch artifacts for phase evaluation');
-    }
-  }
+
+  // Look up the intent's branchName for the diff (pr-agent persists it).
+  const phaseIntent = phase.intentId
+    ? await getRepositories().intents.findById(phase.intentId).catch(() => null)
+    : null;
 
   const token = await resolveProjectCredential(project);
   if (!token) throw new Error(`Project ${project.name} has no Git credential on file`);
@@ -587,6 +585,73 @@ async function handlePlanningEvaluate(
     await simpleGit().clone(cloneUrl, workDir);
     const repo = simpleGit(workDir);
     try { await repo.checkout(project.defaultBranch); } catch { /* */ }
+
+    // Diff: the phase's PR branch against the default branch. If
+    // auto-merge already squashed the PR back into main, the branch
+    // is gone — fall back to inspecting the most recent commits on
+    // default for files mentioning the intent's correlation id.
+    if (phaseIntent?.branchName) {
+      try {
+        await repo.fetch('origin', phaseIntent.branchName).catch(() => undefined);
+        const diff = await repo.diff([
+          '--name-only',
+          `origin/${project.defaultBranch}`,
+          `origin/${phaseIntent.branchName}`,
+        ]).catch(() => '');
+        builtFilePaths = diff.split('\n').map((s) => s.trim()).filter((s) => s.length > 0 && !s.startsWith('.gestalt/'));
+      } catch (err) {
+        childLog.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'PR-branch diff failed — trying merged-commit fallback',
+        );
+      }
+    }
+    // Fallback: read the most recent commits on default whose
+    // subject includes the intent correlation id (pr-agent +
+    // auto-merge stamps the squash commit with the correlation
+    // prefix). Limited to 5 commits to keep this cheap.
+    if (builtFilePaths.length === 0 && phaseIntent?.correlationId) {
+      try {
+        const log = await repo.log({
+          format: { hash: '%H', subject: '%s' },
+          maxCount: 5,
+        });
+        const corrPrefix = phaseIntent.correlationId.slice(0, 8);
+        for (const entry of log.all) {
+          if (entry.subject.includes(corrPrefix)) {
+            const files = await repo.show([
+              '--name-only',
+              '--pretty=format:',
+              entry.hash,
+            ]).catch(() => '');
+            builtFilePaths = files.split('\n').map((s) => s.trim()).filter((s) => s.length > 0 && !s.startsWith('.gestalt/'));
+            break;
+          }
+        }
+      } catch (err) {
+        childLog.warn(
+          { err: err instanceof Error ? err.message : String(err) },
+          'Merged-commit fallback failed — proceeding with empty file list',
+        );
+      }
+    }
+    // Final fallback: the legacy artifacts-table read. Keeps the
+    // pre-TR_025 behaviour for the (rare) case where neither
+    // branchName nor a stamped commit exists. Filter widened to
+    // include test artifacts too.
+    if (builtFilePaths.length === 0 && phaseIntent) {
+      try {
+        const arts = await artifacts.findByCorrelationId(phaseIntent.correlationId);
+        builtFilePaths = arts
+          .filter((a) => a.type === 'code' || a.type === 'test')
+          .map((a) => a.path);
+      } catch { /* */ }
+    }
+
+    childLog.info(
+      { phaseIndex: phase.phaseIndex, builtFileCount: builtFilePaths.length },
+      'phase-evaluator: resolved built file list',
+    );
 
     let harnessConfig: HarnessConfig | null = null;
     try {
