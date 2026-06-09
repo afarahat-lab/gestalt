@@ -667,6 +667,115 @@ historical list.
 - LLM model name not validated at startup.
 - (MEDIUM, TR_004) test-agent punts on method coverage.
 
+### Product backlog
+
+Forward-looking product work — items that change platform UX
+or surface area beyond bug-fixes and Aider-quality follow-ups.
+Grouped by surface (Dashboard, CLI, etc).
+
+#### Dashboard
+
+#### HIGH — Dashboard: feature/intent tracking redesign
+
+The current dashboard tracking is agent-centric and hard to
+interpret. Required redesign keeps agents visible but makes
+them expandable with a full execution trace.
+
+**Feature view:**
+- Feature card shows: title, description, overall status,
+  phase progress (e.g. "3 of 5 phases deployed")
+- Expanding a feature shows phases in order
+- Each phase shows: status, PR link, deploy time, files created
+- Phase in progress shows live agent activity
+- Files accessible from phase: PLAN.md, phase scope,
+  architecture, phase result — readable in dashboard
+
+**Intent/phase detail view — agent tree with execution trace:**
+- Starts with the input (what was submitted)
+- Shows agents in execution order as an expandable list
+- Each agent row shows: name, status (running/complete/
+  skipped/failed), duration, token count
+- Expanding an agent shows its full execution trace,
+  sorted by time:
+  - Prompt sent to LLM (rendered as readable text,
+    with option to view raw)
+  - Each tool call: tool name, input, output, duration
+  - LLM response: rendered as readable narrative,
+    with option to expand to raw JSON
+  - Decisions made: what the LLM decided and why
+    (extracted from the response)
+  - Artifacts created: files written, signals emitted
+  - Self-healing actions: what failed, what the
+    diagnostician decided, what fix-intent was submitted,
+    what happened to it — fully audited and visible
+
+**Readable format principle:**
+- LLM output rendered as formatted text by default
+- "View raw JSON" toggle available on every LLM response
+- "View file" link on every artifact reference
+- Tool call inputs/outputs collapsed by default,
+  expandable inline
+
+**Alerts redesign (aligned with above):**
+- Full failure trace: which agent, which step, what error
+- LLM RCA and recommendations visible inline
+- Self-healing action audit: what was diagnosed, what
+  action was taken, what the outcome was
+- Links to relevant files directly from the alert
+- "What do I need to do" section when human action required
+
+#### LOW — Dashboard: agents view as interactive tree
+
+Replace the current flat agents card with a hierarchical
+tree view showing all available agents organised by layer:
+
+```
+Platform agents
+├── Planning layer
+│   ├── architecture-agent     ● active — feature ea19b18e
+│   ├── planner-agent          ○ idle
+│   └── phase-evaluator-agent  ○ idle
+├── Generate layer
+│   ├── intent-agent           ○ idle
+│   ├── design-agent           ○ idle
+│   ├── context-agent          ○ idle
+│   ├── code-agent (Aider)     ● active — intent 3a114a1d
+│   └── test-agent             ○ skipped (Aider mode)
+├── Gate layer
+│   ├── constraint-agent       ○ idle
+│   └── review-agent           ○ deprecated (PR-Agent active)
+├── Deploy layer
+│   ├── pr-agent               ○ idle
+│   ├── pipeline-agent         ○ idle
+│   └── promotion-agent        ○ idle
+├── Maintenance layer
+│   ├── drift-agent            ○ idle
+│   ├── alignment-agent        ○ idle
+│   ├── gc-agent               ○ idle
+│   └── evaluation-agent       ○ idle
+└── Self-healing
+    └── self-healing-agent     ○ idle
+```
+
+Behaviour:
+- Active agents show a live indicator (●) with the intent
+  or feature ID they are currently processing
+- Hovering over an active agent opens a small popover with:
+  current step, tokens used so far, elapsed time, and
+  the intent text (truncated)
+- Clicking an active agent navigates to the IntentDetail
+  view for the intent it is processing
+- Idle agents show (○) — clicking shows the agent's last
+  execution (most recent IntentDetail that used this agent)
+- Skipped/deprecated agents shown in muted style with reason
+- Custom agents (from agents.yaml) appear under their
+  respective layer with a "custom" badge
+- Tree state persists across navigation (collapsed/expanded)
+- Updates in real time via SSE — no polling needed
+
+This replaces the current "Active agents" card on the
+dashboard home and the flat agent list in the agents tab.
+
 ---
 
 ## Operator caveats / pending actions
