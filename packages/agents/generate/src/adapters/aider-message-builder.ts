@@ -71,8 +71,26 @@ export function buildAiderMessage(
   // TR_032 — PLAN.md is always cited; scope-mentioned paths are
   // appended. The adapter's existsSync filter handles the case
   // where PLAN.md doesn't exist yet (Phase 1 of a feature).
+  // TR_033 — also always cite the common compiler-config + dependency-
+  // manifest filenames so Aider sees the project's strictness settings
+  // and available dependencies before generating. The existsSync filter
+  // naturally drops the ones a project doesn't use (e.g. tsconfig.json
+  // on a Python project, pyproject.toml on a TypeScript project), so
+  // the list can over-cover languages without harm.
   const scopePaths = extractMentionedPaths(intentSpec.rawIntent ?? '');
-  const readFiles = dedupe(['PLAN.md', ...scopePaths]);
+  const readFiles = dedupe([
+    'PLAN.md',
+    'package.json',
+    'tsconfig.json',
+    'pyproject.toml',
+    'requirements.txt',
+    'go.mod',
+    'pom.xml',
+    'mypy.ini',
+    '.eslintrc',
+    '.eslintrc.json',
+    ...scopePaths,
+  ]);
 
   const sections: string[] = ['## Task', intentSpec.rawIntent];
 

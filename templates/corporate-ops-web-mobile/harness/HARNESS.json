@@ -75,7 +75,10 @@
         "All imports must resolve to files that exist in the project or are declared in package.json.",
         "You MUST run a compile/lint check via executeScript before emitting the final files. This is not optional.",
         "Do not use require() for JSON imports — import them using ES module syntax with resolveJsonModule enabled in tsconfig.",
-        "Before generating any repository, service, or controller code, read the DTO and interface files it will use. Never reference a field on a type without confirming it exists in the type definition."
+        "Before generating any repository, service, or controller code, read the DTO and interface files it will use. Never reference a field on a type without confirming it exists in the type definition.",
+        "Before generating code that calls methods on a dependency, read the dependency's source file to confirm which methods exist. Only call methods that are actually defined.",
+        "Read the project's compiler/linter configuration file (tsconfig.json, mypy.ini, pyproject.toml, .eslintrc etc) before generating code. Follow the strictness settings it defines — do not assume permissive defaults.",
+        "Read the project's dependency manifest (package.json, requirements.txt, go.mod, pom.xml etc) before importing external packages. Only import packages that are listed as dependencies."
       ]
     },
     "review-agent": {
@@ -137,7 +140,8 @@
         "Evaluate based on actual built files, not planned files.",
         "Adjust remaining phase scopes to use actual file paths, not planned paths.",
         "Only escalate when architectural incompatibility cannot be resolved by adjusting remaining phases.",
-        "When adjusting remaining phase scopes after a partial success, always update the scope to include the exact file paths of files created in the completed phase. Replace generic references like 'leave.model.ts' with full paths like 'src/modules/leave/leave.model.ts'."
+        "When adjusting remaining phase scopes after a partial success, always update the scope to include the exact file paths of files created in the completed phase. Replace generic references like 'leave.model.ts' with full paths like 'src/modules/leave/leave.model.ts'.",
+        "When adjusting the scope of a routes or controller phase, always cite the service or handler file it depends on so Aider reads it before generating. The scope must make clear which methods are available to call."
       ],
       "evaluationCriteria": [
         "Success: git diff shows files matching the phase scope AND those files meet the success criteria.",

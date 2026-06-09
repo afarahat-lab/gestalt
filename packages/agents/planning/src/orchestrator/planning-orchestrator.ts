@@ -104,6 +104,80 @@ async function readFileSafe(path: string): Promise<string> {
   }
 }
 
+/**
+ * TR_033 — terminate a feature when its in-flight phase intent hits an
+ * escalation-class status. Self-healing parks the parent intent at
+ * `waiting-for-clarification` once the cascade-depth brake fires; without
+ * this helper the planner would leave the feature in `in-progress` until
+ * an operator intervenes manually (the gap the TR_032 verification
+ * surfaced).
+ *
+ * The sequence is intentionally simple — there is nothing for the
+ * phase-evaluator to do (no PR branch to diff, no scope adjustment to
+ * apply), so we skip planning:evaluate entirely. Order: phase status →
+ * feature status → plan log → alert. Each step swallows its own
+ * exception via the surrounding catch in the subscriber.
+ */
+async function markFeatureBlockedAfterEscalation(args: {
+  featureId: string;
+  phaseId: string;
+  phaseIndex: number;
+  phaseTitle: string;
+  intentId: string;
+  correlationId: string;
+  status: string;
+}): Promise<void> {
+  const { features, alerts } = getRepositories();
+  log.warn(
+    {
+      featureId: args.featureId,
+      phaseId: args.phaseId,
+      intentId: args.intentId,
+      phaseIndex: args.phaseIndex,
+      status: args.status,
+    },
+    'Planner phase intent escalated — marking phase failed + feature blocked',
+  );
+  await features.updatePhaseStatus(args.phaseId, 'failed');
+  await features.updateStatus(args.featureId, 'blocked');
+  await features.appendLog({
+    featureId: args.featureId,
+    phaseIndex: args.phaseIndex,
+    eventType: 'phase-escalated',
+    summary:
+      `Phase ${args.phaseIndex + 1} (${args.phaseTitle}) escalated ` +
+      `to '${args.status}' — feature blocked automatically. ` +
+      `Self-healing budget exhausted; human clarification required to resume.`,
+    detail: { intentId: args.intentId, status: args.status },
+  });
+  const alert = await alerts.create({
+    correlationId: args.correlationId,
+    intentId: args.intentId,
+    type: 'feature-blocked',
+    severity: 'high',
+    title: `Feature blocked at phase ${args.phaseIndex + 1}`,
+    description:
+      `Phase ${args.phaseIndex + 1} (${args.phaseTitle}) escalated after ` +
+      `self-healing budget was exhausted. ` +
+      `Human clarification required to resume.`,
+    requiredAction: 'review-manually',
+    context: {
+      featureId: args.featureId,
+      phaseId: args.phaseId,
+      phaseIndex: args.phaseIndex,
+      phaseTitle: args.phaseTitle,
+      intentId: args.intentId,
+      escalationStatus: args.status,
+    },
+  });
+  emitLiveEvent('alert.created', args.correlationId, {
+    alertId: alert.id,
+    type: 'feature-blocked',
+    intentId: args.intentId,
+    severity: 'high',
+  });
+}
+
 async function exists(path: string): Promise<boolean> {
   try {
     await access(path);
@@ -127,17 +201,53 @@ export function startPlanningWorker(queueConfig: QueueConfig): void {
   // reaches a terminal status, dispatch a planning:evaluate task so
   // the loop continues. The subscription stays alive for the process
   // lifetime — no unsubscribe is registered.
+  //
+  // TR_033 — `waiting-for-clarification` is also handled here as a
+  // terminal phase outcome. Self-healing parks a parent intent at
+  // `waiting-for-clarification` when the cascade-depth brake fires
+  // (see `self-healing-loop.ts`); pre-TR_033 the planning subscriber
+  // filtered that status out, leaving the parent feature stuck
+  // `in-progress` indefinitely and forcing manual operator cleanup
+  // (the TR_032 verification surfaced this). The new branch marks
+  // the phase `failed` + feature `blocked` + emits a single clear
+  // `feature-blocked` alert so the operator sees the situation
+  // immediately.
   eventBus.subscribe(async (event) => {
     if (event.type !== 'intent.status-changed') return;
     const payload = event.payload as { intentId?: string; status?: string };
     const intentId = payload?.intentId;
     const status = payload?.status;
     if (!intentId || !status) return;
-    if (status !== 'deployed' && status !== 'failed' && status !== 'escalated') return;
+    if (
+      status !== 'deployed' &&
+      status !== 'failed' &&
+      status !== 'escalated' &&
+      status !== 'waiting-for-clarification'
+    ) {
+      return;
+    }
     try {
       const { features } = getRepositories();
       const phase = await features.findPhaseByIntent(intentId);
       if (!phase) return;  // Not a planner-driven intent — ignore.
+
+      // TR_033 — escalation-class statuses are terminal failures for
+      // the phase. Don't dispatch planning:evaluate; the phase didn't
+      // produce evaluable output. Mark everything terminal in one
+      // sequence so the dashboard reflects reality immediately.
+      if (status === 'waiting-for-clarification' || status === 'escalated') {
+        await markFeatureBlockedAfterEscalation({
+          featureId: phase.featureId,
+          phaseId: phase.id,
+          phaseIndex: phase.phaseIndex,
+          phaseTitle: phase.title,
+          intentId,
+          correlationId: event.correlationId,
+          status,
+        });
+        return;
+      }
+
       log.info(
         { featureId: phase.featureId, phaseId: phase.id, intentId, status },
         'Planner phase intent reached terminal status — dispatching planning:evaluate',

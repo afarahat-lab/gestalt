@@ -54,7 +54,100 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
-### TR_032 — Aider `--read` flag + preservation in schema + broken-state framing (template 0.17.0)
+### TR_033 — Phase 3 quality gaps + escalation→blocked structural fix (template 0.18.0)
+
+Four targeted fixes pushing toward full autonomous feature
+completion. Fixes 1-3 are language-agnostic rule additions;
+Fix 4 is the structural follow-up to the TR_032 verification
+gap (escalated intents leaving features stuck `in-progress`).
+
+- **Fix 1** — `aider-message-builder.ts` base `readFiles` list
+  expanded to include `package.json`, `tsconfig.json`,
+  `pyproject.toml`, `requirements.txt`, `go.mod`, `pom.xml`,
+  `mypy.ini`, `.eslintrc(.json)`. The adapter's `existsSync`
+  filter naturally drops files a project doesn't use, so the
+  same list works on TypeScript / Python / Go / Java without
+  language-tagging the platform code.
+- **Fix 2** — three language-agnostic rules added to
+  `agentConfig.code-agent.rules` in the **template** HARNESS:
+  read dependency source before calling its methods; read
+  compiler/linter config before generating; read dependency
+  manifest before importing. Examples in the rule text list
+  multiple ecosystems (`tsconfig.json / mypy.ini / pyproject.toml`,
+  `package.json / requirements.txt / go.mod`).
+- **Fix 3** — new rule on
+  `agentConfig.phase-evaluator-agent.rules` (template) — when
+  adjusting a routes/controller phase scope, cite the
+  service/handler file it depends on. Closes the TR_032 Phase 3
+  root cause.
+- **Fix 4** — structural. `AlertType` gains `'feature-blocked'`
+  (no migration — no DB CHECK constraint on `alerts.type`).
+  Planning orchestrator's `intent.status-changed` subscriber
+  now treats `waiting-for-clarification` + `escalated` as
+  terminal phase outcomes via a new
+  `markFeatureBlockedAfterEscalation` helper: phase → failed,
+  feature → blocked, `phase-escalated` log entry, a single
+  `feature-blocked` alert. Self-healing already parked the
+  parent intent at `waiting-for-clarification` when the
+  cascade brake fired (`self-healing-loop.ts:604`) — Fix 4
+  completes the story.
+
+Template bumped 0.17.0 → 0.18.0. Build clean across all 13
+packages. Live verification pending.
+
+**Operator action — trackeros:** my Fix 2 + Fix 3 edits on
+trackeros's `HARNESS.json` were reverted by the operator/linter
+this session. The new code-agent + phase-evaluator rules only
+ship via the template; existing projects (including trackeros)
+need a manual patch on their own `HARNESS.json` to opt in. For
+the live verification recipe to test Fix 2 + Fix 3 end-to-end,
+trackeros's HARNESS must be patched first with the three
+code-agent rules and the one phase-evaluator rule from the
+template.
+
+**Operator action — other projects:** None on the platform.
+Template auto-refreshes at server boot to `0.18.0`. New
+projects pick up the rules automatically.
+
+### TR_032 — Aider `--read` flag + preservation in schema + broken-state framing (template 0.17.0, verified)
+
+Three targeted platform-mechanic fixes addressing the
+TR_028 → TR_031 Aider DTO-drift blocker. No new HARNESS
+rules, no new migrations.
+
+- **Fix 1** — `runAider` accepts `readFiles?: string[]`;
+  `buildAiderMessage` returns `{ message, readFiles }`
+  (PLAN.md + paths regex-extracted from the intent's scope
+  text). The adapter renders each as a `--read "<path>"`
+  flag, existsSync-filtered against `workDir`. Removed the
+  TR_030/TR_031 prose `## Read PLAN.md first` and
+  `## Before generating any code` sections — `--read`
+  enforces what they only asked.
+- **Fix 2** — preservation sentence ("Preserve all existing
+  exports, types, interfaces, and imports. Only add or
+  modify what is needed to resolve the CI failure shown
+  above.") hard-coded as the closing sentence of the
+  `fixIntent` JSON-schema description in
+  `self-healing-agent.ts`. HARNESS preservation rule
+  removed from the template.
+- **Fix 3** — `fixIntent` description now requires BROKEN
+  STATE framing (not MISSING STATE) with verbatim
+  WRONG/CORRECT examples. Addresses the TR_031 cycle-3
+  finding that Aider inverts negation.
+
+Template bumped 0.16.0 → 0.17.0. Build clean across all 13
+packages. **Verified end-to-end on trackeros 2026-06-09** —
+feature `fd844f7d` Phase 1 + Phase 2 both deployed cleanly
+(Phase 2 was the killer phase across TR_028-31, first ship);
+Phase 3 escalated on unrelated TS-strict + missing-method
+issues (the TR_033 fixes target those). `readFiles` array
+present on every Aider invocation. Preservation footer
+present on both fix-intents. Cascade brake at depth 2 fired
+correctly. Operator had to manually clean up the escalated
+feature after the cycle — Fix 4 above closes that gap.
+
+**Operator action:** None new. The TR_032 preservation rule
+removal already shipped via the template.
 
 Three targeted platform-mechanic fixes addressing the
 TR_028 → TR_031 Aider DTO-drift blocker. No new HARNESS

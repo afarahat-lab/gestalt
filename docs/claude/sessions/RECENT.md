@@ -3,6 +3,164 @@
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+### Session 2026-06-10 — Claude Code (TR_033: Phase 3 quality gaps — package.json/tsconfig.json on --read, language-agnostic code-agent rules, phase-evaluator routes-cite rule, escalation→blocked structural fix)
+
+Brief: four targeted fixes pushing for full autonomous feature
+completion. Fixes 1-3 are language-agnostic rule additions
+(no hard-coded TypeScript). Fix 4 is the structural follow-up
+the TR_032 verification surfaced — escalated intents leaving
+the parent feature stuck `in-progress` indefinitely.
+
+What changed:
+
+**Fix 1 — package.json + tsconfig.json (and friends) on `--read`**
+
+- **`packages/agents/generate/src/adapters/aider-message-builder.ts`** —
+  the base `readFiles` list expanded from `['PLAN.md']` to also
+  include the common compiler-config + dependency-manifest
+  filenames across languages: `package.json`, `tsconfig.json`,
+  `pyproject.toml`, `requirements.txt`, `go.mod`, `pom.xml`,
+  `mypy.ini`, `.eslintrc`, `.eslintrc.json`. The adapter's
+  `existsSync` filter naturally drops the ones a project doesn't
+  use — a TypeScript project sees `package.json + tsconfig.json`
+  as `--read` flags; a Python project sees `pyproject.toml +
+  requirements.txt`. No language tagged in the .ts code.
+
+**Fix 2 — language-agnostic code-agent rules in template HARNESS**
+
+- **`templates/corporate-ops-web-mobile/harness/HARNESS.json`** —
+  three new rules appended to `agentConfig.code-agent.rules`
+  (verbatim from the brief): one for reading dependency source
+  before calling methods; one for reading compiler/linter config
+  before generating; one for reading dependency manifest before
+  importing. Examples list multiple ecosystems
+  (tsconfig.json / mypy.ini / pyproject.toml / .eslintrc;
+  package.json / requirements.txt / go.mod / pom.xml) so the
+  LLM doesn't pattern-match to a specific stack.
+- **trackeros HARNESS.json was NOT updated this session** — the
+  edit was reverted by the operator/linter. Template changes
+  flow to NEW projects; existing projects (including trackeros)
+  need an operator-driven push. For the verification recipe to
+  test the new rules end-to-end, trackeros's HARNESS.json must
+  be manually patched first.
+
+**Fix 3 — phase-evaluator routes-cite rule in template HARNESS**
+
+- **`templates/corporate-ops-web-mobile/harness/HARNESS.json`** —
+  new rule appended to `agentConfig.phase-evaluator-agent.rules`:
+  > "When adjusting the scope of a routes or controller phase,
+  > always cite the service or handler file it depends on so
+  > Aider reads it before generating. The scope must make clear
+  > which methods are available to call."
+
+  Closes the TR_032 Phase 3 root cause: the routes phase scope
+  didn't cite `leave.service.ts`, so `--read` didn't pick it up,
+  so Aider invented method names. Language-agnostic framing
+  (routes/controllers).
+- **trackeros HARNESS.json was NOT updated this session** — same
+  revert behaviour as Fix 2.
+
+**Fix 4 — escalation → feature blocked (structural)**
+
+- **`packages/core/src/repository/index.ts`** — `AlertType` union
+  extended with `'feature-blocked'`. No migration required (no
+  DB CHECK constraint on `alerts.type` — confirmed via `\d alerts`).
+- **`packages/agents/planning/src/orchestrator/planning-orchestrator.ts`** —
+  the `intent.status-changed` subscriber now accepts
+  `waiting-for-clarification` in addition to deployed / failed /
+  escalated. When the new status indicates an escalation
+  (`waiting-for-clarification` or `escalated`), the subscriber
+  routes to the new `markFeatureBlockedAfterEscalation` helper
+  instead of dispatching `planning:evaluate` (there's nothing
+  to evaluate — the phase produced no usable output).
+- **`markFeatureBlockedAfterEscalation`** (new helper) marks the
+  phase `failed`, marks the feature `blocked`, appends a
+  `phase-escalated` event to the plan log, and creates a single
+  `feature-blocked` alert with `severity: high` +
+  `requiredAction: review-manually`. The `alert.created` SSE
+  event fires so the dashboard alerts list updates immediately.
+  Self-healing already parks the parent intent at
+  `waiting-for-clarification` when the cascade brake fires
+  (`self-healing-loop.ts:604`) — Fix 4 completes the story
+  end-to-end.
+- **`templates/corporate-ops-web-mobile/template.json`** —
+  version `0.17.0` → `0.18.0`.
+
+What's verified (build only):
+
+- ✅ `pnpm -r build` clean across all 13 packages.
+- ✅ AlertType union extension picks up cleanly across
+  repository / postgres-adapter / type-only consumers.
+- ✅ Planning orchestrator new branch + helper compile without
+  lint regressions.
+
+What's NOT verified yet (live cycle pending):
+
+- ❌ End-to-end multi-phase autonomous completion (the brief's
+  milestone).
+- ❌ Aider compliance with the expanded `--read` set — whether
+  seeing `tsconfig.json` strict mode causes it to narrow
+  `unknown` catches and import Express types.
+- ❌ Phase 3 routes phase only calling methods that exist on
+  LeaveService (depends on the new template rules; trackeros
+  needs manual HARNESS patching first to test).
+- ❌ Fix 4 in action — whether an escalated phase immediately
+  drops the feature to `blocked` without manual cleanup.
+
+Decisions made:
+
+- **No new migration for Fix 4.** `alerts.type` has no DB CHECK
+  constraint, so adding `feature-blocked` is type-only.
+- **No new HARNESS rules for Fix 1.** Adding rules like "read
+  package.json before importing" would duplicate the `--read`
+  mechanism. Fewer overlapping guidance channels means less
+  for the LLM to reconcile.
+- **Respected the trackeros HARNESS.json revert.** The operator
+  rolled back my Fix 2 + Fix 3 edits on the trackeros repo;
+  re-applying would be hostile. Template changes flow forward;
+  trackeros is opt-in.
+- **Did not normalise the `--read` list to a config-driven set.**
+  A future change could move the list to
+  `HARNESS.codeGeneration.readFiles` so operators tune it per
+  project; today the platform-default list is fine.
+
+Pending follow-ups (NEW from TR_033):
+
+- (none yet — these will emerge from live verification)
+
+Carryover follow-ups (status updates):
+
+- **(ADDRESSED by TR_033 Fix 4 — pending live verification)**
+  TR_032 finding: escalated intents leave the parent feature
+  stuck `in-progress` indefinitely. Structural fix landed.
+- **(ADDRESSED by TR_033 Fix 1 — pending live verification)**
+  TR_032 Phase 3 finding: Aider didn't know the project was
+  TypeScript-strict (`unknown` catch types). `tsconfig.json`
+  now goes via `--read`.
+- **(ADDRESSED in TEMPLATE by TR_033 Fix 2 + Fix 3 — trackeros
+  needs operator push)** TR_032 Phase 3 finding: Aider invented
+  service methods. Template rules tighten the contract;
+  trackeros's HARNESS.json needs the same rules patched in.
+- **(STILL OPEN — HIGH)** TR_018/020: restore TR_010 mandatory
+  `executeScript tsc --noEmit` code-agent rule on trackeros's
+  HARNESS.json. Not bundled here — TR_033's new code-agent
+  rule about reading tsconfig.json should reduce most of the
+  same errors at generation time.
+- **(STILL OPEN — MEDIUM)** TR_014: Aider token-spend capture
+  in `agent_executions.tokens_used`.
+
+Build status: `pnpm -r build` clean across all 13 packages.
+Server Docker image will rebuild for live verification.
+Template auto-refreshes to `0.18.0` on next server boot.
+
+Files changed:
+- `packages/agents/generate/src/adapters/aider-message-builder.ts`
+- `packages/core/src/repository/index.ts`
+- `packages/agents/planning/src/orchestrator/planning-orchestrator.ts`
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
+- `templates/corporate-ops-web-mobile/template.json`
+
+---
 ### Session 2026-06-09 — Claude Code (TR_032: three targeted Aider compliance fixes — `--read` flag, preservation rule in .ts schema, fix-intent broken-state framing — built clean, awaiting live verification)
 
 Brief: three surgical fixes for the remaining TR_028 → TR_031
@@ -490,193 +648,4 @@ trackeros planning-loop commits (auto-merged on main):
 
 Multiple stranded PRs closed during cleanup: #94–#107
 range across the day.
-
----
-### Session 2026-06-09 — Claude Code (TR_029: planner+evaluator prior-phase path rules — planner side verified; Aider code-agent prompt does not honour scope-cited paths; new HIGH follow-up captured)
-
-Brief: add explicit "include prior-phase file paths in scope
-text" rules to `agentConfig.planner-agent.phaseScopingRules`
-and `agentConfig.phase-evaluator-agent.rules` to fix the
-TR_028 Aider DTO-drift blocker. Push to template +
-trackeros, re-submit the leave-management feature, verify
-Phase 2 scope cites `src/modules/leave/leave.model.ts` by
-full path.
-
-What changed (HARNESS edits only — no platform code change,
-no migration):
-
-- **`templates/corporate-ops-web-mobile/harness/HARNESS.json`** —
-  two new `agentConfig.planner-agent.phaseScopingRules` items
-  (verbatim from the brief): one mandating per-phase explicit
-  prior-file-path lists, one specifically for repository-phase
-  scopes referencing the prior model path. One new
-  `agentConfig.phase-evaluator-agent.rules` item mandating
-  full-path replacement when adjusting scopes after a partial
-  verdict.
-- **`/Users/amrmohamed/Work/trackeros/HARNESS.json`** —
-  identical edits committed as `cf35c03b`.
-- **`templates/corporate-ops-web-mobile/template.json`** —
-  version `0.14.0` → `0.15.0`.
-- **trackeros cleanup** — `git rm leave.model.ts` to remove
-  the stray repo-root file TR_028's fix-intent created.
-  Committed alongside the HARNESS edit.
-
-Test cleanup:
-
-- Closed TR_028 stranded PRs #83 #84 #85 #87 (already
-  closed; idempotent).
-- Closed TR_029 stranded PRs #89 #90 #91 with
-  `--delete-branch`.
-
-Live verification (Step 2 + Step 3 of the brief):
-
-- `gestalt feature submit "..."` returned feature
-  `068adb58-cf71-43b6-993f-ed4889a861c7`, status `planning`.
-- architecture-agent 21:38:21; planner-agent 21:38:29.
-- Planner emitted 4 phases. **The planner-side change worked
-  end-to-end** — PLAN.md `Phase 2` carries:
-  > _Depends on: src/modules/leave/leave.model.ts,
-  > src/modules/leave/leave.repository.ts_
-  >
-  > "This phase depends on src/modules/leave/leave.model.ts
-  > and src/modules/leave/leave.repository.ts from Phase 1."
-- **Phase 1 (model + repository in same phase) → ✓ deployed**
-  at 21:41:45 via the full Aider 9s → CI pass → PR-Agent 33s
-  → verdict `none` → gate (constraint-agent only, ADR-051
-  skip) → squash-merge chain (PR #88). TR_023's "model +
-  repository together" rule was actually applied this time
-  because the rule had been in HARNESS.json for prior cycles
-  but the planner wasn't honouring it before — TR_029's
-  additional phaseScopingRules tipped it over.
-- **Phase 2 (service) → blocked** after 3 attempts × 2
-  self-healing retries each (6 total Aider runs in ~10
-  minutes). PRs #89, #90, #91 all failed CI. **The
-  Aider-side gap surfaced** — even with Phase 2's scope text
-  explicitly saying "This phase depends on
-  src/modules/leave/leave.model.ts...", Aider's generated
-  service code hallucinated against the deployed Phase 1
-  files:
-  - Imported `ILeaveRepository` from `./leave.repository`
-    (Phase 1 exports `LeaveRepository`, not `ILeaveRepository`)
-  - Referenced `LeaveRequest.leaveType` (Phase 1 model has
-    `leaveTypeId`)
-  - Tried to import `../balance/balance.model` and
-    `../employee/employee.model` — sibling modules that the
-    planner never scheduled. The architecture-agent's
-    high-level model list mentions balance/employee modules
-    at the FEATURE level; the planner only scheduled 4
-    phases (model+repo / service / routes / tests). Aider
-    read the architecture description, not the actual phase
-    scope.
-- Self-healing this cycle chose **pure retry** every time
-  (not `fix-intent`). The diagnostician's call wasn't
-  unreasonable — the errors looked like "code mistake" not
-  "systemic gap" — but on the same Aider-quality failure
-  pattern as TR_028, a fix-intent dispatch wouldn't have
-  unblocked the cycle either (TR_028 verified that path).
-- Phase 2 hit `Phase retry budget exhausted — marking phase
-  failed and feature blocked` at 21:52:54. Wall-clock
-  submission → blocked: ~14m 33s.
-
-What this VERIFIES:
-
-- ✅ Planner correctly emits prior-phase file paths in scope
-  text after the TR_029 rule additions. Visible in PLAN.md
-  on trackeros main.
-- ✅ Planner correctly bundles model + repository in a
-  single phase (TR_023 rule + TR_029 reinforcement).
-- ✅ Phase 1 deploys end-to-end through Aider → CI →
-  PR-Agent → gate → promotion in <3 minutes — same shape
-  as TR_028 Phase 1.
-- ✅ PR-Agent posts the "PR Reviewer Guide" comment on PR
-  #88; verdict `none` → proceed.
-- ✅ Phase-evaluator returns `partial` (1 adjustment
-  applied) and updates PLAN.md with the actual paths.
-- ✅ Phase 2 auto-dispatched after Phase 1 deploys.
-- ✅ Phase retry budget exhausts cleanly (`Phase retry
-  budget exhausted` log line + feature `blocked` state).
-
-What this DOES NOT verify (regression-equivalent of
-TR_028):
-
-- ❌ End-to-end multi-phase autonomous completion. Phases
-  3 + 4 never reached.
-- ❌ Aider reading the files the scope text names. Even
-  with a verbatim "read it before generating any code that
-  references its types" instruction, Aider hallucinates
-  field names and import paths.
-
-Decisions made:
-
-- **Did not extend the code-agent prompt in this session.**
-  The brief asked for HARNESS edits only; the Aider
-  code-agent gap is a NEW finding from TR_029 verification,
-  not part of the brief. Captured as a new HIGH follow-up
-  for a future TR_xxx session.
-- **Did not advance phase retry budget** above 2. The
-  underlying failure is Aider's reading discipline, not
-  budget; more retries would just multiply cost.
-
-Pending follow-ups (NEW from TR_029):
-
-- **(HIGH — NEW from TR_029)** Aider code-agent prompt must
-  mandate `readFile()` on every path mentioned in the phase
-  scope BEFORE generating code. Today the scope text says
-  "depends on src/modules/leave/leave.model.ts" verbatim;
-  Aider receives this and starts generating without
-  reading. Options: (a) add a code-agent rule to HARNESS
-  ("Before writing any code, call readFile() on every path
-  mentioned in the scope under 'Depends on:'"); (b) modify
-  code-agent's prompt assembler to pre-fetch the contents
-  of cited paths and inline them; (c) Aider's `--read`
-  flag for explicit file-list injection.
-- **(HIGH — NEW from TR_029)** Architecture-agent's
-  module-level high-level description ("Modules: leave /
-  balance / policy / employee — each owns these files...")
-  feeds into Phase 2's prompt context. Aider treats this as
-  ground truth and tries to import from sibling modules
-  that the planner never scheduled. Either (a) the
-  architecture-agent's output shouldn't be in the
-  code-agent's context (only the planner's phase scope
-  should be), or (b) the planner's scope text must
-  explicitly say "DO NOT import from modules outside this
-  phase's file list".
-- **(MEDIUM — NEW from TR_029)** Self-healing's `retry` vs
-  `fix-intent` routing decision is opaque. In TR_028 the
-  diagnostician chose `fix-intent` for the same class of
-  Aider-quality failure; in TR_029 it chose `retry` every
-  time. The decision is LLM-driven (ADR-050, no hardcoded
-  pattern matching) so variance is expected — but
-  operators should see WHY in the alert body
-  (`technicalDetail` is populated but not surfaced on the
-  current alert page).
-
-Carryover follow-ups (status updates):
-
-- **(STILL OPEN — HIGH)** TR_023/TR_028 Aider DTO drift —
-  PROMOTED again as TR_029 confirmed the planner-side fix
-  is necessary but not sufficient.
-- **(STILL OPEN — HIGH)** TR_018/020: restore TR_010
-  mandatory `executeScript tsc --noEmit` code-agent rule on
-  trackeros's HARNESS.json. Would have caught Phase 2's TS
-  errors pre-emit before Aider committed each round.
-- **(STILL OPEN — MEDIUM)** TR_014: Aider token-spend
-  capture in `agent_executions.tokens_used`.
-
-Build status: unchanged. `pnpm -r build` not re-run (no
-source files modified). Server state unchanged. Docker
-image unchanged. Template auto-refreshes on next server
-boot to `0.15.0`.
-
-trackeros operator commits in this session:
-- `cf35c03b` — HARNESS.json TR_029 rules + remove stray
-  repo-root `leave.model.ts`.
-
-trackeros planning-loop commits (auto-merged):
-- `c44960f7` — Phase 1 deployed (model + repository
-  together in `src/modules/leave/`).
-- (PLAN.md updates — `git pull` to see exact SHAs.)
-
-PR-Agent's review comment confirmed on PR #88. PRs #89,
-#90, #91 closed during cleanup.
 

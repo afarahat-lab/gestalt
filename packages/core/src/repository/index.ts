@@ -1355,7 +1355,17 @@ export type AlertType =
    * from PR-Agent's review comment, which is forwarded to the
    * self-healing diagnostician as `technicalDetail`.
    */
-  | 'review-requested-changes';
+  | 'review-requested-changes'
+  /**
+   * TR_033 — a planner-driven phase intent reached a terminal
+   * "stuck" status (`waiting-for-clarification` after self-healing
+   * exhausted its cascade-depth budget). The planning orchestrator
+   * marks the feature `blocked` and emits this alert so operators
+   * see the situation immediately, without having to correlate
+   * intent / phase / feature rows manually. No DB CHECK constraint
+   * exists on `alerts.type`, so this addition needs no migration.
+   */
+  | 'feature-blocked';
 
 export type AlertRequiredAction =
   | 'provide-clarification'
