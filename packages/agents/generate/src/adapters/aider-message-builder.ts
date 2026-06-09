@@ -29,6 +29,30 @@ export function buildAiderMessage(
 
   const sections: string[] = ['## Task', intentSpec.rawIntent];
 
+  sections.push('');
+  sections.push('## Read PLAN.md first');
+  sections.push(
+    'PLAN.md at the repository root is the source of truth for what\n' +
+      'has been built in prior phases of this feature. Each completed\n' +
+      'phase has a "What has been built" subsection listing the exact\n' +
+      'files created and the key exports (types, classes, functions)\n' +
+      'they provide.\n\n' +
+      'Read PLAN.md BEFORE you generate any code. Use the "What has\n' +
+      'been built" sections to know which files exist on disk, which\n' +
+      'exports are available, and which field names and signatures\n' +
+      'to use. Do not invent exports — only reference what PLAN.md\n' +
+      'says was built.',
+  );
+
+  sections.push('');
+  sections.push('## Before generating any code');
+  sections.push(
+    'Read every existing file in the repository that your generated\n' +
+      'code will import from or extend. Confirm the exact field names,\n' +
+      'exported types, and function signatures before referencing them.\n' +
+      "Do not assume a type's shape — read its definition.",
+  );
+
   if (intentSpec.successCriteria && intentSpec.successCriteria.length > 0) {
     sections.push('');
     sections.push('## Success criteria');
@@ -60,6 +84,16 @@ export function buildAiderMessage(
     sections.push('## Design context');
     sections.push(designSpec.slice(0, MAX_DESIGN_BYTES));
   }
+
+  sections.push('');
+  sections.push('## Important — architecture context is reference only');
+  sections.push(
+    'The architecture and design context above describes the intended\n' +
+      'system design. Many modules and types it mentions DO NOT EXIST\n' +
+      'YET in the repository — they are planned for future phases.\n' +
+      'Only import from files that actually exist in the repository.\n' +
+      'Use your repository map to verify a file exists before importing it.',
+  );
 
   return sections.join('\n').trim();
 }

@@ -54,6 +54,36 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_030 + TR_031 — Aider-message-builder + PLAN.md "What has been built" + context-only fix-intent (template 0.16.0)
+
+Two consecutive briefs targeting Aider DTO drift. TR_030
+added two generic prose blocks to `aider-message-builder.ts`
+(read-existing-files; architecture-is-reference-only).
+TR_031 added a `Read PLAN.md first` block to the message-
+builder; extended `PhaseEvaluation` with `builtFiles` (the
+phase-evaluator-agent now also lists exports per built file
+in its git-diff pass); rewrote the `fixIntent` JSON-schema
+description in `self-healing-agent.ts` to require CONTEXT
+only (no prescriptive "Update X to add Y"). HARNESS
+preservation-rule bullet added for self-healing-agent.
+Template 0.15.0 → 0.16.0.
+
+Verified end-to-end on a clean trackeros main: PLAN.md
+populates the `**What has been built:**` section under each
+deployed phase with files + key exports; fix-intent text
+is now context-only; self-healing routes to fix-intent
+immediately on first failure; cascade brake fires at depth 2.
+
+**Operator action:** Existing projects can adopt the new
+preservation rule by appending to
+`HARNESS.json.agentConfig.self-healing-agent.rules`:
+"Fix-intent context must end with a preservation statement.
+For TypeScript projects: 'Do not remove or rename existing
+exports, types, or interfaces. Only add or modify what is
+needed to resolve the CI failure.'" Python or other
+language projects substitute their own preservation clause.
+trackeros migrated in commit `7d94746a`.
+
 ### TR_029 — Planner+evaluator prior-phase path rules (template 0.15.0)
 
 Two new `agentConfig.planner-agent.phaseScopingRules` items and

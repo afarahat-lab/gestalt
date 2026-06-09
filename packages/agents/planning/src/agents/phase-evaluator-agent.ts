@@ -103,7 +103,18 @@ function parsePhaseEvaluation(raw: string, correlationId: string): PhaseEvaluati
       }
       adjustments.push(adj);
     }
-    return { verdict, summary, adjustments };
+    const builtFilesIn = Array.isArray(parsed.builtFiles) ? parsed.builtFiles : [];
+    const builtFiles: PhaseEvaluation['builtFiles'] = [];
+    for (const entry of builtFilesIn) {
+      if (!entry || typeof entry !== 'object') continue;
+      const e = entry as Record<string, unknown>;
+      const path = typeof e['path'] === 'string' ? e['path'].trim() : '';
+      if (!path) continue;
+      const exportsIn = Array.isArray(e['exports']) ? e['exports'] as unknown[] : [];
+      const exports = exportsIn.filter((x): x is string => typeof x === 'string' && x.trim() !== '');
+      builtFiles.push(exports.length > 0 ? { path, exports } : { path });
+    }
+    return { verdict, summary, adjustments, builtFiles };
   } catch (err) {
     log.warn(
       { err: err instanceof Error ? err.message : String(err), correlationId },

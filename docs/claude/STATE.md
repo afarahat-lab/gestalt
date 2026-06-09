@@ -4,7 +4,9 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-09 (after TR_029 — added explicit "include prior-phase file paths in scope text" rules to `planner-agent.phaseScopingRules` + `phase-evaluator-agent.rules` to fix the TR_028 Aider DTO-drift blocker. Template 0.14.0 → 0.15.0. **Planner-side change verified end-to-end** — Phase 2's scope on the re-submitted leave-management feature explicitly cites `src/modules/leave/leave.model.ts` + `leave.repository.ts` by full path; Phase 1 correctly bundled model+repository (TR_023 rule honoured). Phase 1 deployed cleanly (PR #88, ~3m). **Aider-side gap surfaced**: even with the scope text explicitly saying "depends on src/modules/leave/leave.model.ts", Aider's Phase 2 service code hallucinated against the deployed Phase 1 files (`ILeaveRepository` vs `LeaveRepository`, `LeaveRequest.leaveType` vs `leaveTypeId`, imports of non-scheduled sibling modules `../balance/`, `../employee/`). 6 Aider runs across 3 phase attempts; self-healing chose pure `retry` every time (not fix-intent). Feature blocked at 1/4 phases. Two new HIGH follow-ups: (1) code-agent prompt must mandate readFile() on every cited path before generating; (2) architecture-agent's high-level module list is leaking into code-agent context and Aider imports from un-scheduled sibling modules.) Last full session report at `docs/claude/TEST_REPORT_028.md`; TR_028 is the prior milestone for end-to-end machinery.
+**Last updated:** 2026-06-09 (after TR_030 + TR_031 — combat Aider DTO-drift via Aider-message-builder additions and PLAN.md "What has been built" + context-only fix-intent. TR_030 added two generic behavioural prose blocks to `aider-message-builder.ts` (read-existing-files-before-generating; architecture-context-is-reference-only). TR_031 added a `## Read PLAN.md first` block to the message-builder, extended `PhaseEvaluation` with a `builtFiles` field that the phase-evaluator-agent populates via git diff + readFile, and rewrote the `fixIntent` JSON-schema description in `self-healing-agent.ts` to require CONTEXT not PRESCRIPTION ("CI failed: TS error X. Files involved Y. Analyse and fix" — not "Update Z to add A"). Template 0.15.0 → 0.16.0. **What's verified end-to-end on trackeros**: (a) PLAN.md gets a `**What has been built:**` section under each deployed phase listing files + key exports — confirmed on the third verification cycle (clean trackeros main, feature `35fb580e`); (b) fix-intent dispatched text is now context-only on both fix-intents in the cycle — no prescriptive "Update X to add Y" framing; (c) self-healing routes to fix-intent immediately on first CI failure (vs 3-attempts cycle in TR_028/29/30); (d) TR_025 cascade-depth brake fires at depth 2. **What's NOT verified**: Aider STILL doesn't comply with read-before-generate consistently — Phase 2 service code hallucinated `ILeaveRepository` + imported non-existent sibling modules `../balance/`, `../employee/` despite PLAN.md's "What has been built" being on disk. The HARNESS preservation rule didn't reach the dispatched fix-intent text — the LLM didn't append the preservation footer despite the rule existing. Aider also inverted negation: fix-intent said "ILeaveRepository does not exist" → Aider created `ILeaveRepository`. Two new HIGH follow-ups: (1) move preservation requirement from HARNESS bullet into JSON-schema description; (2) use Aider's `--read <file>` flag to force PLAN.md + cited paths into context. Last full milestone test report at `docs/claude/TEST_REPORT_028.md`.)
+
+**Earlier (TR_029) — added explicit "include prior-phase file paths in scope text" rules to `planner-agent.phaseScopingRules` + `phase-evaluator-agent.rules` to fix the TR_028 Aider DTO-drift blocker. Template 0.14.0 → 0.15.0. **Planner-side change verified end-to-end** — Phase 2's scope on the re-submitted leave-management feature explicitly cites `src/modules/leave/leave.model.ts` + `leave.repository.ts` by full path; Phase 1 correctly bundled model+repository (TR_023 rule honoured). Phase 1 deployed cleanly (PR #88, ~3m). **Aider-side gap surfaced**: even with the scope text explicitly saying "depends on src/modules/leave/leave.model.ts", Aider's Phase 2 service code hallucinated against the deployed Phase 1 files (`ILeaveRepository` vs `LeaveRepository`, `LeaveRequest.leaveType` vs `leaveTypeId`, imports of non-scheduled sibling modules `../balance/`, `../employee/`). 6 Aider runs across 3 phase attempts; self-healing chose pure `retry` every time (not fix-intent). Feature blocked at 1/4 phases. Two new HIGH follow-ups: (1) code-agent prompt must mandate readFile() on every cited path before generating; (2) architecture-agent's high-level module list is leaking into code-agent context and Aider imports from un-scheduled sibling modules.) Last full session report at `docs/claude/TEST_REPORT_028.md`; TR_028 is the prior milestone for end-to-end machinery.
 
 **Earlier (TR_028) — milestone planning-loop re-test on the leave-management feature, verifying every TR_020 through TR_027 mechanism end-to-end in a single 19-min autonomous cycle. Phase 1 (model) deployed cleanly (Aider 5s → CI pass → PR-Agent 27s → verdict `none` → gate (constraint-agent only) → squash-merge, ~2m 44s). Phase 2 (repository) hit the known TR_023 Aider DTO-drift issue: repository code references model fields that don't exist (`leaveType` vs deployed `leaveTypeId`; `totalDays/usedDays/year` vs deployed `balance`). Self-healing's diagnostician correctly chose `action: 'retry'` for the first two cycles, then `action: 'fix-intent'` on the third (systemic gap detected). Fix-intent child dispatched + deployed in ~2m 25s (Aider 4s → CI pass → PR-Agent 24s → deploy → onSuccessDispatch envelope fired → parent resumed). But the fix-intent prompt didn't include a file path; Aider wrote a stray `/leave.model.ts` at repo root that tsc never resolves. Parent Phase 2 resumed → failed → planner retry budget exhausted → feature `blocked` at 1/4 phases. Two NEW HIGH follow-ups: (1) promoted TR_023 — planner must put model+repository in same phase OR code-agent must read existing model first; (2) self-healing fix-intent prompt enrichment — must include the failing import path and existing field shape. Architecture-agent / planner-agent / phase-evaluator-agent / PR-Agent / self-healing fix-intent + onSuccessDispatch / cascade-depth brake / phase retry budget all VERIFIED working as designed. TEST_REPORT_028.md in `docs/claude/`.)
 **Repo:** https://github.com/afarahat-lab/gestalt
@@ -241,6 +243,35 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
+### TR_030 + TR_031 — Combat Aider DTO drift (in-flight)
+
+**TR_030**: added two generic prose instructions to
+`aider-message-builder.ts` — read-existing-files-before-
+generating + architecture-context-is-reference-only.
+Platform mechanic, no HARNESS change, no migration.
+
+**TR_031**: added a `## Read PLAN.md first` section to the
+message-builder; extended `PhaseEvaluation` with `builtFiles`
+(populated by phase-evaluator-agent via git diff + readFile);
+rewrote the `fixIntent` JSON-schema description in
+`self-healing-agent.ts` to require CONTEXT-only fix-intent
+text (no prescriptive "Update X to add Y"). Added a HARNESS
+preservation-rule bullet for self-healing-agent. Template
+0.15.0 → 0.16.0.
+
+**Verified end-to-end** on a clean trackeros main: PLAN.md's
+"What has been built" section populates correctly; fix-intent
+text is now context-only; self-healing routes to fix-intent
+immediately on first CI failure; TR_025 cascade brake fires
+at depth 2.
+
+**Not verified**: Aider compliance with the read-before-
+generate prose. Phase 2 still hallucinated `ILeaveRepository`
+and imported non-existent sibling modules. The HARNESS
+preservation rule didn't reach the dispatched fix-intent
+text (the LLM didn't append the preservation footer). Two
+new HIGH follow-ups in the carryover bullets list.
+
 ### TR_029 — Planner+evaluator prior-phase path rules (HARNESS only)
 
 Two `phaseScopingRules` items and one `phase-evaluator-agent`
@@ -383,6 +414,47 @@ archive for the full diffs.
 
 ### Active follow-ups (carryover or NEW)
 
+- **(HIGH — NEW from TR_031)** Move the preservation
+  requirement from the HARNESS `self-healing-agent.rules`
+  bullet into the `fixIntent` JSON-schema description in
+  `buildDiagnosisPrompt`. The HARNESS rule was added in
+  TR_031 but the diagnostician LLM didn't honour it in
+  two consecutive fix-intent dispatches — neither ended
+  with the preservation footer. Schema-string guidance
+  reliably influences output; HARNESS bullets are advisory.
+- **(HIGH — NEW from TR_031)** Pass `--read PLAN.md` and
+  `--read <every-scope-cited-path>` to Aider's CLI
+  invocation. Forcing a file into Aider's context window
+  is dramatically stronger than a prose "please read this
+  first" instruction. TR_030's read-before-generate
+  instruction is in the prompt; TR_031's PLAN.md "What
+  has been built" is on disk; Aider still hallucinates
+  symbol names.
+- **(MEDIUM — NEW from TR_031)** Stale-file pollution on
+  trackeros main. When a feature is blocked, files from
+  deployed phases stay on main. The next cycle's Aider
+  reads them as ground truth and tries to compose around
+  them, introducing new conflicts. Options: (a) a
+  `gestalt feature reset` command that un-merges deployed
+  phases; (b) PLAN.md tracks "files owned by this feature"
+  and a cleanup-on-block step git-rms them.
+- **(MEDIUM — NEW from TR_031)** Phase-evaluator-agent
+  hallucinated `verdict: escalate` with `toolCallCount: 0`
+  on the first verification cycle. The `callLLMWithTools`
+  loop should reject responses where the agent's JSON
+  claims tool-derived evidence ("confirmed by git diff")
+  but the model didn't invoke any tools.
+- **(MEDIUM — NEW from TR_030/TR_031)** Aider doesn't
+  reliably parse negated assertions. Fix-intent text said
+  "X does not exist" — Aider created X. The diagnostician's
+  prompt should be framed as POSITIVE assertions ("Use
+  `LeaveRepository` which exists at `src/modules/leave/
+  leave.repository.ts`") rather than negations.
+- **(LOW — NEW from TR_031)** Phase-branch is deleted on
+  squash-merge before phase-evaluator runs against it.
+  `git diff origin/<default>...origin/<phaseBranch>`
+  returns empty when the branch is gone. Pass the merge
+  SHA in `branchContext` instead.
 - **(HIGH — NEW from TR_029)** Aider code-agent prompt must
   mandate `readFile()` on every path mentioned in the phase
   scope BEFORE generating any code. TR_029 verified the

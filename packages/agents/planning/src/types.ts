@@ -96,4 +96,15 @@ export interface PhaseEvaluation {
     updatedDependencies?: string[];
     reason: string;
   }>;
+  /**
+   * Files that the evaluated phase actually wrote, with their key
+   * exports. Sourced from the agent's git diff + readFile pass —
+   * NOT from Aider stdout (ADR-050). Rendered into PLAN.md's
+   * "What has been built" section so future phases (and Aider on
+   * future Aider runs) can see what concretely exists on disk.
+   */
+  builtFiles?: Array<{
+    path: string;
+    exports?: string[];
+  }>;
 }

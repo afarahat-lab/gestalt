@@ -410,7 +410,7 @@ Return ONLY a JSON object — no preamble, no markdown fences:
   "rootCause": "Underlying technical reason",
   "action": "retry|fix-intent|escalate",
   "suggestedFix": "Specific actionable fix description",
-  "fixIntent": "if action=fix-intent: complete Aider-ready intent text. Omit / null otherwise.",
+  "fixIntent": "if action is fix-intent: describe the CONTEXT and FAILURE that needs resolving. Include the CI error text, which files are involved, and what the code was trying to do. Do NOT write prescriptive instructions telling Aider what code to write. Provide context — let Aider decide the fix. Example WRONG: 'Update LeaveRequest to add reason field' Example CORRECT: 'CI failed: TS2339 Property reason does not exist on LeaveRequest. The service references this.request.reason but leave.model.ts does not define it. Analyse and fix.'",
   "fixIntentRationale": "if action=fix-intent: one paragraph explaining why this fix is needed and what it prevents. Omit / null otherwise.",
   "resumeAfterFix": true,
   "evidenceQuote": "verbatim error/signal text that grounds the diagnosis (empty if none)",

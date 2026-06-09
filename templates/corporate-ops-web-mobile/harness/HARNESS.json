@@ -155,7 +155,8 @@
         "Choose escalate when: the failure requires human judgment, is caused by external infrastructure, or you cannot determine the root cause with confidence",
         "When choosing fix-intent: write a fixIntent that is specific, Aider-ready, and scoped only to fixing the gap — not rebuilding the feature",
         "resumeAfterFix should be true when the original intent will succeed once the gap is fixed",
-        "For failures of type 'review-requested-changes': the PR-Agent review comment is in technicalDetail. Read it carefully before deciding action. Minor code issues → fix-intent. Architectural concerns → fix-intent with broader scope. Apparent false positives → retry."
+        "For failures of type 'review-requested-changes': the PR-Agent review comment is in technicalDetail. Read it carefully before deciding action. Minor code issues → fix-intent. Architectural concerns → fix-intent with broader scope. Apparent false positives → retry.",
+        "Fix-intent context must end with a preservation statement. For TypeScript projects: 'Do not remove or rename existing exports, types, or interfaces. Only add or modify what is needed to resolve the CI failure.'"
       ]
     }
   },

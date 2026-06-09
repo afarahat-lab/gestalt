@@ -666,9 +666,13 @@ async function handlePlanningEvaluate(
         summary: `${evaluation.adjustments.length} adjustment(s) applied to remaining phases`,
         detail: { adjustments: evaluation.adjustments },
       });
-      // Re-emit PLAN.md to reflect the adjustments.
-      await rewritePlanMd(workDir, feature, repo, project.defaultBranch);
     }
+
+    // Always re-emit PLAN.md after a phase deploys so the
+    // "What has been built" section reflects what's on disk —
+    // even when no scope adjustments were issued. TR_031 — the
+    // next phase's Aider reads PLAN.md to know what exists.
+    await rewritePlanMd(workDir, feature, repo, project.defaultBranch);
 
     // Bump current phase + dispatch next, OR mark feature completed.
     const nextIndex = phase.phaseIndex + 1;
@@ -772,7 +776,10 @@ async function rewritePlanMd(
   lines.push('## Phases');
   lines.push('');
   for (const p of phases) {
-    const result = p.result as { pendingScopeAdjustment?: { updatedScope?: string; reason?: string } } | null;
+    const result = p.result as {
+      pendingScopeAdjustment?: { updatedScope?: string; reason?: string };
+      builtFiles?: Array<{ path: string; exports?: string[] }>;
+    } | null;
     const adj = result?.pendingScopeAdjustment;
     lines.push(`### Phase ${p.phaseIndex + 1}: ${p.title} [${p.status}]`);
     if (adj?.reason) {
@@ -781,6 +788,19 @@ async function rewritePlanMd(
     lines.push('');
     lines.push(adj?.updatedScope ?? p.scope);
     lines.push('');
+    if (p.status === 'deployed' && Array.isArray(result?.builtFiles) && result.builtFiles.length > 0) {
+      lines.push('**What has been built:**');
+      for (const f of result.builtFiles) {
+        const path = (f.path ?? '').trim();
+        if (!path) continue;
+        if (Array.isArray(f.exports) && f.exports.length > 0) {
+          lines.push(`- \`${path}\` — ${f.exports.map((e) => `\`${e}\``).join(', ')}`);
+        } else {
+          lines.push(`- \`${path}\``);
+        }
+      }
+      lines.push('');
+    }
   }
   await writeFile(join(workDir, 'PLAN.md'), lines.join('\n'), 'utf8');
   await commitAndPush(repo, branch, `chore(planning): adjust PLAN.md after phase evaluation [gestalt-planning]`);
