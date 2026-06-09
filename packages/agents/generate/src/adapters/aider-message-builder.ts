@@ -7,6 +7,15 @@
  * whole point of using it. We provide the "what" and "why"; Aider
  * provides the "how".
  *
+ * TR_032 — the prose "Read PLAN.md first" and "Before generating any
+ * code, read every file you import from" sections were removed.
+ * Across TR_029 / TR_030 / TR_031 Aider repeatedly ignored those
+ * instructions and hallucinated against deployed phase artifacts.
+ * The `runAider` adapter now passes those files via the `--read`
+ * flag, which forces Aider to PROCESS them — not a polite request.
+ * This builder returns the list of paths to inject alongside the
+ * message; the caller wires them into the Aider invocation.
+ *
  * This is the opposite contract from the Gestalt-native code-agent
  * (which receives a fully spec'd JSON-output prompt with file paths
  * + expected schema). Aider operates on prose tasks and writes
@@ -18,40 +27,54 @@ import type { ContextSnapshot, IntentSpec } from '../types';
 const MAX_ARCHITECTURE_BYTES = 2000;
 const MAX_DESIGN_BYTES = 2000;
 
+/**
+ * TR_032 — matches any token that looks like a relative project
+ * path with a known source / config extension. Used to pull cited
+ * files out of the intent's raw text (the planner emits them
+ * verbatim per the TR_029 phaseScopingRules) so they can be
+ * forwarded to Aider as `--read` flags.
+ *
+ * Extensions are deliberately broad — we catch TypeScript /
+ * JavaScript / JSON / YAML / Markdown / Python / SQL. The `existsSync`
+ * filter in `runAider` drops any path that isn't actually present
+ * in the work-dir, so over-extraction is harmless.
+ */
+const FILE_PATH_RE =
+  /(?<![\w/])([a-zA-Z0-9_\-./]+\.(?:ts|tsx|js|jsx|json|md|yaml|yml|py|sql))(?![\w/])/g;
+
+/**
+ * Result of building an Aider message — TR_032 splits the previous
+ * single-string return into the message body plus the file list to
+ * pass to `runAider` via `--read`.
+ */
+export interface AiderMessage {
+  message: string;
+  /**
+   * Paths (relative to the project root) the caller should pass to
+   * `runAider`'s `readFiles` parameter. PLAN.md is always present.
+   * The `runAider` adapter is responsible for filtering this list
+   * against `existsSync` before invoking Aider — over-inclusion here
+   * is intentional.
+   */
+  readFiles: string[];
+}
+
 export function buildAiderMessage(
   intentSpec: IntentSpec,
   designSpec: string | null,
   snapshot: ContextSnapshot,
-): string {
+): AiderMessage {
   const codeAgentRules =
     snapshot.harness.agentConfig?.['code-agent']?.rules ?? [];
   const architecture = snapshot.architectureMd ?? '';
 
+  // TR_032 — PLAN.md is always cited; scope-mentioned paths are
+  // appended. The adapter's existsSync filter handles the case
+  // where PLAN.md doesn't exist yet (Phase 1 of a feature).
+  const scopePaths = extractMentionedPaths(intentSpec.rawIntent ?? '');
+  const readFiles = dedupe(['PLAN.md', ...scopePaths]);
+
   const sections: string[] = ['## Task', intentSpec.rawIntent];
-
-  sections.push('');
-  sections.push('## Read PLAN.md first');
-  sections.push(
-    'PLAN.md at the repository root is the source of truth for what\n' +
-      'has been built in prior phases of this feature. Each completed\n' +
-      'phase has a "What has been built" subsection listing the exact\n' +
-      'files created and the key exports (types, classes, functions)\n' +
-      'they provide.\n\n' +
-      'Read PLAN.md BEFORE you generate any code. Use the "What has\n' +
-      'been built" sections to know which files exist on disk, which\n' +
-      'exports are available, and which field names and signatures\n' +
-      'to use. Do not invent exports — only reference what PLAN.md\n' +
-      'says was built.',
-  );
-
-  sections.push('');
-  sections.push('## Before generating any code');
-  sections.push(
-    'Read every existing file in the repository that your generated\n' +
-      'code will import from or extend. Confirm the exact field names,\n' +
-      'exported types, and function signatures before referencing them.\n' +
-      "Do not assume a type's shape — read its definition.",
-  );
 
   if (intentSpec.successCriteria && intentSpec.successCriteria.length > 0) {
     sections.push('');
@@ -95,5 +118,46 @@ export function buildAiderMessage(
       'Use your repository map to verify a file exists before importing it.',
   );
 
-  return sections.join('\n').trim();
+  return {
+    message: sections.join('\n').trim(),
+    readFiles,
+  };
+}
+
+/**
+ * TR_032 — extract file paths from prose. The planner emits scope
+ * text like *"This phase depends on src/modules/leave/leave.model.ts
+ * and leave.repository.ts"* per the TR_029 rules; this regex pulls
+ * them out so `runAider` can `--read` them.
+ *
+ * Filters out absolute paths and URL-looking tokens; everything
+ * else is forwarded for existsSync-based filtering downstream.
+ * Order-preserving, deduplicated.
+ */
+export function extractMentionedPaths(text: string): string[] {
+  if (!text) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const match of text.matchAll(FILE_PATH_RE)) {
+    let path = match[1];
+    if (!path) continue;
+    if (path.includes('://')) continue;       // skip URLs
+    if (path.startsWith('/')) continue;       // skip absolute paths
+    if (path.startsWith('./')) path = path.slice(2);
+    if (seen.has(path)) continue;
+    seen.add(path);
+    out.push(path);
+  }
+  return out;
+}
+
+function dedupe(items: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of items) {
+    if (seen.has(item)) continue;
+    seen.add(item);
+    out.push(item);
+  }
+  return out;
 }

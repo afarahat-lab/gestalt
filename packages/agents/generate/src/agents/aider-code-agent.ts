@@ -61,7 +61,16 @@ export class AiderCodeAgent extends BaseLLMAgent {
     // section) so Aider still runs.
     const designSpec = await loadLatestDesignSpec(correlationId);
 
-    const message = buildAiderMessage(intentSpec, designSpec, task.contextSnapshot);
+    // TR_032 — buildAiderMessage now returns both the message body
+    // and the list of files to inject into Aider's context window
+    // via the `--read` flag. The adapter filters readFiles against
+    // existsSync, so over-inclusion (e.g. PLAN.md before Phase 1
+    // creates it) is silently dropped rather than failing the run.
+    const { message, readFiles } = buildAiderMessage(
+      intentSpec,
+      designSpec,
+      task.contextSnapshot,
+    );
     this.lastPrompt = message;
 
     log.info(
@@ -70,6 +79,7 @@ export class AiderCodeAgent extends BaseLLMAgent {
         model: modelString,
         projectRoot,
         messageBytes: message.length,
+        readFiles,
       },
       'Running Aider code generation',
     );
@@ -80,6 +90,8 @@ export class AiderCodeAgent extends BaseLLMAgent {
       modelString,
       apiKey,
       baseUrl,
+      undefined,
+      readFiles,
     );
 
     // Aider's stdout becomes the row's `llm_response` — the dashboard

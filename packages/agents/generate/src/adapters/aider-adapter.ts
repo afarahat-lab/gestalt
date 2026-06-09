@@ -30,6 +30,8 @@
  * truth from git, not from Aider's narrative.
  */
 
+import { existsSync } from 'fs';
+import { join } from 'path';
 import { executeScript } from '@gestalt/core';
 
 export interface AiderResult {
@@ -58,6 +60,19 @@ export async function runAider(
   apiKey: string,
   baseUrl?: string,
   timeoutMs: number = DEFAULT_AIDER_TIMEOUT_MS,
+  /**
+   * TR_032 — files to force into Aider's context window via `--read`.
+   *
+   * `--read` is the only way to make Aider PROCESS a file before
+   * generating. Prose "please read PLAN.md" instructions in the
+   * message body were demonstrably ignored across TR_029 / TR_030 /
+   * TR_031. Each path is checked with `existsSync` against `workDir`
+   * before being added — passing a not-yet-created file would make
+   * Aider error out before it can write it.
+   *
+   * Pass an empty array (or omit) to skip the flag entirely.
+   */
+  readFiles?: string[],
 ): Promise<AiderResult> {
   // `--message` is shell-quoted with double-quotes. Escape any
   // embedded double-quote in the message so the boundary remains
@@ -69,11 +84,23 @@ export async function runAider(
     .replace(/\$/g, '\\$')
     .replace(/`/g, '\\`');
 
+  // TR_032 — `--read <path>` flag per file that exists in workDir.
+  // The flag is repeated; Aider concatenates them into a read-only
+  // file set the LLM sees as context before the message. Filtering
+  // by `existsSync` keeps the command valid when the planner cites
+  // a path that's about to be created in this phase.
+  const readFlags = (readFiles ?? [])
+    .filter((f) => f.length > 0 && existsSync(join(workDir, f)))
+    .map((f) => `--read "${f.replace(/"/g, '\\"')}"`)
+    .join(' ');
+
   // --yes-always — TR_026: never prompt for confirmation. Aider
   //                sometimes injects mid-session prompts ("Apply
   //                this change?") that hang on a TTY-less server.
   //                `--yes-always` is the stronger form of `--yes`.
   // --no-git     — pr-agent owns every git op (clone / commit / push).
+  // --read       — TR_032: force PLAN.md + cited dependency files
+  //                into Aider's context window. Skipped when empty.
   // --model      — model string forwarded from the platform LLM
   //                registry; uses the same routing as the rest of
   //                the code-agent path.
@@ -82,9 +109,12 @@ export async function runAider(
     'aider',
     '--yes-always',
     '--no-git',
+    readFlags,
     `--model "${modelString}"`,
     `--message "${escapedMessage}"`,
-  ].join(' ');
+  ]
+    .filter((part) => part.length > 0)
+    .join(' ');
 
   const result = await executeScript(command, workDir, timeoutMs, {
     OPENAI_API_KEY: apiKey,

@@ -11,7 +11,9 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-09 (after TR_030 + TR_031 — combat Aider DTO-drift via Aider-message-builder additions and PLAN.md "What has been built" + context-only fix-intent. TR_030 added two generic behavioural prose blocks to `aider-message-builder.ts` (read-existing-files-before-generating; architecture-context-is-reference-only). TR_031 added a `## Read PLAN.md first` block to the message-builder, extended `PhaseEvaluation` with a `builtFiles` field that the phase-evaluator-agent populates via git diff + readFile, and rewrote the `fixIntent` JSON-schema description in `self-healing-agent.ts` to require CONTEXT not PRESCRIPTION ("CI failed: TS error X. Files involved Y. Analyse and fix" — not "Update Z to add A"). Template 0.15.0 → 0.16.0. **What's verified end-to-end on trackeros**: (a) PLAN.md gets a `**What has been built:**` section under each deployed phase listing files + key exports — confirmed on the third verification cycle (clean trackeros main, feature `35fb580e`); (b) fix-intent dispatched text is now context-only on both fix-intents in the cycle — no prescriptive "Update X to add Y" framing; (c) self-healing routes to fix-intent immediately on first CI failure (vs 3-attempts cycle in TR_028/29/30); (d) TR_025 cascade-depth brake fires at depth 2. **What's NOT verified**: Aider STILL doesn't comply with read-before-generate consistently — Phase 2 service code hallucinated `ILeaveRepository` + imported non-existent sibling modules `../balance/`, `../employee/` despite PLAN.md's "What has been built" being on disk. The HARNESS preservation rule didn't reach the dispatched fix-intent text — the LLM didn't append the preservation footer despite the rule existing. Aider also inverted negation: fix-intent said "ILeaveRepository does not exist" → Aider created `ILeaveRepository`. Two new HIGH follow-ups: (1) move preservation requirement from HARNESS bullet into JSON-schema description; (2) use Aider's `--read <file>` flag to force PLAN.md + cited paths into context. Last full milestone test report at `docs/claude/TEST_REPORT_028.md`.)
+**Last updated:** 2026-06-09 (after TR_032 — three targeted Aider compliance fixes, all in `.ts` as platform mechanics (ADR-042 compliant). **Fix 1**: `runAider` accepts a new optional `readFiles?: string[]` parameter; `buildAiderMessage` returns `{ message, readFiles }` including PLAN.md plus paths extracted from the intent's scope text via a new `extractMentionedPaths` regex. The adapter renders each as a `--read "<path>"` flag (existsSync-filtered against `workDir`) — `--read` forces files into Aider's context window, replacing the prose "please read X" instructions TR_030/TR_031 demonstrated Aider ignores. The corresponding `## Read PLAN.md first` and `## Before generating any code` prose sections were removed from the message builder. **Fix 2**: the preservation sentence ("Preserve all existing exports, types, interfaces, and imports. Only add or modify what is needed to resolve the CI failure shown above.") is now hard-coded as the closing sentence of the `fixIntent` JSON-schema description in `self-healing-agent.ts` — promoted from a HARNESS bullet (which TR_031 showed the LLM honoured inconsistently). The HARNESS preservation rule was removed from the template. **Fix 3**: the same `fixIntent` description now requires BROKEN STATE framing (not MISSING STATE) with verbatim WRONG/CORRECT examples — addresses the TR_031 cycle-3 finding that Aider inverts negation ("X does not exist" → CREATES X). Template 0.16.0 → 0.17.0. **Build**: `pnpm -r build` clean across all 13 packages. **Live verification pending** — operator runs the brief's `gestalt feature submit "Build the leave management module..." --project trackeros` recipe.)
+
+**Earlier (TR_030 + TR_031)** — combat Aider DTO-drift via Aider-message-builder additions and PLAN.md "What has been built" + context-only fix-intent. TR_030 added two generic behavioural prose blocks to `aider-message-builder.ts` (read-existing-files-before-generating; architecture-context-is-reference-only). TR_031 added a `## Read PLAN.md first` block to the message-builder (later removed by TR_032 Fix 1), extended `PhaseEvaluation` with a `builtFiles` field that the phase-evaluator-agent populates via git diff + readFile, and rewrote the `fixIntent` JSON-schema description in `self-healing-agent.ts` to require CONTEXT not PRESCRIPTION ("CI failed: TS error X. Files involved Y. Analyse and fix" — not "Update Z to add A"). Template 0.15.0 → 0.16.0. **Verified end-to-end on trackeros**: (a) PLAN.md gets a `**What has been built:**` section under each deployed phase listing files + key exports — confirmed on the third verification cycle (clean trackeros main, feature `35fb580e`); (b) fix-intent dispatched text is now context-only on both fix-intents in the cycle — no prescriptive "Update X to add Y" framing; (c) self-healing routes to fix-intent immediately on first CI failure; (d) TR_025 cascade-depth brake fires at depth 2. **Not verified**: Aider still didn't comply with read-before-generate consistently — Phase 2 service code hallucinated `ILeaveRepository` + imported non-existent sibling modules `../balance/`, `../employee/` despite PLAN.md's "What has been built" being on disk. The HARNESS preservation rule didn't reach the dispatched fix-intent text. Aider also inverted negation: fix-intent said "ILeaveRepository does not exist" → Aider created `ILeaveRepository`. **All three findings became TR_032 fixes above.**
 
 **Earlier (TR_029) — added explicit "include prior-phase file paths in scope text" rules to `planner-agent.phaseScopingRules` + `phase-evaluator-agent.rules` to fix the TR_028 Aider DTO-drift blocker. Template 0.14.0 → 0.15.0. **Planner-side change verified end-to-end** — Phase 2's scope on the re-submitted leave-management feature explicitly cites `src/modules/leave/leave.model.ts` + `leave.repository.ts` by full path; Phase 1 correctly bundled model+repository (TR_023 rule honoured). Phase 1 deployed cleanly (PR #88, ~3m). **Aider-side gap surfaced**: even with the scope text explicitly saying "depends on src/modules/leave/leave.model.ts", Aider's Phase 2 service code hallucinated against the deployed Phase 1 files (`ILeaveRepository` vs `LeaveRepository`, `LeaveRequest.leaveType` vs `leaveTypeId`, imports of non-scheduled sibling modules `../balance/`, `../employee/`). 6 Aider runs across 3 phase attempts; self-healing chose pure `retry` every time (not fix-intent). Feature blocked at 1/4 phases. Two new HIGH follow-ups: (1) code-agent prompt must mandate readFile() on every cited path before generating; (2) architecture-agent's high-level module list is leaking into code-agent context and Aider imports from un-scheduled sibling modules.) Last full session report at `docs/claude/TEST_REPORT_028.md`; TR_028 is the prior milestone for end-to-end machinery.
 
@@ -884,6 +886,43 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_032 — Aider `--read` flag + preservation in schema + broken-state framing (template 0.17.0)
+
+Three targeted platform-mechanic fixes addressing the
+TR_028 → TR_031 Aider DTO-drift blocker. No new HARNESS
+rules, no new migrations.
+
+- **Fix 1** — `runAider` accepts `readFiles?: string[]`;
+  `buildAiderMessage` returns `{ message, readFiles }`
+  (PLAN.md + paths regex-extracted from the intent's scope
+  text). The adapter renders each as a `--read "<path>"`
+  flag, existsSync-filtered against `workDir`. Removed the
+  TR_030/TR_031 prose `## Read PLAN.md first` and
+  `## Before generating any code` sections — `--read`
+  enforces what they only asked.
+- **Fix 2** — preservation sentence ("Preserve all existing
+  exports, types, interfaces, and imports. Only add or
+  modify what is needed to resolve the CI failure shown
+  above.") hard-coded as the closing sentence of the
+  `fixIntent` JSON-schema description in
+  `self-healing-agent.ts`. HARNESS preservation rule
+  removed from the template.
+- **Fix 3** — `fixIntent` description now requires BROKEN
+  STATE framing (not MISSING STATE) with verbatim
+  WRONG/CORRECT examples. Addresses the TR_031 cycle-3
+  finding that Aider inverts negation.
+
+Template bumped 0.16.0 → 0.17.0. Build clean across all 13
+packages. Live verification pending — operator runs the
+brief's `gestalt feature submit` recipe on trackeros.
+
+**Operator action:** Existing projects can prune the now-
+redundant preservation rule from
+`HARNESS.json.agentConfig.self-healing-agent.rules` (it's
+in the platform schema now). The rule is harmless if left
+in — both fire. trackeros not auto-migrated; operator can
+clean up on next HARNESS edit.
+
 ### TR_030 + TR_031 — Aider-message-builder + PLAN.md "What has been built" + context-only fix-intent (template 0.16.0)
 
 Two consecutive briefs targeting Aider DTO drift. TR_030
@@ -1208,6 +1247,158 @@ Moved to [@docs/claude/ARCHITECTURE.md](./ARCHITECTURE.md#key-type-alignment-rul
 
 
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
+
+---
+### Session 2026-06-09 — Claude Code (TR_032: three targeted Aider compliance fixes — `--read` flag, preservation rule in .ts schema, fix-intent broken-state framing — built clean, awaiting live verification)
+
+Brief: three surgical fixes for the remaining TR_028 → TR_031
+Aider DTO-drift blocker. No new HARNESS rules added, no new
+migrations — all three fixes are platform mechanics in `.ts`
+(ADR-042 compliant).
+
+What changed:
+
+**Fix 1 — Aider `--read` flag (promotes the TR_031 follow-up)**
+
+- **`packages/agents/generate/src/adapters/aider-adapter.ts`** —
+  `runAider` accepts a new optional `readFiles?: string[]`
+  parameter. Each path is filtered with
+  `existsSync(join(workDir, path))` before being added (passing
+  a not-yet-created file would make Aider error out). Surviving
+  paths render as repeated `--read "<file>"` flags in the
+  command, sitting between `--no-git` and `--model`. Empty list
+  → flag omitted entirely (the argv filter drops empty parts).
+- **`packages/agents/generate/src/adapters/aider-message-builder.ts`** —
+  `buildAiderMessage` return type changed from `string` to
+  `{ message: string; readFiles: string[] }`. PLAN.md is always
+  in `readFiles`; additional paths come from a new
+  `extractMentionedPaths` regex that pulls file-path-shaped
+  tokens out of `intentSpec.rawIntent` (the planner emits paths
+  per the TR_029 phaseScopingRules — they're now read-injected,
+  not merely cited in prose). Removed the prior `## Read PLAN.md
+  first` and `## Before generating any code` prose sections —
+  the `--read` flag enforces what they only asked.
+- **`packages/agents/generate/src/agents/aider-code-agent.ts`** —
+  destructures `{ message, readFiles }` from `buildAiderMessage`,
+  passes `readFiles` to `runAider` as the new last param. Logs
+  `readFiles` on the "Running Aider code generation" line so
+  operators can see what was injected.
+
+**Fix 2 — Preservation requirement hard-coded in `.ts` schema**
+
+- **`packages/core/src/agents/self-healing-agent.ts`** — the
+  `fixIntent` field's description in the diagnostician's
+  response JSON schema now ends with: _"ALWAYS end the fixIntent
+  with this exact sentence: 'Preserve all existing exports,
+  types, interfaces, and imports. Only add or modify what is
+  needed to resolve the CI failure shown above.'"_ This is
+  platform mechanics — every Aider-targeted fix-intent must
+  preserve exports; there's no project-specific variant — so
+  it lives in the .ts schema not in HARNESS rules (ADR-042
+  split). TR_031 verification showed the HARNESS bullet was
+  inconsistently honoured by the LLM; schema-string guidance
+  reliably reaches the model.
+- **`templates/corporate-ops-web-mobile/harness/HARNESS.json`** —
+  removed the now-redundant preservation rule from
+  `agentConfig.self-healing-agent.rules`.
+
+**Fix 3 — Fix-intent framing: broken state, not missing state**
+
+- **`packages/core/src/agents/self-healing-agent.ts`** — same
+  `fixIntent` description gains a BROKEN STATE vs MISSING
+  STATE framing rule with verbatim WRONG/CORRECT examples:
+  > WRONG: "ILeaveRepository does not exist in the module"
+  > CORRECT: "The service imports ILeaveRepository but the
+  > repository file exports LeaveRepository (no I prefix).
+  > The import path is wrong."
+
+  Addresses the TR_031 cycle-3 finding that Aider inverts
+  negation — "X does not exist" → CREATES X. Reframing the
+  failure as a broken / wrong import or type rename gives Aider
+  a fixable shape instead of a missing-thing-to-create.
+
+- **`templates/corporate-ops-web-mobile/template.json`** —
+  version `0.16.0` → `0.17.0`.
+
+What's verified (build only):
+
+- ✅ `pnpm -r build` clean across all 13 packages.
+- ✅ TypeScript types match — `runAider` signature change picks
+  up the new optional param; `buildAiderMessage` callers
+  destructure correctly; no unused-binding errors.
+
+What's NOT verified yet (live cycle pending):
+
+- ❌ End-to-end multi-phase autonomous completion.
+- ❌ Aider compliance with `--read`-injected PLAN.md +
+  dependency files. The brief's verification recipe
+  (`gestalt feature submit "Build the leave management
+  module..." --project trackeros`) hasn't been run yet —
+  operator to execute.
+- ❌ Fix-intent preservation footer presence on each dispatch.
+- ❌ Fix-intent broken-state framing on each dispatch.
+
+Decisions made:
+
+- **`extractMentionedPaths` is a regex, not an AST.** The
+  planner's scope text is prose; a regex over file-path-shaped
+  tokens (`[a-z0-9_\-./]+\.(ts|tsx|js|jsx|json|md|yaml|yml|py|sql)`)
+  catches what we need. The `existsSync` filter in `runAider`
+  is the safety net for over-extraction.
+- **Removed the TR_030 + TR_031 prose `## Read PLAN.md first`
+  and `## Before generating any code` sections.** The `--read`
+  flag enforces what they could only ask. Keeping both would
+  duplicate the instruction at two strengths — the `--read`
+  flag is the strong form.
+- **Preservation requirement promoted to .ts schema (ADR-042
+  reinterpretation).** The split rule reads "platform mechanics
+  in .ts, project-tunable guidance in HARNESS/agents.yaml".
+  Preservation is a hard invariant of every Aider fix-intent
+  — no project-specific variant makes sense. Move to .ts.
+- **Did not modify trackeros HARNESS.json.** The redundant
+  preservation rule on trackeros is harmless (the .ts schema
+  rule fires too). Operator can prune it on next HARNESS edit.
+- **Did not run live verification.** The cycle takes ~15
+  minutes and needs the server up + a clean trackeros main.
+  Operator to run the brief's recipe.
+
+Pending follow-ups (NEW from TR_032):
+
+- (none yet — these will emerge from live verification)
+
+Carryover follow-ups (status updates):
+
+- **(ADDRESSED by TR_032 Fix 1 — pending live verification)**
+  TR_031 follow-up: Aider `--read <file>` for PLAN.md + cited
+  paths. Implemented; awaiting end-to-end confirmation.
+- **(ADDRESSED by TR_032 Fix 2 — pending live verification)**
+  TR_031 follow-up: preservation requirement in schema not
+  HARNESS bullet.
+- **(ADDRESSED by TR_032 Fix 3 — pending live verification)**
+  TR_031 finding: Aider inverts negated fixIntent text.
+- **(STILL OPEN — HIGH)** TR_029 follow-up: architecture-agent's
+  module-level description still feeds into Phase N code-agent
+  context. Aider may still import from sibling modules. Fix 1's
+  `--read` flag doesn't address this directly — that's a
+  separate prompt-scoping change.
+- **(STILL OPEN — HIGH)** TR_018/020: restore TR_010 mandatory
+  `executeScript tsc --noEmit` code-agent rule on trackeros's
+  HARNESS.json.
+- **(STILL OPEN — MEDIUM)** TR_031 follow-up: stale-file
+  pollution on trackeros main from failed prior cycles.
+- **(STILL OPEN — MEDIUM)** TR_014: Aider token-spend capture.
+
+Build status: `pnpm -r build` clean across all 13 packages.
+Server state unchanged. Docker image unchanged. Template
+auto-refreshes to `0.17.0` on next server boot.
+
+Files changed:
+- `packages/agents/generate/src/adapters/aider-adapter.ts`
+- `packages/agents/generate/src/adapters/aider-message-builder.ts`
+- `packages/agents/generate/src/agents/aider-code-agent.ts`
+- `packages/core/src/agents/self-healing-agent.ts`
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
+- `templates/corporate-ops-web-mobile/template.json`
 
 ---
 ### Session 2026-06-09 — Claude Code (TR_030 + TR_031: combat Aider DTO drift via Aider-message-builder additions and PLAN.md "What has been built" + context-only fix-intent — structural mechanisms verified, Aider compliance still partial)

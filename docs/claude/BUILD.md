@@ -54,6 +54,43 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_032 — Aider `--read` flag + preservation in schema + broken-state framing (template 0.17.0)
+
+Three targeted platform-mechanic fixes addressing the
+TR_028 → TR_031 Aider DTO-drift blocker. No new HARNESS
+rules, no new migrations.
+
+- **Fix 1** — `runAider` accepts `readFiles?: string[]`;
+  `buildAiderMessage` returns `{ message, readFiles }`
+  (PLAN.md + paths regex-extracted from the intent's scope
+  text). The adapter renders each as a `--read "<path>"`
+  flag, existsSync-filtered against `workDir`. Removed the
+  TR_030/TR_031 prose `## Read PLAN.md first` and
+  `## Before generating any code` sections — `--read`
+  enforces what they only asked.
+- **Fix 2** — preservation sentence ("Preserve all existing
+  exports, types, interfaces, and imports. Only add or
+  modify what is needed to resolve the CI failure shown
+  above.") hard-coded as the closing sentence of the
+  `fixIntent` JSON-schema description in
+  `self-healing-agent.ts`. HARNESS preservation rule
+  removed from the template.
+- **Fix 3** — `fixIntent` description now requires BROKEN
+  STATE framing (not MISSING STATE) with verbatim
+  WRONG/CORRECT examples. Addresses the TR_031 cycle-3
+  finding that Aider inverts negation.
+
+Template bumped 0.16.0 → 0.17.0. Build clean across all 13
+packages. Live verification pending — operator runs the
+brief's `gestalt feature submit` recipe on trackeros.
+
+**Operator action:** Existing projects can prune the now-
+redundant preservation rule from
+`HARNESS.json.agentConfig.self-healing-agent.rules` (it's
+in the platform schema now). The rule is harmless if left
+in — both fire. trackeros not auto-migrated; operator can
+clean up on next HARNESS edit.
+
 ### TR_030 + TR_031 — Aider-message-builder + PLAN.md "What has been built" + context-only fix-intent (template 0.16.0)
 
 Two consecutive briefs targeting Aider DTO drift. TR_030
