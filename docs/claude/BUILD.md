@@ -54,6 +54,73 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_045 — Third intent-agent rule: interface signatures are contracts (template 0.30.0, build clean, TR_044 6th-bar CLOSED)
+
+One abstract rule appended to
+`agentConfig.intent-agent.rules` in template + trackeros
+HARNESS. Closes TR_044's NEW HIGH finding (intent-agent
+escalating on TypeScript interface signatures with no method
+bodies as "stubs throwing 'Not implemented'"). No platform code
+change. No new migration.
+
+The rule (no TypeScript-specific language; applies to any
+contract pattern in any language):
+
+> "Interface method signatures in per-phase architecture
+> specifications are CONTRACTS to be implemented by the
+> code-agent during this phase. They are not stubs. An
+> interface showing method signatures without bodies is
+> correct and complete — do not flag missing method bodies as
+> ambiguity or missing implementation."
+
+Template `0.29.0 → 0.30.0`. `pnpm -r build` clean across all
+13 packages.
+
+**Live verification — TR_044 6th bar CLOSED:** trackeros feature
+`48aa490e-4142-442c-bab4-41c03e21e4b9` on `chat-latest`:
+- ✅ Intent-agent did NOT escalate on the
+  interface-signatures-as-stubs pattern. Phase 1 intent
+  `5910f943` transitioned cleanly from `pending` →
+  `generating` immediately on dispatch.
+- ✅ Plan tightened to 7 phases (vs TR_044's 10). Phase 2
+  bundles "Create AND cancel leave requests"; Phase 7
+  bundles "Employee integration, RBAC, balance consumption,
+  and compliance coverage".
+- ✅ Phase 1 per-phase architecture: **5 interfaces + 5
+  criteria** — richest across the TR_036 → TR_045 sequence.
+
+**Cycle still blocked on a 7th rigor bar:** intent-agent
+escalated on "The project context defines LeaveRequest
+lifecycle states as Pending, Approved, Rejected, while the
+phase architecture specifies repository model status values
+PENDING, APPROVED, REJECTED, and CANCELLED". Architecture-
+agent introduced `CANCELLED` to support Phase 2's cancel
+workflow but the documented project lifecycle (in
+ARCHITECTURE.md / GOLDEN_PRINCIPLES.md) only lists the three
+other states.
+
+**New HIGH follow-up for TR_046:**
+- (a) architecture-agent rule: "If a feature requires a
+  lifecycle state not in the project context, add the new
+  state to `architectureMdUpdate` so docs are updated in
+  lockstep"; OR
+- (b) intent-agent rule: "If a phase introduces a state
+  value implied by the feature scope (e.g. 'cancel' implies
+  a CANCELLED state), treat the new value as consistent with
+  the documented lifecycle"; OR
+- (c) architecture-agent regex post-processing that
+  normalises lifecycle state names against the documented
+  set.
+
+**Operator action — trackeros:** none beyond the
+already-pushed `b49b65c8 chore(TR_045): intent-agent rule —
+interface signatures are contracts, not stubs`.
+
+**Operator action — other projects:** Append the third rule
+to existing projects'
+`HARNESS.json.agentConfig.intent-agent.rules`. Template
+auto-refreshes to `0.30.0` at next server boot.
+
 ### TR_044 — LLM-generated stack-substitution map (regex post-process for per-phase architecture) + goldenPrinciples injection into architecture-agent prompts (template 0.29.0, build clean, per-phase framework leak CLOSED end-to-end)
 
 Two fixes against TR_042's two HIGH NEW follow-ups — per-phase Vitest
