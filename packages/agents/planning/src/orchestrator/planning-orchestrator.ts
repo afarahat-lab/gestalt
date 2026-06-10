@@ -588,10 +588,27 @@ async function runPerPhaseArchitecture(
     const { features } = getRepositories();
     const priorPhases = (await features.listPhases(feature.id)).filter((p) => p.phaseIndex < phase.phaseIndex);
     const archMd = feature.architecture ?? '';
-    const pa = await new ArchitectureAgent().designPhase(
+    const architectureAgent = new ArchitectureAgent();
+    const draftPa = await architectureAgent.designPhase(
       feature, phase.title, phase.architecture ?? phase.scope,
       archMd, priorPhases, workDir, harnessConfig, correlationId,
     );
+
+    // STOPGAP (ADR-056): per-phase review pass. TR_041's verification
+    // surfaced that the FEATURE-level review (`reviewDesign`) cleaned
+    // framework leaks at the feature level but the per-phase pass
+    // still emitted Vitest references in success criteria. TR_042
+    // applies the same treatment here. When the LangGraph
+    // architecture-crew lands, delete this call + `reviewPhaseDesign`
+    // + `buildPhaseArchitectureReviewPrompt`.
+    childLog.info(
+      { featureId: feature.id, phaseId: phase.id, phaseIndex: phase.phaseIndex },
+      'Invoking architecture-agent reviewPhaseDesign (TR_042 stopgap)',
+    );
+    const pa = await architectureAgent.reviewPhaseDesign(
+      draftPa, phase, feature, workDir, harnessConfig, correlationId,
+    );
+
     const summary = JSON.stringify(pa);
     // TR_034 — persist the scoped PhaseArchitecture JSON onto
     // `feature_phases.architecture` so `aider-code-agent` can read it

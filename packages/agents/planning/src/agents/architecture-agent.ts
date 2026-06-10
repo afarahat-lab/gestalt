@@ -24,7 +24,7 @@ import {
 import type { HarnessConfig, FeatureRecord, FeaturePhaseRecord } from '@gestalt/core';
 import {
   buildFeatureArchitecturePrompt, buildPhaseArchitecturePrompt,
-  buildArchitectureReviewPrompt,
+  buildArchitectureReviewPrompt, buildPhaseArchitectureReviewPrompt,
 } from '../prompts/architecture-prompt';
 import type { FeatureArchitecture, PhaseArchitecture } from '../types';
 
@@ -164,6 +164,91 @@ export class ArchitectureAgent extends BaseLLMAgent {
     );
     const raw = await this.callLLM(prompt, agentCfg, correlationId);
     return parsePhaseArchitecture(raw, correlationId);
+  }
+
+  /**
+   * TR_042 — STOPGAP (ADR-056). Mirrors `reviewDesign` for the
+   * per-phase architecture. The feature-level review in TR_041
+   * cleaned the feature architecture but the per-phase pass kept
+   * leaking framework references; TR_042's verification of the
+   * per-phase pass surfaced both the framework drift and a
+   * scope-vs-architecture file-list mismatch. This review pass
+   * applies the SAME treatment that worked at the feature level:
+   * a stack-compliance block rendered FIRST in the prompt + a
+   * five-point review checklist.
+   *
+   * Returns the original draft on ANY failure path (loadAgentConfig
+   * throw, callLLM throw, parse-to-empty) so the pipeline is never
+   * blocked on a review-only error. Same safety semantics as
+   * `reviewDesign`.
+   *
+   * This single-agent self-review will be replaced by the
+   * LangGraph architecture crew per-phase reviewer in Phase 1 of
+   * the migration. Delete this method +
+   * `buildPhaseArchitectureReviewPrompt` + the orchestrator call
+   * site when the crew lands.
+   */
+  async reviewPhaseDesign(
+    draft: PhaseArchitecture,
+    phase: FeaturePhaseRecord,
+    feature: FeatureRecord,
+    projectRoot: string,
+    harnessConfig: HarnessConfig | null,
+    correlationId: string,
+  ): Promise<PhaseArchitecture> {
+    this.lastTokensUsed = 0;
+    this.setHarnessConfigForRun(harnessConfig);
+    let agentCfg;
+    try {
+      agentCfg = await loadAgentConfig(projectRoot, 'architecture-agent');
+    } catch (err) {
+      log.warn(
+        { err: err instanceof Error ? err.message : String(err), correlationId },
+        'architecture-agent reviewPhaseDesign could not load agent config — returning original draft',
+      );
+      return draft;
+    }
+    const prompt = this.addJsonResponseGuard(
+      buildPhaseArchitectureReviewPrompt(draft, phase, feature, agentCfg, harnessConfig),
+    );
+    let raw: string;
+    try {
+      raw = await this.callLLM(prompt, agentCfg, correlationId);
+    } catch (err) {
+      log.warn(
+        { err: err instanceof Error ? err.message : String(err), correlationId },
+        'architecture-agent reviewPhaseDesign LLM call failed — returning original draft',
+      );
+      return draft;
+    }
+    const reviewed = parsePhaseArchitecture(raw, correlationId);
+    // `parsePhaseArchitecture` never throws — it returns an
+    // empty-fields fallback object on JSON-parse failure. Detect
+    // that case explicitly and return the original draft instead
+    // of an empty review (the empty-fallback would discard the
+    // legitimate work the design pass just produced).
+    if (reviewed.interfaces.length === 0 && reviewed.successCriteria.length === 0) {
+      log.warn(
+        { correlationId, phaseId: phase.id },
+        'architecture-agent reviewPhaseDesign parsed to empty — returning original draft',
+      );
+      return draft;
+    }
+    log.info(
+      {
+        correlationId,
+        phaseId: phase.id,
+        phaseIndex: phase.phaseIndex,
+        beforeInterfaces: draft.interfaces.length,
+        afterInterfaces: reviewed.interfaces.length,
+        beforeImports: draft.importStatements.length,
+        afterImports: reviewed.importStatements.length,
+        beforeCriteria: draft.successCriteria.length,
+        afterCriteria: reviewed.successCriteria.length,
+      },
+      'architecture-agent reviewPhaseDesign complete',
+    );
+    return reviewed;
   }
 }
 

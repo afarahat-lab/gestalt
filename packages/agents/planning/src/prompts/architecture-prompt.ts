@@ -15,7 +15,7 @@
 
 import type { AgentConfig, HarnessConfig, FeatureRecord, FeaturePhaseRecord } from '@gestalt/core';
 import { renderHarnessAgentRules } from '@gestalt/core';
-import type { FeatureArchitecture } from '../types';
+import type { FeatureArchitecture, PhaseArchitecture } from '../types';
 
 /**
  * TR_038 — Render the project's declared stack from
@@ -311,6 +311,124 @@ export function buildArchitectureReviewPrompt(
     '    { "title": "...", "rationale": "...", "estimatedFiles": 3 }',
     '  ],',
     '  "architectureMdUpdate": "markdown to append to ARCHITECTURE.md"',
+    '}',
+    '```',
+  ].filter(Boolean).join('\n');
+}
+
+/**
+ * TR_042 — Per-phase architecture review prompt. Mirrors
+ * `buildArchitectureReviewPrompt` for the FEATURE-level draft, but
+ * operates on the per-phase `PhaseArchitecture` shape (interfaces /
+ * importStatements / sqlSchema / successCriteria). Same positioning
+ * principles as TR_041's `buildArchitectureReviewPrompt`:
+ *
+ *   1. Stack compliance check rendered FIRST (TR_041 verified that
+ *      this is the only prompt position that overrides chat-latest's
+ *      framework bias — feature-level cycle came back framework-free
+ *      after the move; per-phase still leaked because designPhase
+ *      had no review pass).
+ *   2. Review checklist with explicit stack + file-list + interface +
+ *      import + success-criteria items.
+ *   3. Same "REWRITE the relevant field" language — no hedging.
+ *
+ * STOPGAP (ADR-056): this single-agent self-review is a lightweight
+ * stand-in for the LangGraph architecture-crew per-phase reviewer.
+ * Delete `buildPhaseArchitectureReviewPrompt` +
+ * `ArchitectureAgent.reviewPhaseDesign()` + the orchestrator call
+ * site when Phase 1 of the migration lands.
+ *
+ * The output schema mirrors the original `PhaseArchitecture` shape
+ * so the existing `parsePhaseArchitecture` parses the review result.
+ * On parse failure the caller returns the original draft unchanged.
+ */
+export function buildPhaseArchitectureReviewPrompt(
+  draft: PhaseArchitecture,
+  phase: FeaturePhaseRecord,
+  feature: FeatureRecord,
+  agentCfg: AgentConfig,
+  harnessConfig: HarnessConfig | null,
+): string {
+  const harnessSection = renderHarnessAgentRules('architecture-agent', harnessConfig);
+  const stackSection = renderStackSection(harnessConfig);
+  const draftJson = JSON.stringify(draft, null, 2).slice(0, 2000);
+
+  // TR_042 — Stack compliance check rendered FIRST. TR_041 verified
+  // that any other prompt position lets chat-latest's framework
+  // bias bleed through into the per-phase success criteria.
+  const stack = harnessConfig?.stack;
+  const stackComplianceCheck =
+    stack && Object.keys(stack).length > 0
+      ? [
+          '## MANDATORY: Stack compliance check (read this first)',
+          '',
+          'The following stack is declared for this project. It is',
+          'the authoritative source for every framework, library,',
+          'and tool choice in the per-phase design you are about to',
+          'review. You MUST treat any deviation in the draft below',
+          'as a defect that you correct before returning. Do not',
+          'hedge with "or" alternatives ("Jest or Vitest tests …").',
+          '',
+          '```json',
+          JSON.stringify(stack, null, 2),
+          '```',
+          '',
+          'Before returning:',
+          '- Verify every framework reference in the success criteria,',
+          '  interface signatures, and import statements matches the',
+          '  declared stack.',
+          '- If you find any mismatch, REWRITE the relevant field with',
+          '  the declared stack value. Do not preserve the original.',
+          '',
+        ].join('\n')
+      : '';
+
+  return [
+    stackComplianceCheck,
+    `You are ${agentCfg.role} reviewing a per-phase design.`,
+    `Goal: ${agentCfg.goal}.`,
+    '',
+    harnessSection,
+    stackSection,
+    '## Phase being reviewed',
+    `Feature: ${feature.title}`,
+    `Phase ${phase.phaseIndex + 1}: ${phase.title}`,
+    '',
+    '## Phase scope (from planner-agent — the authoritative file list lives in the architecture below, not in the planner scope)',
+    phase.scope,
+    '',
+    '## Draft per-phase architecture to review',
+    '```json',
+    draftJson,
+    '```',
+    '',
+    '## Review checklist',
+    'Review the draft for:',
+    '1. Stack compliance — no framework references outside the declared stack (no Vitest if the stack says Jest, no Express if the stack says Fastify, etc).',
+    '2. File list completeness — every file the phase must create is named under `interfaces` (with `File: <path>\\n<contents>` framing) and referenced by `importStatements` and `successCriteria` consistently.',
+    '3. Interface completeness — every interface has exact method signatures, no `// TODO` or `...` ellipses.',
+    '4. Import accuracy — every entry in `importStatements` references a file that already exists OR is being created in this phase. No reference to a future phase\'s files.',
+    '5. Success-criteria accuracy — every criterion uses the declared stack, names real file paths, and is independently verifiable.',
+    '',
+    'If the draft passes all five checks, return it unchanged.',
+    'If any check fails, fix the issue and return the corrected version.',
+    'Return the COMPLETE PhaseArchitecture JSON — not just the changes.',
+    '',
+    'Return ONLY a single JSON object — no preamble, no markdown fences — in the same schema as the input:',
+    '',
+    '```json',
+    '{',
+    '  "interfaces": [',
+    '    "File: src/modules/<name>/<name>.model.ts\\nexport interface ...",',
+    '    "File: src/modules/<name>/<name>.repository.ts\\nimport { ... } from \\"./...\\";\\nexport interface ..."',
+    '  ],',
+    '  "importStatements": [',
+    '    "import { ... } from \\"./<name>.model\\""',
+    '  ],',
+    '  "sqlSchema": "CREATE TABLE ... (optional — omit when the phase has no SQL changes)",',
+    '  "successCriteria": [',
+    '    "src/modules/<name>/<name>.model.ts exists and exports ..."',
+    '  ]',
     '}',
     '```',
   ].filter(Boolean).join('\n');

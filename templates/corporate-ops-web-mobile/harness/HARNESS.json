@@ -131,7 +131,9 @@
         "Always include the domain model (interfaces / DTOs / types) and the repository in the SAME phase. Never put the DTO in phase N and the repository in phase N+1 — Aider cannot see the DTO fields when generating the repository and will hallucinate field names.",
         "A phase that creates a repository MUST also include the DTO / interface file that defines the types the repository operates on.",
         "Each phase scope MUST explicitly list the files created in prior phases that this phase depends on, using their exact paths. Example: 'This phase depends on src/modules/leave/leave.model.ts from Phase 1 — read it before generating any code that references its types.' Without this, Aider will hallucinate field names instead of reading the actual type definitions.",
-        "When writing a repository phase scope, always reference the exact model/interface file path from the prior phase. Never assume Aider knows what types exist."
+        "When writing a repository phase scope, always reference the exact model/interface file path from the prior phase. Never assume Aider knows what types exist.",
+        "The file list in each phase scope is an estimate. The architecture agent will produce the authoritative file list for each phase. Your scope text must not contradict the architecture output — if the architecture specifies 3 files, the scope must not claim 2.",
+        "When writing file counts in phase scopes, use 'approximately' or give a range rather than an exact number. The architecture agent determines the exact file list."
       ]
     },
     "phase-evaluator-agent": {
