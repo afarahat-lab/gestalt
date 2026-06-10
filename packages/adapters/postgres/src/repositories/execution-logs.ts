@@ -9,6 +9,7 @@
 
 import type {
   AgentExecutionLogRepository, AgentExecutionLogRecord, ToolCallLogEntry,
+  TokenManagementLogRecord,
 } from '@gestalt/core';
 import { getDb } from '../client';
 import { parseJsonb } from '../utils';
@@ -30,6 +31,7 @@ interface LogRow {
   // both. Migration 012 added the column with `DEFAULT '[]'::jsonb`
   // so pre-migration rows + non-LLM agents come back as `[]`.
   toolCalls: unknown;
+  tokenManagement: unknown;
   createdAt: Date;
 }
 
@@ -49,6 +51,7 @@ function rowToRecord(row: LogRow): AgentExecutionLogRecord {
     errorMessage: row.errorMessage,
     modelUsed: row.modelUsed,
     toolCalls: parseJsonb<ToolCallLogEntry[]>(row.toolCalls, []),
+    tokenManagement: parseJsonb<TokenManagementLogRecord | null>(row.tokenManagement, null),
     createdAt: row.createdAt,
   };
 }
@@ -81,7 +84,7 @@ export class PostgresAgentExecutionLogRepository implements AgentExecutionLogRep
         execution_id, correlation_id, agent_role,
         prompt, llm_response, result_status,
         artifact_paths, signal_types, error_message,
-        model_used, tool_calls
+        model_used, tool_calls, token_management
       ) VALUES (
         ${log.executionId},
         ${log.correlationId},
@@ -93,7 +96,10 @@ export class PostgresAgentExecutionLogRepository implements AgentExecutionLogRep
         ${log.signalTypes},
         ${log.errorMessage},
         ${log.modelUsed},
-        ${db.json((log.toolCalls ?? []) as unknown as Parameters<typeof db.json>[0])}
+        ${db.json((log.toolCalls ?? []) as unknown as Parameters<typeof db.json>[0])},
+        ${log.tokenManagement
+          ? db.json(log.tokenManagement as unknown as Parameters<typeof db.json>[0])
+          : null}
       )
       RETURNING *
     `;

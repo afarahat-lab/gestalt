@@ -111,7 +111,7 @@ export class PostgresFeatureRepository implements FeatureRepository {
   // ── feature_phases ──────────────────────────────────────────────
 
   async createPhase(
-    phase: Omit<FeaturePhaseRecord, 'createdAt' | 'updatedAt' | 'status' | 'intentId' | 'result' | 'retryCount'>,
+    phase: Omit<FeaturePhaseRecord, 'createdAt' | 'updatedAt' | 'status' | 'intentId' | 'result' | 'retryCount' | 'mergeCommitSha'>,
   ): Promise<FeaturePhaseRecord> {
     const db = getDb();
     const [row] = await db<FeaturePhaseRecord[]>`
@@ -179,6 +179,18 @@ export class PostgresFeatureRepository implements FeatureRepository {
     const [row] = await db<FeaturePhaseRecord[]>`
       UPDATE feature_phases
       SET architecture = ${architecture}, updated_at = NOW()
+      WHERE id = ${phaseId}
+      RETURNING *
+    `;
+    if (!row) throw new Error(`Feature phase ${phaseId} not found`);
+    return this.hydratePhase(row);
+  }
+
+  async updatePhaseMergeCommit(phaseId: string, mergeCommitSha: string): Promise<FeaturePhaseRecord> {
+    const db = getDb();
+    const [row] = await db<FeaturePhaseRecord[]>`
+      UPDATE feature_phases
+      SET merge_commit_sha = ${mergeCommitSha}, updated_at = NOW()
       WHERE id = ${phaseId}
       RETURNING *
     `;
@@ -261,6 +273,9 @@ export class PostgresFeatureRepository implements FeatureRepository {
       result: parseJsonb<unknown>(row.result, null),
       // TR_022 — column DEFAULT 0; defensive for legacy rows / drivers.
       retryCount: typeof row.retryCount === 'number' ? row.retryCount : 0,
+      // TR_035 / ADR-057 (Part B2) — null on legacy rows + on
+      // NoOpPipelineAdapter rows that never call updatePhaseMergeCommit.
+      mergeCommitSha: typeof row.mergeCommitSha === 'string' ? row.mergeCommitSha : null,
     };
   }
 

@@ -862,6 +862,9 @@ async function drivePlan(
               : null,
             modelUsed: agentInstance?.lastModelUsed ?? null,
             toolCalls: agentInstance?.lastToolCallLog ?? [],
+            // TR_035 / ADR-057 — per-call token-management telemetry
+            // from BaseLLMAgent's five-layer pipeline (migration 029).
+            tokenManagement: agentInstance?.lastTokenManagement ?? null,
           }).catch((err) => {
             childLog.warn({ err, executionId, agentRole }, 'executionLogs.save failed');
           });
@@ -984,6 +987,7 @@ async function drivePlan(
             // before any LLM call.
             modelUsed: agentInstance?.lastModelUsed ?? null,
             toolCalls: agentInstance?.lastToolCallLog ?? [],
+            tokenManagement: agentInstance?.lastTokenManagement ?? null,
           }).catch(() => undefined);
           emitLiveEvent('agent.completed', plan.correlationId, {
             executionId,

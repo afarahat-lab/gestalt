@@ -161,16 +161,24 @@ export class ReviewAgent extends BaseLLMAgent {
     // section so they take precedence in the LLM's reading order.
     const fullHarness = await loadFullHarness(task.harnessConfig.projectRoot);
 
-    const prompt = buildReviewPrompt(
-      codeArtifacts,
-      task.harnessConfig.goldenPrinciples,
-      projectRules,
-      agentConfig,
-      isScaffolding,
-      task.harnessConfig.stack?.testFramework,
-      intentSpecOutOfScope,
-      projectStateFiles,
-      fullHarness,
+    // TR_035 / ADR-057 — Layer 3 + 5 read knobs from harnessConfig.
+    // `loadFullHarness` returns a narrowed-type partial; the JSON it
+    // parses still includes `tokenManagement` when present, so the
+    // cast is safe at runtime.
+    this.setHarnessConfigForRun(fullHarness as Parameters<typeof this.setHarnessConfigForRun>[0]);
+
+    const prompt = this.addJsonResponseGuard(
+      buildReviewPrompt(
+        codeArtifacts,
+        task.harnessConfig.goldenPrinciples,
+        projectRules,
+        agentConfig,
+        isScaffolding,
+        task.harnessConfig.stack?.testFramework,
+        intentSpecOutOfScope,
+        projectStateFiles,
+        fullHarness,
+      ),
     );
 
     let review: LLMReview;

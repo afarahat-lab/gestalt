@@ -42,9 +42,13 @@ export class PlannerAgent extends BaseLLMAgent {
     correlationId: string,
   ): Promise<FeaturePlan> {
     this.lastTokensUsed = 0;
+    // TR_035 / ADR-057 — Layer 3 + 5 read knobs from harnessConfig.
+    this.setHarnessConfigForRun(harnessConfig);
     const agentCfg = await loadAgentConfig(projectRoot, 'planner-agent');
-    const prompt = buildFeaturePlanPrompt(
-      feature, architecture, agentCfg, harnessConfig, bounds,
+    const prompt = this.addJsonResponseGuard(
+      buildFeaturePlanPrompt(
+        feature, architecture, agentCfg, harnessConfig, bounds,
+      ),
     );
     const raw = await this.callLLM(prompt, agentCfg, correlationId);
     const plan = parseFeaturePlan(raw, correlationId);

@@ -1,7 +1,7 @@
 {
   "id": "corporate-ops-web-mobile",
   "name": "Corporate Operations Web & Mobile",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "tier": "tier1",
   "description": "Harness for corporate operations web and mobile applications",
   "variables": {

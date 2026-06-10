@@ -293,6 +293,31 @@ async function maybeAutoMerge(args: {
       commitTitle,
     });
 
+    // TR_035 / ADR-057 (Part B2) — when this intent belongs to a
+    // planner phase, persist the squash-merge SHA onto
+    // `feature_phases.merge_commit_sha` so the next planning-loop
+    // evaluation can enumerate built files via `git show
+    // --name-only --format= <sha>`. Best-effort: a failure here
+    // never blocks the merge.
+    if (mergeResult.sha) {
+      try {
+        const { features } = getRepositories();
+        const phase = await features.findPhaseByIntent(input.intentId);
+        if (phase) {
+          await features.updatePhaseMergeCommit(phase.id, mergeResult.sha);
+          log.debug(
+            { correlationId: input.correlationId, phaseId: phase.id, sha: mergeResult.sha },
+            'Persisted phase merge commit SHA',
+          );
+        }
+      } catch (err) {
+        log.warn(
+          { err, correlationId: input.correlationId, intentId: input.intentId },
+          'updatePhaseMergeCommit failed — phase-evaluator will fall back to git diff',
+        );
+      }
+    }
+
     await deploymentEvents.append({
       correlationId: input.correlationId,
       intentId: input.intentId,

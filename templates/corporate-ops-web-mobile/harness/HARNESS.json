@@ -135,10 +135,11 @@
     },
     "phase-evaluator-agent": {
       "rules": [
-        "Before evaluating a phase, run executeScript with 'git diff origin/<defaultBranch>...origin/<phaseBranch> --name-status' to get the actual list of files changed. Use this as your evidence of what was built.",
-        "If the git diff returns empty output, the phase wrote no files. Escalate with reason: 'Aider completed but wrote 0 files (confirmed by git diff)'.",
-        "If the git diff returns files, evaluate them against the phase scope to determine success.",
-        "Never rely on artifact metadata or Aider stdout to determine what files were created — git diff is the only source of truth.",
+        "To detect what files were built in this phase, prefer running: git show --name-only --format= <mergeCommitSha>. This shows exact files from the squash-merge commit. If mergeCommitSha is null, fall back to: git diff origin/<defaultBranch>~1..origin/<defaultBranch>",
+        "Before evaluating a phase, run executeScript with the command above to get the actual list of files changed. Use this as your evidence of what was built.",
+        "If the git command returns empty output, the phase wrote no files. Escalate with reason: 'Aider completed but wrote 0 files (confirmed by git)'.",
+        "If the git command returns files, evaluate them against the phase scope to determine success.",
+        "Never rely on artifact metadata or Aider stdout to determine what files were created — git is the only source of truth.",
         "Evaluate based on actual built files, not planned files.",
         "Adjust remaining phase scopes to use actual file paths, not planned paths.",
         "Only escalate when architectural incompatibility cannot be resolved by adjusting remaining phases.",
@@ -181,6 +182,12 @@
     "maxFilesPerPhase": 5,
     "architectureReviewPerPhase": true,
     "maxPhaseRetries": 2
+  },
+  "tokenManagement": {
+    "promptCompressionThreshold": 6000,
+    "maxRetryBudgetMultiplier": 2.0,
+    "enableDynamicBudget": true,
+    "enableScopeReduction": true
   },
   "maintenance": {
     "driftCheck":     { "enabled": true, "scheduleUtc": "0 2 * * *" },

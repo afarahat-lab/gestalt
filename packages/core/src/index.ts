@@ -117,7 +117,7 @@ export type {
   MaintenanceRunRecord, MaintenanceRunStatus, MaintenanceFinding,
   FindingAttemptRecord,
   AlertRecord, AlertType, AlertRequiredAction,
-  AgentExecutionLogRecord,
+  AgentExecutionLogRecord, TokenManagementLogRecord,
   ProjectMembershipRecord,
   InterventionRecord, InterventionAction,
   PlatformLLMRecord, PlatformLLMRepository, LLMApiShape,
@@ -149,7 +149,7 @@ export type {
 export { getRepositories, setRepositories } from './repository/index';
 
 // Harness
-export type { HarnessConfig, HarnessAgentConfig, ConstraintRule, ContextSnapshot, HarnessValidationResult } from './harness/index';
+export type { HarnessConfig, HarnessAgentConfig, ConstraintRule, ContextSnapshot, HarnessValidationResult, TokenManagementConfig } from './harness/index';
 export { HarnessEngine, createHarnessEngine, REQUIRED_CONTEXT_FILES } from './harness/index';
 
 // Events

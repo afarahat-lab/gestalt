@@ -45,6 +45,12 @@ export interface LLMResponse {
   tokensUsed: number;
   model: string;
   durationMs: number;
+  /** TR_035 / ADR-057 — OpenAI `finish_reason` surfaced so the
+   *  `BaseLLMAgent` truncation-retry layer can detect `'length'`
+   *  responses and re-issue the call with a larger budget. Unknown
+   *  values (custom providers without the field) collapse to
+   *  `'unknown'`. */
+  finishReason: 'stop' | 'length' | 'content_filter' | 'unknown';
 }
 
 // ─── Tool use (ADR-038) ──────────────────────────────────────────────────────
@@ -278,12 +284,18 @@ export class LLMClient {
       const data = await response.json() as OpenAIResponse;
       const content = data.choices[0]?.message?.content ?? '';
       const tokensUsed = data.usage?.total_tokens ?? 0;
+      const rawFinish = data.choices[0]?.finish_reason;
+      const finishReason: LLMResponse['finishReason'] =
+        rawFinish === 'stop' || rawFinish === 'length' || rawFinish === 'content_filter'
+          ? rawFinish
+          : 'unknown';
 
       return {
         content,
         tokensUsed,
         model: data.model ?? this.config.model,
         durationMs: Date.now() - startedAt,
+        finishReason,
       };
     } finally {
       clearTimeout(timeout);

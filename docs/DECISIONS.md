@@ -1932,3 +1932,74 @@ Update `docs/claude/sessions/RECENT.md` and regenerate
 `docs/claude/DECISIONS.md`. Share PR URLs for review.
 
 **Operator action:** none until implementation begins.
+
+
+## ADR-057 — Dynamic token budget management in BaseLLMAgent
+
+Date: 2026-06
+Status: Accepted
+
+Context: Static `max_tokens` declared in `agents.yaml`
+causes truncation on complex tasks and reasoning models.
+gpt-5.5 / o1 / o3 reasoning models consume tokens thinking
+before responding, so a flat 3000-token budget can be
+exhausted by the reasoning trace alone. Manual tuning of
+`max_tokens` per agent does not scale: every new agent,
+every new model, and every new prompt section forces a
+re-tuning pass.
+
+Decision: `BaseLLMAgent` applies five layers of token
+management automatically on every LLM call:
+
+- **Layer 1 — Model-aware defaults**: reasoning models
+  (prefixes `o1` / `o3` / `gpt-5`) get a higher default
+  budget (8000) than standard models (2000) when no
+  explicit `max_tokens` is configured.
+- **Layer 2 — Dynamic budget**: `max_tokens` scales with
+  input size. The larger of the configured value and a
+  proportional estimate (input × 0.5 standard, × 1.5
+  reasoning) is used, capped by a model-specific hard limit.
+- **Layer 3 — Scope reduction**: prompts exceeding a
+  configurable threshold are compressed before the LLM
+  call via structural text-pattern rewrites. Strategies in
+  order: summarise prior phase history, compress rule
+  sections to the first sentence per bullet, strip the full
+  architecture context block. No LLM calls are made for the
+  compression itself.
+- **Layer 4 — JSON response guard**: agents expecting
+  structured output append a mandatory JSON completion
+  instruction (start with `{`, end with `}`, never leave
+  arrays unclosed, prefer a minimal valid object on
+  low-token states).
+- **Layer 5 — Truncation retry**: if `finish_reason` is
+  `length`, the call is retried with the budget multiplied
+  by `maxRetryBudgetMultiplier` (default 2.0), up to 3
+  attempts, capped by the model's hard limit.
+
+Thresholds are configurable in `HARNESS.json.tokenManagement`
+(`promptCompressionThreshold`, `maxRetryBudgetMultiplier`,
+`enableDynamicBudget`, `enableScopeReduction`). All token
+management actions are persisted into
+`agent_execution_logs.token_management` (JSONB) for operator
+visibility (migration 029).
+
+Rationale: the platform cannot predict token needs per
+request. Automatic detection and recovery is more robust
+than manual tuning. Scope reduction is preferred over
+budget expansion — smaller, focused prompts produce better
+results than larger ones. Layer 4 + Layer 5 together close
+the TR_034 root cause where gpt-5.5's `designPhase` returned
+empty JSON: the JSON guard frames the contract, and the
+truncation retry recovers when the reasoning trace ate the
+budget.
+
+Per ADR-042: the five layers are platform mechanics in `.ts`
+(model detection, threshold math, retry policy). The
+configurable thresholds live in `HARNESS.json` where
+operators can tune them per project.
+
+**Operator action:** existing projects opt in by adding the
+`tokenManagement` block to `HARNESS.json`. Absent → all five
+layers run with the defaults in code. There is no opt-out
+for the layers themselves; individual layers can be disabled
+via the `enableDynamicBudget` / `enableScopeReduction` flags.

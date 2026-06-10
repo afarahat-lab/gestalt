@@ -85,8 +85,35 @@ import type {
 } from '../types';
 import type { ToolLoopMessage } from '../llm/index';
 import type { McpClient } from '../tools/mcp-client';
+import type { HarnessConfig, TokenManagementConfig } from '../harness/index';
+import { createContextLogger } from '../logger/index';
 import type { AgentConfig } from './agent-config';
 import { applyAgentConfig } from './agent-config-helpers';
+
+/**
+ * TR_035 / ADR-057 — Per-call token-management telemetry. Captured
+ * by `BaseLLMAgent` on every LLM invocation and read by the calling
+ * orchestrator after `run()` returns so it can persist into
+ * `agent_execution_logs.token_management` (JSONB; migration 029).
+ *
+ * `reductionStrategy` is the LAST strategy applied (null when no
+ * scope reduction fired). `budgetExpansions` counts Layer 5 retries
+ * (0 when the first attempt succeeded). `truncationOccurred` is true
+ * iff the final accepted response still came back with
+ * `finishReason === 'length'` after retries were exhausted.
+ */
+export interface TokenManagementLog {
+  originalPromptTokens: number;
+  finalPromptTokens: number;
+  reductionStrategy:
+    | 'phase-history-summarisation'
+    | 'rules-compression'
+    | 'architecture-trim'
+    | null;
+  budgetExpansions: number;
+  finalMaxTokens: number;
+  truncationOccurred: boolean;
+}
 
 /**
  * Safety cap on tool calls per agent run (ADR-038). Prevents an
@@ -252,8 +279,39 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
    *  reset it themselves at the top. */
   lastTokensUsed: number = 0;
 
+  /** TR_035 / ADR-057 — per-call token-management telemetry from the
+   *  most recent LLM invocation. `null` when no LLM call has been
+   *  made this run, or for tool-loop calls (the loop has multiple
+   *  LLM turns; only the final turn's telemetry is captured). The
+   *  orchestrator persists this into
+   *  `agent_execution_logs.token_management` (migration 029). */
+  lastTokenManagement: TokenManagementLog | null = null;
+
+  /** TR_035 / ADR-057 — harness config the current `run()` is
+   *  operating under. Set by the template `run()` method from
+   *  `task.contextSnapshot.harness` so the inner `callLLM*` helpers
+   *  can read the `tokenManagement` knobs without threading the
+   *  config through every signature. Subclasses that override
+   *  `run()` set this themselves via `this.setHarnessConfig(...)`.
+   *  `null` when the caller didn't supply a harness config (e.g.
+   *  legacy gate / maintenance entry points). */
+  protected harnessConfigForRun: HarnessConfig | null = null;
+
+  private readonly tokenLog = createContextLogger({ module: 'token-management' });
+
   constructor(agentRole: AgentRole) {
     this.agentRole = agentRole;
+  }
+
+  /**
+   * TR_035 / ADR-057 — subclasses that override `run()` should call
+   * this at the top of their override so the inner `callLLM*` helpers
+   * see the harness config the layers need. Public for the same
+   * reason — the gate / maintenance orchestrators don't extend a
+   * common template method, so they call this directly.
+   */
+  setHarnessConfigForRun(harnessConfig: HarnessConfig | null): void {
+    this.harnessConfigForRun = harnessConfig;
   }
 
   /**
@@ -270,11 +328,13 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
    */
   async run(task: TTask): Promise<TResult> {
     this.lastTokensUsed = 0;
+    this.lastTokenManagement = null;
     const t = task as unknown as {
       correlationId: string;
-      contextSnapshot: { agentConfig: AgentConfig };
+      contextSnapshot: { agentConfig: AgentConfig; harness?: HarnessConfig };
     };
     const { agentConfig } = t.contextSnapshot;
+    this.harnessConfigForRun = t.contextSnapshot.harness ?? null;
     const rawPrompt = this.buildPrompt(task);
     const prompt = applyAgentConfig(rawPrompt, agentConfig);
     const raw = await this.callLLM(prompt, agentConfig, t.correlationId);
@@ -315,6 +375,22 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
   /**
    * Messages-array variant for agents that need a separate system
    * message. `promptForLog` is what gets stored in `this.lastPrompt`.
+   *
+   * TR_035 / ADR-057 — All five token-management layers fire from
+   * inside this method so every code path that calls the LLM (via
+   * `callLLM`, `callLLMWithMessages`, or the no-tools fallback from
+   * `runToolLoop`) inherits the same behaviour automatically.
+   *
+   *   - Layer 1 (model-aware defaults) + Layer 2 (dynamic budget)
+   *     happen during the budget calc each attempt.
+   *   - Layer 3 (scope reduction) compresses the LAST user message
+   *     when the rendered prompt exceeds the threshold.
+   *   - Layer 4 (JSON guard) is applied by callers via
+   *     `addJsonResponseGuard()` on the prompt they build; this is
+   *     not invoked here because it is prompt-shape-specific.
+   *   - Layer 5 (truncation retry) re-issues the call on
+   *     `finish_reason === 'length'`, doubling the budget each
+   *     pass up to 3 attempts.
    */
   protected async callLLMWithMessages(
     messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
@@ -322,25 +398,207 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
     correlationId: string,
     promptForLog: string,
   ): Promise<string> {
-    // Routes through the platform LLM registry (migration 014) so a
-    // per-agent `model` override picks up the registered baseUrl +
-    // apiKeyEnv. Falls back to the legacy `getLLMClient(model)` path
-    // when the registry has no matching row.
+    const cfg = this.tokenManagementKnobs();
+
+    // ─── Layer 3: scope reduction (operator-disable-able) ──────────
+    // Compress only the LAST user message — system / assistant /
+    // earlier turns are caller-shaped (e.g. context-fixer's preserve
+    // rule lives in the system role; rewriting it would break the
+    // contract). Token estimate is the WHOLE rendered prompt so the
+    // threshold catches multi-message bloat too.
+    const originalPromptTokens = estimateTokens(promptForLog);
+    let reductionStrategy: TokenManagementLog['reductionStrategy'] = null;
+    let reducedMessages = messages;
+    let reducedPromptForLog = promptForLog;
+    if (cfg.enableScopeReduction) {
+      const { messages: m, promptForLog: p, strategy } =
+        this.maybeReducePromptScope(messages, promptForLog, cfg.promptCompressionThreshold);
+      reducedMessages = m;
+      reducedPromptForLog = p;
+      reductionStrategy = strategy;
+    }
+
+    // ─── Resolve client (after reduction so Layer 1 sees the same
+    //                    model the wire call will use) ──────────────
     const client = await getLLMClientForModel(agentConfig.llm.model);
     this.lastModelUsed = client.getModel();
-    this.lastPrompt = promptForLog;
-    const result = await client.complete({
-      messages,
-      ...(agentConfig.llm.temperature !== undefined ? { temperature: agentConfig.llm.temperature } : {}),
-      ...(agentConfig.llm.maxTokens !== undefined ? { maxTokens: agentConfig.llm.maxTokens } : {}),
-      correlationId,
-    });
-    if (!result.ok) {
-      throw new Error(`LLM call failed: ${result.error.message}`);
+    this.lastPrompt = reducedPromptForLog;
+    const model = client.getModel();
+
+    // ─── Layer 1 + Layer 2: configured | reasoning-default → dynamic
+    const configuredMaxTokens =
+      agentConfig.llm.maxTokens ?? resolveDefaultMaxTokens(model);
+    const dynamicMaxTokens = cfg.enableDynamicBudget
+      ? calculateDynamicBudget(reducedPromptForLog, configuredMaxTokens, model)
+      : Math.min(configuredMaxTokens, getModelHardLimit(model));
+
+    // ─── Layer 5: truncation-retry loop ────────────────────────────
+    const MAX_ATTEMPTS = 3;
+    let effectiveMaxTokens = dynamicMaxTokens;
+    let attempt = 1;
+    let finalContent = '';
+    let truncationOccurred = false;
+    let finishReason: 'stop' | 'length' | 'content_filter' | 'unknown' = 'unknown';
+
+    while (attempt <= MAX_ATTEMPTS) {
+      const result = await client.complete({
+        messages: reducedMessages,
+        ...(agentConfig.llm.temperature !== undefined ? { temperature: agentConfig.llm.temperature } : {}),
+        maxTokens: effectiveMaxTokens,
+        correlationId,
+      });
+      if (!result.ok) {
+        throw new Error(`LLM call failed: ${result.error.message}`);
+      }
+      this.lastTokensUsed += result.value.tokensUsed ?? 0;
+      finalContent = result.value.content;
+      finishReason = result.value.finishReason;
+
+      if (finishReason !== 'length' || attempt >= MAX_ATTEMPTS) {
+        truncationOccurred = finishReason === 'length';
+        if (truncationOccurred) {
+          this.tokenLog.error({
+            agentRole: this.agentRole, attempts: attempt,
+            correlationId,
+          }, 'LLM truncated after max retries — using partial response');
+        }
+        break;
+      }
+
+      // Expand for the next attempt.
+      const nextMax = Math.min(
+        Math.ceil(effectiveMaxTokens * cfg.maxRetryBudgetMultiplier),
+        getModelHardLimit(model),
+      );
+      if (nextMax <= effectiveMaxTokens) {
+        // Already at the hard limit — re-issuing won't help.
+        truncationOccurred = true;
+        break;
+      }
+      this.tokenLog.warn({
+        agentRole: this.agentRole, correlationId, attempt,
+        currentMax: effectiveMaxTokens, nextMax,
+        tokensUsed: result.value.tokensUsed,
+      }, 'LLM truncated — retrying with larger budget');
+      effectiveMaxTokens = nextMax;
+      attempt += 1;
     }
-    this.lastLlmResponse = result.value.content;
-    this.lastTokensUsed += result.value.tokensUsed ?? 0;
-    return result.value.content;
+
+    this.lastLlmResponse = finalContent;
+    this.lastTokenManagement = {
+      originalPromptTokens,
+      finalPromptTokens: estimateTokens(reducedPromptForLog),
+      reductionStrategy,
+      budgetExpansions: attempt - 1,
+      finalMaxTokens: effectiveMaxTokens,
+      truncationOccurred,
+    };
+    return finalContent;
+  }
+
+  /**
+   * TR_035 / ADR-057 — Layer 4 JSON response guard. Subclasses that
+   * expect structured-JSON output call this on the built prompt
+   * BEFORE handing it to `applyAgentConfig` / `callLLM`. Kept on the
+   * base class so every agent uses the same wording.
+   */
+  protected addJsonResponseGuard(prompt: string): string {
+    return (
+      prompt +
+      '\n\nCRITICAL: Your response MUST be valid, complete JSON.\n' +
+      'Start with { and end with }.\n' +
+      'If running low on tokens, produce a minimal valid JSON object ' +
+      'rather than truncated output.\n' +
+      'Never leave JSON arrays or objects unclosed.'
+    );
+  }
+
+  /**
+   * TR_035 / ADR-057 — resolve the `tokenManagement` knobs for the
+   * current run. Reads `HarnessConfig.tokenManagement` when present,
+   * falls back to baked-in defaults otherwise.
+   */
+  private tokenManagementKnobs(): Required<TokenManagementConfig> {
+    const cfg = this.harnessConfigForRun?.tokenManagement;
+    return {
+      promptCompressionThreshold: cfg?.promptCompressionThreshold ?? 6000,
+      maxRetryBudgetMultiplier: cfg?.maxRetryBudgetMultiplier ?? 2.0,
+      enableDynamicBudget: cfg?.enableDynamicBudget ?? true,
+      enableScopeReduction: cfg?.enableScopeReduction ?? true,
+    };
+  }
+
+  /**
+   * TR_035 / ADR-057 — Layer 3 scope reduction. Applies up to three
+   * structural text-pattern rewrites to the LAST user message in the
+   * caller's `messages` array, stopping as soon as the estimated
+   * token count falls below `threshold`. Returns the (possibly
+   * unchanged) messages, the corresponding `promptForLog` view, and
+   * the name of the last strategy applied (null when no rewrite
+   * fired).
+   */
+  private maybeReducePromptScope(
+    messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+    promptForLog: string,
+    threshold: number,
+  ): {
+    messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
+    promptForLog: string;
+    strategy: TokenManagementLog['reductionStrategy'];
+  } {
+    const initialTokens = estimateTokens(promptForLog);
+    if (initialTokens <= threshold) {
+      return { messages, promptForLog, strategy: null };
+    }
+
+    this.tokenLog.warn({
+      agentRole: this.agentRole, estimatedTokens: initialTokens, threshold,
+    }, 'Prompt exceeds threshold — applying scope reduction');
+
+    // Find the last user-role message (closest to the model). The
+    // bulk of every agent's prompt lives there (`buildPrompt` →
+    // single user content). System messages are intentionally
+    // preserved.
+    const lastUserIdx = lastUserIndex(messages);
+    if (lastUserIdx < 0) {
+      // No user message to compress — bail out.
+      return { messages, promptForLog, strategy: null };
+    }
+
+    let candidate = messages[lastUserIdx].content;
+    let strategy: TokenManagementLog['reductionStrategy'] = null;
+
+    // Strategy 1: summarise prior phase result blocks.
+    candidate = summarisePriorPhaseHistory(candidate);
+    if (estimateTokens(renderPromptForLog(messages, lastUserIdx, candidate)) <= threshold) {
+      strategy = 'phase-history-summarisation';
+      this.tokenLog.info({ agentRole: this.agentRole, strategy },
+        'Scope reduction applied');
+      return finalise(messages, lastUserIdx, candidate, strategy);
+    }
+
+    // Strategy 2: compress rule bullets to first sentence.
+    candidate = compressRulesSection(candidate);
+    if (estimateTokens(renderPromptForLog(messages, lastUserIdx, candidate)) <= threshold) {
+      strategy = 'rules-compression';
+      this.tokenLog.info({ agentRole: this.agentRole, strategy },
+        'Scope reduction applied');
+      return finalise(messages, lastUserIdx, candidate, strategy);
+    }
+
+    // Strategy 3: trim full architecture block.
+    candidate = trimArchitectureContext(candidate);
+    strategy = 'architecture-trim';
+    const finalTokens = estimateTokens(renderPromptForLog(messages, lastUserIdx, candidate));
+    if (finalTokens <= threshold) {
+      this.tokenLog.info({ agentRole: this.agentRole, strategy },
+        'Scope reduction applied');
+    } else {
+      this.tokenLog.warn({
+        agentRole: this.agentRole, finalTokens,
+      }, 'Scope reduction insufficient — truncation retry will handle');
+    }
+    return finalise(messages, lastUserIdx, candidate, strategy);
   }
 
   /**
@@ -458,6 +716,21 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
     this.lastModelUsed = client.getModel();
     this.lastPrompt = promptForLog;
 
+    // TR_035 / ADR-057 — Layer 1 + 2 also apply to the tool-loop
+    // path. Each turn uses the same dynamic budget derived from the
+    // initial prompt (the loop history grows, but `max_tokens` only
+    // bounds the assistant's response; the request token count is
+    // managed by the model's context window). Layer 5 truncation
+    // retry is intentionally NOT applied per turn — the existing
+    // `capStruck` mechanism already handles end-of-loop runaway.
+    const model = client.getModel();
+    const cfg = this.tokenManagementKnobs();
+    const configuredMaxTokens =
+      agentConfig.llm.maxTokens ?? resolveDefaultMaxTokens(model);
+    const effectiveMaxTokens = cfg.enableDynamicBudget
+      ? calculateDynamicBudget(promptForLog, configuredMaxTokens, model)
+      : Math.min(configuredMaxTokens, getModelHardLimit(model));
+
     const toolCallLog: ToolCallLogEntry[] = [];
     let totalToolCalls = 0;
     let finalText = '';
@@ -472,7 +745,7 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
         messages: history,
         tools: capStruck ? [] : tools,
         ...(agentConfig.llm.temperature !== undefined ? { temperature: agentConfig.llm.temperature } : {}),
-        ...(agentConfig.llm.maxTokens !== undefined ? { maxTokens: agentConfig.llm.maxTokens } : {}),
+        maxTokens: effectiveMaxTokens,
         correlationId,
       });
       if (!result.ok) {
@@ -664,4 +937,155 @@ function findMcpForCall(
     if (toolName.startsWith(prefix)) return client;
   }
   return null;
+}
+
+// ─── Token-management helpers (TR_035 / ADR-057) ───────────────────────
+
+/**
+ * Rough token estimate (4 chars ≈ 1 token). Cheap and good enough
+ * for budget routing — every layer that calls this rounds up, so
+ * over-estimation is the safe direction.
+ */
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+/** Reasoning models burn tokens on internal thought before emitting
+ *  output. Detected by prefix so newly released gpt-5.x / o3.x
+ *  variants pick up the higher default automatically. */
+function isReasoningModel(model: string): boolean {
+  const reasoningPrefixes = ['o1', 'o3', 'gpt-5'];
+  const lower = model.toLowerCase();
+  return reasoningPrefixes.some((p) => lower.startsWith(p));
+}
+
+/** Layer 1 — model-aware default `max_tokens` when the agent config
+ *  did not declare one. Reasoning models get headroom for the
+ *  reasoning trace. */
+function resolveDefaultMaxTokens(model: string): number {
+  return isReasoningModel(model) ? 8000 : 2000;
+}
+
+/** Hard cap per model. Used to clamp Layer 2 dynamic budgets and
+ *  Layer 5 retry expansions so the platform never sends a `max_tokens`
+ *  the provider will reject. Unknown models default to 16384, the
+ *  legacy gpt-4 family ceiling. */
+function getModelHardLimit(model: string): number {
+  const limits: Record<string, number> = {
+    'gpt-5.5': 32000,
+    'gpt-5.5-pro': 32000,
+    'gpt-5': 32000,
+    'gpt-4o': 16384,
+    'gpt-4o-mini': 16384,
+    'o1': 32000,
+    'o3': 32000,
+  };
+  return limits[model] ?? 16384;
+}
+
+/** Layer 2 — dynamic budget. `max_tokens` scales with the rendered
+ *  prompt size so a small intent doesn't hold a 12k slot and a large
+ *  one isn't starved. Reasoning models use a 1.5× input ratio (output
+ *  + reasoning), standard models 0.5×. Bounded below by the
+ *  configured value and above by the model hard limit. */
+function calculateDynamicBudget(
+  promptText: string,
+  configuredMaxTokens: number,
+  model: string,
+): number {
+  const estimatedInputTokens = estimateTokens(promptText);
+  const outputRatio = isReasoningModel(model) ? 1.5 : 0.5;
+  const dynamic = Math.ceil(estimatedInputTokens * outputRatio);
+  return Math.min(
+    Math.max(configuredMaxTokens, dynamic),
+    getModelHardLimit(model),
+  );
+}
+
+/** Index of the last user-role message; -1 if none. */
+function lastUserIndex(
+  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'user') return i;
+  }
+  return -1;
+}
+
+/** Re-render a `promptForLog` view after compressing the message at
+ *  `targetIdx`. Joined with double newlines to match how callers like
+ *  `applyAgentConfig` produce the single-string log view. */
+function renderPromptForLog(
+  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+  targetIdx: number,
+  newContent: string,
+): string {
+  return messages
+    .map((m, i) => (i === targetIdx ? newContent : m.content))
+    .join('\n\n');
+}
+
+/** Produce the return triple from a scope-reduction strategy step. */
+function finalise(
+  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+  targetIdx: number,
+  newContent: string,
+  strategy: TokenManagementLog['reductionStrategy'],
+): {
+  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
+  promptForLog: string;
+  strategy: TokenManagementLog['reductionStrategy'];
+} {
+  const next = messages.slice();
+  next[targetIdx] = { ...messages[targetIdx], content: newContent };
+  return {
+    messages: next,
+    promptForLog: renderPromptForLog(messages, targetIdx, newContent),
+    strategy,
+  };
+}
+
+/** Strategy 1 — replace detailed per-phase result blocks with a
+ *  one-line summary. Matches `### Phase N <title>` markdown headers
+ *  followed by their body up to the next phase header or top-level
+ *  section. */
+function summarisePriorPhaseHistory(prompt: string): string {
+  return prompt.replace(
+    /### Phase \d+[^\n]*\n[\s\S]*?(?=### Phase |\n## |$)/g,
+    (match) => {
+      const title = match.match(/### (Phase \d+[^\n]*)/)?.[1];
+      return title ? `### ${title} — deployed\n` : '';
+    },
+  );
+}
+
+/** Strategy 2 — keep only the first sentence of each rule bullet
+ *  under `## Rules` / `## Project rules` headers. Bullets without a
+ *  terminating period are truncated to 120 chars. */
+function compressRulesSection(prompt: string): string {
+  return prompt.replace(
+    /(## (?:Rules|Project rules)[^\n]*\n)([\s\S]*?)(\n## |$)/,
+    (_, header: string, body: string, end: string) => {
+      const compressed = body
+        .split('\n')
+        .map((l) => {
+          if (!l.startsWith('- ')) return l;
+          const m = l.match(/^(- [^.]+\.)/);
+          return m ? m[1] : l.slice(0, 120);
+        })
+        .join('\n');
+      return `${header}${compressed}${end}`;
+    },
+  );
+}
+
+/** Strategy 3 — strip the full architecture block, leaving the
+ *  scoped-per-phase block intact. Matches `## Architecture context`
+ *  or `## Full architecture` up to the next top-level `## Scoped` /
+ *  `## Task` header. */
+function trimArchitectureContext(prompt: string): string {
+  return prompt.replace(
+    /## (?:Architecture context|Full architecture|Project architecture)[\s\S]*?(?=\n## Scoped|\n## Task|\n## Phase|$)/,
+    '',
+  );
 }

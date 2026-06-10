@@ -725,6 +725,15 @@ async function handlePlanningEvaluate(
       {
         defaultBranch: project.defaultBranch,
         phaseBranch: phaseIntent?.branchName ?? null,
+        // TR_035 / ADR-057 (Part B2) — the squash-merge SHA populated
+        // by the deploy promotion-agent after the phase's PR
+        // auto-merged. `null` when the adapter doesn't support
+        // auto-merge (NoOpPipelineAdapter) or when the PR closed
+        // without going through the promotion-agent path; the
+        // phase-evaluator-agent falls back to `git diff
+        // origin/<defaultBranch>~1..origin/<defaultBranch>` in
+        // that case.
+        mergeCommitSha: phase.mergeCommitSha,
       },
       remaining,
       workDir,

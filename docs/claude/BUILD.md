@@ -18,7 +18,7 @@ docker-compose logs -f server
 |---|---|
 | `pnpm -r build` | ✅ clean (13 packages) |
 | `docker-compose up -d` | ✅ healthy (server / postgres / redis) |
-| Migrations applied | 027 (latest: `027_self_healing_pr_agent`) |
+| Migrations applied | 029 (latest: `029_token_management_and_phase_merge`) |
 | Server reachable | `http://localhost:3000/health` returns 200 |
 | Dashboard | served at `http://localhost:3000/app/` |
 
@@ -53,6 +53,62 @@ None blocking the build. Areas to keep in mind:
 ---
 
 ## Pending operator actions
+
+### TR_035 — Dynamic token budget management + phase merge SHA (ADR-057, template 0.20.0, build clean, live verification pending)
+
+Two categories of work. Part A — platform-level five-layer
+token management in `BaseLLMAgent`:
+
+- Layer 1 (model-aware defaults: reasoning models get 8k,
+  standard 2k).
+- Layer 2 (dynamic budget: input × 1.5 reasoning / × 0.5
+  standard, clamped by per-model hard limits).
+- Layer 3 (scope reduction: three structural rewrites for
+  prompts above the threshold).
+- Layer 4 (JSON response guard appended to six structured-
+  output agents: architecture-agent `designFeature` +
+  `designPhase`, planner-agent, phase-evaluator-agent,
+  constraint-agent, review-agent, self-healing-agent).
+- Layer 5 (truncation retry doubling the budget on
+  `finish_reason: 'length'`, up to 3 attempts).
+
+Knobs configurable in `HARNESS.json.tokenManagement`
+(`promptCompressionThreshold` / `maxRetryBudgetMultiplier` /
+`enableDynamicBudget` / `enableScopeReduction`).
+
+Part B — three TR_034 follow-up fixes:
+
+- **B1** — `architecture-agent.max_tokens: 12000` in
+  trackeros `agents.yaml` as the fallback floor. Layers 2 +
+  5 in BaseLLMAgent handle higher cases.
+- **B2** — phase-evaluator prefers `git show --name-only
+  --format= <mergeCommitSha>` over the prior `git diff`
+  fallback. The existing `mergePullRequest` already returns
+  the squash-merge SHA, so the promotion-agent's
+  `maybeAutoMerge` now `findPhaseByIntent → updatePhaseMergeCommit`
+  after a successful merge. New `feature_phases.merge_commit_sha`
+  column (migration 029). Phase-evaluator-agent rules in the
+  template + trackeros HARNESS updated to teach the agent the
+  new command (with fallback when SHA is null).
+- **B3** — single migration `029_token_management_and_phase_merge.sql`
+  bundles both new columns.
+
+Template bumped 0.19.0 → 0.20.0. `pnpm -r build` clean across
+all 13 packages. Migration 029 applied at next server boot.
+Live verification pending — runtime telemetry will show each
+layer firing.
+
+**Operator action — trackeros:** the operator may patch the
+phase-evaluator-agent rule into `trackeros/HARNESS.json` if it
+gets reverted (precedent from TR_033). The `tokenManagement`
+block + `architecture-agent` 12k bump are already in trackeros.
+
+**Operator action — other projects:** Existing projects can
+opt in by adding a `tokenManagement` block to `HARNESS.json`.
+Absent → all five layers run with the defaults baked into
+`BaseLLMAgent` (threshold 6000, multiplier 2.0, both feature
+flags on). Template auto-refreshes to `0.20.0` at next server
+boot for new projects.
 
 ### TR_034 — Scoped per-phase architecture replaces full architecture context in Aider message (template 0.19.0, mechanisms verified)
 

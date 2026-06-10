@@ -232,6 +232,36 @@ export interface HarnessConfig {
     blockOnChangesRequested?: boolean;
     pendingTimeoutSeconds?: number;
   };
+  /**
+   * TR_035 / ADR-057 — Dynamic token budget management knobs.
+   * Absent → all five layers run with the defaults baked into
+   * `BaseLLMAgent` (threshold 6000 tokens, retry multiplier 2.0,
+   * both feature flags on). Operators tune per-project.
+   */
+  tokenManagement?: TokenManagementConfig;
+}
+
+/**
+ * TR_035 / ADR-057 — knobs that gate the five token-management
+ * layers in `BaseLLMAgent`. Layer 1 (model-aware defaults) +
+ * Layer 4 (JSON guard) + Layer 5 (truncation retry) always run;
+ * only Layers 2 and 3 are operator-disable-able because they
+ * change prompt text the operator may want to preserve byte-for-
+ * byte.
+ */
+export interface TokenManagementConfig {
+  /** Estimated input tokens above which Layer 3 scope reduction
+   *  kicks in. Default 6000. */
+  promptCompressionThreshold?: number;
+  /** Multiplier applied to `max_tokens` on each Layer 5 retry.
+   *  Default 2.0. Capped per call by the model's hard limit. */
+  maxRetryBudgetMultiplier?: number;
+  /** Layer 2 toggle. Default true. When false the configured
+   *  `max_tokens` is used verbatim. */
+  enableDynamicBudget?: boolean;
+  /** Layer 3 toggle. Default true. When false the prompt is sent
+   *  unmodified regardless of size. */
+  enableScopeReduction?: boolean;
 }
 
 // ─── Context snapshot (what agents receive) ───────────────────────────────────

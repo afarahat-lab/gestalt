@@ -36,6 +36,16 @@ const log = createContextLogger({ module: 'phase-evaluator-agent' });
 export interface PhaseBranchContext {
   defaultBranch: string;
   phaseBranch: string | null;
+  /**
+   * TR_035 / ADR-057 (Part B2) — squash-merge commit SHA persisted
+   * by the deploy promotion-agent. When present, the evaluator
+   * prefers `git show --name-only --format= <sha>` (exact file
+   * list from the squash-merge commit) over the prior `git diff
+   * origin/<defaultBranch>~1..origin/<defaultBranch>` fallback.
+   * `null` when the adapter didn't auto-merge or the phase
+   * pre-dates migration 029.
+   */
+  mergeCommitSha: string | null;
 }
 
 export class PhaseEvaluatorAgent extends BaseLLMAgent {
@@ -58,10 +68,14 @@ export class PhaseEvaluatorAgent extends BaseLLMAgent {
     correlationId: string,
   ): Promise<PhaseEvaluation> {
     this.lastTokensUsed = 0;
+    // TR_035 / ADR-057 — Layer 3 + 5 read knobs from harnessConfig.
+    this.setHarnessConfigForRun(harnessConfig);
     const agentCfg = await loadAgentConfig(projectRoot, 'phase-evaluator-agent');
-    const prompt = buildPhaseEvaluationPrompt(
-      feature, completedPhase, branchContext, remainingPhases,
-      agentCfg, harnessConfig,
+    const prompt = this.addJsonResponseGuard(
+      buildPhaseEvaluationPrompt(
+        feature, completedPhase, branchContext, remainingPhases,
+        agentCfg, harnessConfig,
+      ),
     );
     // TR_026 — the evaluator now runs in the tool-use loop with
     // `executeScript` available so it can call git itself. The

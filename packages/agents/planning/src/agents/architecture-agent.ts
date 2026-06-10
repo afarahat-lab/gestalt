@@ -51,9 +51,13 @@ export class ArchitectureAgent extends BaseLLMAgent {
     correlationId: string,
   ): Promise<FeatureArchitecture> {
     this.lastTokensUsed = 0;
+    // TR_035 / ADR-057 Layer 3+5 read knobs from harnessConfig.
+    this.setHarnessConfigForRun(harnessConfig);
     const agentCfg = await loadAgentConfig(projectRoot, 'architecture-agent');
-    const prompt = buildFeatureArchitecturePrompt(
-      feature, existingArchitectureMd, agentCfg, harnessConfig,
+    const prompt = this.addJsonResponseGuard(
+      buildFeatureArchitecturePrompt(
+        feature, existingArchitectureMd, agentCfg, harnessConfig,
+      ),
     );
     const raw = await this.callLLM(prompt, agentCfg, correlationId);
     return parseFeatureArchitecture(raw, correlationId);
@@ -75,10 +79,13 @@ export class ArchitectureAgent extends BaseLLMAgent {
     correlationId: string,
   ): Promise<PhaseArchitecture> {
     this.lastTokensUsed = 0;
+    this.setHarnessConfigForRun(harnessConfig);
     const agentCfg = await loadAgentConfig(projectRoot, 'architecture-agent');
-    const prompt = buildPhaseArchitecturePrompt(
-      feature, phaseTitle, phaseRationale, featureArchitecture,
-      priorPhases, agentCfg, harnessConfig,
+    const prompt = this.addJsonResponseGuard(
+      buildPhaseArchitecturePrompt(
+        feature, phaseTitle, phaseRationale, featureArchitecture,
+        priorPhases, agentCfg, harnessConfig,
+      ),
     );
     const raw = await this.callLLM(prompt, agentCfg, correlationId);
     return parsePhaseArchitecture(raw, correlationId);

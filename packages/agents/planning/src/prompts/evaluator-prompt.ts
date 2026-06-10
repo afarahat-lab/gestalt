@@ -51,8 +51,9 @@ export function buildPhaseEvaluationPrompt(
     `Planned scope: ${oneLine(completedPhase.scope)}`,
     '',
     '## Branch context (for your git diff)',
-    `Default branch: ${branchContext.defaultBranch}`,
-    `Phase branch:   ${branchContext.phaseBranch ?? '(none — pr-agent did not persist a branch)'}`,
+    `Default branch:   ${branchContext.defaultBranch}`,
+    `Phase branch:     ${branchContext.phaseBranch ?? '(none — pr-agent did not persist a branch)'}`,
+    `Merge commit SHA: ${branchContext.mergeCommitSha ?? '(none — adapter did not auto-merge, fall back to git diff)'}`,
     '',
     '## Remaining phases (not yet started)',
     remainingBlock,
@@ -67,9 +68,16 @@ export function buildPhaseEvaluationPrompt(
     'A typical command:',
     '',
     '```sh',
-    branchContext.phaseBranch
-      ? `git diff origin/${branchContext.defaultBranch}...origin/${branchContext.phaseBranch} --name-status`
-      : `git log -1 --name-status origin/${branchContext.defaultBranch}`,
+    // TR_035 / ADR-057 (Part B2) — prefer the squash-merge SHA when
+    // present. `git show --name-only --format= <sha>` returns the
+    // exact file list from the merged commit, regardless of whether
+    // the phase branch was deleted after merge. Fall back to the
+    // diff path when the adapter didn't auto-merge.
+    branchContext.mergeCommitSha
+      ? `git show --name-only --format= ${branchContext.mergeCommitSha}`
+      : branchContext.phaseBranch
+        ? `git diff origin/${branchContext.defaultBranch}...origin/${branchContext.phaseBranch} --name-status`
+        : `git log -1 --name-status origin/${branchContext.defaultBranch}`,
     '```',
     '',
     'Read the output and decide:',

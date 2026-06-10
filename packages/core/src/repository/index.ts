@@ -372,11 +372,45 @@ export interface AgentExecutionLogRecord {
    * for operator audit, not re-execution. Migration 012.
    */
   toolCalls: ToolCallLogEntry[];
+  /**
+   * TR_035 / ADR-057 — per-call token-management telemetry from
+   * `BaseLLMAgent`'s five-layer pipeline. `null` for non-LLM agents,
+   * pre-migration-029 rows, and tool-loop calls (only the final
+   * turn's telemetry is captured). Migration 029.
+   */
+  tokenManagement: TokenManagementLogRecord | null;
   createdAt: Date;
 }
 
+/**
+ * TR_035 / ADR-057 — JSONB-shape mirror of
+ * `TokenManagementLog` in `@gestalt/core/agents/base-llm-agent`.
+ * Defined here too so the repository layer doesn't depend on the
+ * agents layer. Keep the two in sync.
+ */
+export interface TokenManagementLogRecord {
+  originalPromptTokens: number;
+  finalPromptTokens: number;
+  reductionStrategy:
+    | 'phase-history-summarisation'
+    | 'rules-compression'
+    | 'architecture-trim'
+    | null;
+  budgetExpansions: number;
+  finalMaxTokens: number;
+  truncationOccurred: boolean;
+}
+
 export interface AgentExecutionLogRepository extends BaseRepository {
-  save(log: Omit<AgentExecutionLogRecord, 'id' | 'createdAt'>): Promise<AgentExecutionLogRecord>;
+  /**
+   * `tokenManagement` is optional on insert so legacy call sites
+   * (non-LLM agents, pre-TR_035 orchestrators) don't need updating;
+   * `null` is persisted when absent. New LLM call sites populate
+   * from `BaseLLMAgent.lastTokenManagement`.
+   */
+  save(log: Omit<AgentExecutionLogRecord, 'id' | 'createdAt' | 'tokenManagement'> & {
+    tokenManagement?: TokenManagementLogRecord | null;
+  }): Promise<AgentExecutionLogRecord>;
   findByExecutionId(executionId: string): Promise<AgentExecutionLogRecord | null>;
   findByCorrelationId(correlationId: string): Promise<AgentExecutionLogRecord[]>;
 }
@@ -628,6 +662,17 @@ export interface FeaturePhaseRecord {
    * did pre-TR_022.
    */
   retryCount: number;
+  /**
+   * TR_035 / ADR-057 (Part B2) — squash-merge commit SHA recorded by
+   * the deploy promotion-agent after the phase's auto-merged PR
+   * closes. Lets the phase-evaluator-agent enumerate built files
+   * via `git show --name-only --format= <sha>` instead of falling
+   * back to a `git diff` against the default branch. `null` for
+   * non-auto-merge adapters (NoOpPipelineAdapter), for phases that
+   * pre-date migration 029, and during the window between
+   * phase-deployed and merge-commit-write. Migration 029.
+   */
+  mergeCommitSha: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -666,7 +711,7 @@ export interface FeatureRepository extends BaseRepository {
   setCurrentPhase(id: string, phaseIndex: number): Promise<FeatureRecord>;
 
   // ── feature_phases CRUD ─────────────────────────────────────────
-  createPhase(phase: Omit<FeaturePhaseRecord, 'createdAt' | 'updatedAt' | 'status' | 'intentId' | 'result' | 'retryCount'>): Promise<FeaturePhaseRecord>;
+  createPhase(phase: Omit<FeaturePhaseRecord, 'createdAt' | 'updatedAt' | 'status' | 'intentId' | 'result' | 'retryCount' | 'mergeCommitSha'>): Promise<FeaturePhaseRecord>;
   findPhaseByIndex(featureId: string, phaseIndex: number): Promise<FeaturePhaseRecord | null>;
   listPhases(featureId: string): Promise<FeaturePhaseRecord[]>;
   updatePhaseIntent(phaseId: string, intentId: string): Promise<FeaturePhaseRecord>;
@@ -698,6 +743,16 @@ export interface FeatureRepository extends BaseRepository {
    * Passing `null` clears the column.
    */
   updatePhaseArchitecture(phaseId: string, architecture: string | null): Promise<FeaturePhaseRecord>;
+
+  /**
+   * TR_035 / ADR-057 (Part B2) — persist the squash-merge commit SHA
+   * after the phase's PR auto-merges. Called by the deploy
+   * promotion-agent. Read by the planning orchestrator when
+   * dispatching `planning:evaluate` so phase-evaluator-agent receives
+   * an exact handle (`git show --name-only --format= <sha>`) instead
+   * of a coarse `git diff origin/<default>`. Migration 029.
+   */
+  updatePhaseMergeCommit(phaseId: string, mergeCommitSha: string): Promise<FeaturePhaseRecord>;
 
   // ── feature_plan_log append-only log ────────────────────────────
   appendLog(entry: Omit<FeaturePlanLogRecord, 'id' | 'createdAt'>): Promise<FeaturePlanLogRecord>;

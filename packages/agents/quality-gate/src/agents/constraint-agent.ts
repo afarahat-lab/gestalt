@@ -133,7 +133,12 @@ export class ConstraintAgent extends BaseLLMAgent {
       loadAgentConfig(task.harnessConfig.projectRoot, 'constraint-agent'),
     ]);
 
-    const prompt = this.buildVerificationPrompt(task, harnessConfig, intentSpec, agentConfig);
+    // TR_035 / ADR-057 — Layer 3 + 5 read knobs from harnessConfig.
+    this.setHarnessConfigForRun(harnessConfig);
+
+    const prompt = this.addJsonResponseGuard(
+      this.buildVerificationPrompt(task, harnessConfig, intentSpec, agentConfig),
+    );
 
     let response: string;
     try {

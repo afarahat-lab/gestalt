@@ -226,7 +226,9 @@ export class SelfHealingAgent extends BaseLLMAgent {
     projectRoot?: string,
   ): Promise<SelfHealingDiagnosis> {
     const agentConfig = await resolveSelfHealingAgentConfig(projectRoot);
-    const prompt = this.buildDiagnosisPrompt(ctx);
+    // TR_035 / ADR-057 Layer 4 — diagnostician returns JSON; framing
+    // the contract reduces gpt-5.x truncation-on-reasoning failures.
+    const prompt = this.addJsonResponseGuard(this.buildDiagnosisPrompt(ctx));
 
     let raw: string;
     try {

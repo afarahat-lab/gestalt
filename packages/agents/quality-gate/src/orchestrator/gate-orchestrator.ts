@@ -518,6 +518,12 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
         if (constraintAgent.lastLlmResponse) decorated.llmResponse = constraintAgent.lastLlmResponse;
         if (constraintAgent.lastModelUsed) decorated.modelUsed = constraintAgent.lastModelUsed;
         if (constraintAgent.lastTokensUsed > 0) decorated.tokensUsed = constraintAgent.lastTokensUsed;
+        // TR_035 / ADR-057 — forward per-call token-management
+        // telemetry to the executionLogs.save site below.
+        if (constraintAgent.lastTokenManagement) {
+          (decorated as unknown as { tokenManagement?: unknown }).tokenManagement =
+            constraintAgent.lastTokenManagement;
+        }
         // TEST_REPORT_005 evolution — constraint-agent now drives a
         // tool-use loop (executeScript / readFile / searchFiles).
         // Forward the call log so the dashboard's tool-call panel
@@ -557,6 +563,11 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
             // the review-agent row.
             if (reviewAgent.lastTokensUsed > 0) {
               (r as unknown as { tokensUsed?: number }).tokensUsed = reviewAgent.lastTokensUsed;
+            }
+            // TR_035 / ADR-057 — token management telemetry.
+            if (reviewAgent.lastTokenManagement) {
+              (r as unknown as { tokenManagement?: unknown }).tokenManagement =
+                reviewAgent.lastTokenManagement;
             }
             return r;
           },
@@ -806,6 +817,17 @@ async function runWithObservability<T extends GateAgentResult>(
     llmResponse?: string;
     modelUsed?: string;
     toolCalls?: Array<{ toolName: string; input: Record<string, unknown>; output: string; isError: boolean; calledAt: Date; toolSource?: string }>;
+    /** TR_035 / ADR-057 — populated by LLM-backed gate agents
+     *  (review-agent / constraint-agent) from
+     *  `BaseLLMAgent.lastTokenManagement` after the run. */
+    tokenManagement?: {
+      originalPromptTokens: number;
+      finalPromptTokens: number;
+      reductionStrategy: 'phase-history-summarisation' | 'rules-compression' | 'architecture-trim' | null;
+      budgetExpansions: number;
+      finalMaxTokens: number;
+      truncationOccurred: boolean;
+    } | null;
   };
   await executionLogs.save({
     executionId,
@@ -825,6 +847,7 @@ async function runWithObservability<T extends GateAgentResult>(
     // `agent_execution_logs.tool_calls`. Empty for non-tool-using
     // gate agents.
     toolCalls: resultWithPrompt.toolCalls ?? [],
+    tokenManagement: resultWithPrompt.tokenManagement ?? null,
   }).catch((err) => {
     childLog.warn({ err, executionId, agentRole }, 'executionLogs.save failed');
   });
