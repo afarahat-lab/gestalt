@@ -11,7 +11,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-10 (after TR_036 — four fixes against TR_035 verification findings. (Fix 1) Constraint-agent + review-agent rules in HARNESS rewritten to abstract layer-role language ("data access layer", "business logic layer"); concrete `pool.query` / `*.repository.ts` matchers removed. Both verificationGuidance blocks rewritten to "read ARCHITECTURE.md first; a finding is only valid if it violates a rule given the actual structure of this project". (Fix 2) New `buildProjectStructureBrief(projectRoot)` helper in `gate-orchestrator.ts` reads ARCHITECTURE.md (truncated to 2000 chars) + enumerates a depth-2 directory tree under `src/` using Node's `readdir` (equivalent to `find src -maxdepth 2 -type d`, bounded to 30 entries). The brief is set on `GateTask.projectStructureBrief` (new optional field on the type); constraint-agent's `buildVerificationPrompt` injects it before the rules section, llm-review-agent's `buildReviewPrompt` injects it at the top of the prompt. (Fix 3) Planner's `maxPhaseRetries` exhaustion path in `planning-orchestrator.ts` now creates a `feature-blocked` alert + emits `alert.created` SSE — previously it marked the feature `blocked` silently and operators only saw the failure via `gestalt feature show`. (Fix 4) trackeros `agents.yaml` `test-agent.goal` switched Vitest → Jest to align with the rest of the project's already-Jest tooling. Template `0.20.0 → 0.21.0`. Build clean across all 13 packages. **Live verification cycle escalated at intent-agent on a planner/architecture-agent symbol-name inconsistency BEFORE reaching the gate**, so Fixes 1+2 (gate-side) didn't get an LLM-level test; Fix 3's new alert call didn't fire (the cycle escalated via the existing TR_033 `waiting-for-clarification` path which already has its own alert). New HIGH follow-up: cross-check planner-agent vs architecture-agent symbol names. **Earlier (TR_035 — mechanisms 6/8 PASS, feature blocked by orthogonal gate constraint-agent false-positives)** — dynamic five-layer token budget management + phase-evaluator git detection via squash-merge SHA + architecture-agent 12k fallback floor. ADR-057 appended to `docs/DECISIONS.md` before implementing. **Part A**: `BaseLLMAgent` gains a five-layer pipeline on every LLM call. Layer 1 — model-aware defaults (reasoning models `o1`/`o3`/`gpt-5*` get 8k vs 2k standard). Layer 2 — dynamic budget (input × 1.5 for reasoning, × 0.5 standard, clamped by per-model hard limits). Layer 3 — scope reduction with three structural rewrites (`summarisePriorPhaseHistory`, `compressRulesSection`, `trimArchitectureContext`) when estimated input tokens exceed the configurable threshold (default 6000). Layer 4 — JSON response guard (`addJsonResponseGuard()` appended to prompts by the six structured-output agents: architecture-agent's `designFeature`+`designPhase`, planner-agent, phase-evaluator-agent, constraint-agent, review-agent, self-healing-agent). Layer 5 — truncation retry (re-issues the call on `finish_reason: 'length'` with a doubled budget, up to 3 attempts). `LLMResponse` extended with `finishReason`. New `HarnessConfig.tokenManagement` block (`promptCompressionThreshold` / `maxRetryBudgetMultiplier` / `enableDynamicBudget` / `enableScopeReduction`) tunes thresholds per project. Per-call telemetry persisted into `agent_execution_logs.token_management` (JSONB; migration 029). **Part B**: (B1) `architecture-agent.max_tokens` bumped 6k → 12k in trackeros `agents.yaml` as the fallback floor; Layers 2 + 5 handle higher cases. (B2) Phase-evaluator now prefers `git show --name-only --format= <mergeCommitSha>` over `git diff` — the existing `mergePullRequest` already returns the squash-merge SHA, so the promotion-agent's `maybeAutoMerge` now resolves `findPhaseByIntent → updatePhaseMergeCommit(phase.id, sha)` after the merge succeeds. New `FeaturePhaseRecord.mergeCommitSha` column (migration 029) + `FeatureRepository.updatePhaseMergeCommit` (postgres impl + oracle/mssql stubs). `PhaseBranchContext` extended; `evaluator-prompt.ts` prefers `git show` when SHA present, falls back gracefully. HARNESS template + trackeros `phase-evaluator-agent.rules` updated to teach the agent the new command. Template 0.19.0 → 0.20.0. Build: `pnpm -r build` clean across all 13 packages. **Live verification pending** for all 10 parts — needs `gestalt feature submit` cycle on trackeros to observe Layer N firings + `git show` path.
+**Last updated:** 2026-06-10 (after TR_037 — planner-agent now injects architecture-agent's full JSON as a "Canonical type and symbol names" block at the top of its prompt, plus a HARNESS rule telling the planner to use those exact names. Architecture flows from architecture-agent → planner-agent → intent-agent without symbol-name drift. **Verified end-to-end on trackeros feature `ce9d1b80`**: planner-agent emitted Phase 1 scope "Create … defining the **canonical LeaveRequest type** … using the **fields id, employeeId, leaveType, startDate, endDate, and status**" matching architecture-agent's emitted entity verbatim; 5-phase plan (vs prior 7-8) with 4 interfaces + 5 success criteria + SQL schema in Phase 1's per-phase architecture; intent-agent did NOT escalate on a symbol-name conflict. Cycle still blocked at intent-agent, but on a DIFFERENT, more nuanced ambiguity — "The concrete persistence implementation backing LeaveRepository is not specified" — i.e. architecture-agent defined the `LeaveRepository` interface but didn't pin the concrete DB driver. New HIGH follow-up: architecture-agent should specify the concrete persistence implementation (e.g. `pg` Pool) from `HARNESS.stack.database`. Template `0.21.0 → 0.22.0`. Build clean across all 13 packages. **Earlier (TR_036 — gate-side fixes shipped, verification blocked at intent-agent before reaching the gate)** — four fixes against TR_035 verification findings. (Fix 1) Constraint-agent + review-agent rules in HARNESS rewritten to abstract layer-role language ("data access layer", "business logic layer"); concrete `pool.query` / `*.repository.ts` matchers removed. Both verificationGuidance blocks rewritten to "read ARCHITECTURE.md first; a finding is only valid if it violates a rule given the actual structure of this project". (Fix 2) New `buildProjectStructureBrief(projectRoot)` helper in `gate-orchestrator.ts` reads ARCHITECTURE.md (truncated to 2000 chars) + enumerates a depth-2 directory tree under `src/` using Node's `readdir` (equivalent to `find src -maxdepth 2 -type d`, bounded to 30 entries). The brief is set on `GateTask.projectStructureBrief` (new optional field on the type); constraint-agent's `buildVerificationPrompt` injects it before the rules section, llm-review-agent's `buildReviewPrompt` injects it at the top of the prompt. (Fix 3) Planner's `maxPhaseRetries` exhaustion path in `planning-orchestrator.ts` now creates a `feature-blocked` alert + emits `alert.created` SSE — previously it marked the feature `blocked` silently and operators only saw the failure via `gestalt feature show`. (Fix 4) trackeros `agents.yaml` `test-agent.goal` switched Vitest → Jest to align with the rest of the project's already-Jest tooling. Template `0.20.0 → 0.21.0`. Build clean across all 13 packages. **Live verification cycle escalated at intent-agent on a planner/architecture-agent symbol-name inconsistency BEFORE reaching the gate**, so Fixes 1+2 (gate-side) didn't get an LLM-level test; Fix 3's new alert call didn't fire (the cycle escalated via the existing TR_033 `waiting-for-clarification` path which already has its own alert). New HIGH follow-up: cross-check planner-agent vs architecture-agent symbol names. **Earlier (TR_035 — mechanisms 6/8 PASS, feature blocked by orthogonal gate constraint-agent false-positives)** — dynamic five-layer token budget management + phase-evaluator git detection via squash-merge SHA + architecture-agent 12k fallback floor. ADR-057 appended to `docs/DECISIONS.md` before implementing. **Part A**: `BaseLLMAgent` gains a five-layer pipeline on every LLM call. Layer 1 — model-aware defaults (reasoning models `o1`/`o3`/`gpt-5*` get 8k vs 2k standard). Layer 2 — dynamic budget (input × 1.5 for reasoning, × 0.5 standard, clamped by per-model hard limits). Layer 3 — scope reduction with three structural rewrites (`summarisePriorPhaseHistory`, `compressRulesSection`, `trimArchitectureContext`) when estimated input tokens exceed the configurable threshold (default 6000). Layer 4 — JSON response guard (`addJsonResponseGuard()` appended to prompts by the six structured-output agents: architecture-agent's `designFeature`+`designPhase`, planner-agent, phase-evaluator-agent, constraint-agent, review-agent, self-healing-agent). Layer 5 — truncation retry (re-issues the call on `finish_reason: 'length'` with a doubled budget, up to 3 attempts). `LLMResponse` extended with `finishReason`. New `HarnessConfig.tokenManagement` block (`promptCompressionThreshold` / `maxRetryBudgetMultiplier` / `enableDynamicBudget` / `enableScopeReduction`) tunes thresholds per project. Per-call telemetry persisted into `agent_execution_logs.token_management` (JSONB; migration 029). **Part B**: (B1) `architecture-agent.max_tokens` bumped 6k → 12k in trackeros `agents.yaml` as the fallback floor; Layers 2 + 5 handle higher cases. (B2) Phase-evaluator now prefers `git show --name-only --format= <mergeCommitSha>` over `git diff` — the existing `mergePullRequest` already returns the squash-merge SHA, so the promotion-agent's `maybeAutoMerge` now resolves `findPhaseByIntent → updatePhaseMergeCommit(phase.id, sha)` after the merge succeeds. New `FeaturePhaseRecord.mergeCommitSha` column (migration 029) + `FeatureRepository.updatePhaseMergeCommit` (postgres impl + oracle/mssql stubs). `PhaseBranchContext` extended; `evaluator-prompt.ts` prefers `git show` when SHA present, falls back gracefully. HARNESS template + trackeros `phase-evaluator-agent.rules` updated to teach the agent the new command. Template 0.19.0 → 0.20.0. Build: `pnpm -r build` clean across all 13 packages. **Live verification pending** for all 10 parts — needs `gestalt feature submit` cycle on trackeros to observe Layer N firings + `git show` path.
 
 **Earlier (TR_034 — mechanisms verified, autonomous completion not achieved)** — scoped per-phase architecture replaces the full architecture context in the Aider message. `buildAiderMessage` dropped `## Project architecture` and `## Design context` in favor of a `## Scoped architecture for this phase` block built from architecture-agent's `designPhase()` JSON. New `updatePhaseArchitecture` repo method persists the JSON; `aider-code-agent.loadPhaseArchitectureForCycle()` reads it back. Template 0.18.0 → 0.19.0. Verified live on trackeros feature `45fe91b3`: per-phase pass fires, `readFiles` includes real shared/db paths, `messageBytes` 5705 → 2922, Phase 1 deployed via PR #119. **Same TR_033 failure mode persisted**: gpt-5.5 + Aider produced zero source code; architecture-agent's `designPhase` returned empty arrays so the scoped block was empty and dropped — Aider got task + rules + readFiles only. TR_035 Part B1 raises the floor to 12k; TR_035 Layer 4 frames the JSON contract.
 
@@ -943,6 +943,57 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_037 — Planner-agent uses architecture-agent's canonical type names (template 0.22.0, build clean, symbol-name conflict resolved end-to-end)
+
+Two fixes against the TR_036 NEW HIGH follow-up:
+
+- **Fix 1** — `packages/agents/planning/src/prompts/planner-prompt.ts`
+  injects the full `FeatureArchitecture` JSON (sliced to 2000
+  chars) as a `## Canonical type and symbol names` section above
+  the HARNESS rules and above the task description. The planner
+  sees architecture-agent's canonical names before it starts
+  planning. No threading through `task.context` needed — the
+  planner-agent already receives `architecture` as a positional
+  parameter via `planFeature(feature, architecture, …)`.
+- **Fix 2** — `agentConfig.planner-agent.rules` in template +
+  trackeros HARNESS appended with: "The architecture specification
+  provided above defines the canonical type names, interface
+  names, and symbol names for this feature. Use these exact names
+  in all phase scopes. Do not invent alternative names or rename
+  types." Abstract — no hardcoded type names.
+
+Template bumped 0.21.0 → 0.22.0. `pnpm -r build` clean across
+all 13 packages.
+
+**Live verification — symbol-name conflict resolved:** trackeros
+feature `ce9d1b80-b442-4547-afcf-d389e4aa8b63` on `chat-latest`
+produced a 5-phase plan with Phase 1 scope using
+architecture-agent's canonical `LeaveRequest` type + field list
+verbatim. Phase 1's per-phase architecture: 4 interfaces +
+5 success criteria + full SQL schema. Cycle proceeded into
+`generating` without intent-agent escalation on symbol names.
+
+**Cycle still blocked at intent-agent — NEW orthogonal finding:**
+After the symbol-name conflict was resolved, intent-agent escalated
+on a different ambiguity: "The concrete persistence implementation
+backing `LeaveRepository` is not specified." Architecture-agent
+defines the interface but doesn't pin the concrete DB
+driver/package. This is a stricter intent-agent bar than the prior
+symbol-name conflict — and TR_037's fix doesn't address it.
+
+**Operator action — trackeros:** none new beyond the already-pushed
+`5f083345 chore(TR_037): planner-agent canonical-names rule`.
+
+**Operator action — other projects:** Existing projects adopt the
+canonical-names rule by appending to
+`HARNESS.json.agentConfig.planner-agent.rules`:
+> "The architecture specification provided above defines the
+> canonical type names, interface names, and symbol names for
+> this feature. Use these exact names in all phase scopes. Do
+> not invent alternative names or rename types."
+
+Template auto-refreshes to `0.22.0` at next server boot.
+
 ### TR_036 — Abstract gate rules + auto-generated project-structure brief + maxPhaseRetries alert path (template 0.21.0, build clean, live verification partial)
 
 Four fixes against TR_035 verification findings:
@@ -1571,6 +1622,157 @@ Moved to [@docs/claude/ARCHITECTURE.md](./ARCHITECTURE.md#key-type-alignment-rul
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+### Session 2026-06-10 — Claude Code (TR_037: planner-agent uses architecture-agent's canonical type names — TR_036 follow-up — symbol-name conflict resolved end-to-end; intent-agent now blocks on a different ambiguity — concrete persistence implementation not specified)
+
+Brief: one-fix-one-rule directly addressing TR_036's NEW HIGH
+follow-up. TR_036's verification cycle blocked at intent-agent on
+`LeaveStatus vs LeaveRequestStatus` / `CreateLeaveRequestDto vs
+CreateLeaveRequestInput` — the planner-agent and architecture-agent
+emit type names independently with nothing reconciling them. This
+session injects architecture-agent's full JSON output into the
+planner-agent prompt as a "Canonical type and symbol names" block,
+plus a HARNESS rule telling the planner to use those exact names.
+
+What changed (2 fixes):
+
+**Fix 1 — Inject canonical architecture into planner-agent prompt**
+
+- `packages/agents/planning/src/prompts/planner-prompt.ts` —
+  `buildFeaturePlanPrompt` now renders the full
+  `FeatureArchitecture` object as a `## Canonical type and symbol
+  names` section with the architecture JSON pretty-printed and
+  sliced to 2000 chars. The section sits BETWEEN the persona/goal
+  framing and the harness rules section, BEFORE the task
+  description — the planner sees canonical names before it starts
+  planning. Prior planner-prompt only injected
+  `Domain entities: <names>` and `Modules: <name>@<path>` — the
+  attributes + interface fields where canonical field names live
+  were dropped.
+- No threading through `task.context` needed — the planner-agent
+  already receives `architecture` as a positional parameter via
+  `planFeature(feature, architecture, …)`. The Fix 1 change is
+  entirely inside `planner-prompt.ts`.
+
+**Fix 2 — Abstract canonical-names rule in HARNESS**
+
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json` and
+  `/Users/amrmohamed/Work/trackeros/HARNESS.json` —
+  `agentConfig.planner-agent.rules` appended with: "The
+  architecture specification provided above defines the canonical
+  type names, interface names, and symbol names for this feature.
+  Use these exact names in all phase scopes. Do not invent
+  alternative names or rename types."
+- Abstract — no hardcoded type names. The LLM reads the
+  architecture output (now in the prompt) and applies the rule.
+
+**Template version bumped 0.21.0 → 0.22.0.** No new migration.
+Build clean across all 13 packages.
+
+What's verified live (trackeros feature
+`ce9d1b80-b442-4547-afcf-d389e4aa8b63` on chat-latest):
+
+- ✅ **Canonical names alignment** — the architecture-agent
+  defined `LeaveRequest` with attributes `id, employeeId,
+  leaveType, startDate, endDate, status` and the planner emitted
+  Phase 1 scope: "Create src/modules/leave/leave.model.ts
+  defining the **canonical LeaveRequest type** and DTOs needed by
+  persistence using the **fields id, employeeId, leaveType,
+  startDate, endDate, and status**". Exact name + exact field
+  list. No more `LeaveStatus` vs `LeaveRequestStatus` divergence.
+- ✅ **Tighter plan** — 5 phases (vs TR_036's 7, TR_035's 8) with
+  meaningful titles (e.g. "Leave Module Core Domain and
+  Persistence", "Leave Request Submission Workflow") instead of
+  the prior "Create leave model" / "Create leave repository"
+  decomposition.
+- ✅ **Richer per-phase architecture** — Phase 1 has 4 interfaces +
+  5 success criteria + SQL schema (`leave_requests` table with
+  full column list + indices). Vs TR_036's 2 interfaces + 5
+  criteria and TR_035's 1 interface + 1-2 criteria.
+- ✅ **Intent-agent did NOT escalate on symbol names** — the
+  cycle proceeded into `generating` (no immediate cascade brake
+  on the TR_036 symbol mismatch).
+- ✅ **feature-blocked alert** fired correctly via the existing
+  TR_033 helper.
+
+What blocked the verification cycle (NEW orthogonal finding):
+
+After ~6 minutes in `generating`, intent-agent escalated to
+`waiting-for-clarification` with a DIFFERENT reason:
+
+> "High-impact ambiguity: The concrete persistence
+> implementation backing LeaveRepository is not specified."
+
+i.e. the architecture-agent defined the `LeaveRepository`
+interface but didn't pin the concrete DB driver / package
+choice (`pg` Pool? Knex? Prisma?). The planner inherited this
+ambiguity; intent-agent's clarification check is strict enough
+to flag it. Self-healing → cascade brake → feature blocked.
+Total cycle wall-clock: ~6 minutes.
+
+What this means: TR_037 closed the symbol-name conflict gap
+that TR_036 verification surfaced. A NEW, more nuanced
+ambiguity is now the blocker — architectural decisions
+(implementation choice) the architecture-agent doesn't pin
+because they aren't strictly necessary for the interface
+contract. This is a stricter intent-agent than the platform
+needs for autonomous completion.
+
+**Pending follow-ups (NEW from TR_037 verification):**
+
+- **(HIGH — NEW)** architecture-agent should specify the
+  concrete persistence implementation per repository
+  interface — at minimum the DB driver/package name. The
+  fix could be HARNESS-only (new
+  `architecture-agent.architectureGuidance` item) or
+  platform-side (a deterministic post-processing step that
+  reads `HARNESS.stack.database` and appends "Implement with
+  the `pg` driver targeting Postgres" to each repository
+  interface description).
+- **(MEDIUM — NEW)** intent-agent's clarification bar is too
+  strict for autonomous planning. A `LeaveRepository` interface
+  with no concrete implementation note is reasonable — the
+  code-agent can pick a reasonable default based on the
+  project's `package.json` + `HARNESS.stack`. Either (a)
+  intent-agent's clarification scoring treats
+  "implementation-detail not specified" as low-severity, or
+  (b) self-healing's diagnostician dispatches a `fix-intent`
+  child to add the concrete implementation note before
+  cascade-braking.
+
+Carryover follow-ups (status updates):
+
+- **(RESOLVED by TR_037 Fix 1)** TR_036 HIGH: planner-agent ↔
+  architecture-agent symbol-name inconsistency. The planner
+  now sees the architecture JSON verbatim and uses the same
+  names. Verified end-to-end on the live cycle.
+- **(STILL OPEN — HIGH from TR_036)** Gate-side fixes (Project
+  structure brief + abstract rules) still not LLM-tested — the
+  gate has never run in any verification cycle since they
+  landed. The new TR_037 follow-ups need to be resolved first
+  to get past intent-agent.
+
+Build status: `pnpm -r build` clean across all 13 packages.
+Template auto-refreshes to `0.22.0` at next server boot.
+
+Files changed:
+- `packages/agents/planning/src/prompts/planner-prompt.ts`
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
+- `templates/corporate-ops-web-mobile/template.json`
+- `/Users/amrmohamed/Work/trackeros/HARNESS.json` (separate repo)
+
+Live URLs:
+- Dashboard: http://localhost:3000/app/
+- TR_037 verification feature:
+  http://localhost:3000/app/features/ce9d1b80-b442-4547-afcf-d389e4aa8b63
+- PLAN.md on trackeros main:
+  https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
+- trackeros TR_037 HARNESS commit:
+  https://github.com/afarahat-lab/trackeros/commit/5f083345
+- platform feat commit (will land after this session's
+  RECENT.md commit): pending
+
+---
+---
 ### Session 2026-06-10 — Claude Code (TR_036: abstract constraint+review rules + auto-generated project-structure brief at gate runtime + maxPhaseRetries alert path + trackeros Jest alignment — build clean across all 13 packages; live verification cycle blocked at intent-agent on a planner/architecture-agent naming inconsistency before TR_036's gate-side code paths could execute; alert path verified via the existing TR_033 helper that fired on the cascade-brake escalation)
 
 Brief: four fixes targeting the constraint-agent false-positive
@@ -1807,492 +2009,6 @@ Files changed:
 - `templates/corporate-ops-web-mobile/template.json`
 - `/Users/amrmohamed/Work/trackeros/HARNESS.json` (separate repo)
 - `/Users/amrmohamed/Work/trackeros/agents.yaml` (separate repo)
-
----
----
-### Session 2026-06-10 — Claude Code (TR_035: dynamic 5-layer token budget management + phase-evaluator git-show via merge-commit SHA + architecture-agent 12k floor — ADR-057 added, all 13 packages build clean; live verification — mechanisms 6/8 PASS, feature did not converge due to gate constraint-agent false-positives orthogonal to TR_035)
-
-Brief: two categories of work bundled. **Part A** — platform-level
-dynamic token management (ADR-057, five layers in BaseLLMAgent).
-**Part B** — three TR_034 follow-up fixes to unblock the planning
-loop milestone. ADR-057 added to `docs/DECISIONS.md` before
-implementing.
-
-What changed (10 parts):
-
-**Part A1 — `HarnessConfig.tokenManagement` type**
-
-- `packages/core/src/harness/index.ts` — new
-  `TokenManagementConfig` interface (`promptCompressionThreshold`,
-  `maxRetryBudgetMultiplier`, `enableDynamicBudget`,
-  `enableScopeReduction`), optional on `HarnessConfig`. Re-exported
-  from `@gestalt/core`'s public surface.
-
-**Part A2 — Five-layer token management in `BaseLLMAgent`**
-
-- `packages/core/src/agents/base-llm-agent.ts` — `callLLMWithMessages`
-  rewritten as a pipeline. Layer 1 (model-aware defaults via
-  `resolveDefaultMaxTokens` / `isReasoningModel`), Layer 2
-  (dynamic budget via `calculateDynamicBudget` — input × 1.5 for
-  reasoning, × 0.5 standard, clamped by per-model hard limits),
-  Layer 3 (scope reduction with three structural rewrites:
-  `summarisePriorPhaseHistory`, `compressRulesSection`,
-  `trimArchitectureContext`), Layer 5 (truncation retry doubling
-  the budget on `finish_reason === 'length'`, up to 3 attempts).
-  Same layers wire through `runToolLoop` for tool-use agents
-  (Layer 5 stays on `callLLMWithMessages` only — multi-turn
-  truncation is handled by the existing `capStruck` mechanism).
-- `packages/core/src/llm/index.ts` — `LLMResponse` extended with
-  `finishReason: 'stop' | 'length' | 'content_filter' | 'unknown'`.
-  `callProvider` extracts `data.choices[0]?.finish_reason` from
-  OpenAI's response.
-- `BaseLLMAgent` gains `lastTokenManagement: TokenManagementLog |
-  null` (per-call telemetry) and `harnessConfigForRun: HarnessConfig
-  | null` (set in the template `run()` from
-  `task.contextSnapshot.harness`; subclasses that override `run`
-  call `setHarnessConfigForRun(harness)`). Layer 4
-  (`addJsonResponseGuard`) lives as a protected method — callers
-  apply it to prompts they build before handing them to `callLLM`.
-
-**Part A3 — JSON guard applied to six structured-output agents**
-
-- `architecture-agent.designFeature` + `designPhase` — both
-  prompts wrapped in `addJsonResponseGuard`; both call
-  `setHarnessConfigForRun` before `callLLM`.
-- `planner-agent.planFeature` — same treatment.
-- `phase-evaluator-agent.evaluatePhase` — same treatment
-  (prompt wrapped before tool-loop call).
-- `constraint-agent.verify` (quality-gate) — guard applied;
-  harness config wired from `loadHarnessConfig`.
-- `llm-review-agent.review` — guard applied; partial-typed
-  `fullHarness` cast to the setter shape (runtime JSON includes
-  `tokenManagement` when present).
-- `self-healing-agent.diagnose` — guard applied to the
-  diagnosis prompt. Doesn't currently receive harness config —
-  uses Layer 1/2/4/5 with baked-in defaults (Layer 3 off without
-  config; acceptable).
-
-**Part A4 + B3 — Migration 029_token_management_and_phase_merge.sql**
-
-Single migration adds two columns:
-- `agent_execution_logs.token_management JSONB`
-- `feature_phases.merge_commit_sha TEXT`
-
-Both `ALTER TABLE … ADD COLUMN IF NOT EXISTS`. Pure schema, no
-`schema_migrations` write (runner owns).
-
-**Part A4 — Repository wiring**
-
-- `AgentExecutionLogRecord` gains `tokenManagement:
-  TokenManagementLogRecord | null`. New
-  `TokenManagementLogRecord` type (mirror of the agent-side
-  `TokenManagementLog`) defined in the repository module so the
-  postgres adapter doesn't depend on `@gestalt/agents-*`.
-- `AgentExecutionLogRepository.save` shape made
-  backward-compatible: `tokenManagement` is **optional** on
-  insert (`Omit<…, 'tokenManagement'> & { tokenManagement?: …
-  | null }`) so legacy non-LLM call sites don't need updating.
-- Postgres impl: `LogRow.tokenManagement` added, parsed via
-  `parseJsonb` on read, persisted via `db.json(…)` on write,
-  `null` when caller omits.
-- Generate-orchestrator (`orchestrator.ts`): both the success
-  and the throw-path `executionLogs.save` calls now pass
-  `tokenManagement: agentInstance?.lastTokenManagement ?? null`.
-- Gate-orchestrator (`gate-orchestrator.ts`): constraint-agent
-  + review-agent decorators forward `lastTokenManagement` onto
-  the result so the orchestrator's `executionLogs.save` site
-  reads it back.
-- Planning-orchestrator does not currently persist execution
-  logs for architecture/planner/evaluator — telemetry is
-  available on `lastTokenManagement` for runtime use but not
-  written to the DB yet. Out of scope for this brief.
-
-**Part A5 — HARNESS template + trackeros**
-
-- `templates/corporate-ops-web-mobile/harness/HARNESS.json` —
-  new `tokenManagement` block with the four default values
-  (6000 / 2.0 / true / true).
-- `trackeros/HARNESS.json` — same block added.
-- `templates/corporate-ops-web-mobile/template.json` —
-  `0.19.0 → 0.20.0`.
-
-**Part B1 — architecture-agent floor bumped 6k → 12k**
-
-`trackeros/agents.yaml` — `architecture-agent.llm.max_tokens:
-12000`. Comment explains: this is now the fallback floor;
-Layers 2 + 5 in BaseLLMAgent handle prompts that need more.
-
-**Part B2 — Phase-evaluator git detection via merge-commit SHA**
-
-- `FeaturePhaseRecord` gains `mergeCommitSha: string | null`.
-  Postgres `hydratePhase` defends against legacy rows. Oracle +
-  MSSQL stubs added.
-- `FeatureRepository.updatePhaseMergeCommit(phaseId, sha):
-  Promise<FeaturePhaseRecord>` added on the interface, postgres
-  impl, and oracle/mssql stubs.
-- `createPhase` Omit list updated across all three adapter
-  signatures to exclude `mergeCommitSha` (caller doesn't pass it).
-- The brief proposed a separate `getMergeCommitSha(prNumber)`
-  on `GitHubActionsAdapter`, but the existing
-  `mergePullRequest` already returns `{ merged, sha }` — no new
-  adapter call needed. Instead the promotion-agent's
-  `maybeAutoMerge` writes the SHA after a successful merge:
-  `findPhaseByIntent(intentId)` → `updatePhaseMergeCommit(phase.id,
-  sha)`. Best-effort: a failure here logs + continues.
-- Planning-orchestrator's `evaluatePhase` dispatch threads
-  `phase.mergeCommitSha` into the `PhaseBranchContext`.
-  `PhaseBranchContext` type extended.
-- `evaluator-prompt.ts` — the prompt now prefers `git show
-  --name-only --format= <sha>` when the SHA is present, and
-  falls back to `git diff origin/<defaultBranch>...origin/<phaseBranch>`
-  otherwise. Branch-context display section gains a
-  `Merge commit SHA:` line.
-- HARNESS template + trackeros `agentConfig.phase-evaluator-agent.rules`
-  — new top rule: "To detect what files were built in this
-  phase, prefer running: git show --name-only --format=
-  <mergeCommitSha>. … If mergeCommitSha is null, fall back to:
-  git diff origin/<defaultBranch>~1..origin/<defaultBranch>".
-
-**Part C — ADR-057**
-
-Appended to `docs/DECISIONS.md`. Status: Accepted. Documents
-the five layers, the rationale (manual tuning doesn't scale;
-scope reduction preferred over budget expansion), and the
-ADR-042 split — layers are platform mechanics in `.ts`,
-thresholds are tunable in HARNESS.
-
-What's verified (build):
-
-- ✅ `pnpm -r build` clean across all 13 packages.
-- ✅ TypeScript types match — `LLMResponse.finishReason`
-  surface change rippled to provider; `tokenManagement` optional
-  on `save` so legacy call sites still compile; `mergeCommitSha`
-  added everywhere; `createPhase` Omit lists kept consistent.
-
-What's NOT verified yet (live cycle pending):
-
-- ❌ Layer 1 model-aware defaults firing in practice (need to
-  observe `Dynamic token budget: X → Y` log lines).
-- ❌ Layer 2 dynamic budget — needs to be observed for both a
-  small prompt (no expansion) and a large prompt (expanded).
-- ❌ Layer 3 scope reduction strategies — `summarisePriorPhaseHistory`
-  + `compressRulesSection` + `trimArchitectureContext` need
-  prompts large enough to trigger them. The regex patterns
-  target `### Phase N` headers, `## Rules`/`## Project rules`
-  blocks, and `## Architecture context`/`## Full architecture`
-  blocks; if the actual prompt structure differs from these
-  patterns the reduction is a no-op (the threshold-skip path
-  will log "Scope reduction insufficient — truncation retry
-  will handle").
-- ❌ Layer 4 JSON guard — applied to six agents but its effect
-  is observable only via output quality (the goal is fewer
-  malformed JSON responses from gpt-5.5 reasoning).
-- ❌ Layer 5 truncation retry — needs `finish_reason: 'length'`
-  to fire. Only observable on undersized budgets.
-- ❌ `agent_execution_logs.token_management` populated end-to-end.
-- ❌ `feature_phases.merge_commit_sha` populated after auto-merge.
-- ❌ Phase-evaluator running `git show <sha>` instead of `git diff`.
-- ❌ End-to-end feature completion — the milestone goal.
-
-Decisions made:
-
-- **Template version bumped 0.19.0 → 0.20.0** (the brief said
-  0.18.0 but template was already 0.19.0 from TR_034).
-- **No separate `getMergeCommitSha` adapter method** — the
-  existing `mergePullRequest` return value already carries
-  the SHA. Saved one wire round-trip and avoided a new
-  PipelineAdapter interface method that would force every
-  stub to implement it.
-- **Layer 4 stays as a manual call**, not auto-applied. Some
-  agents (constraint-agent in tool-use loop) return YAML or
-  prose; auto-guarding would break them.
-- **Truncation retry caps at the model's hard limit**, not at
-  the configured ceiling. If the model itself only supports
-  16384 tokens, retrying with 32k would error before the
-  request reaches the provider.
-- **Layer 3 reduces the LAST user message only**. System
-  messages (e.g. context-fixer's ADR-018 preservation rule)
-  are caller-shaped — rewriting them would break the
-  contract.
-- **`harnessConfigForRun` is a stored field, not a parameter.**
-  Threading it through every `callLLM*` signature would
-  break every gate / maintenance subclass that overrides
-  `run()`. The stored field + `setHarnessConfigForRun`
-  helper keeps the existing call sites unchanged and gives
-  overrides a one-line opt-in.
-
-Pending follow-ups (NEW from TR_035):
-
-- **(MEDIUM — NEW)** Planning-orchestrator does not yet
-  persist `agent_execution_logs` rows for
-  architecture-agent / planner-agent / phase-evaluator-agent.
-  Token-management telemetry for these agents is captured on
-  the agent instance but lost at the orchestrator boundary.
-  Add the save calls (and an `agent_executions` row per
-  agent) so the dashboard's IntentDetail accordion can show
-  token-management findings for the planning layer too.
-- **(LOW — NEW)** Layer 3's `compressRulesSection` only
-  preserves the first sentence of each bullet. If a project
-  declares rules where the first sentence is generic and
-  the body carries the substance (e.g.
-  `- Read existing files. Specifically: package.json, …`),
-  the compression drops the substance. Mitigation:
-  operators write rules with the substance up front; or
-  add a second strategy that keeps full bullets but drops
-  every other bullet.
-- **(LOW — NEW)** The scope-reduction regex patterns are
-  prompt-structure-specific. If a project's `agents.yaml`
-  `prompt_extensions` produces a section named
-  `## Architecture brief` instead of
-  `## Architecture context`, the `trimArchitectureContext`
-  strategy is a no-op. Document the expected headers in the
-  HARNESS docs.
-- **(LOW — NEW)** Layer 5 retry doubles the budget on
-  `finish_reason: 'length'`. For reasoning models that
-  consumed the entire budget on reasoning (gpt-5.5 cases
-  observed in TR_034), the doubled budget gives more
-  reasoning headroom, not necessarily more output. Consider
-  a heuristic: if the response is short AND truncated AND
-  the model is a reasoning model, double the *output*
-  ratio instead of the absolute budget.
-
-Carryover follow-ups (status updates):
-
-- **(ADDRESSED by TR_035 Part B1 — pending live verification)**
-  TR_034 HIGH NEW: `architecture-agent.designPhase` returned
-  empty arrays with gpt-5.5. Bumped to 12k fallback floor;
-  Layer 2 + 5 in BaseLLMAgent handle higher cases.
-- **(STILL OPEN — MEDIUM, from TR_034)** Two escalate paths
-  diverge — phase-evaluator-agent's escalate at line 633
-  doesn't fire Fix 4. Unify by routing through
-  `markFeatureBlockedAfterEscalation`. Not touched this
-  session.
-- **(STILL OPEN — HIGH, from TR_033)** gpt-5.5 + Aider
-  produces zero source code. The brief assumes the scoped
-  architecture (with TR_035's JSON guard + dynamic budget
-  giving it more room to fill the JSON) helps. Live
-  verification will tell.
-- **(STILL OPEN — HIGH, from TR_033)** Auto-merge pipeline
-  pushes `.aider.*` history + `.gestalt/<id>/` metadata
-  + PLAN.md to project main. Trackeros has been
-  garbage-collected manually after every cycle. Not
-  addressed.
-- **(STILL OPEN — MEDIUM, from TR_033)** `classifyError`
-  treats `TypeError: fetch failed` as `retryable: false`.
-- **(STILL OPEN — MEDIUM, from TR_014)** Aider token-spend
-  capture in `agent_executions.tokens_used`.
-
-Build status: `pnpm -r build` clean across all 13 packages.
-Server Docker image will rebuild for live verification.
-Template auto-refreshes to `0.20.0` on next server boot.
-
-Files changed:
-- `docs/DECISIONS.md` (ADR-057 appended)
-- `packages/core/src/harness/index.ts`
-- `packages/core/src/index.ts`
-- `packages/core/src/llm/index.ts`
-- `packages/core/src/agents/base-llm-agent.ts`
-- `packages/core/src/agents/self-healing-agent.ts`
-- `packages/core/src/repository/index.ts`
-- `packages/adapters/postgres/src/migrations/029_token_management_and_phase_merge.sql`
-  (new)
-- `packages/adapters/postgres/src/repositories/execution-logs.ts`
-- `packages/adapters/postgres/src/repositories/features.ts`
-- `packages/adapters/oracle/src/repositories/features.ts`
-- `packages/adapters/mssql/src/repositories/features.ts`
-- `packages/agents/generate/src/orchestrator/orchestrator.ts`
-- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`
-- `packages/agents/quality-gate/src/agents/constraint-agent.ts`
-- `packages/agents/quality-gate/src/agents/llm-review-agent.ts`
-- `packages/agents/deploy/src/agents/promotion-agent.ts`
-- `packages/agents/planning/src/agents/architecture-agent.ts`
-- `packages/agents/planning/src/agents/planner-agent.ts`
-- `packages/agents/planning/src/agents/phase-evaluator-agent.ts`
-- `packages/agents/planning/src/orchestrator/planning-orchestrator.ts`
-- `packages/agents/planning/src/prompts/evaluator-prompt.ts`
-- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
-- `templates/corporate-ops-web-mobile/template.json`
-- `/Users/amrmohamed/Work/trackeros/HARNESS.json` (separate repo)
-- `/Users/amrmohamed/Work/trackeros/agents.yaml` (separate repo)
-
-## Live verification — TR_035 (TEST_REPORT_035.md)
-
-Full verification cycle executed: `docker-compose down -v +
-up -d --build`, operator re-bootstrapped (`init-admin → login
-→ init` on trackeros from scratch — wiped vault meant prior
-project + admin were gone), feature submitted twice.
-
-**Two runs, two model configurations:**
-
-| Aspect          | Run 1                       | Run 2                          |
-|-----------------|-----------------------------|--------------------------------|
-| Platform LLM    | `gpt-4o-mini` (default)     | `chat-latest` (post-restart)   |
-| `api_shape`     | `chat-completions`          | `responses` (reasoning model)  |
-| Feature ID      | `08a1928e-aec1-…`           | `25651054-2008-…`              |
-| Outcome         | Manually aborted as blocked | Phase 1 in `phase-retry 1/2` loop at report-final time |
-
-Run 1 surfaced the operator-side cost of `-v` wipe (admin
-user gone, vault gone, project re-registration needed) and
-the operator-side cost of platform default being
-`gpt-4o-mini` (gate failed 3× — TR_016 pattern). The operator
-switched `.env` to `chat-latest`, then I updated
-`platform_llms` (`model_string: chat-latest`,
-`api_shape: responses`) and submitted Run 2.
-
-**Six of eight checks PASS or are PASS-via-static-evidence:**
-
-- **Check #1 — Dynamic budget calc**: PASS via persisted
-  telemetry. `finalMaxTokens` on every row matches configured
-  ceiling (2000/4000/6000). Layer 2 calc ran; configured
-  value was always larger, so retained. Layer 1 default of
-  2000 visible on intent-agent (which has no override).
-- **Check #2 — architecture-agent JSON non-empty**: **PASS**.
-  Plan log: `Phase 1 architecture: 1 interface(s), 2 criteria`
-  on Run 1, `1 interface(s), 1 criteria` on Run 2. Compare
-  TR_034's `0 interface(s), 0 criteria` — Layer 4 JSON guard
-  closes that failure mode on BOTH `gpt-4o-mini` and
-  `chat-latest`. This was the single most impactful check.
-- **Check #3 — Truncation retry log**: dormant (no
-  `finish_reason: 'length'` across 56 calls). Code path
-  exists.
-- **Check #4 — `token_management` JSONB populated**: **PASS**.
-  56 rows captured across both runs. Distribution: intent /
-  design / test × ~19 each. All rows show the full TR_035
-  shape (originalPromptTokens / finalPromptTokens /
-  reductionStrategy / budgetExpansions / finalMaxTokens /
-  truncationOccurred). Tool-loop agents (code-agent /
-  constraint-agent / review-agent) don't yet populate this
-  column — TR_036 follow-up.
-- **Check #5 — `merge_commit_sha` populated**: NOT
-  EXERCISED. Both runs used `pipeline.adapter: noop`.
-  `maybeAutoMerge` short-circuits before the new
-  `updatePhaseMergeCommit` call. Code path verified
-  statically.
-- **Check #6 — phase-evaluator uses `git show <sha>`**:
-  NOT EXERCISED (depends on #5). Plumbing verified:
-  `PhaseBranchContext.mergeCommitSha` threaded through
-  planning-orchestrator → evaluator prompt; prompt selects
-  `git show` when SHA non-null, falls back to `git diff`
-  otherwise.
-- **Check #7 — Phase 2 auto-dispatched**: NOT REACHED.
-  Phase 1 never deployed in either run.
-- **Check #8 — Feature `completed`**: NOT REACHED.
-
-**Why Phase 1 didn't deploy (orthogonal to TR_035):** the
-gate's constraint-agent + review-agent produce false
-positives on a freshly-scaffolded trackeros:
-
-1. review-agent: "test file uses Vitest, project config
-   specifies Jest" — the freshly-init'd trackeros HARNESS
-   scaffolds Jest, but I gave Vitest in the project
-   description. Mismatch baked in at init time.
-2. review-agent + constraint-agent: both flag the legitimate
-   `src/shared/db/connection.ts` (the only place
-   `new Pool()` belongs) as a repository-pattern violation.
-   Literal reading of the rule produces the false flag.
-3. constraint-agent: "No console.log in business-logic
-   files" mis-applied to a model file.
-
-Even chat-latest correctly applies the rule text — the rule
-text + prompt assembly together produce these flags. Matches
-TR_016's "gate's structural following bar is higher than
-code-agent's creative bar" finding.
-
-**Additional TR_022 mechanism verified concurrently:**
-Full Phase 1 retry exhaustion sequence captured in Run 2
-plan log:
-- 08:21:23 phase-submitted (intent 03c0316f)
-- 08:51:01 phase-retry 1/2 → intent 4ab11339
-- 09:21:20 phase-retry 2/2 → intent b3720daa
-- 09:53:24 phase-failed (terminal) — feature blocked
-
-TR_022 `maxPhaseRetries: 2` mechanism verified end-to-end.
-Wall-clock for the 3 attempts: ~92 minutes.
-
-**NEW HIGH FINDING — TR_033 Fix 4 alert gap:** Terminal
-`Status: blocked` reached at 09:53:24, but the alerts table
-shows zero `feature-blocked` alerts. Fix 4's
-`markFeatureBlockedAfterEscalation` helper (which creates
-the alert + writes `phase-escalated` plan log entry) only
-fires from the `intent.status-changed` subscriber on
-`waiting-for-clarification` / `escalated` statuses — i.e.
-the self-healing cascade-brake path. The planner's
-`maxPhaseRetries` exhaustion path is a DIFFERENT escalation
-entry that marks `feature.status = 'blocked'` directly and
-writes `phase-failed` to the plan log but **does NOT route
-through Fix 4** → no alert created. Operator only sees the
-failure via `gestalt feature show` / dashboard, not via the
-alerts feed. **TR_036 follow-up: unify the two paths through
-`markFeatureBlockedAfterEscalation`.**
-
-**Decisions made during verification:**
-
-- Marked Run 1 feature `blocked` via SQL after gpt-4o-mini
-  exhausted retries (cycle was stuck repeating the same
-  CONSTRAINT_VIOLATION pattern; pushing further would not
-  produce new evidence). Flushed BullMQ to free workers for
-  Run 2.
-- Did NOT edit trackeros HARNESS to drop the
-  repository-pattern rule mid-verification — that would
-  conflate the test with the fix.
-- Did NOT push a new template to switch test framework
-  detection — out of scope for TR_035.
-
-**Pending follow-ups (NEW from TR_035 verification):**
-
-- **(HIGH — NEW)** TR_033 Fix 4 alert gap (above):
-  planner's `maxPhaseRetries` exhaustion path doesn't fire
-  the `feature-blocked` alert. Unify the two escalation
-  paths through `markFeatureBlockedAfterEscalation`.
-- **(MEDIUM — NEW)** Tool-loop agents (code-agent /
-  constraint-agent / review-agent) don't capture
-  `lastTokenManagement`. `runToolLoop` should write a
-  final-turn aggregate so the dashboard's token-management
-  panel shows them too.
-- **(MEDIUM — NEW)** Planning-orchestrator does not yet
-  persist `agent_execution_logs` rows for architecture /
-  planner / phase-evaluator agents. Token-management
-  telemetry for these is lost at the orchestrator boundary.
-- **(HIGH — RESURFACED)** Constraint-agent +
-  review-agent rules in the template HARNESS need a
-  `src/shared/db/*` carve-out for the repository-pattern
-  rule. Every freshly-init'd project will hit this
-  false-positive cascade until the rule wording is fixed.
-  Separate workstream — out of TR_035 scope but blocks
-  every autonomous cycle.
-- **(MEDIUM — RESURFACED)** Template scaffolding test
-  framework lock-in — `gestalt init` substitutes Jest into
-  the harness regardless of the project description text.
-  When the description specifies Vitest, generated code uses
-  Vitest imports; the gate then flags the mismatch.
-
-**Carryover follow-ups (status updates):**
-
-- **(ADDRESSED by TR_035 Layer 4 — VERIFIED on Run 1 +
-  Run 2)** TR_034 HIGH: gpt-5.5 designPhase emits empty
-  JSON. Layer 4 JSON guard closes this. Verified on both a
-  non-reasoning model (gpt-4o-mini) and a reasoning model
-  (chat-latest).
-- **(ADDRESSED by TR_035 Part B1 — PARTIAL)** TR_034 HIGH:
-  architecture-agent 12k floor. Trackeros local
-  `agents.yaml` has 12k bumped; remote was reset by `gestalt
-  init` to platform-default `~`. Not exercised on either
-  remote because the relevant override is local.
-- **(STILL OPEN — HIGH)** TR_032/033: gpt-5.5 + Aider zero
-  source code. Not exercised — this verification used the
-  LLM-driven code-agent path (codeGeneration backend defaults
-  to `gestalt` on a freshly-init'd HARNESS).
-
-**Build status:** `pnpm -r build` clean across all 13
-packages. Test report: `docs/claude/TEST_REPORT_035.md`.
-Server containers running with migration 029 applied;
-`agent_execution_logs.token_management` JSONB +
-`feature_phases.merge_commit_sha` TEXT columns both
-queryable.
-
-**Files changed (verification — beyond the implementation
-session):**
-- `docs/claude/TEST_REPORT_035.md` (new)
 
 ---
 ---

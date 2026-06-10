@@ -54,6 +54,57 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_037 — Planner-agent uses architecture-agent's canonical type names (template 0.22.0, build clean, symbol-name conflict resolved end-to-end)
+
+Two fixes against the TR_036 NEW HIGH follow-up:
+
+- **Fix 1** — `packages/agents/planning/src/prompts/planner-prompt.ts`
+  injects the full `FeatureArchitecture` JSON (sliced to 2000
+  chars) as a `## Canonical type and symbol names` section above
+  the HARNESS rules and above the task description. The planner
+  sees architecture-agent's canonical names before it starts
+  planning. No threading through `task.context` needed — the
+  planner-agent already receives `architecture` as a positional
+  parameter via `planFeature(feature, architecture, …)`.
+- **Fix 2** — `agentConfig.planner-agent.rules` in template +
+  trackeros HARNESS appended with: "The architecture specification
+  provided above defines the canonical type names, interface
+  names, and symbol names for this feature. Use these exact names
+  in all phase scopes. Do not invent alternative names or rename
+  types." Abstract — no hardcoded type names.
+
+Template bumped 0.21.0 → 0.22.0. `pnpm -r build` clean across
+all 13 packages.
+
+**Live verification — symbol-name conflict resolved:** trackeros
+feature `ce9d1b80-b442-4547-afcf-d389e4aa8b63` on `chat-latest`
+produced a 5-phase plan with Phase 1 scope using
+architecture-agent's canonical `LeaveRequest` type + field list
+verbatim. Phase 1's per-phase architecture: 4 interfaces +
+5 success criteria + full SQL schema. Cycle proceeded into
+`generating` without intent-agent escalation on symbol names.
+
+**Cycle still blocked at intent-agent — NEW orthogonal finding:**
+After the symbol-name conflict was resolved, intent-agent escalated
+on a different ambiguity: "The concrete persistence implementation
+backing `LeaveRepository` is not specified." Architecture-agent
+defines the interface but doesn't pin the concrete DB
+driver/package. This is a stricter intent-agent bar than the prior
+symbol-name conflict — and TR_037's fix doesn't address it.
+
+**Operator action — trackeros:** none new beyond the already-pushed
+`5f083345 chore(TR_037): planner-agent canonical-names rule`.
+
+**Operator action — other projects:** Existing projects adopt the
+canonical-names rule by appending to
+`HARNESS.json.agentConfig.planner-agent.rules`:
+> "The architecture specification provided above defines the
+> canonical type names, interface names, and symbol names for
+> this feature. Use these exact names in all phase scopes. Do
+> not invent alternative names or rename types."
+
+Template auto-refreshes to `0.22.0` at next server boot.
+
 ### TR_036 — Abstract gate rules + auto-generated project-structure brief + maxPhaseRetries alert path (template 0.21.0, build clean, live verification partial)
 
 Four fixes against TR_035 verification findings:
