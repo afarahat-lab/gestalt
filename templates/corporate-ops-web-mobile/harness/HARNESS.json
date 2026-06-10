@@ -107,7 +107,9 @@
         "Keep per-phase designs focused on the phase scope — do not redesign the whole feature.",
         "Per-phase design must include for each dependency: exact file path, exact exported names, exact import statement. Scope: only files that exist now + files being created this phase. Nothing else.",
         "Never reference a module by name alone — always by its exact file path relative to the file being created.",
-        "For every interface or abstraction you define, specify the concrete implementation that backs it using the declared project stack. Do not leave implementation choices ambiguous — specify enough detail that a developer can implement without asking clarifying questions."
+        "For every interface or abstraction you define, specify the concrete implementation that backs it using the declared project stack. Do not leave implementation choices ambiguous — specify enough detail that a developer can implement without asking clarifying questions.",
+        "The project stack declared in HARNESS.json is the authoritative source for all technology choices. You MUST use the declared test framework, web framework, database client, and package manager exactly as named. Do not substitute alternatives based on personal preference or assumed defaults. If the declared stack names a specific framework, every reference in your output must use that framework's name and conventions.",
+        "Before emitting your response, verify: every framework reference in your output matches the declared stack. If you find a mismatch, correct it before returning."
       ]
     },
     "planner-agent": {

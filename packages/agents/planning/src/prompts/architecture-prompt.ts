@@ -215,6 +215,31 @@ export function buildArchitectureReviewPrompt(
   const stackSection = renderStackSection(harnessConfig);
   const draftJson = JSON.stringify(draft, null, 2).slice(0, 3000);
 
+  // TR_040 — stack compliance gate. The review pass becomes an
+  // enforcement step: any framework reference in the draft that
+  // doesn't match `HARNESS.stack` must be corrected before the
+  // reviewed JSON is returned. Empty string when no stack is
+  // declared — the check is skipped cleanly.
+  const stack = harnessConfig?.stack;
+  const stackComplianceCheck =
+    stack && Object.keys(stack).length > 0
+      ? [
+          '## Stack compliance check',
+          '',
+          'The following stack is declared for this project:',
+          '```json',
+          JSON.stringify(stack, null, 2),
+          '```',
+          '',
+          'Before returning, verify:',
+          '- Every framework reference matches the declared stack.',
+          '- No alternative frameworks appear in success criteria,',
+          '  interface names, or implementation notes.',
+          '- If you find any mismatch, correct it in your output.',
+          '',
+        ].join('\n')
+      : '';
+
   return [
     `You are ${agentCfg.role} performing a design review.`,
     `Goal: ${agentCfg.goal}.`,
@@ -240,6 +265,7 @@ export function buildArchitectureReviewPrompt(
     'If it has gaps, fix them and return the corrected version.',
     'Return the COMPLETE architecture JSON — not just the changes.',
     '',
+    stackComplianceCheck,
     'Return ONLY a single JSON object — no preamble, no markdown fences — in the same schema as the input:',
     '',
     '```json',
