@@ -39,6 +39,21 @@ export interface FeatureArchitecture {
   }>;
   /** Markdown to append to `docs/ARCHITECTURE.md`. */
   architectureMdUpdate: string;
+  /**
+   * TR_044 — Substitution map produced once per feature by
+   * `ArchitectureAgent.buildStackSubstitutions` (gpt-4o-mini
+   * one-shot classification). Shape: `{ "<canonical>": ["<alt1>",
+   * "<alt2>", ...] }` keyed by the declared `HARNESS.stack`
+   * values. Read by each `planning:phase` task to deterministically
+   * rewrite framework references in the reviewed per-phase
+   * architecture (LLM-only stack binding failed twice across
+   * TR_040–TR_042 at the per-phase scale; TR_044 falls back to
+   * regex substitution).
+   *
+   * Absent / empty → no substitution is applied. The pipeline is
+   * never blocked on substitution-map generation failure.
+   */
+  stackSubstitutions?: Record<string, string[]>;
 }
 
 /**

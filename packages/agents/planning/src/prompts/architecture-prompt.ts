@@ -34,6 +34,39 @@ import type { FeatureArchitecture, PhaseArchitecture } from '../types';
  * Returns empty string when `HARNESS.json.stack` is absent — callers
  * test `length > 0` and omit the section cleanly.
  */
+/**
+ * TR_044 — Render the project's `docs/GOLDEN_PRINCIPLES.md` content
+ * as a markdown section the architecture-agent reads BEFORE
+ * designing or reviewing. Closes the TR_042 gap where intent-agent
+ * escalated on cross-cutting concerns (audit logging, etc.) the
+ * architecture-agent had never been told about — intent-agent reads
+ * the project's goldenPrinciples but the architecture-agent did not.
+ *
+ * Truncated to 3000 chars to keep the prompt within budget; the
+ * agent can `readFile` the full version if it needs more.
+ *
+ * Returns empty string when the project has no
+ * `docs/GOLDEN_PRINCIPLES.md` — callers test `length > 0` and omit
+ * the section cleanly.
+ */
+function renderGoldenPrinciplesSection(goldenPrinciplesMd: string): string {
+  const trimmed = goldenPrinciplesMd.trim();
+  if (trimmed.length === 0) return '';
+  return [
+    '## Project golden principles (cross-cutting concerns)',
+    '',
+    'These project-wide rules govern every feature. Account for',
+    'them in your design — every interface, phase, and success',
+    'criterion you emit must satisfy these principles or include',
+    'a phase that fulfils them. Intent-agent and review-agent both',
+    'read the same principles and will flag any feature that',
+    'leaves a principle unaddressed.',
+    '',
+    trimmed.slice(0, 3000),
+    '',
+  ].join('\n');
+}
+
 function renderStackSection(harnessConfig: HarnessConfig | null): string {
   const stack = harnessConfig?.stack;
   if (!stack || Object.keys(stack).length === 0) return '';
@@ -61,9 +94,11 @@ export function buildFeatureArchitecturePrompt(
   existingArchitectureMd: string,
   agentCfg: AgentConfig,
   harnessConfig: HarnessConfig | null,
+  goldenPrinciplesMd: string = '',
 ): string {
   const harnessSection = renderHarnessAgentRules('architecture-agent', harnessConfig);
   const stackSection = renderStackSection(harnessConfig);
+  const goldenPrinciplesSection = renderGoldenPrinciplesSection(goldenPrinciplesMd);
   const archExcerpt = existingArchitectureMd.slice(0, 3000);
   const extensions = agentCfg.promptExtensions ?? [];
 
@@ -73,6 +108,7 @@ export function buildFeatureArchitecturePrompt(
     '',
     harnessSection,
     stackSection,
+    goldenPrinciplesSection,
     '## Existing project architecture (docs/ARCHITECTURE.md, truncated to 3000 chars)',
     archExcerpt || '(no existing architecture file)',
     '',
@@ -126,9 +162,11 @@ export function buildPhaseArchitecturePrompt(
   priorPhases: FeaturePhaseRecord[],
   agentCfg: AgentConfig,
   harnessConfig: HarnessConfig | null,
+  goldenPrinciplesMd: string = '',
 ): string {
   const harnessSection = renderHarnessAgentRules('architecture-agent', harnessConfig);
   const stackSection = renderStackSection(harnessConfig);
+  const goldenPrinciplesSection = renderGoldenPrinciplesSection(goldenPrinciplesMd);
   const extensions = agentCfg.promptExtensions ?? [];
   const priorPhasesBlock = priorPhases.length
     ? priorPhases.map((p, i) => `  ${i + 1}. ${p.title} (${p.status}) — ${oneLine(p.scope)}`).join('\n')
@@ -140,6 +178,7 @@ export function buildPhaseArchitecturePrompt(
     '',
     harnessSection,
     stackSection,
+    goldenPrinciplesSection,
     '## Feature',
     `Title: ${feature.title}`,
     `Description: ${oneLine(feature.description)}`,
@@ -210,9 +249,11 @@ export function buildArchitectureReviewPrompt(
   feature: FeatureRecord,
   agentCfg: AgentConfig,
   harnessConfig: HarnessConfig | null,
+  goldenPrinciplesMd: string = '',
 ): string {
   const harnessSection = renderHarnessAgentRules('architecture-agent', harnessConfig);
   const stackSection = renderStackSection(harnessConfig);
+  const goldenPrinciplesSection = renderGoldenPrinciplesSection(goldenPrinciplesMd);
   const draftJson = JSON.stringify(draft, null, 2).slice(0, 3000);
 
   // TR_040 → TR_041 — stack compliance gate. The review pass
@@ -266,6 +307,7 @@ export function buildArchitectureReviewPrompt(
     '',
     harnessSection,
     stackSection,
+    goldenPrinciplesSection,
     '## Draft architecture to review',
     '```json',
     draftJson,
@@ -348,9 +390,11 @@ export function buildPhaseArchitectureReviewPrompt(
   feature: FeatureRecord,
   agentCfg: AgentConfig,
   harnessConfig: HarnessConfig | null,
+  goldenPrinciplesMd: string = '',
 ): string {
   const harnessSection = renderHarnessAgentRules('architecture-agent', harnessConfig);
   const stackSection = renderStackSection(harnessConfig);
+  const goldenPrinciplesSection = renderGoldenPrinciplesSection(goldenPrinciplesMd);
   const draftJson = JSON.stringify(draft, null, 2).slice(0, 2000);
 
   // TR_042 — Stack compliance check rendered FIRST. TR_041 verified
@@ -390,6 +434,7 @@ export function buildPhaseArchitectureReviewPrompt(
     '',
     harnessSection,
     stackSection,
+    goldenPrinciplesSection,
     '## Phase being reviewed',
     `Feature: ${feature.title}`,
     `Phase ${phase.phaseIndex + 1}: ${phase.title}`,
@@ -432,4 +477,112 @@ export function buildPhaseArchitectureReviewPrompt(
     '}',
     '```',
   ].filter(Boolean).join('\n');
+}
+
+/**
+ * TR_044 — Prompt that asks an LLM to produce a canonical-name →
+ * alternatives map for the declared project stack. The platform
+ * code does NOT hardcode framework alternatives; the LLM knows
+ * which frameworks compete with which in any ecosystem, so we ask
+ * it once per feature.
+ *
+ * Output schema (the LLM must return ONLY this JSON):
+ *
+ *   {
+ *     "Jest":    ["Vitest", "Mocha", "Jasmine"],
+ *     "Fastify": ["Express", "Koa", "Hapi"]
+ *   }
+ *
+ * The keys are the declared canonical names from
+ * `HARNESS.json.stack` verbatim; the values are realistic
+ * alternatives a developer in the same ecosystem might confuse
+ * with the declared choice.
+ *
+ * No framework knowledge in the platform code — only the prompt
+ * structure + the JSON schema framing.
+ */
+export function buildStackSubstitutionPrompt(stack: Record<string, string>): string {
+  return [
+    'You are a software framework expert.',
+    '',
+    'The following technology stack is declared for a project:',
+    '',
+    '```json',
+    JSON.stringify(stack, null, 2),
+    '```',
+    '',
+    'For each declared framework or tool, list the most common',
+    'alternative names or frameworks that a developer might',
+    'accidentally use instead.',
+    '',
+    'Return ONLY valid JSON — no preamble, no markdown:',
+    '',
+    '```json',
+    '{',
+    '  "<declared-name>": ["<alternative-1>", "<alternative-2>", "..."]',
+    '}',
+    '```',
+    '',
+    'Only include entries for values that actually appear in the',
+    'declared stack above. Only list realistic alternatives that',
+    'a developer in this ecosystem might confuse with the declared',
+    'choice. Skip values that are clearly not framework choices',
+    '(e.g. version numbers, true/false flags).',
+    '',
+    'Example for a TypeScript/Jest/Fastify stack:',
+    '',
+    '```json',
+    '{',
+    '  "Jest":    ["Vitest", "Mocha", "Jasmine"],',
+    '  "Fastify": ["Express", "Koa", "Hapi"]',
+    '}',
+    '```',
+  ].join('\n');
+}
+
+/**
+ * TR_044 — Pure utility. Apply a `<alternative-lowercase> →
+ * <canonical>` substitution map to every string field of a
+ * `PhaseArchitecture`. Word-boundary regex matches keep
+ * substring collisions (e.g. "express-train" if "express" were
+ * in the map) from rewriting unintended tokens.
+ *
+ * No framework knowledge inside this function — it receives a
+ * Map and applies it, byte-for-byte. The caller (built from the
+ * LLM-generated substitution map) is responsible for what gets
+ * substituted.
+ *
+ * Returns a new `PhaseArchitecture` — the input is never mutated.
+ */
+export function applyStackSubstitutions(
+  draft: PhaseArchitecture,
+  substitutions: Map<string, string>,
+): PhaseArchitecture {
+  if (substitutions.size === 0) return draft;
+
+  const rewrite = (s: string): string => {
+    let out = s;
+    for (const [alt, canonical] of substitutions.entries()) {
+      // Word-boundary, case-insensitive match. `alt` is stored in
+      // lowercase by the caller; the `i` flag matches mixed-case
+      // occurrences ("Vitest", "vitest", "VITEST") consistently.
+      const re = new RegExp(`\\b${escapeRegex(alt)}\\b`, 'gi');
+      out = out.replace(re, canonical);
+    }
+    return out;
+  };
+
+  const result: PhaseArchitecture = {
+    interfaces: draft.interfaces.map(rewrite),
+    importStatements: draft.importStatements.map(rewrite),
+    successCriteria: draft.successCriteria.map(rewrite),
+  };
+  if (draft.sqlSchema !== undefined) {
+    result.sqlSchema = rewrite(draft.sqlSchema);
+  }
+  return result;
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

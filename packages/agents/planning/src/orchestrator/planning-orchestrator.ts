@@ -48,6 +48,7 @@ import type {
 import { ArchitectureAgent } from '../agents/architecture-agent';
 import { PlannerAgent } from '../agents/planner-agent';
 import { PhaseEvaluatorAgent } from '../agents/phase-evaluator-agent';
+import { applyStackSubstitutions } from '../prompts/architecture-prompt';
 import type { FeatureArchitecture, FeaturePlan, PhaseEvaluation } from '../types';
 
 const log = createContextLogger({ module: 'planning-orchestrator' });
@@ -371,6 +372,11 @@ async function handlePlanningStart(
 
     // Read existing context + harness.
     const archMd = await readFileSafe(join(workDir, 'docs/ARCHITECTURE.md'));
+    // TR_044 — feed `docs/GOLDEN_PRINCIPLES.md` into architecture-agent
+    // so cross-cutting concerns (audit logging, security boundaries,
+    // etc.) reach it the same way they reach intent-agent. Empty
+    // string when the project has no principles file.
+    const goldenPrinciplesMd = await readFileSafe(join(workDir, 'docs/GOLDEN_PRINCIPLES.md'));
     let harnessConfig: HarnessConfig | null = null;
     try {
       const snap = await createHarnessEngine(workDir).buildSnapshot(correlationId);
@@ -385,7 +391,7 @@ async function handlePlanningStart(
     childLog.info({ featureId: feature.id }, 'Invoking architecture-agent for feature-level design');
     const architectureAgent = new ArchitectureAgent();
     const draftArchitecture = await architectureAgent.designFeature(
-      feature, archMd, workDir, harnessConfig, correlationId,
+      feature, archMd, workDir, harnessConfig, correlationId, goldenPrinciplesMd,
     );
 
     // STOPGAP (ADR-056): This single-agent review step is a
@@ -396,9 +402,29 @@ async function handlePlanningStart(
     // delete `reviewDesign()`, `buildArchitectureReviewPrompt`,
     // and this call site.
     childLog.info({ featureId: feature.id }, 'Invoking architecture-agent reviewDesign (TR_038 stopgap)');
-    const architecture = await architectureAgent.reviewDesign(
-      draftArchitecture, feature, workDir, harnessConfig, correlationId,
+    const reviewedArchitecture = await architectureAgent.reviewDesign(
+      draftArchitecture, feature, workDir, harnessConfig, correlationId, goldenPrinciplesMd,
     );
+
+    // TR_044 — Generate the substitution map ONCE per feature.
+    // LLM-only stack binding (TR_040 → TR_042) failed twice at the
+    // per-phase scale; the deterministic regex pass downstream
+    // closes that gap. The map is attached to `feature.architecture`
+    // so each `planning:phase` task reads it back without an extra
+    // LLM call.
+    childLog.info({ featureId: feature.id }, 'Invoking architecture-agent buildStackSubstitutions (TR_044)');
+    const substitutionsMap = await architectureAgent.buildStackSubstitutions(
+      harnessConfig?.stack, correlationId,
+    );
+    const stackSubstitutions: Record<string, string[]> = {};
+    for (const [alt, canonical] of substitutionsMap.entries()) {
+      if (!stackSubstitutions[canonical]) stackSubstitutions[canonical] = [];
+      stackSubstitutions[canonical].push(alt);
+    }
+    const architecture: FeatureArchitecture = {
+      ...reviewedArchitecture,
+      stackSubstitutions,
+    };
 
     await features.appendLog({
       featureId: feature.id,
@@ -588,10 +614,14 @@ async function runPerPhaseArchitecture(
     const { features } = getRepositories();
     const priorPhases = (await features.listPhases(feature.id)).filter((p) => p.phaseIndex < phase.phaseIndex);
     const archMd = feature.architecture ?? '';
+    // TR_044 — read GOLDEN_PRINCIPLES.md from the cloned tree so
+    // each per-phase design + review pass sees cross-cutting
+    // concerns the same way intent-agent does.
+    const goldenPrinciplesMd = await readFileSafe(join(workDir, 'docs/GOLDEN_PRINCIPLES.md'));
     const architectureAgent = new ArchitectureAgent();
     const draftPa = await architectureAgent.designPhase(
       feature, phase.title, phase.architecture ?? phase.scope,
-      archMd, priorPhases, workDir, harnessConfig, correlationId,
+      archMd, priorPhases, workDir, harnessConfig, correlationId, goldenPrinciplesMd,
     );
 
     // STOPGAP (ADR-056): per-phase review pass. TR_041's verification
@@ -605,9 +635,51 @@ async function runPerPhaseArchitecture(
       { featureId: feature.id, phaseId: phase.id, phaseIndex: phase.phaseIndex },
       'Invoking architecture-agent reviewPhaseDesign (TR_042 stopgap)',
     );
-    const pa = await architectureAgent.reviewPhaseDesign(
-      draftPa, phase, feature, workDir, harnessConfig, correlationId,
+    const reviewedPa = await architectureAgent.reviewPhaseDesign(
+      draftPa, phase, feature, workDir, harnessConfig, correlationId, goldenPrinciplesMd,
     );
+
+    // TR_044 — deterministic stack substitution. Read the
+    // substitution map cached on `feature.architecture` (generated
+    // ONCE at planning:start by `buildStackSubstitutions`) and
+    // apply it to the reviewed `PhaseArchitecture`. This is the
+    // belt-and-braces step that closes the per-phase Vitest leak
+    // TR_040 → TR_042 couldn't fix via LLM-only prompts.
+    let substitutions = new Map<string, string>();
+    if (feature.architecture) {
+      try {
+        const parsed = JSON.parse(feature.architecture) as { stackSubstitutions?: Record<string, string[]> };
+        const stored = parsed.stackSubstitutions;
+        if (stored) {
+          for (const [canonical, alternatives] of Object.entries(stored)) {
+            if (!Array.isArray(alternatives)) continue;
+            for (const alt of alternatives) {
+              if (typeof alt !== 'string') continue;
+              substitutions.set(alt.toLowerCase(), canonical);
+            }
+          }
+        }
+      } catch {
+        // feature.architecture is markdown (legacy) — not JSON.
+        // Substitution map is unavailable; pipeline proceeds without
+        // it.
+        substitutions = new Map();
+      }
+    }
+    const pa = substitutions.size > 0
+      ? applyStackSubstitutions(reviewedPa, substitutions)
+      : reviewedPa;
+    if (substitutions.size > 0) {
+      childLog.info(
+        {
+          featureId: feature.id,
+          phaseId: phase.id,
+          phaseIndex: phase.phaseIndex,
+          mapSize: substitutions.size,
+        },
+        'Applied TR_044 stack substitutions to per-phase architecture',
+      );
+    }
 
     const summary = JSON.stringify(pa);
     // TR_034 — persist the scoped PhaseArchitecture JSON onto

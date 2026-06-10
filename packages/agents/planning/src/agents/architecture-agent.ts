@@ -21,10 +21,11 @@
 import {
   BaseLLMAgent, loadAgentConfig, extractJsonObject, createContextLogger,
 } from '@gestalt/core';
-import type { HarnessConfig, FeatureRecord, FeaturePhaseRecord } from '@gestalt/core';
+import type { HarnessConfig, FeatureRecord, FeaturePhaseRecord, AgentConfig } from '@gestalt/core';
 import {
   buildFeatureArchitecturePrompt, buildPhaseArchitecturePrompt,
   buildArchitectureReviewPrompt, buildPhaseArchitectureReviewPrompt,
+  buildStackSubstitutionPrompt,
 } from '../prompts/architecture-prompt';
 import type { FeatureArchitecture, PhaseArchitecture } from '../types';
 
@@ -50,6 +51,7 @@ export class ArchitectureAgent extends BaseLLMAgent {
     projectRoot: string,
     harnessConfig: HarnessConfig | null,
     correlationId: string,
+    goldenPrinciplesMd: string = '',
   ): Promise<FeatureArchitecture> {
     this.lastTokensUsed = 0;
     // TR_035 / ADR-057 Layer 3+5 read knobs from harnessConfig.
@@ -57,7 +59,7 @@ export class ArchitectureAgent extends BaseLLMAgent {
     const agentCfg = await loadAgentConfig(projectRoot, 'architecture-agent');
     const prompt = this.addJsonResponseGuard(
       buildFeatureArchitecturePrompt(
-        feature, existingArchitectureMd, agentCfg, harnessConfig,
+        feature, existingArchitectureMd, agentCfg, harnessConfig, goldenPrinciplesMd,
       ),
     );
     const raw = await this.callLLM(prompt, agentCfg, correlationId);
@@ -86,6 +88,7 @@ export class ArchitectureAgent extends BaseLLMAgent {
     projectRoot: string,
     harnessConfig: HarnessConfig | null,
     correlationId: string,
+    goldenPrinciplesMd: string = '',
   ): Promise<FeatureArchitecture> {
     this.lastTokensUsed = 0;
     this.setHarnessConfigForRun(harnessConfig);
@@ -100,7 +103,7 @@ export class ArchitectureAgent extends BaseLLMAgent {
       return draft;
     }
     const prompt = this.addJsonResponseGuard(
-      buildArchitectureReviewPrompt(draft, feature, agentCfg, harnessConfig),
+      buildArchitectureReviewPrompt(draft, feature, agentCfg, harnessConfig, goldenPrinciplesMd),
     );
     let raw: string;
     try {
@@ -152,6 +155,7 @@ export class ArchitectureAgent extends BaseLLMAgent {
     projectRoot: string,
     harnessConfig: HarnessConfig | null,
     correlationId: string,
+    goldenPrinciplesMd: string = '',
   ): Promise<PhaseArchitecture> {
     this.lastTokensUsed = 0;
     this.setHarnessConfigForRun(harnessConfig);
@@ -159,7 +163,7 @@ export class ArchitectureAgent extends BaseLLMAgent {
     const prompt = this.addJsonResponseGuard(
       buildPhaseArchitecturePrompt(
         feature, phaseTitle, phaseRationale, featureArchitecture,
-        priorPhases, agentCfg, harnessConfig,
+        priorPhases, agentCfg, harnessConfig, goldenPrinciplesMd,
       ),
     );
     const raw = await this.callLLM(prompt, agentCfg, correlationId);
@@ -195,6 +199,7 @@ export class ArchitectureAgent extends BaseLLMAgent {
     projectRoot: string,
     harnessConfig: HarnessConfig | null,
     correlationId: string,
+    goldenPrinciplesMd: string = '',
   ): Promise<PhaseArchitecture> {
     this.lastTokensUsed = 0;
     this.setHarnessConfigForRun(harnessConfig);
@@ -209,7 +214,7 @@ export class ArchitectureAgent extends BaseLLMAgent {
       return draft;
     }
     const prompt = this.addJsonResponseGuard(
-      buildPhaseArchitectureReviewPrompt(draft, phase, feature, agentCfg, harnessConfig),
+      buildPhaseArchitectureReviewPrompt(draft, phase, feature, agentCfg, harnessConfig, goldenPrinciplesMd),
     );
     let raw: string;
     try {
@@ -249,6 +254,88 @@ export class ArchitectureAgent extends BaseLLMAgent {
       'architecture-agent reviewPhaseDesign complete',
     );
     return reviewed;
+  }
+
+  /**
+   * TR_044 — Ask the LLM to produce a `<canonical> → [alternatives]`
+   * map for the declared project stack. The platform code does NOT
+   * hardcode framework alternatives; the LLM knows which frameworks
+   * compete with which in any ecosystem.
+   *
+   * The map is generated ONCE per feature (in `planning:start`) and
+   * cached on `FeatureArchitecture.stackSubstitutions` so each
+   * per-phase pass reads the same map without paying an extra LLM
+   * call. Each per-phase pass then deterministically applies the
+   * substitutions to the reviewed `PhaseArchitecture` via
+   * `applyStackSubstitutions` (pure utility).
+   *
+   * Uses a deliberately cheap/fast model (gpt-4o-mini, no reasoning
+   * effort) — this is a one-shot classification call, not a
+   * judgement task. The substitution map should produce identical
+   * output regardless of model quality given the same stack input.
+   *
+   * Returns an empty Map on ANY failure path (loadAgentConfig
+   * throws → empty; callLLM throws → empty; JSON parse fails →
+   * empty). Empty Map means `applyStackSubstitutions` skips
+   * cleanly — the pipeline is never blocked on this.
+   */
+  async buildStackSubstitutions(
+    stack: Record<string, string> | undefined,
+    correlationId: string,
+  ): Promise<Map<string, string>> {
+    if (!stack || Object.keys(stack).length === 0) {
+      return new Map();
+    }
+    this.lastTokensUsed = 0;
+    // Inline a minimal AgentConfig — this call is a one-shot
+    // classification, not a reasoning task. gpt-4o-mini is fast,
+    // cheap, and deterministic enough for this output shape.
+    // Defining the config here keeps the substitution-map path
+    // independent of `loadAgentConfig` (which loads the
+    // architecture-agent's heavyweight model gpt-5.5) so the
+    // substitution lookup doesn't pay reasoning-tokens cost.
+    const minimalAgentConfig: AgentConfig = {
+      role: 'Software framework expert',
+      goal: 'Generate canonical-to-alternatives substitution maps',
+      llm: { model: 'gpt-4o-mini', temperature: 0.0, maxTokens: 1500 },
+      promptExtensions: [],
+    };
+    const prompt = this.addJsonResponseGuard(buildStackSubstitutionPrompt(stack));
+    let raw: string;
+    try {
+      raw = await this.callLLM(prompt, minimalAgentConfig, correlationId);
+    } catch (err) {
+      log.warn(
+        { err: err instanceof Error ? err.message : String(err), correlationId },
+        'architecture-agent buildStackSubstitutions LLM call failed — using empty map',
+      );
+      return new Map();
+    }
+    const substitutions = new Map<string, string>();
+    try {
+      const parsed = JSON.parse(extractJsonObject(raw)) as Record<string, unknown>;
+      for (const [canonical, alternatives] of Object.entries(parsed)) {
+        if (!Array.isArray(alternatives)) continue;
+        for (const alt of alternatives) {
+          if (typeof alt !== 'string') continue;
+          const altLower = alt.trim().toLowerCase();
+          if (altLower.length === 0) continue;
+          if (altLower === canonical.toLowerCase()) continue;
+          substitutions.set(altLower, canonical);
+        }
+      }
+    } catch (err) {
+      log.warn(
+        { err: err instanceof Error ? err.message : String(err), correlationId },
+        'architecture-agent buildStackSubstitutions JSON parse failed — using empty map',
+      );
+      return new Map();
+    }
+    log.info(
+      { correlationId, mapSize: substitutions.size },
+      'architecture-agent buildStackSubstitutions complete',
+    );
+    return substitutions;
   }
 }
 
