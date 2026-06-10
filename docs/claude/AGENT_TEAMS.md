@@ -1,0 +1,324 @@
+# Agent Teams — LangGraph Migration Blueprint
+
+_This document maps every agent team and their relationships.
+It is the blueprint for the LangGraph graph-of-graphs
+implementation (ADR-056). Each team listed here maps to
+a LangGraph StateGraph or subgraph node._
+
+---
+
+## Platform graph (top level)
+
+The platform is a master StateGraph that routes between
+five layer subgraphs based on intent classification:
+
+```
+PlatformGraph
+├── IntentClassifierNode
+│     single-intent → GenerateGraph
+│     complex-feature → PlanningGraph
+├── PlanningGraph (subgraph)
+├── GenerateGraph (subgraph)
+├── GateGraph (subgraph)
+├── DeployGraph (subgraph)
+└── MaintenanceGraph (subgraph)
+```
+
+---
+
+## Planning graph
+
+```
+PlanningGraph
+├── ArchitectureGraph (subgraph — see below)
+├── PlannerNode
+│     reads: ArchitectureGraph output
+│     emits: ordered phase list with deferred context
+├── PhaseDispatchNode
+│     dispatches each phase as GenerateGraph input
+└── PhaseEvaluatorNode
+      reads: git diff of merged phase commit
+      decides: continue | adjust | escalate
+```
+
+---
+
+## Architecture graph (subgraph of Planning)
+
+_Currently implemented as a single architecture-agent with
+a self-review pass. The LangGraph migration replaces this
+with a deliberating crew._
+
+```
+ArchitectureGraph
+├── [Parallel nodes]
+│     ├── DomainArchitectNode
+│     │     focus: entities, relationships, domain model
+│     ├── DataArchitectNode
+│     │     focus: schema, persistence, migrations
+│     └── AppArchitectNode
+│           focus: layers, interfaces, dependencies
+└── ChiefArchitectNode (supervisor)
+      receives: all three parallel outputs
+      resolves: conflicts, naming inconsistencies,
+                missing implementations
+      enforces: stack compliance, lifecycle coverage,
+                symbol name consistency
+      emits: single reviewed FeatureArchitecture
+```
+
+State flows:
+- All three architect nodes receive the same feature description
+  and HARNESS.json stack
+- ChiefArchitectNode receives all three outputs as graph state
+- ChiefArchitect's output flows to PlannerNode
+
+_Stopgap until migration: single architecture-agent with
+reviewDesign + reviewPhaseDesign methods (TR_038, TR_041, TR_042)_
+
+---
+
+## Generate graph
+
+```
+GenerateGraph
+├── IntentNode
+│     validates: intent spec, detects ambiguity
+│     emits: IntentSpec with outOfScope list
+├── DesignNode
+│     reads: IntentSpec
+│     emits: DesignSpec
+├── ContextNode
+│     reads: IntentSpec + DesignSpec
+│     emits: ContextSnapshot
+└── CodeNode
+      tool: AiderTool (executeScript wrapper)
+      reads: ContextSnapshot + phase architecture
+      emits: committed files on branch
+```
+
+Conditional edges:
+- IntentNode → ambiguity detected → HumanFeedbackNode
+- IntentNode → clear → DesignNode
+- CodeNode → complete → GateGraph
+
+---
+
+## Gate graph
+
+```
+GateGraph
+├── [Parallel nodes]
+│     ├── ConstraintNode
+│     │     tool: executeScript (git diff + project tools)
+│     │     reads: ARCHITECTURE.md + project structure brief
+│     │     emits: constraint signals with quoted evidence
+│     └── PRAgentNode
+│           tool: executeScript (pr-agent CLI)
+│           reads: PR diff via GitHub API
+│           emits: review verdict (approved | changes-requested)
+└── GateVerdictNode (supervisor)
+      receives: ConstraintNode + PRAgentNode outputs
+      decides: pass | fail | escalate
+```
+
+Conditional edges:
+- GateVerdictNode → pass → DeployGraph
+- GateVerdictNode → fail → SelfHealingGraph
+- GateVerdictNode → escalate → HumanFeedbackNode
+
+_Note: review-agent (llm-review-agent.ts) is deprecated
+(ADR-051). PRAgentNode replaces it. review-agent retained
+as fallback for non-GitHub adapters._
+
+---
+
+## Deploy graph
+
+```
+DeployGraph
+├── PRNode
+│     creates PR on gestalt/* branch
+├── PipelineNode
+│     polls CI status (GitHub Actions / noop)
+│     emits: ci-pass | ci-fail
+└── PromotionNode
+      stages then promotes to production
+      fires onSuccessDispatch after promotion
+```
+
+Conditional edges:
+- PipelineNode → ci-pass → GateGraph
+- PipelineNode → ci-fail → SelfHealingGraph
+- PromotionNode → promoted → PlanningGraph (next phase)
+                           OR complete (single intent)
+
+---
+
+## Self-healing graph
+
+```
+SelfHealingGraph
+├── DiagnosticNode
+│     model: gpt-5.5-pro (highest reasoning)
+│     reads: failure context + CI output + signals
+│     emits: action (retry | fix-intent | escalate)
+└── [Conditional on action]
+      retry → GenerateGraph (with retry context)
+      fix-intent → GenerateGraph (child intent)
+                   onSuccessDispatch → parent resumes
+      escalate → HumanFeedbackNode
+```
+
+Depth limit: MAX_FIX_INTENT_DEPTH = 2
+Retry budget: maxPhaseRetries per phase (default 2)
+
+---
+
+## Maintenance graph
+
+```
+MaintenanceGraph
+├── [Scheduled triggers]
+│     ├── DriftNode — detects ARCHITECTURE.md drift
+│     ├── AlignmentNode — detects code/doc misalignment
+│     ├── GCNode — cleans stale branches and alerts
+│     └── EvaluationNode — monitoring metrics analysis
+└── [External scan triggers]
+      └── ExternalScanNode
+            receives: CodeAnt/SonarQube/Semgrep findings
+            emits: MaintenanceIntent → GenerateGraph
+```
+
+---
+
+## Human feedback node (shared across graphs)
+
+```
+HumanFeedbackNode
+      LangGraph interrupt() — pauses execution
+      persists: current graph state to PostgreSQL
+      creates: alert with full context
+      waits: operator provides clarification
+      resumes: from exact interrupt point
+```
+
+Used by:
+- IntentNode (high-impact ambiguity)
+- GateVerdictNode (GP_BREACH escalation)
+- SelfHealingGraph (budget exhausted)
+- PlanningGraph (phase blocked after maxPhaseRetries)
+
+---
+
+## Tool inventory (shared across all graphs)
+
+Tools available to nodes via LangChain StructuredTool:
+
+| Tool | Type | Used by |
+|---|---|---|
+| AiderTool | Custom StructuredTool | CodeNode |
+| ExecuteScriptTool | Custom StructuredTool | ConstraintNode, PRAgentNode, PhaseEvaluatorNode |
+| ReadFileTool | LangChain FileManagementToolkit | All agents |
+| ListDirectoryTool | LangChain FileManagementToolkit | All agents |
+| FileSearchTool | LangChain FileManagementToolkit | All agents |
+| PRAgentTool | Custom StructuredTool | PRAgentNode |
+| QodoGenTool | Custom StructuredTool | CodeNode (ADR-053, pending) |
+| SWEAgentTool | Custom StructuredTool | MaintenanceGraph (ADR-054, pending) |
+| K8sGPTTool | Custom StructuredTool | MaintenanceGraph (ADR-055, pending) |
+
+---
+
+## Migration order (ADR-056)
+
+```
+Phase 1 — Architecture graph (CURRENT BLOCKER)
+  Replace: architecture-agent + reviewDesign stopgap
+  With: ArchitectureGraph subgraph
+        (DomainArchitect + DataArchitect + AppArchitect
+         + ChiefArchitect supervisor)
+
+Phase 2 — Planning graph
+  Replace: planning-orchestrator.ts
+  With: PlanningGraph StateGraph
+        (ArchitectureGraph + PlannerNode + PhaseEvaluatorNode)
+
+Phase 3 — Generate graph
+  Replace: generate orchestrator
+  With: GenerateGraph StateGraph
+        (IntentNode + DesignNode + ContextNode + CodeNode)
+
+Phase 4 — Gate graph
+  Replace: gate-orchestrator.ts
+  With: GateGraph StateGraph
+        (ConstraintNode + PRAgentNode + GateVerdictNode)
+
+Phase 5 — Self-healing graph
+  Replace: self-healing-loop.ts
+  With: SelfHealingGraph StateGraph
+        (DiagnosticNode + conditional edges)
+
+Phase 6 — Deploy + Maintenance graphs
+  Replace: remaining orchestrators
+  With: DeployGraph + MaintenanceGraph
+```
+
+BullMQ stays as inter-graph transport throughout.
+PostgreSQL checkpointer replaces custom agent_checkpoints.
+HumanFeedbackNode uses LangGraph interrupt() throughout.
+
+---
+
+## State schema (Pydantic-style, for LangGraph TypedDict)
+
+Each graph passes a typed state object. Key fields:
+
+```typescript
+interface GestaltGraphState {
+  // Identity
+  correlationId: string;
+  projectId: string;
+  featureId?: string;
+  phaseId?: string;
+
+  // Intent
+  intentText: string;
+  intentSpec?: IntentSpec;
+  deferredToLaterPhases?: string[];
+
+  // Architecture (planning layer)
+  featureArchitecture?: FeatureArchitecture;
+  phaseArchitecture?: PhaseArchitecture;
+
+  // Code generation
+  projectRoot: string;
+  branch?: string;
+  prNumber?: number;
+  prUrl?: string;
+  mergeCommitSha?: string;
+
+  // Gate
+  gateSignals?: FeedbackSignal[];
+  gateVerdict?: 'pass' | 'fail' | 'escalate';
+
+  // Self-healing
+  selfHealingAction?: 'retry' | 'fix-intent' | 'escalate';
+  fixIntentText?: string;
+  fixIntentDepth: number;
+  retryCount: number;
+
+  // Human feedback
+  humanFeedback?: string;
+  awaitingHumanFeedback: boolean;
+
+  // Checkpointing
+  lastCompletedNode?: string;
+  checkpointedAt?: string;
+}
+```
+
+---
+
+_Last updated: 2026-06 (TR_042 session)_
+_Update this file whenever a new agent team is designed
+or an existing team changes structure._
