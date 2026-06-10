@@ -331,8 +331,17 @@ export function buildArchitectureReviewPrompt(
     // and no later phase ever added `update` — yet Phase 5 was
     // titled "manager approval and rejection workflow".
     '5. Lifecycle coverage — for every entity whose state changes during the feature lifecycle, verify that at least one phase in `recommendedPhases` includes a method to perform that mutation. If a state transition exists in the feature description but no phase adds the corresponding mutation method, ADD it to the most appropriate phase.',
+    // TR_046 — closes the 7th intent-agent rigor bar surfaced by
+    // TR_045 verification (architecture-agent introduced a
+    // CANCELLED lifecycle state to support a "cancel" workflow
+    // phase, but the project context's ARCHITECTURE.md only
+    // documented Pending / Approved / Rejected; intent-agent
+    // caught the divergence). Every new domain concept the
+    // review pass introduces must land in `architectureMdUpdate`
+    // so the project docs stay consistent with the architecture.
+    '6. Documentation consistency — every new domain concept introduced in this architecture (lifecycle states, enum values, entity types, relationships) that does not appear in the existing project documentation must appear in `architectureMdUpdate`. If a new concept is defined in `domainEntities` or `modules` but missing from `architectureMdUpdate`, ADD it before returning.',
     '',
-    'If the draft passes all five checks, return it unchanged.',
+    'If the draft passes all six checks, return it unchanged.',
     'If any check fails, fix the issue and return the corrected version.',
     'Return the COMPLETE architecture JSON — not just the changes.',
     '',
@@ -454,8 +463,15 @@ export function buildPhaseArchitectureReviewPrompt(
     '3. Interface completeness — every interface has exact method signatures, no `// TODO` or `...` ellipses.',
     '4. Import accuracy — every entry in `importStatements` references a file that already exists OR is being created in this phase. No reference to a future phase\'s files.',
     '5. Success-criteria accuracy — every criterion uses the declared stack, names real file paths, and is independently verifiable.',
+    // TR_046 — same documentation-consistency check as the feature
+    // review. At the per-phase scale this catches new lifecycle
+    // states / enum values / entity types the phase introduces
+    // (e.g. CANCELLED in a status enum) that should be reflected
+    // back in the per-phase scope text or — when the per-phase
+    // pass has no scope-update surface — flagged for the operator.
+    '6. Documentation consistency — every new domain concept introduced in this per-phase architecture (lifecycle states, enum values, entity types, relationships) that does not appear in the project context (ARCHITECTURE.md / GOLDEN_PRINCIPLES.md) must be flagged in a `successCriteria` line that asks for the doc update. Do not introduce a concept silently — surface it where downstream agents can see it.',
     '',
-    'If the draft passes all five checks, return it unchanged.',
+    'If the draft passes all six checks, return it unchanged.',
     'If any check fails, fix the issue and return the corrected version.',
     'Return the COMPLETE PhaseArchitecture JSON — not just the changes.',
     '',

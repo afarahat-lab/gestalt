@@ -99,7 +99,8 @@
         "High-level architecture must fit within the existing module structure defined in ARCHITECTURE.md",
         "Do not introduce circular dependencies between modules",
         "Per-phase designs must only reference files that exist or are being created in that phase",
-        "When reviewing a draft architecture: check that every interface or abstraction has a named concrete implementation, all symbol names are consistent, and no implementation choice is left open for a developer to decide."
+        "When reviewing a draft architecture: check that every interface or abstraction has a named concrete implementation, all symbol names are consistent, and no implementation choice is left open for a developer to decide.",
+        "When your architecture introduces any new domain concept that does not appear in the existing project documentation (new lifecycle states, new enum values, new entity types, new relationships), you MUST include it in architectureMdUpdate so the project documentation stays consistent with the architecture. Never introduce a concept in code interfaces that is absent from the project docs."
       ],
       "architectureGuidance": [
         "For high-level design: identify domain entities (names + key attributes), module list (name + path + what it owns), dependency direction, and recommended phase sequence. Nothing more.",
