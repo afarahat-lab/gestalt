@@ -18,7 +18,7 @@ docker-compose logs -f server
 |---|---|
 | `pnpm -r build` | ✅ clean (13 packages) |
 | `docker-compose up -d` | ✅ healthy (server / postgres / redis) |
-| Migrations applied | 029 (latest: `029_token_management_and_phase_merge`) — no new migration in TR_036 |
+| Migrations applied | 029 (latest: `029_token_management_and_phase_merge`) — no new migration in TR_043 |
 | Server reachable | `http://localhost:3000/health` returns 200 |
 | Dashboard | served at `http://localhost:3000/app/` |
 
@@ -53,6 +53,194 @@ None blocking the build. Areas to keep in mind:
 ---
 
 ## Pending operator actions
+
+### TR_044 — LLM-generated stack-substitution map (regex post-process for per-phase architecture) + goldenPrinciples injection into architecture-agent prompts (template 0.29.0, build clean, per-phase framework leak CLOSED end-to-end)
+
+Two fixes against TR_042's two HIGH NEW follow-ups — per-phase Vitest
+leak and goldenPrinciples-aware architecture-agent.
+
+- **Fix 1 (stack substitution)** — three parts:
+  - `buildStackSubstitutionPrompt` + `applyStackSubstitutions`
+    pure utility added to `architecture-prompt.ts`. The platform
+    has ZERO framework knowledge baked in — the LLM enumerates
+    alternatives per ecosystem; the utility receives a Map and
+    applies it via case-insensitive word-boundary regex to every
+    string field of a `PhaseArchitecture`.
+  - `ArchitectureAgent.buildStackSubstitutions` method (gpt-4o-mini
+    inline minimal AgentConfig, one-shot classification, safe-fail
+    → empty Map on ANY error path).
+  - `FeatureArchitecture` gains optional
+    `stackSubstitutions?: Record<string, string[]>` field. The
+    orchestrator generates the map ONCE per feature at
+    `planning:start`, attaches to the feature architecture, and
+    each `planning:phase` reads it back and applies
+    `applyStackSubstitutions` to the `reviewPhaseDesign` output
+    BEFORE persisting `feature_phases.architecture`.
+- **Fix 2 (goldenPrinciples injection)** — new
+  `renderGoldenPrinciplesSection(goldenPrinciplesMd)` helper
+  (sibling to `renderStackSection`). All four architecture-agent
+  prompt builders + all four agent methods accept an optional
+  `goldenPrinciplesMd: string = ''` parameter. Orchestrator reads
+  `docs/GOLDEN_PRINCIPLES.md` via `readFileSafe` at both
+  `planning:start` and `runPerPhaseArchitecture` (per-phase clone
+  is fresh) and threads it through. File absent → empty string →
+  section omitted cleanly.
+
+Template `0.28.0 → 0.29.0`. `pnpm -r build` clean across all 13
+packages. No new migration.
+
+**Live verification — PER-PHASE FRAMEWORK LEAK CLOSED:**
+trackeros feature `fc99779a-b372-451d-a314-dd75301014f7` on
+`chat-latest`:
+- ✅ `buildStackSubstitutions complete` log fires at 19:12:54
+  (gpt-4o-mini one-shot map generation worked).
+- ✅ Phase 1 architecture: `jest=0 vitest=0 fastify=0 express=0`
+  via DB query. Compare TR_042's `Vitest=2 + vitest=1 = 3
+  mentions`. The TR_040 → TR_042 unsolved gap is structurally
+  closed by the deterministic regex pass.
+- ✅ Golden-principles injection observably shaped the plan:
+  Phase 3 "Create AuditRecord domain model and repository"
+  (the EXACT TR_042 complaint), Phase 7 RBAC, Phase 10 E2E
+  coverage. 10-phase plan vs TR_042's 8.
+
+**Cycle still blocked on a 6th intent-agent rigor bar:** "The
+intent refers to PostgreSQL-backed repository operations, while
+the provided architecture shows method stubs throwing 'Not
+implemented'". Intent-agent reads abstract TypeScript interface
+signatures (no method bodies, which is CORRECT for an
+architecture phase — the code-agent implements them later) as
+evidence the implementation is missing. Captured as new HIGH
+follow-up for TR_045.
+
+**Operator action — trackeros:** none. TR_044 is platform-side
+only; no HARNESS changes needed.
+
+**Operator action — other projects:** Add `docs/GOLDEN_PRINCIPLES.md`
+to projects that don't have one — architecture-agent now reads it
+the same way intent-agent does. Template auto-refreshes to
+`0.29.0` at next server boot.
+
+### TR_043 — `reasoning_effort` parameter per agent (template 0.28.0, build clean, live verification pending)
+
+Feature request — GPT-5.5+ family supports a
+`reasoning_effort: 'xhigh' | 'high' | 'medium' | 'low' |
+'non-reasoning'` parameter on the `responses` API. Surface
+it as a per-agent knob in `agents.yaml`, plumb it through
+the platform, and log the chosen level on every LLM call so
+operators can see which reasoning level fired for which
+agent.
+
+- **Part 1** —
+  `packages/core/src/agents/agent-config.ts` gains a
+  `ReasoningEffort` literal-union type + a
+  `VALID_REASONING_EFFORTS` runtime set;
+  `AgentLlmConfig` gains
+  `reasoningEffort?: ReasoningEffort`.
+  `agent-config-loader.ts` parses both `reasoning_effort`
+  (snake_case, matches the OpenAI wire field) and
+  `reasoningEffort` (camelCase) from YAML. Unknown values
+  fall through silently — the agent inherits the model's
+  default reasoning behaviour. `normaliseCustomAgent`
+  (ADR-037) inherits the same parser. Both names exported
+  from `@gestalt/core`.
+- **Part 2** —
+  `packages/core/src/llm/index.ts` — `LLMRequest` +
+  `CompleteWithToolsRequest` gain `reasoningEffort?`. A
+  new `reasoningEffortField(apiShape, reasoningEffort)`
+  helper alongside `temperatureField` / `tokenLimitField`
+  emits `reasoning_effort: <value>` ONLY when
+  `apiShape === 'responses'` AND a value was supplied.
+  Both `callProvider` (single-turn) and
+  `callProviderWithTools` (function-calling loop) spread
+  the helper into the request body. Standard
+  chat-completions calls remain byte-for-byte identical.
+- **Part 3** — `BaseLLMAgent` (in
+  `packages/core/src/agents/base-llm-agent.ts`)
+  `callLLMWithMessages` and `runToolLoop` spread
+  `agentConfig.llm.reasoningEffort` into
+  `client.complete(...)` / `client.completeWithTools(...)`.
+  `TokenManagementLog` + `TokenManagementLogRecord` (in
+  `repository/index.ts`) gain
+  `reasoningEffort: 'xhigh' | 'high' | 'medium' | 'low' |
+  'non-reasoning' | null` so per-call telemetry lands in
+  the existing `agent_execution_logs.token_management`
+  JSONB column — no migration needed. Generate +
+  maintenance orchestrators pass `agent.lastTokenManagement`
+  through verbatim; the gate orchestrator's inline
+  structural mirror was extended to include the new field.
+- **Part 4** — template `agents.yaml` preamble documents
+  `reasoning_effort` (values + apiShape gating + per-level
+  rationale). trackeros `agents.yaml` bound to `gpt-5.5`
+  on every framework agent and `gpt-5.5-pro` on
+  `self-healing-agent`, with per-agent reasoning levels
+  per the brief's matrix (architecture: high,
+  self-healing: high, planner: medium, phase-evaluator:
+  medium, constraint: low, review: low, code-agent: none —
+  Aider drives its own reasoning loop). `constraint-agent`
+  is a NEW entry in trackeros's `agents.yaml` (was
+  inheriting `PER_ROLE_DEFAULTS`).
+- **Part 5** — covered by Part 3 — `reasoningEffort` is
+  captured in `agent_execution_logs.token_management`. The
+  brief explicitly excluded dashboard surfacing; operators
+  read the field via direct DB query or via the existing
+  `gestalt intent show` execution-log panel.
+
+Template bumped `0.27.0 → 0.28.0`. `pnpm -r build` clean
+across all 13 packages.
+
+**Live verification — pending.** Recipe from the brief:
+
+```bash
+gestalt feature submit \
+  "Build the leave management module..." \
+  --project trackeros
+```
+
+then:
+
+```sql
+SELECT agent_role,
+       token_management->>'reasoningEffort' AS reasoning_effort,
+       token_management->>'finalMaxTokens'  AS max_tokens
+  FROM agent_execution_logs
+ WHERE token_management IS NOT NULL
+ ORDER BY created_at DESC LIMIT 20;
+```
+
+Expected: `architecture-agent` row with
+`reasoningEffort = 'high'` and `finalMaxTokens` reflecting
+the new 12000 ceiling. Compare architecture output quality
+against TR_041/TR_042 baselines (framework leak, file-count
+mismatch).
+
+**Constraints respected:**
+
+- `reasoning_effort` only emitted when
+  `apiShape === 'responses'` (gpt-5.5+, gpt-5.5-pro). Other
+  models silently drop it — no error.
+- `gpt-5.5-pro` already requires `apiShape: 'responses'`
+  in `platform_llms` (set up under TR_033). No new registry
+  rows required.
+- No new migration — `agent_execution_logs.token_management`
+  is JSONB; the new field is additive on read+write.
+- ADR-042 compliance — `agents.yaml` carries the per-agent
+  values; `.ts` carries only structural framing +
+  validation.
+
+**Operator action — trackeros:** my edits to
+`/Users/amrmohamed/Work/trackeros/agents.yaml` are
+unpushed. Operator should review + commit + push so the
+next planning cycle picks them up. If the linter reverts
+parts of the YAML (precedent from TR_033), re-apply the
+seven blocks from the brief's Part 3 matrix.
+
+**Operator action — other projects:** Existing projects
+on GPT-5.5+ family can opt in by adding
+`reasoning_effort: <level>` to relevant agent llm blocks in
+their own `agents.yaml`. Absent → no behaviour change (the
+field is sent only when present, and only on `responses`
+apiShape). Template auto-refreshes to `0.28.0` at next
+server boot for new projects.
 
 ### TR_042 — Per-phase architecture review pass + planner file-list mirroring (template 0.28.0, build clean, mixed verification: review-pass plumbing + planner file-count rule both verified; per-phase Vitest leak persists)
 
