@@ -71,6 +71,10 @@ ADR to respect; read the canonical file to know **why**._
   (accepted, pending implementation)
 - **ADR-055** — K8sGPT feeds Gestalt Kubernetes operations layer
   (accepted, pending implementation)
+- **ADR-056** — Agent orchestration layer migrated to LangGraph.js
+  (TypeScript-native graph orchestration; state persistence,
+  conditional edges, HITL via `interrupt()`. CrewAI / Mastra /
+  n8n evaluated and rejected. Migration begins after TR_034.)
 
 > ADR-052 (external scanner webhook → MaintenanceIntent pattern)
 > is referenced by ADR-054–055 but has not yet been authored —
@@ -326,9 +330,9 @@ as context). High-level design is committed to
 consultation never designs in a vacuum.
 **Implication:** never collapse the two methods into a single
 "design everything up front" call. `designPhase()` must receive
-completed phase results. Future CrewAI migration keeps the same
-two-mode interface (chief / data / app architect crew); don't
-change the surface.
+completed phase results. The future LangGraph.js migration
+(ADR-056) keeps the same two-mode interface (chief / data /
+app architect subgraph); don't change the surface.
 
 ### ADR-050 — LLM-driven evaluation and routing (no hardcoded decision logic)
 Any decision that requires evaluating context, classifying a

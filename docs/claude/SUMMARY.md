@@ -782,6 +782,41 @@ Behaviour:
 This replaces the current "Active agents" card on the
 dashboard home and the flat agent list in the agents tab.
 
+#### Platform
+
+#### MEDIUM — LangGraph.js migration (ADR-056)
+
+Replace custom agent orchestration with LangGraph.js. See
+ADR-056 for full rationale and what was evaluated.
+
+Prerequisites:
+- TR_034 complete (planning loop reaches `completed`).
+- At least one full feature completes autonomously.
+
+Phase 1 — Generate layer:
+- `BaseLLMAgent` becomes a LangGraph node.
+- Generate orchestrator becomes a `StateGraph`.
+- LangGraph PostgreSQL checkpointer handles state
+  persistence. No custom checkpoint table is added.
+- File tools replaced with LangChain `FileManagementToolkit`.
+- Aider wrapped as a LangChain `StructuredTool`.
+- `executeScript` kept as a custom `StructuredTool` (preserves
+  the ADR-050 safety blocklist).
+
+Phase 2 — Planning layer:
+- Planning orchestrator becomes a `StateGraph`.
+- architecture-agent becomes a subgraph (enables architecture
+  crew in future per ADR-049).
+- LangGraph `interrupt()` replaces custom escalation.
+
+Phase 3 — Gate layer.
+Phase 4 — Deploy layer.
+Phase 5 — Maintenance layer.
+
+BullMQ stays as the inter-layer transport. LangGraph runs
+inside BullMQ workers. TypeScript server, dashboard, CLI
+unchanged. HARNESS.json + agents.yaml unchanged (ADR-042).
+
 ---
 
 ## Operator caveats / pending actions

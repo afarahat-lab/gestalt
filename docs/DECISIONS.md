@@ -1491,10 +1491,11 @@ architecture produces vague generalities. The phase-level
 consultation grounds its recommendations in what was actually
 built, not just what was planned.
 
-**Future:** When CrewAI migration occurs, the architecture agent
-becomes an architecture crew (chief architect, data architect,
-application architect) using the same two-mode consultation pattern.
-The interface stays identical; the implementation improves.
+**Future:** When the LangGraph.js migration occurs (ADR-056),
+the architecture agent becomes an architecture subgraph (chief
+architect, data architect, application architect) using the same
+two-mode consultation pattern. The interface stays identical;
+the implementation improves.
 
 **Consequences:**
 - architecture-agent.ts exposes two methods: designFeature() and
@@ -1789,640 +1790,145 @@ enterprise operations teams in the GCC/MENA target market.
 
 ---
 
-## ADR-056 — Agent layer migrated to Python with CrewAI
+## ADR-056 — Agent orchestration layer migrated to LangGraph.js
 
-**Date:** 2026-06-09
-**Status:** Deferred — design preserved for a future revisit (see addendum at the end of this ADR). Flip to **Accepted** when implementation begins.
+**Date:** 2026-06-10
+**Status:** Accepted — pending implementation after TR_034.
+
+### Context
+
+Gestalt's custom agent orchestration (`BaseLLMAgent`, five
+layer orchestrators, the self-healing loop, the planning loop)
+implements a state machine with conditional edges, retry
+cycles, cyclic reasoning loops, and human-in-the-loop
+escalation. This was built from scratch and accounts for a
+significant maintenance burden — every TR-series session
+since TR_020 has touched orchestration code. Several
+frameworks were evaluated as replacements.
+
+### Frameworks evaluated
+
+- **CrewAI** — Rejected. Python-only. Requires a full backend
+  migration. The language boundary between the TypeScript
+  server and Python agent workers adds operational complexity
+  that LangGraph.js avoids.
+
+- **Mastra** — Evaluated seriously. TypeScript-native,
+  excellent developer experience, 300k+ weekly npm downloads,
+  built-in memory and observability. Rejected for Gestalt's
+  use case because: (1) optimised for lightweight serverless
+  patterns, not long-running stateful enterprise workflows;
+  (2) no SOC 2 compliance as of 2026 — required by GCC/MENA
+  enterprise customers; (3) lacks time-travel debugging
+  needed for diagnosing deep agent loop failures.
+
+- **n8n** — Rejected. Sustainable Use License prohibits
+  embedding in commercial platforms without a commercial
+  license. Not suitable as a platform component.
+
+- **LangGraph.js** — Selected.
 
 ### Decision
 
-The agent layer (`@gestalt/agents-generate`,
-`@gestalt/agents-quality-gate`, `@gestalt/agents-deploy`,
-`@gestalt/agents-maintenance`, `@gestalt/agents-planning`)
-migrates from TypeScript to Python. CrewAI provides crew-based
-execution. **BullMQ + Redis remain as the job queue and
-durability layer.** PostgreSQL remains as the state store,
-accessed via SQLAlchemy + asyncpg. The TypeScript server, React
-dashboard, CLI, and all infrastructure are **unchanged**.
+LangGraph.js (`@langchain/langgraph`, TypeScript).
 
-This is a surgical migration of the worker processes — not a
-platform-wide rewrite. The TypeScript server keeps owning routes,
-auth, dispatch, the dashboard, and operator surfaces; only the
-processes that consume agent jobs become Python.
+### Rationale
 
-### Communication
+Gestalt's requirements map precisely to LangGraph.js
+strengths:
 
-The TypeScript server dispatches BullMQ jobs exactly as today.
-Python workers consume from the same queues. The server has no
-knowledge that workers are Python — **BullMQ is the contract**.
+- Long-running asynchronous workflows that span minutes to
+  hours across multiple BullMQ jobs — LangGraph `StateGraph`
+  models this exactly.
+- Deep cyclic reasoning (generate → CI fail → self-healing →
+  fix-intent → resume) — LangGraph conditional edges handle
+  this natively.
+- State must survive server restarts — LangGraph PostgreSQL
+  checkpointer provides this without a custom checkpoint
+  schema.
+- Human-in-the-loop escalation — LangGraph `interrupt()` is a
+  first-class primitive, not a custom feature to build.
+- SOC 2 compliance — LangChain/LangGraph has it; Mastra does
+  not.
+- Time-travel debugging via LangSmith — directly useful for
+  diagnosing the agent loop failures documented in
+  TR_001–TR_034.
 
-### State persistence across restarts
+The 4–8 week TypeScript/Python release lag is accepted as a
+known tradeoff. The features Gestalt needs (state
+persistence, HITL checkpoints, conditional edges) are stable
+and well-tested in the TypeScript version.
 
-BullMQ re-dispatches incomplete jobs on worker restart. A new
-`agent_checkpoints` table in PostgreSQL allows Python workers to
-resume from the last completed step within a job without
-restarting the whole cycle.
+### What changes
 
-### Facade pattern
+- `BaseLLMAgent` → LangGraph node.
+- Five orchestrators → one `StateGraph` per layer.
+- Custom checkpoint system → LangGraph PostgreSQL
+  checkpointer. No new custom checkpoint table is added.
+- Custom self-healing loop → LangGraph conditional edges.
+- Custom human-in-the-loop escalation → LangGraph
+  `interrupt()`.
+- File tools (`readFile`, `listDirectory`, `searchFiles`,
+  `getFileTree`) → LangChain `FileManagementToolkit`
+  (`ReadFileTool`, `ListDirectoryTool`, `FileSearchTool`).
+- `executeScript` → kept as a custom LangChain
+  `StructuredTool`. Gestalt's safety blocklist
+  (`BLOCKED_PATTERNS` per ADR-050) must be preserved.
+- Aider → LangChain `StructuredTool` wrapper. Same
+  subprocess invocation as today.
 
-Gestalt defines abstract base classes (`GestaltAgent`,
-`GestaltCrew`, `GestaltTool`) in Python. CrewAI implements them.
-If CrewAI is replaced in the future, only the implementation
-swaps — not Gestalt's business logic.
+### What stays unchanged
 
-### Aider integration
-
-Aider becomes a CrewAI `BaseTool` subclass (`AiderTool`). The
-code-agent crew calls `AiderTool` when code generation is needed.
-Same `executeScript`-style subprocess pattern as the TypeScript
-path, wrapped in a CrewAI tool surface so the LLM decides when
-to invoke it.
+- TypeScript Fastify server, React dashboard, CLI.
+- PostgreSQL database and every migration 001–027.
+- BullMQ + Redis. LangGraph graphs are invoked by BullMQ
+  workers; BullMQ remains the inter-layer transport.
+- `HARNESS.json` + `agents.yaml`. ADR-042 still applies —
+  prompt content stays project-tunable.
+- All prompt improvements from TR_001–TR_034.
+- PR-Agent integration (ADR-051).
+- Self-healing fix-intent mechanism (ADR-050, migration 026).
+- All routing decisions remain LLM-driven (ADR-050). The
+  graph's conditional edges route on LLM output fields, not
+  on hardcoded `switch` statements.
 
 ### Migration order
 
-1. **Generate layer** — highest value, most complex agents
-2. **Planning layer** — architecture-crew concept unlocked
-   (ChiefArchitect + DataArchitect + AppArchitect — matches
-   ADR-049's foreshadowing)
-3. **Gate layer** — constraint + review crews
-4. **Deploy layer** — pr / pipeline / promotion crews
-5. **Maintenance layer** — drift / alignment / gc / evaluation
-   crews
-
-### New repository structure
-
-```
-agents/                          ← new top-level Python project
-  pyproject.toml                 ← single Python project
-  gestalt/
-    core/
-      base.py                    ← GestaltAgent, GestaltCrew, GestaltTool
-      checkpoint.py              ← checkpoint read/write
-      config.py                  ← HARNESS.json + agents.yaml readers
-      db.py                      ← SQLAlchemy async engine
-      queue.py                   ← BullMQ job consumer (bullmq Python client)
-      llm.py                     ← LLM registry resolver
-      tools/
-        aider.py                 ← AiderTool (CrewAI BaseTool)
-        execute_script.py        ← ExecuteScriptTool
-        file_tools.py            ← ReadFileTool, SearchFilesTool, etc.
-    generate/
-      crew.py                    ← GenerateCrew
-      agents/
-        intent_agent.py
-        design_agent.py
-        context_agent.py
-        code_agent.py
-      worker.py                  ← BullMQ consumer entry point
-    gate/
-      crew.py                    ← GateCrew
-      agents/
-        constraint_agent.py
-        review_agent.py
-      worker.py
-    planning/
-      crew.py                    ← PlanningCrew
-      crews/
-        architecture_crew.py     ← ChiefArchitect + DataArchitect + AppArchitect
-      agents/
-        planner_agent.py
-        phase_evaluator_agent.py
-      worker.py
-    deploy/
-      crew.py
-      agents/
-        pr_agent.py
-        pipeline_agent.py
-        promotion_agent.py
-      worker.py
-    maintenance/
-      crew.py
-      agents/
-        drift_agent.py
-        alignment_agent.py
-        gc_agent.py
-        evaluation_agent.py
-      worker.py
-```
-
-### Part 1 — Facade base classes
-
-`agents/gestalt/core/base.py`:
-
-```python
-from abc import ABC, abstractmethod
-from pydantic import BaseModel
-from crewai import Agent, Crew, Task, BaseTool
-from typing import Any
-
-class GestaltTool(BaseTool, ABC):
-    """Base class for all Gestalt tools.
-    Wraps CrewAI BaseTool with Gestalt-specific context."""
-    project_root: str = ""
-    correlation_id: str = ""
-
-class GestaltAgent(ABC):
-    """Base class for all Gestalt agents.
-    Wraps a CrewAI Agent with Gestalt config loading."""
-
-    def __init__(self, role: str, harness_config: dict, agents_yaml: dict):
-        self.role = role
-        self.harness_config = harness_config
-        self.agents_yaml = agents_yaml
-        self._agent = self._build_crewai_agent()
-
-    def _build_crewai_agent(self) -> Agent:
-        # Load from agents.yaml per ADR-042
-        agent_cfg = self.agents_yaml.get(self.role, {})
-        harness_cfg = self.harness_config.get(
-            'agentConfig', {}
-        ).get(self.role, {})
-
-        rules = harness_cfg.get('rules', [])
-        extensions = agent_cfg.get('prompt_extensions', [])
-
-        backstory = '\n'.join([
-            agent_cfg.get('goal', ''),
-            *(['Rules:'] + [f'- {r}' for r in rules] if rules else []),
-            *extensions,
-        ])
-
-        return Agent(
-            role=agent_cfg.get('role', self.role),
-            goal=agent_cfg.get('goal', ''),
-            backstory=backstory,
-            llm=self._resolve_llm(agent_cfg),
-            tools=self._get_tools(),
-            verbose=True,
-        )
-
-    @abstractmethod
-    def _get_tools(self) -> list:
-        pass
-
-    def _resolve_llm(self, agent_cfg: dict) -> Any:
-        # Resolve LLM from platform registry
-        # Returns a LiteLLM-compatible model string
-        model = agent_cfg.get('llm', {}).get('model')
-        return model or 'gpt-4o'
-
-    @property
-    def crewai_agent(self) -> Agent:
-        return self._agent
-
-
-class GestaltCrew(ABC):
-    """Base class for all Gestalt crews."""
-
-    def __init__(
-        self,
-        correlation_id: str,
-        project_root: str,
-        harness_config: dict,
-        agents_yaml: dict,
-    ):
-        self.correlation_id = correlation_id
-        self.project_root = project_root
-        self.harness_config = harness_config
-        self.agents_yaml = agents_yaml
-
-    @abstractmethod
-    async def run(self, payload: dict) -> dict:
-        pass
-
-    async def checkpoint(self, step: str, data: dict) -> None:
-        """Write checkpoint to PostgreSQL for restart resumability."""
-        from gestalt.core.checkpoint import write_checkpoint
-        await write_checkpoint(self.correlation_id, step, data)
-```
-
-### Part 2 — AiderTool
-
-`agents/gestalt/core/tools/aider.py`:
-
-```python
-from gestalt.core.base import GestaltTool
-from pydantic import Field
-import subprocess, os
-
-class AiderTool(GestaltTool):
-    name: str = "aider_code_generator"
-    description: str = (
-        "Generate or modify code using Aider. "
-        "Provide the task description. "
-        "Aider reads PLAN.md and existing files before generating. "
-        "Returns the list of files written and Aider output. "
-        "Use this tool when code needs to be written or modified."
-    )
-    model_string: str = ""
-    api_key: str = ""
-    api_base: str = ""
-
-    def _run(self, task: str) -> str:
-        env = os.environ.copy()
-        env['OPENAI_API_KEY'] = self.api_key
-        env['OPENAI_API_BASE'] = self.api_base
-
-        cmd = [
-            'aider',
-            '--yes-always',
-            '--no-git',
-            '--read', 'PLAN.md',
-            '--model', self.model_string,
-            '--message', task,
-        ]
-
-        result = subprocess.run(
-            cmd,
-            cwd=self.project_root,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env=env,
-        )
-
-        return f"Exit: {result.returncode}\n{result.stdout}\n{result.stderr}"
-```
-
-### Part 3 — Checkpoint system
-
-`agents/gestalt/core/checkpoint.py`:
-
-```python
-from sqlalchemy.ext.asyncio import AsyncSession
-from datetime import datetime, timezone
-
-async def write_checkpoint(
-    correlation_id: str,
-    step: str,
-    data: dict,
-    db: AsyncSession,
-) -> None:
-    """Write a checkpoint so workers can resume after restart."""
-    await db.execute(
-        """
-        INSERT INTO agent_checkpoints
-          (correlation_id, step, step_data, created_at)
-        VALUES (:correlation_id, :step, :data, :now)
-        ON CONFLICT (correlation_id, step)
-        DO UPDATE SET step_data = :data, created_at = :now
-        """,
-        {
-            'correlation_id': correlation_id,
-            'step': step,
-            'data': data,
-            'now': datetime.now(timezone.utc),
-        }
-    )
-    await db.commit()
-
-async def read_latest_checkpoint(
-    correlation_id: str,
-    db: AsyncSession,
-) -> dict | None:
-    result = await db.execute(
-        """
-        SELECT step, step_data FROM agent_checkpoints
-        WHERE correlation_id = :id
-        ORDER BY created_at DESC LIMIT 1
-        """,
-        {'id': correlation_id}
-    )
-    row = result.fetchone()
-    if not row:
-        return None
-    return {'step': row.step, 'data': row.step_data}
-```
-
-New migration `028_agent_checkpoints.sql`:
-
-```sql
-CREATE TABLE agent_checkpoints (
-  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  correlation_id  UUID NOT NULL,
-  step            TEXT NOT NULL,
-  step_data       JSONB NOT NULL DEFAULT '{}',
-  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE (correlation_id, step)
-);
-
-CREATE INDEX idx_agent_checkpoints_correlation
-  ON agent_checkpoints (correlation_id, created_at DESC);
-```
-
-### Part 4 — BullMQ Python consumer
-
-`agents/gestalt/core/queue.py`:
-
-```python
-from bullmq import Worker
-from typing import Callable, Awaitable
-
-def create_worker(
-    queue_name: str,
-    handler: Callable[[dict], Awaitable[dict]],
-    redis_url: str,
-    concurrency: int = 3,
-) -> Worker:
-    """Create a BullMQ worker that consumes from a queue.
-    On restart, BullMQ automatically re-dispatches
-    incomplete jobs."""
-
-    async def process(job, token):
-        # Check for existing checkpoint — resume if found
-        checkpoint = await read_latest_checkpoint(
-            job.data.get('correlationId')
-        )
-        return await handler({**job.data, 'checkpoint': checkpoint})
-
-    return Worker(queue_name, process, {'connection': redis_url})
-```
-
-Worker entry point for the generate layer
-(`agents/gestalt/generate/worker.py`):
-
-```python
-import asyncio
-from gestalt.core.queue import create_worker
-from gestalt.generate.crew import GenerateCrew
-
-async def handle_generate_job(payload: dict) -> dict:
-    crew = GenerateCrew(
-        correlation_id=payload['correlationId'],
-        project_root=payload['projectRoot'],
-        harness_config=await load_harness(payload['projectId']),
-        agents_yaml=await load_agents_yaml(payload['projectId']),
-    )
-    return await crew.run(payload)
-
-if __name__ == '__main__':
-    worker = create_worker(
-        queue_name='gestalt-generate',
-        handler=handle_generate_job,
-        redis_url=os.environ['REDIS_URL'],
-    )
-    asyncio.get_event_loop().run_forever()
-```
-
-### Part 5 — Generate crew (Phase 1 of migration)
-
-`agents/gestalt/generate/crew.py`:
-
-```python
-from crewai import Crew, Task
-from gestalt.core.base import GestaltCrew
-from gestalt.generate.agents.intent_agent import IntentAgent
-from gestalt.generate.agents.design_agent import DesignAgent
-from gestalt.generate.agents.context_agent import ContextAgent
-from gestalt.generate.agents.code_agent import CodeAgent
-
-class GenerateCrew(GestaltCrew):
-
-    async def run(self, payload: dict) -> dict:
-        checkpoint = payload.get('checkpoint')
-
-        intent_agent = IntentAgent(
-            self.harness_config, self.agents_yaml
-        )
-        design_agent = DesignAgent(
-            self.harness_config, self.agents_yaml
-        )
-        context_agent = ContextAgent(
-            self.harness_config, self.agents_yaml
-        )
-        code_agent = CodeAgent(
-            self.harness_config, self.agents_yaml,
-            project_root=self.project_root,
-        )
-
-        # Resume from checkpoint if available
-        if checkpoint and checkpoint['step'] == 'intent_complete':
-            intent_spec = checkpoint['data']['intentSpec']
-        else:
-            intent_task = Task(
-                description=f"Analyse this intent: {payload['text']}",
-                agent=intent_agent.crewai_agent,
-                expected_output='IntentSpec JSON',
-            )
-            crew = Crew(
-                agents=[intent_agent.crewai_agent],
-                tasks=[intent_task],
-            )
-            result = crew.kickoff()
-            intent_spec = result.raw
-            await self.checkpoint('intent_complete', {'intentSpec': intent_spec})
-
-        # ... design, context, code steps follow same pattern
-
-        return {'status': 'completed', 'artifacts': []}
-```
-
-### Part 6 — Docker Compose: add Python agent workers
-
-In `docker-compose.yml`, add Python worker services alongside
-the existing TypeScript server:
-
-```yaml
-generate-worker:
-  build:
-    context: ./agents
-    dockerfile: Dockerfile
-  command: python -m gestalt.generate.worker
-  environment:
-    - REDIS_URL=redis://redis:6379
-    - DATABASE_URL=postgresql+asyncpg://gestalt:${POSTGRES_PASSWORD}@postgres/gestalt
-    - LLM_API_KEY=${LLM_API_KEY}
-  depends_on:
-    - redis
-    - postgres
-  networks:
-    - gestalt-network
-
-gate-worker:
-  build:
-    context: ./agents
-    dockerfile: Dockerfile
-  command: python -m gestalt.gate.worker
-  environment:
-    - REDIS_URL=redis://redis:6379
-    - DATABASE_URL=postgresql+asyncpg://gestalt:${POSTGRES_PASSWORD}@postgres/gestalt
-  depends_on:
-    - redis
-    - postgres
-  networks:
-    - gestalt-network
-
-planning-worker:
-  build:
-    context: ./agents
-    dockerfile: Dockerfile
-  command: python -m gestalt.planning.worker
-  environment:
-    - REDIS_URL=redis://redis:6379
-    - DATABASE_URL=postgresql+asyncpg://gestalt:${POSTGRES_PASSWORD}@postgres/gestalt
-  depends_on:
-    - redis
-    - postgres
-  networks:
-    - gestalt-network
-```
-
-`agents/Dockerfile`:
-
-```dockerfile
-FROM python:3.12-slim
-
-# Install git, Aider, PR-Agent (same as TypeScript server)
-RUN apt-get update && apt-get install -y git
-RUN pip install aider-chat pr-agent
-
-WORKDIR /app
-COPY pyproject.toml .
-RUN pip install -e .
-
-COPY gestalt/ gestalt/
-```
-
-### Part 7 — Remove TypeScript agent workers from server startup
-
-In `packages/server/src/server.ts`, remove:
-
-```typescript
-// REMOVE — worker now runs in Python
-// import { startOrchestratorWorker } from '@gestalt/agents-generate';
-// startOrchestratorWorker(config.queue);
-
-// REMOVE — planning worker now runs in Python
-// import { startPlanningWorker } from '@gestalt/agents-planning';
-// startPlanningWorker(config.queue);
-```
-
-The server still dispatches to the same BullMQ queues. Python
-workers consume from them. No other server changes. Keep all
-TypeScript agent packages in the monorepo for reference during
-migration — mark each as `@deprecated` in its `package.json`
-description as Python equivalents are completed.
-
-### Part 8 — Prompt content stays in HARNESS.json and agents.yaml
-
-ADR-042 applies in Python exactly as in TypeScript:
-
-- `.py` files contain structural framing and JSON schemas
-- `HARNESS.json` `agentConfig` contains rules
-- `agents.yaml` contains role, goal, prompt_extensions
-
-`GestaltAgent._build_crewai_agent()` reads both and assembles
-the CrewAI Agent backstory from them. No LLM guidance prose in
-`.py` files.
-
-### Implementation sequence
-
-1. `agents/gestalt/core/` — base classes, checkpoint, queue,
-   tools (Aider, executeScript, file tools)
-2. Migration `028_agent_checkpoints.sql`
-3. `agents/gestalt/generate/` — generate crew + workers
-4. Remove TypeScript generate worker from server startup
-5. Verify: BullMQ job dispatched by TypeScript server, consumed
-   by Python worker, result lands in PostgreSQL
-6. `agents/gestalt/planning/` — planning crew with architecture
-   crew (ChiefArchitect + DataArchitect + AppArchitect)
-7. `agents/gestalt/gate/` — gate crew
-8. `agents/gestalt/deploy/` — deploy crew
-9. `agents/gestalt/maintenance/` — maintenance crew
-
-### Constraints
-
-- TypeScript server unchanged — only `server.ts` startup imports
-  removed.
-- BullMQ queue names unchanged — same names Python workers
-  consume from.
-- PostgreSQL schema unchanged except the new `agent_checkpoints`
-  table.
-- All existing ADRs apply in Python:
-  - ADR-042 (prompt content lives in HARNESS.json + agents.yaml)
-  - ADR-043 (Aider as opt-in code generation backend)
-  - ADR-044 (model selection — gpt-4o for gate, gpt-4o-mini for code)
-  - ADR-045 (evidence requirement for all finding-emitting agents)
-  - ADR-050 (all evaluation and routing decisions are LLM-driven)
-- `pyproject.toml` dependencies: `crewai`, `bullmq`,
-  `sqlalchemy[asyncio]`, `asyncpg`, `pydantic`, `python-dotenv`.
-
-### Verification after generate-layer migration
-
-```bash
-docker-compose up -d
-gestalt run "Add GET /ping endpoint returning pong" \
-  --project trackeros --watch
-```
-
-Server logs should show:
-
-```
-[TypeScript server] Dispatched job to gestalt-generate
-[Python generate-worker] Picked up job <id>
-[Python generate-worker] GenerateCrew running
-[Python generate-worker] IntentAgent complete — checkpoint written
-[Python generate-worker] AiderTool called
-[Python generate-worker] Checkpoint: aider_complete
-[Python generate-worker] Job complete
-[TypeScript server] Intent status → deployed
-```
-
-### When implementation begins
-
-Read `CLAUDE.md` before starting. Update
-`docs/claude/sessions/RECENT.md`, regenerate
-`docs/claude/SUMMARY.md`, flip this ADR's status from
-`Deferred` to `Accepted` here and in any mirrored doc. Share
-PR URLs for review.
+1. **Generate layer** — highest value, most complex state
+   machine.
+2. **Planning layer** — architecture subgraph unlocks the
+   crew pattern foreshadowed by ADR-049.
+3. **Gate layer** — constraint + review nodes.
+4. **Deploy layer** — pr / pipeline / promotion nodes.
+5. **Maintenance layer** — drift / alignment / gc /
+   evaluation nodes.
+
+### Prerequisites
+
+- TR_034 must complete (planning loop proven end-to-end on a
+  real feature).
+- At least one feature must reach `completed` status before
+  the migration begins. This validates the platform's loop
+  semantics before they are re-expressed in LangGraph.
 
 ### What this ADR does NOT do
 
 - Does not change any ADR 001–055.
-- Does not change the Postgres schema beyond adding the
-  `agent_checkpoints` table.
-- Does not change the dashboard, templates, HARNESS.json,
-  agents.yaml, or any project repo contents.
+- Does not change `HARNESS.json`, `agents.yaml`, or any
+  project repo contents.
 - Does not change BullMQ, Redis, the TypeScript server, the
-  CLI, or the auth providers.
-- Does not implement the roadmap items (unified entry point,
-  dashboard rebuild, digest layer, alerts enrichment, prompt-
-  entry-in-dashboard, config dashboard improvements). Those
-  are independent of this migration.
+  CLI, the dashboard, or the auth providers.
+- Does not add a Python runtime to the platform.
+- Does not change the LLM registry, vault, identity, or
+  templates.
 
-### Addendum — 2026-06-09 — Deferred, design revised
+### When implementation begins
 
-This ADR was opened, implemented in part, rolled back, and revised —
-all on the same day. The history is captured here so the design
-intent is auditable when a future session picks it up.
+Read `CLAUDE.md` (all imported files) before starting.
+Update `docs/claude/sessions/RECENT.md` and regenerate
+`docs/claude/SUMMARY.md`. Flip this ADR's status from
+`Accepted — pending implementation after TR_034` to
+`Accepted — implementation in progress` here and in
+`docs/claude/DECISIONS.md`. Share PR URLs for review.
 
-**v1 (rolled back)** — Original Decision was a *full Python rewrite*
-of every TypeScript package: core, adapters, all five agent layers,
-server, CLI. New code landed under `packages-py/` with `uv` workspaces,
-ruff, mypy, a python:3.12-slim Dockerfile, twelve package skeletons,
-and a partial `gestalt_core` port (types, config, logger, events,
-harness, file_tools as CrewAI `BaseTool` subclasses, execute_script).
-The operator decided this was too disruptive — too long a parity gap,
-too much working machinery thrown away. The `packages-py/` tree was
-deleted. No TypeScript source was modified during v1, so nothing
-needed reverting on the `packages/` side.
-
-**v2 (current ADR body above)** — The design was narrowed to a
-*surgical migration of the agent workers only*. TypeScript server,
-React dashboard, CLI, auth, BullMQ, Redis, and the entire Postgres
-schema (excepting one new `agent_checkpoints` table) stay
-unchanged. Python workers consume the same BullMQ queues the
-TypeScript server dispatches to today — BullMQ is the contract
-across the language boundary. ADRs 042 / 043 / 044 / 045 / 050
-apply in Python exactly as they do in TypeScript. The
-`agents/` top-level directory replaces `packages-py/` as the
-landing zone.
-
-**Status:** Deferred. The platform continues to run on the
-TypeScript stack described in ADRs 001–055. Flip this ADR's
-status to `Accepted` when implementation begins; record the
-session in `docs/claude/sessions/RECENT.md` and regenerate
-`docs/claude/SUMMARY.md`.
-
-**Operator action:** none.
-
+**Operator action:** none until implementation begins.
