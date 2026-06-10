@@ -54,6 +54,86 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_041 — Stack compliance check at TOP of review prompt + lifecycle coverage as 5th checklist item + lifecycle architectureGuidance rule (template 0.26.0, build clean, feature-level pipeline fully cleaned of framework leak)
+
+Three fixes against TR_040's two HIGH NEW follow-ups (Vitest
+binding still leaking; lifecycle-coverage gap).
+
+- **Fix 1** —
+  `packages/agents/planning/src/prompts/architecture-prompt.ts`
+  `buildArchitectureReviewPrompt` restructured. The
+  `## Stack compliance check (read this first)` block is now
+  rendered FIRST in the prompt (before persona, harness
+  section, draft JSON, feature description). The block
+  wording strengthened: "REWRITE the relevant field with the
+  declared stack value. Do not preserve the original."
+- **Fix 2** — same function. The four-point review checklist
+  gains a 5th item: "Lifecycle coverage — for every entity
+  whose state changes during the feature lifecycle, verify
+  that at least one phase in `recommendedPhases` includes a
+  method to perform that mutation. If a state transition
+  exists in the feature description but no phase adds the
+  corresponding mutation method, ADD it to the most
+  appropriate phase."
+- **Fix 3** — `agentConfig.architecture-agent.architectureGuidance`
+  in template + trackeros HARNESS appended with: "Every state
+  transition described in the feature must have a
+  corresponding method in at least one phase. If an entity
+  changes state during the feature lifecycle, ensure the
+  phase plan includes a method for each transition — not
+  just the initial creation."
+
+Template `0.25.0 → 0.26.0`. `pnpm -r build` clean across all
+13 packages.
+
+**Live verification — TR_041 Fix 1 works end-to-end on the
+FEATURE-level pipeline:** trackeros feature
+`595033ff-99b2-460a-b532-70b99e6fed3d` on `chat-latest`:
+- ✅ Post-review feature architecture is FRAMEWORK-FREE.
+  DB query for framework refs: `jest=0 vitest=0 fastify=0
+  express=0`. Compare to TR_040 which still had
+  `vitest=1`. The TOP-positioned stack compliance check
+  conditions the LLM strongly enough that it doesn't even
+  reach for framework names in the draft.
+- ✅ Planner's Phase 1 scope text says "Jest" (not
+  "Vitest", not "Jest or Vitest" hedge).
+- ✅ 8-phase bottom-up dependency-ordered plan:
+  Employee → LeavePolicy → LeaveBalance → balance ops →
+  LeaveRequest → submission → approval → notification.
+  Phase 7 IS the mutation phase the lifecycle-coverage
+  rule asked for — verified at the plan level.
+
+**Cycle still blocked at intent-agent on two NEW gaps:**
+- ❌ Per-phase `designPhase` STILL emits "Vitest tests" in
+  success criteria. TR_041's review enhancements apply only
+  to `reviewDesign` (feature-level), not `designPhase`
+  (per-phase). The per-phase pass has the stack section +
+  architectureGuidance rules but NO review pass.
+- ❌ Intent-agent caught a scope-vs-architecture file-count
+  mismatch — Phase 1 scope text lists 2 files
+  (`employee.model.ts` + `employee.repository.ts`); the
+  per-phase architecture lists 3 files (adds
+  `postgres-employee.repository.ts`) + a SQL schema.
+
+**New HIGH follow-ups for TR_042:**
+- Add `reviewPhaseDesign` mirroring `reviewDesign` so the
+  per-phase pass gets the same stack compliance gate. Or
+  extend `designPhase` to internally re-run with a
+  compliance/scope-alignment instruction appended.
+- Planner-agent must mirror architecture-agent's file list,
+  not just symbol names. Options: planner-prompt rule
+  forcing it to reference the per-phase architecture's
+  file list verbatim, or a post-process substitution.
+
+**Operator action — trackeros:** none new beyond the
+already-pushed `aec2340f chore(TR_041): architecture-agent —
+lifecycle coverage rule`.
+
+**Operator action — other projects:** Append the
+lifecycle-coverage rule to
+`HARNESS.json.agentConfig.architecture-agent.architectureGuidance`.
+Template auto-refreshes to `0.26.0` at next server boot.
+
 ### TR_040 — Architecture-agent binds to HARNESS.stack declared values (template 0.25.0, build clean, partial verification: Fastify bound end-to-end, Vitest binding deferred)
 
 Two changes against TR_039's HIGH NEW follow-up

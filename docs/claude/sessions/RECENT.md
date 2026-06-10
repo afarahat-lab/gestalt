@@ -3,6 +3,197 @@
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+### Session 2026-06-10 — Claude Code (TR_041: stack compliance check moved to TOP of review prompt + lifecycle coverage as 5th checklist item + lifecycle architectureGuidance rule — TOP-positioning works end-to-end on the feature-level pipeline; per-phase architecture still leaks Vitest because designPhase has no review pass)
+
+Brief: three fixes against TR_040's two NEW HIGH follow-ups
+(Vitest binding still leaking; lifecycle-coverage gap that let
+Phase 5 require `update` while no phase ever added it). Fix 1
+moves the TR_040 stack-compliance check from the END of the
+review prompt to the TOP, where the LLM conditions hardest.
+Fix 2 adds a 5th "Lifecycle coverage" checklist item to the
+review task. Fix 3 adds an abstract HARNESS guidance rule for
+the same lifecycle invariant.
+
+What changed (3 fixes):
+
+**Fix 1 — Stack compliance check rendered FIRST in review prompt**
+
+- `packages/agents/planning/src/prompts/architecture-prompt.ts`
+  `buildArchitectureReviewPrompt` restructured. The
+  `## Stack compliance check (read this first)` block is now
+  the FIRST thing in the prompt — rendered before persona,
+  before harness section, before draft JSON, before
+  everything. The block's wording strengthened too: "REWRITE
+  the relevant field with the declared stack value. Do not
+  preserve the original" (vs TR_040's "correct it in your
+  output"). Header changed to `## Stack compliance check
+  (read this first)` so the section can't be mistaken for
+  one of many trailing instructions.
+
+**Fix 2 — Lifecycle coverage as 5th review checklist item**
+
+- Same file, same function. The four-point checklist
+  (completeness / consistency / ambiguity / feasibility)
+  gains a fifth item: "Lifecycle coverage — for every entity
+  whose state changes during the feature lifecycle, verify
+  that at least one phase in `recommendedPhases` includes a
+  method to perform that mutation. If a state transition
+  exists in the feature description but no phase adds the
+  corresponding mutation method, ADD it to the most
+  appropriate phase." The closing instruction also updated
+  to "if the draft passes all FIVE checks, return it
+  unchanged" (vs TR_040's "all four checks").
+
+**Fix 3 — Lifecycle coverage architectureGuidance rule**
+
+- Template + trackeros HARNESS
+  `agentConfig.architecture-agent.architectureGuidance`
+  gains: "Every state transition described in the feature
+  must have a corresponding method in at least one phase.
+  If an entity changes state during the feature lifecycle,
+  ensure the phase plan includes a method for each
+  transition — not just the initial creation." Abstract —
+  no method names, no entity names. The LLM applies it to
+  whatever transitions exist in the specific feature.
+
+**Template version bumped 0.25.0 → 0.26.0.** No new
+migration. Build clean across all 13 packages.
+
+What's verified live (trackeros feature
+`595033ff-99b2-460a-b532-70b99e6fed3d` on `chat-latest`):
+
+- ✅ **Feature-level architecture is FRAMEWORK-FREE
+  post-review.** DB query for framework refs in the
+  persisted (post-reviewDesign) feature architecture
+  returned `jest=0 vitest=0 fastify=0 express=0`. The LLM
+  kept all technology choices abstract — no Vitest leak,
+  no "Jest or Vitest" hedge, no Express slip. The TOP
+  positioning of the stack compliance check conditions
+  the LLM strongly enough that it doesn't even reach for
+  framework names in the draft it returns. Compare to
+  TR_040 which still had `vitest=1`.
+- ✅ **Planner-agent's Phase 1 scope text says "Jest"** —
+  not "Vitest", not "Jest or Vitest" hedge. The
+  architecture-agent's stack-bound output flows through
+  the TR_037 canonical-names section into the planner's
+  prompt; the planner now picks Jest by reading the
+  HARNESS.stack section in its own prompt.
+- ✅ **`reviewDesign` ran (5s, 17:24:38 → 17:24:44).** No
+  parse-fallback, no failure log.
+- ✅ **Plan is dependency-ordered bottom-up** — Phase 1
+  Employee → Phase 2 LeavePolicy → Phase 3 LeaveBalance →
+  Phase 4 balance init/adjustment service → Phase 5
+  LeaveRequest → Phase 6 submission workflow → Phase 7
+  approval/rejection processing → Phase 8 notification.
+  This is the cleanest plan structure across the TR_036
+  → TR_041 sequence. Phase 7 IS the mutation phase the
+  lifecycle-coverage rule asked for.
+
+What blocked the cycle (NEW orthogonal finding):
+
+- ❌ **Per-phase architecture (`designPhase`) still emits
+  "Vitest tests" in success criteria.** Phase 1's
+  per-phase architecture JSON has:
+  > "Vitest tests verify create(), findById(), and
+  > findManager() return expected Employee records ..."
+
+  TR_041's review enhancements apply ONLY to
+  `reviewDesign`, which reviews the FEATURE-level
+  `designFeature` output. `designPhase` (the per-phase
+  architecture pass) has the stack section + the
+  architectureGuidance rules but NO review pass. It picks
+  Vitest as a "modern default" the same way TR_040's
+  designFeature did before TR_041 strengthened the review
+  prompt.
+- ❌ **Intent-agent escalated on a scope-vs-architecture
+  file-count mismatch.** Phase 1 scope text says
+  "Create employee.model.ts and employee.repository.ts"
+  (2 files); per-phase architecture lists 3 files
+  (adds `postgres-employee.repository.ts`) + a SQL schema.
+  Intent-agent flagged this as ambiguity.
+
+The escalation isn't a TR_041 regression — it's the same
+class of issue (architecture-agent over-delivers vs the
+planner's brief scope text) that TR_038's concrete-
+implementation rule introduced. TR_037's canonical-names
+rule pushed the planner to use architecture-agent's
+names, but didn't push it to mirror the FILE LIST.
+
+**Pending follow-ups (NEW from TR_041 verification):**
+
+- **(HIGH — NEW)** `designPhase` needs its own review
+  pass — the per-phase architecture is where the test
+  framework leak now lives, and where the
+  scope-vs-architecture mismatch surfaces. Options:
+  (a) add `reviewPhaseDesign` mirroring `reviewDesign` —
+  same prompt structure, same JSON schema, same return-
+  original-on-failure semantics; (b) extend `designPhase`
+  to internally re-run the same prompt with a "verify
+  stack compliance + verify scope alignment" instruction
+  appended (a single LLM call doing two passes).
+- **(HIGH — NEW)** Planner-agent must mirror the
+  architecture-agent's file list, not just its symbol
+  names. The current planner-prompt injects the
+  architecture JSON as canonical names but the planner
+  emits its own scope text describing which files to
+  create — without checking that those files are exactly
+  the ones the per-phase architecture describes.
+  Options: (a) planner-prompt rule: "Your scope text
+  MUST list every file the per-phase architecture for
+  this phase will create — verify against the per-phase
+  architecture before returning"; (b) planner-prompt
+  rule: "Reference the per-phase architecture JSON
+  verbatim for file lists, modifying it only when
+  necessary"; (c) post-process the planner's scope text
+  to substitute the per-phase architecture's file list
+  whenever it diverges.
+- **(LOW — NEW)** The lifecycle-coverage rule may have
+  contributed to the bottom-up decomposition (8 phases
+  vs TR_039/40's 4-8). When the architecture has to
+  cover ALL state transitions for every entity, the
+  feature decomposes into more granular phases. This is
+  good for correctness but means more sequential phase
+  cycles. Consider raising `planner.maxFilesPerPhase`
+  from 5 to 7-8 so the planner can bundle related
+  files in fewer phases.
+
+Carryover follow-ups (status updates):
+
+- **(PARTIALLY RESOLVED by TR_041)** TR_040 HIGH NEW:
+  Vitest binding. CLOSED at the FEATURE-level
+  architecture (verified). STILL OPEN at the per-phase
+  architecture (new TR_041 follow-up above).
+- **(PARTIALLY RESOLVED by TR_041)** TR_040 HIGH NEW:
+  lifecycle coverage. Phase 7 in the new plan IS the
+  mutation phase for LeaveRequest (covers the approval
+  workflow). Verified at the plan level. Per-phase
+  method coverage in `designPhase` not yet measured —
+  needs the cycle to reach Phase 5 / Phase 7 to confirm
+  the mutation method is in the per-phase architecture
+  JSON.
+
+Build status: `pnpm -r build` clean across all 13
+packages. Template auto-refreshes to `0.26.0` at next
+server boot.
+
+Files changed:
+- `packages/agents/planning/src/prompts/architecture-prompt.ts`
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
+- `templates/corporate-ops-web-mobile/template.json`
+- `/Users/amrmohamed/Work/trackeros/HARNESS.json` (separate
+  repo, pushed at `aec2340f`)
+
+Live URLs:
+- Dashboard: http://localhost:3000/app/
+- TR_041 verification feature:
+  http://localhost:3000/app/features/595033ff-99b2-460a-b532-70b99e6fed3d
+- trackeros PLAN.md:
+  https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
+- trackeros TR_041 HARNESS commit:
+  https://github.com/afarahat-lab/trackeros/commit/aec2340f
+
+---
+---
 ### Session 2026-06-10 — Claude Code (TR_040: HARNESS architectureGuidance binding rules + reviewDesign stack-compliance check — partial verification: Fastify binding worked end-to-end, Vitest binding did NOT; new finding — architecture-agent regressed on LeaveRepository CRUD coverage)
 
 Brief: two changes addressing TR_039's NEW HIGH follow-up
@@ -192,205 +383,6 @@ Live URLs:
   https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
 - trackeros TR_040 HARNESS commit:
   https://github.com/afarahat-lab/trackeros/commit/6c76cc2f
-
----
----
-### Session 2026-06-10 — Claude Code (TR_039: planning orchestrator appends a "Deferred to later phases" section to every phase intent; intent-agent rules in HARNESS tell it not to flag deferred work as ambiguity — intent-agent bar CLEARED end-to-end; cycle finally reached the GATE for the first time across TR_036 → TR_039; new blocker is real config drift in architecture-agent emitting Vitest in success criteria on a Jest-aligned project)
-
-Brief: one platform change + one HARNESS rules block. After
-TR_038 closed the persistence-implementation rigor bar,
-intent-agent escalated on a yet-stricter check: "the intent
-mentions repository CRUD behavior, but LeaveRepository only
-defines create and findById methods". The phased plan
-intentionally defers update/delete to later phases — intent-
-agent reads the full feature description and flags anything
-Phase 1 doesn't implement as an ambiguity. TR_039 tells
-intent-agent which concerns are scheduled for later phases.
-
-What changed (2 fixes):
-
-**Fix 1 — Append `## Deferred to later phases` to every phase intent text**
-
-- `packages/agents/planning/src/orchestrator/planning-orchestrator.ts`
-  — when dispatching `generate:intent` for a phase, the
-  orchestrator now queries `features.listPhases(featureId)`,
-  filters to `phaseIndex > currentPhase.phaseIndex && status
-  === 'pending'`, and passes that list to `buildPhaseIntentText`
-  as a new required parameter. When non-empty, the builder
-  appends a `## Deferred to later phases` section listing
-  each later phase as
-  `- Phase N — <title>: <scope snippet, 100 chars>`.
-- The deferred section is part of the intent text the
-  pipeline already persists; no new field on the intent
-  record, no new migration. Re-dispatches on planner-side
-  retry (TR_022 maxPhaseRetries) re-build the section
-  fresh — so the deferred list always reflects current phase
-  status at retry time.
-
-**Fix 2 — `intent-agent` rules block in HARNESS**
-
-- Template + trackeros `HARNESS.json.agentConfig` gain a NEW
-  `intent-agent` block (didn't exist before — the
-  intent-agent had no per-project rules surface). Two
-  abstract rules:
-  - "This intent describes a single phase of a multi-phase
-    feature. If a 'Deferred to later phases' section is
-    present, the items listed there are intentionally out
-    of scope for this phase. Do not flag them as ambiguities
-    or missing functionality."
-  - "Evaluate the intent against what this phase explicitly
-    commits to delivering, not against the full feature
-    description."
-
-**Template version bumped 0.23.0 → 0.24.0.** No new migration.
-Build clean across all 13 packages.
-
-What's verified live (trackeros feature
-`61953f63-6655-47ae-8be9-879bcc1bffe2` on `chat-latest`):
-
-- ✅ **All 3 attempt-intents contain the Deferred section**
-  (DB query: `SELECT text LIKE '%Deferred to later phases%'`
-  on all 3 Phase-1 intents → all `t`). Each retry rebuilt
-  the section from scratch — consistent across attempts.
-- ✅ **Intent-agent no longer escalates on deferred work** —
-  attempt-1 intent `09554668` got past intent-agent into
-  `generating`, attempt-2 same. Only attempt-3 escalated,
-  and that was the planner exhausting `maxPhaseRetries`
-  after the gate failed too many times — not an intent-agent
-  problem.
-- ✅ **CYCLE REACHED THE GATE FOR THE FIRST TIME** across
-  the TR_036 → TR_039 sequence. Gate ran 6 times (verdicts:
-  3 → 1 → 9 → 2 → 2 → 2 CONSTRAINT_VIOLATION).
-- ✅ **TR_036 mechanisms verified live as a side-effect**:
-  - The constraint-agent + review-agent prompts contain the
-    `Project structure (read before evaluating)` brief
-    (DB query confirms).
-  - Zero false-positive `pool.query`/`new Pool` violations
-    on the shared/db connection file. All 6 visible
-    `CONSTRAINT_VIOLATION` signals are from `review-agent`,
-    none about the data-access-layer rules constraint-agent
-    used to false-positive on.
-- ✅ **TR_038 verified again** — Phase 1 architecture names
-  `PostgresLeaveRepository` with `constructor(private
-  readonly pool: Pool)` (proper DI vs prior global pool),
-  3 repository methods (`create`, `findById`,
-  `findByEmployeeId`), and the full SQL schema with CHECK
-  constraints + indices.
-- ✅ **Tighter plan** — 4 phases (vs TR_038's 5, TR_037's
-  5, TR_036's 7). Plan log:
-  `architecture-designed: 5 module(s), 4 recommended phase(s)`.
-- ✅ **TR_022 maxPhaseRetries 2/2 fired correctly**:
-  16:18:42 phase-submitted → 16:26:01 retry 1/2 →
-  16:34:44 retry 2/2 → 16:35:43 phase-escalated.
-- ✅ **TR_033 Fix 4 / TR_036 Fix 3 `feature-blocked` alert**
-  fired correctly. Visible in `gestalt alerts list`.
-
-What blocked the verification cycle (NEW orthogonal finding):
-
-The gate's `review-agent` flagged a real configuration drift
-in the code-agent's + test-agent's output:
-
-> "[review/architecture] The project's declared test framework
-> is Vitest, but this configuration introduces Jest/ts-jest
-> tooling, creating a test-framework mismatch with the
-> documented and configured stack."
-
-Looking at trackeros's actual state:
-- `package.json scripts.test`: `jest --passWithNoTests`
-- `package.json devDependencies`: jest + ts-jest + @types/jest
-- `jest.config.js` exists
-- `HARNESS.json.stack.testFramework`: "Jest"
-- `agents.yaml test-agent.goal`: "Generate comprehensive
-  Jest tests" (TR_036 Fix 4)
-
-trackeros IS fully Jest-aligned. The review-agent's claim
-"project declares Vitest" must come from the architecture-
-agent's `successCriteria` text — Phase 1's persisted
-architecture says "Vitest tests verify PostgresLeaveRepository
-can persist a LeaveRequest". The architecture-agent emits
-Vitest references INTO the success criteria (which then
-flow into code-agent's prompt + test-agent's output) even
-though `HARNESS.stack.testFramework: "Jest"` is in the
-prompt's stack section.
-
-So: ALL THREE agents in this cycle have inconsistent test
-framework signals — architecture-agent emits Vitest in
-success criteria; test-agent goal says Jest; code-agent
-generates a Vitest spec file. The review-agent correctly
-catches the inconsistency.
-
-The same Vitest/Jest pattern was noted in TR_038 — but it
-didn't matter then because intent-agent blocked first.
-TR_039 cleared intent-agent → the cycle reached the
-gate → the gate caught it.
-
-Also one Fastify/Express mismatch flagged: trackeros's
-HARNESS declares Fastify but the generated app entry-point
-uses Express. Same root cause — architecture-agent doesn't
-read the stack section consistently.
-
-**Pending follow-ups (NEW from TR_039 verification):**
-
-- **(HIGH — NEW)** Architecture-agent's `successCriteria`
-  strings emit Vitest references even when
-  `HARNESS.stack.testFramework: "Jest"` is in the prompt's
-  stack section. The TR_038 stack-injection mechanism reaches
-  the prompt but doesn't bind the LLM's output consistently —
-  it picks Vitest as a "modern default" override. Options:
-  (a) `architecture-agent.architectureGuidance` HARNESS rule
-  appended: "Every success criterion that names a test
-  framework, build tool, web framework, or runtime MUST use
-  the exact tool name from HARNESS.stack — never a 'modern
-  default' the LLM picks independently."; (b) post-process
-  the architecture JSON in `reviewDesign` to substitute
-  `HARNESS.stack.testFramework` for any other test-framework
-  name found in success criteria text; (c) drop framework
-  references from success criteria entirely — they were
-  added as motivation but not load-bearing for the
-  contract.
-- **(MEDIUM — NEW)** Architecture-agent emits Express in
-  the app entry-point design even though HARNESS declares
-  Fastify. Same root cause as (a) above — the stack
-  section doesn't bind framework choice.
-- **(MEDIUM — NEW)** The TR_039 deferred-summary truncates
-  the scope at 100 chars. On long phase scopes the snippet
-  ends mid-sentence (visible in the dispatched intent text:
-  "from p" cut off). Either bump to 200 chars (the intent
-  text isn't budget-constrained at this size) or end the
-  snippet at the last full sentence boundary within the
-  limit.
-
-Carryover follow-ups (status updates):
-
-- **(RESOLVED by TR_039)** TR_038 HIGH NEW: intent-agent's
-  CRUD-completeness check overconstrained for phased
-  delivery. Verified end-to-end — intent-agent now passes
-  on deferred operations.
-- **(VERIFIED LIVE — was previously SHIPPED only)** TR_036
-  Fix 1 (abstract rules) + Fix 2 (project-structure brief)
-  + Fix 3 (maxPhaseRetries alert). All three reached the
-  LLM for the first time on this cycle. Fix 1 + Fix 2
-  observably eliminated false-positives on the data-access
-  layer; Fix 3 alert visible in `gestalt alerts list`.
-
-Build status: `pnpm -r build` clean across all 13 packages.
-Template auto-refreshes to `0.24.0` at next server boot.
-
-Files changed:
-- `packages/agents/planning/src/orchestrator/planning-orchestrator.ts`
-- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
-- `templates/corporate-ops-web-mobile/template.json`
-- `/Users/amrmohamed/Work/trackeros/HARNESS.json` (separate
-  repo, pushed at `f0f9e989`)
-
-Live URLs:
-- Dashboard: http://localhost:3000/app/
-- TR_039 verification feature:
-  http://localhost:3000/app/features/61953f63-6655-47ae-8be9-879bcc1bffe2
-- trackeros PLAN.md:
-  https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
-- trackeros TR_039 HARNESS commit:
-  https://github.com/afarahat-lab/trackeros/commit/f0f9e989
 
 ---
 ---
