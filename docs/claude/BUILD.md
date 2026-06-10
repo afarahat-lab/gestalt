@@ -54,6 +54,81 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_039 — Phase intent text declares deferred scope; intent-agent rules tell it not to flag deferred work (template 0.24.0, build clean, TR_038 follow-up CLOSED; cycle reached the GATE for the first time)
+
+One platform change + one HARNESS rules block. Closes TR_038's
+HIGH follow-up (intent-agent CRUD-completeness rigor on phased
+delivery).
+
+- **Fix 1** —
+  `packages/agents/planning/src/orchestrator/planning-orchestrator.ts`
+  queries `features.listPhases(featureId)` before dispatching
+  each phase intent, filters to `phaseIndex > current &&
+  status === 'pending'`, and passes that to
+  `buildPhaseIntentText` as a new required parameter. The
+  builder appends `## Deferred to later phases` listing each
+  later-pending phase as
+  `- Phase N — <title>: <scope snippet, 100 chars>`. The
+  section becomes part of the intent text the pipeline
+  already persists; no new field on the intent record.
+- **Fix 2** — new `agentConfig.intent-agent` block on
+  template + trackeros HARNESS (didn't exist before). Two
+  abstract rules:
+  1. "This intent describes a single phase of a multi-phase
+     feature. If a 'Deferred to later phases' section is
+     present, the items listed there are intentionally out of
+     scope for this phase. Do not flag them as ambiguities
+     or missing functionality."
+  2. "Evaluate the intent against what this phase explicitly
+     commits to delivering, not against the full feature
+     description."
+
+Template `0.23.0 → 0.24.0`. `pnpm -r build` clean across all
+13 packages.
+
+**Live verification — TR_038 follow-up CLOSED + the cycle
+finally reached the GATE:** trackeros feature
+`61953f63-6655-47ae-8be9-879bcc1bffe2` on `chat-latest`:
+- All 3 Phase-1 attempt-intents contained the Deferred
+  section (DB-confirmed). Each retry rebuilt the section
+  from scratch.
+- Intent-agent passed cleanly on every attempt — no
+  escalation on deferred CRUD operations.
+- **The cycle reached the gate for the first time across
+  TR_036 → TR_039.** Gate ran 6 times. As a side-effect,
+  TR_036's project-structure brief was observed in every
+  gate-agent prompt (DB-confirmed), and zero
+  false-positive `pool.query`/`new Pool` violations were
+  flagged — TR_036 Fix 1 + Fix 2 both verified at the LLM
+  level for the first time.
+- TR_022 `maxPhaseRetries` fired 2/2 correctly:
+  16:18:42 phase-submitted → 16:26:01 retry 1/2 →
+  16:34:44 retry 2/2 → 16:35:43 phase-escalated.
+- `feature-blocked` alert visible in `gestalt alerts list`
+  (TR_036 Fix 3 alert path observed at the LLM level for
+  the first time too).
+
+**Cycle still blocked — NEW orthogonal finding:** the gate's
+review-agent caught a real configuration drift. Architecture-
+agent emits Vitest references in success-criteria text on a
+fully-Jest-aligned project (`HARNESS.stack.testFramework:
+Jest`, `agents.yaml test-agent.goal: Jest`, `package.json
+scripts.test: jest`). TR_038's stack-injection mechanism
+reaches the prompt but doesn't BIND the LLM's framework
+choice — it picks Vitest as a "modern default". Same
+pattern for Fastify-vs-Express in one violation. Captured
+as new HIGH follow-up for TR_040.
+
+**Operator action — trackeros:** none new beyond the
+already-pushed `f0f9e989 chore(TR_039): intent-agent rules —
+deferred scope is out of phase`.
+
+**Operator action — other projects:** Add the new
+`agentConfig.intent-agent` block to existing projects'
+`HARNESS.json` (it didn't exist before, so this is a NEW
+section, not an append). Template auto-refreshes to
+`0.24.0` at next server boot.
+
 ### TR_038 — Architecture-agent self-review + concrete-implementations stack injection (template 0.23.0, build clean, TR_037 follow-up CLOSED)
 
 Two stopgap fixes ahead of the LangGraph architecture-crew migration
