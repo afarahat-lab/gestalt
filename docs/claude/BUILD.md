@@ -54,6 +54,76 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_040 — Architecture-agent binds to HARNESS.stack declared values (template 0.25.0, build clean, partial verification: Fastify bound end-to-end, Vitest binding deferred)
+
+Two changes against TR_039's HIGH NEW follow-up
+(architecture-agent ignores `HARNESS.stack`).
+
+- **Fix 1** — `agentConfig.architecture-agent.architectureGuidance`
+  in template + trackeros HARNESS gains two new abstract rules
+  (no framework names hardcoded): one declaring the
+  HARNESS.stack as authoritative for all technology choices;
+  one telling the agent to verify every framework reference
+  matches the declared stack before emitting the response.
+- **Fix 2** — `buildArchitectureReviewPrompt` gains a
+  `## Stack compliance check` block rendered IMMEDIATELY
+  before the JSON output schema, listing `HARNESS.json.stack`
+  as pretty-printed JSON and telling the agent to correct any
+  mismatch in success criteria, interface names, or
+  implementation notes. Empty string when `HARNESS.stack` is
+  absent — the section is omitted cleanly.
+
+Template `0.24.0 → 0.25.0`. `pnpm -r build` clean across all
+13 packages.
+
+**Live verification — PARTIAL:** trackeros feature
+`8900ab21-bc26-4f89-a000-7c74e02aaa24` on `chat-latest`:
+- ✅ **Fastify binding worked end-to-end.** DB query for
+  framework refs in the post-review feature architecture:
+  `fastify=1 express=0` (vs prior cycles which had
+  `express=1`). Phase 8 title literally reads "Expose Fastify
+  APIs and workflow integration tests".
+- ❌ **Vitest binding did NOT work.** Same DB query:
+  `jest=0 vitest=1`. Phase 1 success criteria still says
+  "Vitest tests for the repository verify successful create
+  and findById persistence". The Phase 1 scope text reads
+  "Include Jest or Vitest unit tests" — hedge phrasing
+  showing the LLM read both signals and split the difference.
+- ⚪ **reviewDesign ran (5s, before/after counts 5→5)** but
+  didn't observably rewrite the framework references — the
+  stack compliance check is in the prompt but didn't override
+  chat-latest's Vitest bias.
+
+**Cycle blocked at intent-agent on a separate finding:**
+`LeaveRequestRepository` has only `create + findById` and
+no later phase ever adds `update`, even though Phase 5
+("manager approval and rejection workflow") needs to mutate
+`LeaveRequest.status`. Architecture-agent regressed on
+coverage vs TR_038/039 — possibly misreading TR_039's
+deferred-section text as a license to minimize Phase 1's
+interface and forgetting to add the methods in later phases.
+
+**New HIGH follow-ups for TR_041:**
+- Vitest binding: move the stack compliance check to the
+  TOP of the review prompt, or add a regex post-processing
+  pass after reviewDesign that reads `HARNESS.stack.testFramework`
+  and substitutes any other test-framework name in the
+  result JSON.
+- Lifecycle coverage rule: every domain entity whose state
+  transitions during the feature lifecycle must have a phase
+  where the corresponding mutation method is added to its
+  repository. Either a new `architectureGuidance` rule or a
+  5th checklist item in `reviewDesign`.
+
+**Operator action — trackeros:** none new beyond the
+already-pushed `6c76cc2f chore(TR_040): architecture-agent must
+bind to HARNESS.stack declared values`.
+
+**Operator action — other projects:** Append the two new
+architectureGuidance items to existing projects'
+`HARNESS.json.agentConfig.architecture-agent.architectureGuidance`.
+Template auto-refreshes to `0.25.0` at next server boot.
+
 ### TR_039 — Phase intent text declares deferred scope; intent-agent rules tell it not to flag deferred work (template 0.24.0, build clean, TR_038 follow-up CLOSED; cycle reached the GATE for the first time)
 
 One platform change + one HARNESS rules block. Closes TR_038's

@@ -3,6 +3,198 @@
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+### Session 2026-06-10 — Claude Code (TR_040: HARNESS architectureGuidance binding rules + reviewDesign stack-compliance check — partial verification: Fastify binding worked end-to-end, Vitest binding did NOT; new finding — architecture-agent regressed on LeaveRepository CRUD coverage)
+
+Brief: two changes addressing TR_039's NEW HIGH follow-up
+(architecture-agent emits Vitest references on a Jest-aligned
+project + Express on a Fastify-aligned project — TR_038's
+stack injection reaches the prompt but doesn't BIND the LLM's
+output).
+
+What changed (2 fixes):
+
+**Fix 1 — Two new `architectureGuidance` binding rules in HARNESS**
+
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json` and
+  `/Users/amrmohamed/Work/trackeros/HARNESS.json` —
+  `agentConfig.architecture-agent.architectureGuidance` appended
+  with two abstract rules (no framework names hardcoded):
+  - "The project stack declared in HARNESS.json is the
+    authoritative source for all technology choices. You MUST
+    use the declared test framework, web framework, database
+    client, and package manager exactly as named. Do not
+    substitute alternatives based on personal preference or
+    assumed defaults. If the declared stack names a specific
+    framework, every reference in your output must use that
+    framework's name and conventions."
+  - "Before emitting your response, verify: every framework
+    reference in your output matches the declared stack. If
+    you find a mismatch, correct it before returning."
+
+**Fix 2 — `reviewDesign` stack-compliance check**
+
+- `packages/agents/planning/src/prompts/architecture-prompt.ts` —
+  `buildArchitectureReviewPrompt` gains a new
+  `## Stack compliance check` block rendered IMMEDIATELY before
+  the JSON-output schema. The block:
+  - Renders `HARNESS.json.stack` as pretty-printed JSON.
+  - Tells the agent to "verify: every framework reference
+    matches the declared stack ... no alternative frameworks
+    appear in success criteria, interface names, or
+    implementation notes ... correct any mismatch in your
+    output".
+  - Empty string when `harnessConfig.stack` is undefined —
+    the check is skipped cleanly (no `'undefined'` text).
+- Platform mechanics per ADR-042 — the rule TEXT lives in
+  HARNESS (Fix 1); the wiring lives in `.ts` (Fix 2).
+
+**Template version bumped 0.24.0 → 0.25.0.** No new migration.
+Build clean across all 13 packages.
+
+What's verified live (trackeros feature
+`8900ab21-bc26-4f89-a000-7c74e02aaa24` on `chat-latest`):
+
+- ✅ **Fastify binding worked end-to-end** — the architecture
+  used Fastify (vs prior TR_036→39 cycles using Express);
+  Phase 8 title literally reads "Expose Fastify APIs and
+  workflow integration tests"; DB query for framework refs
+  in the post-review feature architecture returned
+  `fastify=1 express=0`. The previous TR_039 finding
+  ("review-agent flagged Express but HARNESS says Fastify")
+  is RESOLVED.
+- ❌ **Vitest binding did NOT work** — same DB query returned
+  `jest=0 vitest=1`. Phase 1 success criteria still says
+  "Vitest tests for the repository verify successful create
+  and findById persistence". Phase 1 scope text reads
+  "Include Jest or Vitest unit tests" — hedge phrasing
+  that suggests the LLM read both signals (HARNESS.stack
+  said Jest; its own training preference said Vitest)
+  and split the difference.
+- ⚪ **reviewDesign log fired at 16:53:40, 5s after
+  designFeature.** Before/after counts: 5 entities → 5
+  entities, 5 modules → 5 modules. The review pass did NOT
+  rewrite the framework references — the stack compliance
+  check is in the prompt but didn't override the LLM's
+  bias.
+- ✅ **TR_039 deferred-summary still works** — Phase 1 intent
+  text contains the full `## Deferred to later phases`
+  section listing all 7 later phases with title + scope
+  snippets.
+- ❌ **Cycle still blocked at intent-agent** — escalation
+  text: "The intent requests repository CRUD tests, but the
+  provided repository contract and success criteria only
+  define create and findById methods." This is NOT a TR_040
+  issue — it's a real architectural gap intent-agent caught.
+
+What blocked the cycle (NEW orthogonal finding):
+
+Architecture-agent regressed on Phase 1's
+`LeaveRequestRepository` coverage:
+
+| Session | Phase 1 LeaveRepository methods |
+|---------|-----|
+| TR_038  | `create`, `findById`, `findByEmployeeId` |
+| TR_039  | `create`, `findById`, `findByEmployeeId` |
+| **TR_040** | **`create`, `findById` only** (regression) |
+
+Worse, **no later phase adds the missing methods.** The
+plan has:
+- Phase 4: "Implement leave application workflow service"
+- Phase 5: "Implement manager approval and rejection workflow"
+
+Phase 5 needs to mutate `LeaveRequest.status` from `PENDING`
+to `APPROVED` / `REJECTED` — which requires an `update`
+method on `LeaveRequestRepository`. But the architecture
+doesn't add it in any phase. Intent-agent correctly flagged
+this — the architecture itself is incomplete on the
+approval path.
+
+Why the regression: the architecture-agent appears to have
+read TR_039's deferred-section text in the planner's
+prompt context and minimized Phase 1's interface surface
+("everything else is deferred, so I'll only add what
+Phase 1 STRICTLY needs"). It then forgot to add the
+deferred methods to later phases. This is a misread of
+TR_039's intent — deferred SHOULD include where the work
+is added, not omit it entirely.
+
+**Pending follow-ups (NEW from TR_040 verification):**
+
+- **(HIGH — NEW)** Vitest binding still fails. Options:
+  (a) move the stack compliance check to the TOP of the
+  review prompt (before the draft, where the LLM
+  conditions hardest); (b) add a literal regex
+  post-processing pass after `reviewDesign`: read
+  `HARNESS.stack.testFramework`, replace any other
+  test-framework name in the result JSON with the
+  declared one; (c) inject a sample fragment showing
+  the EXACT framework reference shape ("Use 'Jest tests'
+  in success criteria — not 'Vitest tests' or 'Jest or
+  Vitest tests'"); (d) re-examine `agents.yaml` test-
+  agent goal — the trackeros goal says "Jest" but
+  architecture-agent's prompt extensions might not say
+  anything.
+- **(HIGH — NEW)** Architecture-agent must ensure every
+  domain entity that the feature description implies
+  mutation on has a phase where the mutation method is
+  added to its repository. Either (a)
+  `architectureGuidance` rule: "For every domain entity
+  whose state changes during the feature lifecycle,
+  the architecture must include a phase where the
+  mutation method is added to that entity's
+  repository"; (b) reviewDesign's checklist gains a
+  fifth item: "5. Lifecycle coverage — every state
+  transition implied by the feature description has a
+  phase that adds the corresponding repository method".
+- **(MEDIUM — NEW)** TR_038's reviewDesign before/after
+  log shows same counts (5→5 entities, 5→5 modules) on
+  both this and the prior cycle. The review pass isn't
+  observably making changes. Either (a) log a structured
+  diff between draft and reviewed (path-by-path field
+  changes); (b) the review pass is judging the draft
+  correct and we're at the LLM's bias ceiling — in
+  which case a regex post-processing step is the only
+  reliable framework-binding mechanism.
+- **(LOW — NEW)** Phase count jumped 4 → 8 this session.
+  The architecture-agent's recommendedPhases said 5; the
+  planner expanded to 8. With 8 phases the cycle takes
+  longer in serial. Either reduce the planner's
+  maxPhasesPerFeature for trackeros (current: 10) or
+  improve the architecture's phase grouping guidance.
+
+Carryover follow-ups (status updates):
+
+- **(PARTIALLY RESOLVED by TR_040)** TR_039 HIGH NEW:
+  architecture-agent ignores `HARNESS.stack`. Fastify
+  binding NOW works (Express → Fastify in this cycle's
+  output). Vitest binding still fails — captured as the
+  new HIGH follow-up above.
+- **(STILL OPEN — HIGH from TR_036)** Gate-side
+  verification of TR_036 was reached for the first time
+  in TR_039. The cycle didn't reach the gate this
+  session (intent-agent blocked first).
+
+Build status: `pnpm -r build` clean across all 13 packages.
+Template auto-refreshes to `0.25.0` at next server boot.
+
+Files changed:
+- `packages/agents/planning/src/prompts/architecture-prompt.ts`
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
+- `templates/corporate-ops-web-mobile/template.json`
+- `/Users/amrmohamed/Work/trackeros/HARNESS.json` (separate
+  repo, pushed at `6c76cc2f`)
+
+Live URLs:
+- Dashboard: http://localhost:3000/app/
+- TR_040 verification feature:
+  http://localhost:3000/app/features/8900ab21-bc26-4f89-a000-7c74e02aaa24
+- trackeros PLAN.md:
+  https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
+- trackeros TR_040 HARNESS commit:
+  https://github.com/afarahat-lab/trackeros/commit/6c76cc2f
+
+---
+---
 ### Session 2026-06-10 — Claude Code (TR_039: planning orchestrator appends a "Deferred to later phases" section to every phase intent; intent-agent rules in HARNESS tell it not to flag deferred work as ambiguity — intent-agent bar CLEARED end-to-end; cycle finally reached the GATE for the first time across TR_036 → TR_039; new blocker is real config drift in architecture-agent emitting Vitest in success criteria on a Jest-aligned project)
 
 Brief: one platform change + one HARNESS rules block. After
@@ -199,216 +391,6 @@ Live URLs:
   https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
 - trackeros TR_039 HARNESS commit:
   https://github.com/afarahat-lab/trackeros/commit/f0f9e989
-
----
----
-### Session 2026-06-10 — Claude Code (TR_038: architecture-agent self-review + concrete-implementations stack injection — TR_037 HIGH follow-up CLOSED; the persisted architecture now names PostgresLeaveRepository as concrete impl + imports pg Pool from src/shared/db; intent-agent now blocks on a stricter CRUD-completeness check, a new orthogonal finding)
-
-Brief: two stopgap fixes (ADR-056 — both will be replaced by the
-LangGraph architecture crew). Fix 1 injects `HARNESS.stack` into the
-architecture-agent's prompts so it can name concrete implementations.
-Fix 2 adds a single-agent self-review pass after `designFeature`
-where the SAME agent checks the draft for completeness /
-consistency / ambiguity / feasibility.
-
-What changed (2 fixes):
-
-**Fix 1 — HARNESS.stack injection into architecture-agent prompts**
-
-- `packages/agents/planning/src/prompts/architecture-prompt.ts` —
-  new `renderStackSection(harnessConfig)` helper renders
-  `HARNESS.json.stack` as a `## Project stack` block. Empty
-  string when `stack` is absent. Wired into BOTH
-  `buildFeatureArchitecturePrompt` AND
-  `buildPhaseArchitecturePrompt` (the brief said "per-phase
-  design prompt" but the same gap exists at the feature level
-  where the canonical interfaces are first defined — that's
-  where intent-agent's TR_037 complaint surfaced).
-- New `HARNESS.json.agentConfig.architecture-agent.architectureGuidance`
-  item on the template + trackeros: "For every interface or
-  abstraction you define, specify the concrete implementation
-  that backs it using the declared project stack. Do not
-  leave implementation choices ambiguous — specify enough
-  detail that a developer can implement without asking
-  clarifying questions."
-
-**Fix 2 — Architecture self-review pass (STOPGAP, ADR-056)**
-
-- `packages/agents/planning/src/prompts/architecture-prompt.ts`
-  — new exported `buildArchitectureReviewPrompt` builds the
-  review prompt with: persona + agentCfg.goal, harness rules
-  section, stack section, draft JSON (sliced to 3000 chars),
-  feature description, the four-point review checklist
-  (completeness / consistency / ambiguity / feasibility),
-  and the SAME `FeatureArchitecture` JSON output schema as
-  the original design (so the parse path is reused).
-- `packages/agents/planning/src/agents/architecture-agent.ts`
-  gains `reviewDesign(draft, feature, projectRoot,
-  harnessConfig, correlationId)`. Routes through `callLLM`
-  so ADR-057 token management applies automatically. Returns
-  the original draft on ANY failure path: loadAgentConfig
-  throws → return draft; callLLM throws → return draft; the
-  reviewed output parses to empty (every parse-failure
-  fallback) → return draft. Logs before/after entity + module
-  counts on success so operators see the review's effect.
-- `packages/agents/planning/src/orchestrator/planning-orchestrator.ts`
-  — the architecture-agent feature pass now goes:
-  `designFeature → reviewDesign → save`. The orchestrator
-  carries a STOPGAP (ADR-056) comment block above the
-  reviewDesign call telling the next session to delete this
-  + `buildArchitectureReviewPrompt` + `reviewDesign()` when
-  the LangGraph architecture crew lands.
-- New `HARNESS.json.agentConfig.architecture-agent.rules`
-  item on the template + trackeros: "When reviewing a draft
-  architecture: check that every interface or abstraction
-  has a named concrete implementation, all symbol names are
-  consistent, and no implementation choice is left open for
-  a developer to decide."
-
-**Template version bumped 0.22.0 → 0.23.0.** No new migration.
-Build clean across all 13 packages.
-
-What's verified live (trackeros feature
-`d0513f28-6648-4651-bf4e-15e8771c4e5b` on `chat-latest`):
-
-- ✅ **reviewDesign log fires** —
-  `architecture-agent reviewDesign complete` log line printed
-  at 14:04:37, 6 seconds after `designFeature` returned at
-  14:04:31. Before/after counts logged: 5 entities → 5
-  entities, 5 modules → 5 modules (review judged the
-  structure complete; the LLM didn't add or remove any
-  entries, just enriched the content).
-- ✅ **Concrete implementation NAMED in the architecture** —
-  Phase 1's persisted architecture JSON has:
-  ```
-  "Concrete implementation: PostgresLeaveRepository from
-  src/modules/leave/postgres-leave.repository.ts"
-  ```
-  with the full class declaration `export class
-  PostgresLeaveRepository implements LeaveRepository { … }`
-  and `import { pool } from '../../shared/db/connection'` /
-  `import { Pool } from 'pg'`. This is exactly what TR_037's
-  HIGH NEW follow-up asked for — and it appears organically
-  in the architecture without any platform-side post-
-  processing of "fill in the concrete class name".
-- ✅ **Stack-driven choices** — the `pg` package + `Pool`
-  primitive are pulled directly from
-  `HARNESS.stack.database` ("PostgreSQL"). No more "which
-  DB driver" ambiguity.
-- ✅ **Shared connection layer** named at
-  `src/shared/db/connection.ts` — the constraint-agent +
-  review-agent's TR_036 abstract rules now have a concrete
-  reference point.
-- ✅ **5-phase plan** with model+repo bundled into Phase 1
-  (TR_037 canonical-names rule still working) +
-  Phase 1 architecture: 4 interfaces + 5 criteria + SQL
-  schema with CHECK constraints + indices.
-- ✅ **Intent-agent did NOT escalate on**:
-  - Symbol-name conflict (TR_037 fix sticky)
-  - Persistence implementation choice (TR_038 closed it)
-- ✅ **`feature-blocked` alert fired** via the existing
-  TR_033 helper.
-
-What blocked the verification cycle (NEW orthogonal finding):
-
-After ~15 seconds in `generating`, intent-agent escalated
-to `waiting-for-clarification` with a NEW reason:
-
-> "High-impact ambiguity: The intent mentions repository
-> CRUD behavior, but the specified LeaveRepository
-> interface only defines create and findById methods."
-
-i.e. the LLM (chat-latest) interprets the feature description
-"leave management module" as IMPLYING full CRUD (create /
-read / update / delete) on the `LeaveRepository` interface.
-The architecture-agent decided (legitimately) that Phase 1's
-`LeaveRepository` only needs `create` + `findById` —
-`update` is needed by the approval workflow (Phase 3) and
-`delete` may never be needed at all. Self-healing → cascade
-brake → feature blocked at 14:05:14.
-
-This is the THIRD distinct intent-agent ambiguity in the
-TR_036 → TR_037 → TR_038 sequence:
-
-| Session | Intent-agent escalation reason |
-|---------|--------------------------------|
-| TR_036  | Symbol-name conflict (LeaveStatus vs LeaveRequestStatus) |
-| TR_037  | Concrete persistence implementation not specified |
-| TR_038  | Repository interface missing some CRUD methods implied by the intent |
-
-Each fix closes one rigor bar; intent-agent reveals another.
-
-**Pending follow-ups (NEW from TR_038 verification):**
-
-- **(HIGH — NEW)** Intent-agent's CRUD-completeness check
-  is overconstrained for phased delivery. A `LeaveRepository`
-  with `create` + `findById` in Phase 1 is legitimate when
-  later phases will extend it; intent-agent should treat
-  "phase scope subset of full lifecycle" as a non-blocking
-  partial verdict. Options: (a) `intent-agent.rules`
-  injection telling it the intent text describes the FULL
-  feature lifecycle, not the phase scope; (b) self-healing's
-  diagnostician dispatches a `fix-intent` child that ADDS
-  the missing methods to the architecture before
-  cascade-braking; (c) intent-agent's prompt builder
-  receives a `## Out of scope for this phase: …` block
-  derived from the planner's later-phase scopes.
-- **(MEDIUM — NEW)** The review pass output is identical in
-  shape to the draft on this cycle. That's expected when the
-  LLM judges the draft complete — but means we have no
-  evidence (this cycle) that the review pass would actually
-  CHANGE a flawed draft. Need a deliberately flawed draft
-  (e.g. inject a fake symbol-name conflict) to observe the
-  review pass correcting it. Or: log a structured diff
-  between draft and reviewed so any actual change is visible.
-- **(LOW — NEW)** trackeros's `architecture` JSON for Phase 1
-  still mentions "Vitest" in the success-criteria text
-  ("A Vitest repository test can persist a LeaveRequest…")
-  even though trackeros's agents.yaml test-agent goal was
-  switched to Jest in TR_037. The architecture-agent prompt
-  doesn't see `agents.yaml`, only HARNESS. Either propagate
-  `testFramework: Jest` more visibly into the
-  architecture-agent's stack section (it's there in
-  `HARNESS.stack.testFramework`), or have the architecture-
-  agent reference the framework name explicitly when it
-  emits test-related success criteria.
-
-Carryover follow-ups (status updates):
-
-- **(RESOLVED by TR_038 Fix 1)** TR_037 HIGH NEW:
-  architecture-agent should specify the concrete
-  persistence implementation per repository interface from
-  `HARNESS.stack.database`. **VERIFIED end-to-end** —
-  `PostgresLeaveRepository` named, `pg Pool` imported, full
-  class declaration in the architecture JSON.
-- **(STILL OPEN — HIGH from TR_036)** Gate-side fixes
-  (Project structure brief + abstract rules) still not
-  LLM-tested. The cycle still hasn't reached the gate; each
-  of TR_036/037/038 surfaced a different intent-agent
-  ambiguity. The next session's TR_039 (if it addresses the
-  CRUD-completeness rigor bar) should be the one that
-  finally lets the cycle through to code-agent + gate.
-
-Build status: `pnpm -r build` clean across all 13 packages.
-Template auto-refreshes to `0.23.0` at next server boot.
-
-Files changed:
-- `packages/agents/planning/src/prompts/architecture-prompt.ts`
-- `packages/agents/planning/src/agents/architecture-agent.ts`
-- `packages/agents/planning/src/orchestrator/planning-orchestrator.ts`
-- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
-- `templates/corporate-ops-web-mobile/template.json`
-- `/Users/amrmohamed/Work/trackeros/HARNESS.json` (separate repo,
-  pushed at `22b68de6`)
-
-Live URLs:
-- Dashboard: http://localhost:3000/app/
-- TR_038 verification feature:
-  http://localhost:3000/app/features/d0513f28-6648-4651-bf4e-15e8771c4e5b
-- trackeros PLAN.md:
-  https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
-- trackeros TR_038 HARNESS commit:
-  https://github.com/afarahat-lab/trackeros/commit/22b68de6
 
 ---
 ---
