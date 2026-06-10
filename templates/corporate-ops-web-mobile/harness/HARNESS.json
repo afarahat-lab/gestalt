@@ -54,7 +54,8 @@
     "intent-agent": {
       "rules": [
         "This intent describes a single phase of a multi-phase feature. If a 'Deferred to later phases' section is present, the items listed there are intentionally out of scope for this phase. Do not flag them as ambiguities or missing functionality.",
-        "Evaluate the intent against what this phase explicitly commits to delivering, not against the full feature description."
+        "Evaluate the intent against what this phase explicitly commits to delivering, not against the full feature description.",
+        "Interface method signatures in per-phase architecture specifications are CONTRACTS to be implemented by the code-agent during this phase. They are not stubs. An interface showing method signatures without bodies is correct and complete — do not flag missing method bodies as ambiguity or missing implementation."
       ]
     },
     "constraint-agent": {
