@@ -114,6 +114,17 @@ export interface GateTask {
    * intentional stubs.
    */
   intentText?: string;
+  /**
+   * TR_036 — auto-generated project-structure brief assembled by the
+   * gate-orchestrator from `ARCHITECTURE.md` + a directory tree
+   * snapshot of the cloned project. The constraint-agent and
+   * review-agent inject this BEFORE the rules section so they can
+   * map abstract layer-role rules ("data access layer", "business
+   * logic layer") to the actual paths in the project being reviewed.
+   * Empty string when the project has no ARCHITECTURE.md and no
+   * `src/` tree to enumerate — agents fall back to the rules alone.
+   */
+  projectStructureBrief?: string;
 }
 
 export interface ArtifactRef {

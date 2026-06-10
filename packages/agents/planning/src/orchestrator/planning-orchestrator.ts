@@ -676,6 +676,40 @@ async function handlePlanningEvaluate(
       summary: `Phase ${phase.phaseIndex + 1} (${phase.title}) failed after ${maxPhaseRetries} retries — feature blocked`,
       detail: { retryCount: phase.retryCount, maxPhaseRetries },
     });
+    // TR_036 — surface this terminal block in the alerts feed.
+    // Previously only the self-healing cascade-brake escalation
+    // path (via `markFeatureBlockedAfterEscalation`) created an
+    // alert; the planner's `maxPhaseRetries` exhaustion path was
+    // silent and operators only discovered the failure via the
+    // dashboard / `gestalt feature show`.
+    const { alerts } = getRepositories();
+    const alert = await alerts.create({
+      correlationId,
+      intentId: phase.intentId,
+      type: 'feature-blocked',
+      severity: 'high',
+      title: `Feature blocked at phase ${phase.phaseIndex + 1}`,
+      description:
+        `Phase ${phase.phaseIndex + 1} (${phase.title}) failed after ` +
+        `${maxPhaseRetries} retry attempt${maxPhaseRetries === 1 ? '' : 's'}. ` +
+        `Human review required to resume.`,
+      requiredAction: 'review-manually',
+      context: {
+        featureId: feature.id,
+        phaseId: phase.id,
+        phaseIndex: phase.phaseIndex,
+        phaseTitle: phase.title,
+        intentId: phase.intentId,
+        retryCount: phase.retryCount,
+        maxPhaseRetries,
+      },
+    });
+    emitLiveEvent('alert.created', correlationId, {
+      alertId: alert.id,
+      type: 'feature-blocked',
+      intentId: phase.intentId,
+      severity: 'high',
+    });
     return;
   }
 

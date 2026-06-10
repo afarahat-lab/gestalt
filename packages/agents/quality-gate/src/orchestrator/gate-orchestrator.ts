@@ -462,12 +462,27 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
       'Gate artifacts resolved',
     );
 
+    // TR_036 — assemble a project-structure brief from ARCHITECTURE.md
+    // + a depth-2 directory tree under `src/`. The constraint-agent
+    // and review-agent inject this BEFORE the rules section so they
+    // can map abstract layer-role rules ("data access layer") to the
+    // actual paths in the project being reviewed. Empty string when
+    // the project has no ARCHITECTURE.md and no `src/` tree.
+    const projectStructureBrief = await buildProjectStructureBrief(workDir);
+    if (projectStructureBrief.length > 0) {
+      childLog.debug(
+        { bytes: projectStructureBrief.length },
+        'Project-structure brief assembled for gate agents',
+      );
+    }
+
     const gateTask: GateTask = {
       taskId: message.id,
       correlationId,
       artifacts: gateArtifacts,
       harnessConfig,
       intentText,
+      projectStructureBrief,
     };
 
     // BaseLLMAgent now owns LLM-call routing + lastModelUsed capture.
@@ -1281,4 +1296,86 @@ async function maybeDispatchRetry(args: {
 
 function queueConfigFromEnv(): QueueConfig {
   return { redisUrl: process.env['REDIS_URL'] ?? 'redis://localhost:6379' };
+}
+
+/**
+ * TR_036 — Assemble a project-structure brief from ARCHITECTURE.md +
+ * a depth-2 directory listing under `src/`. The brief is injected
+ * BEFORE the rules section in the constraint-agent + review-agent
+ * prompts so abstract layer-role rules ("data access layer") can be
+ * mapped to the actual paths in the project being reviewed.
+ *
+ * Per ADR-050 the platform does not interpret the brief — it just
+ * enumerates ARCHITECTURE.md text + directory paths and hands them
+ * to the agent. ARCHITECTURE.md is truncated to 2000 chars to keep
+ * the gate prompt within budget; the agent can `readFile` the full
+ * version if it needs more.
+ *
+ * Returns an empty string when neither source is present — callers
+ * test `length > 0` and omit the section entirely in that case.
+ */
+async function buildProjectStructureBrief(projectRoot: string): Promise<string> {
+  let architectureMd = '';
+  try {
+    architectureMd = await readFile(join(projectRoot, 'ARCHITECTURE.md'), 'utf8');
+  } catch {
+    // Not all projects have ARCHITECTURE.md yet — that's fine.
+  }
+
+  // Depth-2 listing under `src/`: equivalent to
+  // `find src -maxdepth 2 -type d`. Limit to 30 entries to keep the
+  // brief bounded.
+  const dirEntries: string[] = [];
+  try {
+    const srcRoot = join(projectRoot, 'src');
+    const top = await readdir(srcRoot, { withFileTypes: true });
+    for (const entry of top) {
+      if (!entry.isDirectory()) continue;
+      dirEntries.push(`src/${entry.name}`);
+      try {
+        const inner = await readdir(join(srcRoot, entry.name), { withFileTypes: true });
+        for (const sub of inner) {
+          if (!sub.isDirectory()) continue;
+          dirEntries.push(`src/${entry.name}/${sub.name}`);
+          if (dirEntries.length >= 30) break;
+        }
+      } catch {
+        // Subdir unreadable — skip.
+      }
+      if (dirEntries.length >= 30) break;
+    }
+  } catch {
+    // No `src/` tree — fall through; the brief may still contain
+    // ARCHITECTURE.md content alone.
+  }
+
+  if (architectureMd.length === 0 && dirEntries.length === 0) {
+    return '';
+  }
+
+  const parts: string[] = [
+    '## Project structure (read before evaluating)',
+    '',
+    "Use this to understand the project's layers and boundaries.",
+    'Rules in this evaluation refer to these layers by their role',
+    '(data access layer, business logic layer, etc.) — map them to',
+    'the actual directories and files shown here.',
+    '',
+  ];
+
+  if (architectureMd.length > 0) {
+    parts.push('### Architecture');
+    parts.push(architectureMd.slice(0, 2000));
+    parts.push('');
+  }
+
+  if (dirEntries.length > 0) {
+    parts.push('### Directory structure');
+    parts.push('```');
+    parts.push(dirEntries.join('\n'));
+    parts.push('```');
+    parts.push('');
+  }
+
+  return parts.join('\n');
 }

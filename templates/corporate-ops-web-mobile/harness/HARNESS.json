@@ -53,20 +53,15 @@
   "agentConfig": {
     "constraint-agent": {
       "rules": [
-        "REPOSITORY PATTERN — what is a VIOLATION (flag this): A service, route, or controller file calls pool.query(), db.execute(), db.query(), new Pool(), or createConnection() directly. Example violation: a file named leave.service.ts containing pool.query('SELECT...').",
-        "REPOSITORY PATTERN — what is CORRECT (do NOT flag): A file named *.repository.ts calling pool.query() or db.query() — that IS the repository's job. This is correct and must never be flagged.",
-        "REPOSITORY PATTERN — what is CORRECT (do NOT flag): A service file importing a repository class or interface (e.g. import LeaveRepository from './leave.repository') and calling methods on it (e.g. this.leaveRepository.createLeaveRequest(req)). This IS the correct pattern.",
-        "All database connections must be created in src/shared/db/ only. Importing a database type for use in a type signature is NOT a violation — only instantiating a connection is.",
-        "No SQL queries outside *.repository.ts files. Services, routes, and controllers must not contain SQL.",
-        "No console.log/warn/error in business-logic files (services, repositories, controllers, routes, modules). Console statements in entry-point files (index.ts, main.ts, server.ts, app.ts, bootstrap.ts) are ACCEPTABLE for startup logging (e.g. `app.listen(PORT, () => console.log(...))`) and MUST NOT be flagged.",
-        "All async functions must handle errors — no unhandled promise rejections.",
-        "No hardcoded credentials or connection strings in source files."
+        "Data access is only permitted in the designated data access layer of this project. Code in business logic, presentation, or routing layers must delegate all data operations to the data access layer.",
+        "The data access layer is the only layer permitted to contain connection management, query execution, and direct interaction with the data store.",
+        "Each architectural layer communicates only with its immediately adjacent layer. Layers must not bypass intermediate layers.",
+        "Dependencies flow in one direction only — from outer layers toward inner layers. Inner layers must not depend on outer layers.",
+        "Error handling must be explicit. Callers must not be exposed to unhandled failures from dependencies."
       ],
       "verificationGuidance": [
-        "For direct-DB-access findings: run searchFiles with pattern 'pool\\.query|db\\.query|new Pool|createConnection' and confirm matches exist OUTSIDE src/shared/db/ AND outside any *.repository.ts file before flagging. If every match is inside a repository file or shared/db/, emit NO violation.",
-        "For import-resolution findings: run executeScript with `npx tsc --noEmit` and only flag imports the compiler explicitly reports as unresolved. Do not flag based on visual inspection alone.",
-        "For missing-dependency findings: run readFile on package.json before flagging. A dependency is not missing if it appears in dependencies, devDependencies, or peerDependencies.",
-        "For console.log findings: run searchFiles with pattern 'console\\.(log|warn|error)' and exclude matches inside entry-point files (index.ts, main.ts, server.ts, app.ts, bootstrap.ts) — startup logging there is acceptable."
+        "Before evaluating any finding, read ARCHITECTURE.md to understand this project's specific layer names, boundaries, and directory structure. Use this to determine what constitutes the data access layer, business logic layer, and routing layer for this project.",
+        "A finding is only valid if it violates a rule given the actual structure of this project as described in ARCHITECTURE.md."
       ]
     },
     "code-agent": {
@@ -83,19 +78,13 @@
     },
     "review-agent": {
       "rules": [
-        "Only flag violations for layers explicitly in scope for this intent.",
+        "Only flag violations for concerns explicitly in scope for this intent.",
         "Do not flag items as missing if they already exist on the project main branch.",
-        "REPOSITORY PATTERN — what is CORRECT (do NOT flag): A *.repository.ts file that calls pool.query() or db.query(). That is its purpose.",
-        "REPOSITORY PATTERN — what is CORRECT (do NOT flag): A service file that imports a repository and delegates to it.",
-        "REPOSITORY PATTERN — VIOLATION: Any non-repository file calling pool.query() or new Pool() directly.",
-        "Do not flag golden principle violations for concerns excluded by IntentSpec.outOfScope."
+        "A finding is only valid if it is supported by quoted evidence from the artifact."
       ],
       "verificationGuidance": [
-        "Trust CI for build correctness. CI ran build / tests / lint / security scan on this exact code BEFORE you were invoked and passed (otherwise you would not be running). Do NOT flag 'TypeScript not installed', 'Import cannot be resolved', 'Type mismatch', missing build tools, missing test runners, or missing linters — the compiler ran in CI and did not complain. Do NOT attempt to run `npx tsc`, `npm test`, or `npm run lint`; the gate's clone has no node_modules and those calls will fail with infrastructure errors that are not actionable.",
-        "For direct-DB-access findings: run searchFiles with pattern 'pool\\.query|db\\.query|new Pool'. Only flag matches OUTSIDE src/shared/db/ AND outside any *.repository.ts file (those are the sanctioned locations). If every match is inside a repository or shared/db/, emit NO 'Direct DB access' finding.",
-        "For missing-dependency findings: run readFile on package.json first. Do not flag a dependency as missing if it already appears in dependencies, devDependencies, or peerDependencies. The Project state section also includes this content — cross-check both.",
-        "Findings without file-evidence (a real line from a real file) must be recorded as severity 'low' and category 'style'. The gate-orchestrator drops low/info findings, so weak guesses stay in the review artifact instead of driving a retry.",
-        "Apply the scope filter: skip any finding whose subject matter appears in IntentSpec.outOfScope. If the intent excludes 'API layer', do not flag missing audit logging on a service file. If the intent excludes 'RBAC', do not flag missing role checks."
+        "Before reviewing, read ARCHITECTURE.md to understand the project's layer structure, naming conventions, and boundaries. Use this as the reference for what is correct versus what is a violation.",
+        "Verify any architectural finding against ARCHITECTURE.md before emitting it."
       ]
     },
     "architecture-agent": {

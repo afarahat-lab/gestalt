@@ -225,9 +225,18 @@ export class ConstraintAgent extends BaseLLMAgent {
     // overridden by the operator's `agents.yaml` block when present)
     // instead of being hardcoded. Mirrors `llm-review-agent.ts`'s
     // `buildReviewPrompt` pattern.
+    //
+    // TR_036 — when the gate-orchestrator assembled a project-structure
+    // brief (ARCHITECTURE.md + src/ directory tree), inject it BEFORE
+    // the rules so the agent can map abstract layer-role rules ("data
+    // access layer") to actual paths.
+    const structureSection = task.projectStructureBrief && task.projectStructureBrief.length > 0
+      ? `${task.projectStructureBrief}\n`
+      : '';
+
     return `You are ${agentConfig.role} working on a project clone at the current working directory.
 
-${rulesSection}
+${structureSection}${rulesSection}
 ${scriptInstruction}
 ${EVIDENCE_REQUIREMENT_SECTION}
 ## Intent
