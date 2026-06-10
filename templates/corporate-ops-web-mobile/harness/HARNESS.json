@@ -51,6 +51,12 @@
     ]
   },
   "agentConfig": {
+    "intent-agent": {
+      "rules": [
+        "This intent describes a single phase of a multi-phase feature. If a 'Deferred to later phases' section is present, the items listed there are intentionally out of scope for this phase. Do not flag them as ambiguities or missing functionality.",
+        "Evaluate the intent against what this phase explicitly commits to delivering, not against the full feature description."
+      ]
+    },
     "constraint-agent": {
       "rules": [
         "Data access is only permitted in the designated data access layer of this project. Code in business logic, presentation, or routing layers must delegate all data operations to the data access layer.",

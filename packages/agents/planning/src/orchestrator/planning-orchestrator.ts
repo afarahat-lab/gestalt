@@ -516,9 +516,20 @@ async function handlePlanningPhase(
       ? await runPerPhaseArchitecture(feature, phase, workDir, harnessConfig, correlationId, childLog)
       : null;
 
+    // TR_039 — collect later-pending phases so the intent text can
+    // declare them as DEFERRED. Without this, intent-agent reads the
+    // full feature description and flags anything Phase 1 doesn't
+    // implement (e.g. update / delete on a repository) as an
+    // ambiguity, even though those concerns are intentionally
+    // scheduled for later phases.
+    const allPhases = await features.listPhases(feature.id);
+    const laterPhases = allPhases.filter(
+      (p) => p.phaseIndex > phase.phaseIndex && p.status === 'pending',
+    );
+
     // Build the final intent text by stitching scope + architecture +
-    // dependency callouts together.
-    const intentText = buildPhaseIntentText(feature, phase, phaseArchitectureUpdate);
+    // dependency callouts + deferred-summary together.
+    const intentText = buildPhaseIntentText(feature, phase, phaseArchitectureUpdate, laterPhases);
 
     // Create + dispatch a generate:intent.
     const newCorrelationId = crypto.randomUUID();
@@ -607,6 +618,16 @@ function buildPhaseIntentText(
   feature: FeatureRecord,
   phase: FeaturePhaseRecord,
   perPhaseArchitecture: string | null,
+  /**
+   * TR_039 — phases scheduled AFTER this one that haven't started
+   * yet. The intent-agent reads the full feature description and
+   * tends to flag anything not implemented in THIS phase's scope as
+   * an ambiguity; rendering the later phases as `## Deferred to
+   * later phases` tells it those concerns are intentionally out of
+   * scope here. Pass `[]` when no later phases exist (last phase
+   * or single-phase feature) and the section is omitted.
+   */
+  laterPhases: FeaturePhaseRecord[],
 ): string {
   const parts: string[] = [];
   parts.push(`[Feature: ${feature.title} — Phase ${phase.phaseIndex + 1}: ${phase.title}]`);
@@ -625,6 +646,18 @@ function buildPhaseIntentText(
     parts.push('');
     parts.push('Detailed phase architecture (architecture-agent):');
     parts.push(perPhaseArchitecture);
+  }
+  if (laterPhases.length > 0) {
+    parts.push('');
+    parts.push('## Deferred to later phases');
+    parts.push(
+      'The following concerns are intentionally OUT OF SCOPE for ' +
+      'this phase and will be addressed in subsequent phases:',
+    );
+    for (const p of laterPhases) {
+      const scopeSnippet = p.scope.replace(/\s+/g, ' ').trim().slice(0, 100);
+      parts.push(`- Phase ${p.phaseIndex + 1} — ${p.title}: ${scopeSnippet}`);
+    }
   }
   return parts.join('\n');
 }
