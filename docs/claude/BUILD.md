@@ -54,6 +54,68 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_038 — Architecture-agent self-review + concrete-implementations stack injection (template 0.23.0, build clean, TR_037 follow-up CLOSED)
+
+Two stopgap fixes ahead of the LangGraph architecture-crew migration
+(ADR-056). Both will be deleted when Phase 1 of the migration lands.
+
+- **Fix 1** — `renderStackSection(harnessConfig)` helper in
+  `architecture-prompt.ts` injects `HARNESS.json.stack` as a
+  `## Project stack` section before the task description in
+  both `buildFeatureArchitecturePrompt` and
+  `buildPhaseArchitecturePrompt`. New `architectureGuidance`
+  rule on template + trackeros tells the agent to specify the
+  concrete implementation for every interface using the
+  declared stack.
+- **Fix 2** — new `buildArchitectureReviewPrompt` +
+  `ArchitectureAgent.reviewDesign(draft, feature, projectRoot,
+  harnessConfig, correlationId)`. A single-agent self-review
+  re-reads the draft and checks completeness / consistency /
+  ambiguity / feasibility. Returns the original draft on ANY
+  failure path so the pipeline is never blocked on a review
+  parse error. The orchestrator wires
+  `designFeature → reviewDesign → save` with a STOPGAP
+  (ADR-056) comment block above the call. New rule on
+  template + trackeros for the review pass.
+
+Template `0.22.0 → 0.23.0`. `pnpm -r build` clean across all
+13 packages. Token management (ADR-057) applies automatically
+because `reviewDesign` calls `callLLM` (which routes through
+the 5-layer pipeline).
+
+**Live verification — TR_037 HIGH NEW follow-up CLOSED:**
+trackeros feature `d0513f28-6648-4651-bf4e-15e8771c4e5b` on
+`chat-latest`:
+- `reviewDesign` log fired at 14:04:37 (6 s after
+  `designFeature`).
+- Phase 1 persisted architecture names `PostgresLeaveRepository`
+  as the concrete class, imports `Pool` from `pg`, defines
+  `src/shared/db/connection.ts`, and includes a SQL schema
+  with CHECK constraints + indices. The "what concrete impl
+  backs this interface" question intent-agent flagged in
+  TR_037 is now answered in the architecture itself.
+
+**Cycle still blocked at intent-agent — NEW orthogonal finding:**
+After ~15 s in `generating`, intent-agent escalated with a NEW
+reason: "The intent mentions repository CRUD behavior, but the
+specified LeaveRepository interface only defines create and
+findById methods." The architecture-agent legitimately scoped
+`LeaveRepository` to Phase-1 CRUD subset (later phases extend),
+but intent-agent reads the feature description as implying
+full CRUD upfront. Third distinct intent-agent rigor bar
+across TR_036 / TR_037 / TR_038. Captured as new HIGH
+follow-up.
+
+**Operator action — trackeros:** none new beyond the
+already-pushed `22b68de6 chore(TR_038): architecture-agent —
+concrete-implementations guidance + review-pass rule`.
+
+**Operator action — other projects:** Append the two new
+items (architectureGuidance + rules) to
+`HARNESS.json.agentConfig.architecture-agent` on existing
+projects. Template auto-refreshes to `0.23.0` at next server
+boot.
+
 ### TR_037 — Planner-agent uses architecture-agent's canonical type names (template 0.22.0, build clean, symbol-name conflict resolved end-to-end)
 
 Two fixes against the TR_036 NEW HIGH follow-up:
