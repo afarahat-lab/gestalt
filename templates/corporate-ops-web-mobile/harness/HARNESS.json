@@ -107,7 +107,8 @@
         "Maximum 5 files per phase",
         "Each phase must be independently deployable through CI and the gate",
         "Phases must be ordered by dependency — never reference a file from a future phase",
-        "Domain model files (*.model.ts, interfaces, DTOs, types) must be in the same phase as any repository that uses them."
+        "Domain model files (*.model.ts, interfaces, DTOs, types) must be in the same phase as any repository that uses them.",
+        "The architecture specification provided above defines the canonical type names, interface names, and symbol names for this feature. Use these exact names in all phase scopes. Do not invent alternative names or rename types."
       ],
       "phaseScopingRules": [
         "GOOD scope: 'Create src/modules/leave/leave.model.ts with TypeScript interfaces for LeaveRequest and CreateLeaveRequestDto. Import LeaveType, LeaveStatus from src/shared/types/index.ts which already exists.' — specific, concrete, references real paths.",

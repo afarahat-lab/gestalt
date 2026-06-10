@@ -33,10 +33,37 @@ export function buildFeaturePlanPrompt(
       ).join('\n')
     : '  (architecture-agent did not recommend specific phases)';
 
+  // TR_037 — inject architecture-agent's full output as canonical
+  // names. The planner-agent runs AFTER architecture-agent, but until
+  // now the planner only saw entity names + module names; the
+  // attributes + dependency map (where the canonical field/type
+  // names live) were dropped. Result: the planner invented
+  // alternative names (e.g. `LeaveStatus` / `CreateLeaveRequestDto`)
+  // that diverged from architecture-agent's (`LeaveRequestStatus` /
+  // `CreateLeaveRequestInput`), and downstream intent-agent caught
+  // the mismatch + escalated. This block surfaces the full
+  // architecture JSON so the planner has no excuse to rename. The
+  // 2000-char slice keeps the prompt within budget; the essential
+  // entity / module / dependency fields fit comfortably.
+  const architectureJsonSlice = JSON.stringify(architecture, null, 2).slice(0, 2000);
+  const canonicalNamesSection = [
+    '## Canonical type and symbol names',
+    '',
+    'The architecture agent has already defined the following.',
+    'You MUST use these exact names in all phase scopes.',
+    'Do not rename, alias, or invent alternative names.',
+    '',
+    '```json',
+    architectureJsonSlice,
+    '```',
+    '',
+  ].join('\n');
+
   return [
     `You are ${agentCfg.role} working on a cloned project at the current working directory.`,
     `Goal: ${agentCfg.goal}.`,
     '',
+    canonicalNamesSection,
     harnessSection,
     '## Feature',
     `Title: ${feature.title}`,
