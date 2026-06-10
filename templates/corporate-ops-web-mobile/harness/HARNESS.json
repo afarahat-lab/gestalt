@@ -109,7 +109,8 @@
         "Never reference a module by name alone — always by its exact file path relative to the file being created.",
         "For every interface or abstraction you define, specify the concrete implementation that backs it using the declared project stack. Do not leave implementation choices ambiguous — specify enough detail that a developer can implement without asking clarifying questions.",
         "The project stack declared in HARNESS.json is the authoritative source for all technology choices. You MUST use the declared test framework, web framework, database client, and package manager exactly as named. Do not substitute alternatives based on personal preference or assumed defaults. If the declared stack names a specific framework, every reference in your output must use that framework's name and conventions.",
-        "Before emitting your response, verify: every framework reference in your output matches the declared stack. If you find a mismatch, correct it before returning."
+        "Before emitting your response, verify: every framework reference in your output matches the declared stack. If you find a mismatch, correct it before returning.",
+        "Every state transition described in the feature must have a corresponding method in at least one phase. If an entity changes state during the feature lifecycle, ensure the phase plan includes a method for each transition — not just the initial creation."
       ]
     },
     "planner-agent": {

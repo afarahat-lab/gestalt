@@ -215,32 +215,52 @@ export function buildArchitectureReviewPrompt(
   const stackSection = renderStackSection(harnessConfig);
   const draftJson = JSON.stringify(draft, null, 2).slice(0, 3000);
 
-  // TR_040 — stack compliance gate. The review pass becomes an
-  // enforcement step: any framework reference in the draft that
-  // doesn't match `HARNESS.stack` must be corrected before the
-  // reviewed JSON is returned. Empty string when no stack is
-  // declared — the check is skipped cleanly.
+  // TR_040 → TR_041 — stack compliance gate. The review pass
+  // becomes an enforcement step: any framework reference in the
+  // draft that doesn't match `HARNESS.stack` must be corrected
+  // before the reviewed JSON is returned. Empty string when no
+  // stack is declared — the check is skipped cleanly.
+  //
+  // TR_041 Fix 1: this section is rendered FIRST in the prompt
+  // — before the persona, before the draft, before the feature
+  // description. The TR_040 placement (just before the JSON
+  // schema, after the review task) failed to override
+  // chat-latest's Vitest bias even though the rule was present.
+  // Pre-conditioning the LLM on the stack BEFORE it reads the
+  // draft is the strongest position in the prompt.
   const stack = harnessConfig?.stack;
   const stackComplianceCheck =
     stack && Object.keys(stack).length > 0
       ? [
-          '## Stack compliance check',
+          '## Stack compliance check (read this first)',
           '',
-          'The following stack is declared for this project:',
+          'The following stack is declared for this project. It is',
+          'the authoritative source for every framework, library,',
+          'and tool choice in the architecture you are about to',
+          'review. You MUST treat any deviation in the draft below',
+          'as a defect that you correct before returning.',
+          '',
           '```json',
           JSON.stringify(stack, null, 2),
           '```',
           '',
-          'Before returning, verify:',
-          '- Every framework reference matches the declared stack.',
-          '- No alternative frameworks appear in success criteria,',
-          '  interface names, or implementation notes.',
-          '- If you find any mismatch, correct it in your output.',
+          'Before returning:',
+          '- Verify every framework reference matches the declared stack.',
+          '- No alternative frameworks may appear in success criteria,',
+          '  interface names, implementation notes, or recommended-phase',
+          '  titles.',
+          '- If you find any mismatch, REWRITE the relevant field with',
+          '  the declared stack value. Do not preserve the original.',
           '',
         ].join('\n')
       : '';
 
   return [
+    // TR_041 Fix 1 — stack compliance check is rendered FIRST so
+    // it conditions the LLM before it reads the draft. Empty
+    // string (rare — no `HARNESS.stack`) is dropped by the
+    // `filter(Boolean)` at the end.
+    stackComplianceCheck,
     `You are ${agentCfg.role} performing a design review.`,
     `Goal: ${agentCfg.goal}.`,
     '',
@@ -260,12 +280,20 @@ export function buildArchitectureReviewPrompt(
     '2. Consistency — symbol names (types, interfaces, modules) are consistent throughout the design.',
     '3. Ambiguity — no open questions a developer would need to ask before implementing.',
     '4. Feasibility — the design can be implemented with the declared stack.',
+    // TR_041 Fix 2 — lifecycle coverage. The feature description
+    // implies state transitions (e.g. "managers approve or
+    // reject" on a leave request); the architecture must include
+    // a phase that adds the corresponding mutation method to the
+    // owning entity's repository. TR_040 verification surfaced
+    // a regression where Phase 1 had only `create + findById`
+    // and no later phase ever added `update` — yet Phase 5 was
+    // titled "manager approval and rejection workflow".
+    '5. Lifecycle coverage — for every entity whose state changes during the feature lifecycle, verify that at least one phase in `recommendedPhases` includes a method to perform that mutation. If a state transition exists in the feature description but no phase adds the corresponding mutation method, ADD it to the most appropriate phase.',
     '',
-    'If the draft is complete and correct, return it unchanged.',
-    'If it has gaps, fix them and return the corrected version.',
+    'If the draft passes all five checks, return it unchanged.',
+    'If any check fails, fix the issue and return the corrected version.',
     'Return the COMPLETE architecture JSON — not just the changes.',
     '',
-    stackComplianceCheck,
     'Return ONLY a single JSON object — no preamble, no markdown fences — in the same schema as the input:',
     '',
     '```json',
