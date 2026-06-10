@@ -3,6 +3,223 @@
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+### Session 2026-06-10 — Claude Code (TR_034: scoped per-phase architecture replaces full architecture context in Aider message — TR_034 mechanisms verified end-to-end; gpt-5.5 + Aider still produces zero source code)
+
+Brief: replace the heavy `## Project architecture` (full
+`docs/ARCHITECTURE.md`) and `## Design context` (full
+`design-spec.json`) blocks in the Aider message with a single
+`## Scoped architecture for this phase` block populated from
+architecture-agent's `designPhase()` output (exact file paths,
+exports, import statements). Closes the TR_033 Phase 3 root
+cause — Aider hallucinated `../../shared/db` because the full
+architecture description mentions modules by NAME, not by path.
+
+What changed (4 parts):
+
+**Part 1 + 2 — HARNESS + agents.yaml rule additions**
+
+- **trackeros HARNESS.json**:
+  `planner.architectureReviewPerPhase: false → true`. Two new
+  `agentConfig.architecture-agent.architectureGuidance` items:
+  per-dependency exact path/exports/import-statement; ban on
+  module-name-only references.
+- **trackeros agents.yaml**: `architecture-agent.prompt_extensions`
+  populated (was `[]`) with five scoping rules including
+  WRONG/CORRECT examples (`'Use the shared/db module'` WRONG;
+  full statement with exact path CORRECT).
+- **Template HARNESS.json + agents.yaml**: same rule additions
+  (the template's `architectureReviewPerPhase` was already `true`).
+
+**Part 3 — `aider-message-builder.ts` rewrite**
+
+- `buildAiderMessage` signature changed from
+  `(intentSpec, designSpec, snapshot)` to
+  `(intentSpec, phaseArchitecture: string | null, snapshot)`.
+- Dropped the `## Project architecture` block (was reading
+  `snapshot.architectureMd` — the module-name hallucination source).
+- Dropped the `## Design context` block (was reading
+  `design-spec.json` — also full-architecture-scoped).
+- New `## Scoped architecture for this phase` block, populated
+  from architecture-agent's per-phase JSON.
+- New `renderPhaseArchitecture()` helper renders
+  `PhaseArchitectureShape` (interfaces / importStatements /
+  sqlSchema / successCriteria) as markdown. The shape is
+  duplicated locally to keep `@gestalt/agents-generate` from
+  importing `@gestalt/agents-planning` (the inter-agent-import ban).
+
+**Part 4 — wiring**
+
+- New `FeatureRepository.updatePhaseArchitecture(phaseId, json)`
+  on the interface + postgres impl + oracle/mssql stubs. No
+  migration (uses existing `architecture` text column).
+- `runPerPhaseArchitecture` in `planning-orchestrator.ts` now
+  persists JSON-stringified `PhaseArchitecture` onto
+  `phase.architecture`. The planner's initial free-form
+  architecture text (if any) is overwritten — it was already
+  consumed by `designPhase()` as input.
+- `aider-code-agent.ts` new helper
+  `loadPhaseArchitectureForCycle(correlationId)` resolves
+  correlationId → intent → phase → `phase.architecture`, parses
+  as `PhaseArchitectureShape` (best-effort shape-guard), renders
+  via `renderPhaseArchitecture`. Falls back to `null` on any
+  failure or when the column doesn't look like JSON.
+  Removed `loadLatestDesignSpec` — `design-spec.json` is no
+  longer Aider's primary architecture context.
+- Template `0.18.0 → 0.19.0`.
+
+Verified end-to-end on trackeros feature `45fe91b3` (cycle
+2026-06-10 05:20-05:42):
+
+- ✅ **Per-phase architecture pass fired**: plan log shows
+  `phase-architecture-designed [phase 1]` at 05:27:40.
+- ✅ **`readFiles` includes scoped paths**: at 05:31:04 the Aider
+  invocation logged `readFiles: [..., "src/shared/db/index.ts",
+  "src/shared/base-repository.ts", ...]` — real file paths,
+  **no `../../shared/db` hallucination at the path level**.
+- ✅ **`messageBytes: 2922`** (TR_033 was 5705) — heavyweight
+  `## Project architecture` and `## Design context` blocks gone
+  from the message.
+- ✅ **`updatePhaseArchitecture` repo method** wrote the JSON to
+  `feature_phases.architecture` for Phase 1 (verified via psql).
+- ✅ **Phase 1 deployed**: gate verdict `pass` at 05:39:01;
+  PR #119 squash-merged + promotion fired.
+- ❌ **gpt-5.5 + Aider produced ZERO source code AGAIN** (same
+  TR_033 pattern). Phase-evaluator-agent's git diff returned
+  exactly:
+  ```
+  A .aider.chat.history.md
+  A .aider.input.history
+  A .gestalt/<id>/aider-output.md
+  A .gestalt/<id>/design-spec.json
+  A .gestalt/<id>/intent-spec.json
+  M docs/DOMAIN.md
+  ```
+  No `src/modules/leave/leave.model.ts`, no `leave.repository.ts`,
+  no tests. TR_026's git-diff evaluator path works flawlessly —
+  the verdict text quotes the brief's expected paths and the
+  actual diff verbatim.
+- ❌ **`architecture-agent.designPhase` returned empty output**:
+  log says `0 interface(s), 0 criteria` for Phase 1. Either
+  gpt-5.5 returned JSON with empty arrays, or it truncated at
+  6000 max_tokens (reasoning consumes the budget), or the new
+  prompt extensions don't translate to gpt-5.5's reasoning-model
+  output shape. The empty architecture → empty
+  `## Scoped architecture for this phase` block → dropped by
+  the message builder (`phaseArchitecture.trim().length > 0`
+  guard). Aider effectively got task + rules + readFiles only —
+  the same context as TR_033.
+
+What this VERIFIES (TR_034 platform mechanisms):
+
+- ✅ `architectureReviewPerPhase: true` triggers the per-phase
+  architecture-agent pass.
+- ✅ `updatePhaseArchitecture` repo method persists scoped JSON
+  onto `phase.architecture`.
+- ✅ `loadPhaseArchitectureForCycle` resolves
+  correlationId → intent → phase → architecture and parses with
+  shape guard.
+- ✅ `buildAiderMessage`'s new signature compiles + ships; the
+  heavyweight architecture blocks are removed; the scoped block
+  lands when the architecture is non-empty.
+- ✅ Phase-evaluator-agent's git-diff path (TR_026) detects the
+  zero-source-code state precisely with the exact list of what
+  was actually written.
+
+What this DOES NOT verify:
+
+- ❌ End-to-end multi-phase autonomous completion.
+- ❌ Whether the scoped architecture block actually helps Aider
+  — gpt-5.5's designPhase output was empty, so the block was
+  dropped. The cycle was effectively the same task + rules +
+  readFiles Aider got in TR_033.
+
+Decisions made:
+
+- **Did not investigate the architecture-agent's empty output
+  during the cycle.** That's a model / prompt issue, not a
+  TR_034 platform-mechanism issue; debugging it would branch
+  this session. Captured as a new HIGH follow-up.
+- **Used TR_033's token bumps unchanged** (architecture 6k,
+  planner 12k, phase-evaluator 8k, self-healing 6k). The
+  architecture-agent's empty output suggests 6k may still be
+  tight for gpt-5.5 reasoning + a multi-interface JSON response.
+- **Did NOT trigger TR_033 Fix 4** (the escalation handler) in
+  this cycle. Phase-evaluator-agent escalated via the existing
+  `if (evaluation.verdict === 'escalate')` path at line 633 — a
+  different code path than the `waiting-for-clarification`
+  intent status that Fix 4 watches. The legacy escalate path
+  calls `features.updateStatus(feature.id, 'blocked')` directly
+  with no alert + no `phase-escalated` event. Not a regression —
+  an observation: the two escalate paths could be unified.
+
+Pending follow-ups (NEW from TR_034):
+
+- **(HIGH — NEW from TR_034)** `architecture-agent.designPhase`
+  returned empty `interfaces` / `importStatements` /
+  `successCriteria` with gpt-5.5. The prompt extensions
+  explicitly demand these fields with WRONG/CORRECT examples.
+  Either gpt-5.5 reasoning consumed the 6k budget before
+  emitting JSON, the prompt's JSON-schema description doesn't
+  map to reasoning-model output, or gpt-5.5 returned valid JSON
+  with empty arrays. Bump architecture-agent `max_tokens` to
+  12k AND/OR add an explicit "this JSON response is mandatory"
+  guard rail.
+- **(MEDIUM — NEW from TR_034)** The two escalate paths
+  diverge. Phase-evaluator-agent escalate at line 633 calls
+  `updateStatus(blocked)` directly — no alert, no
+  `phase-escalated` plan log entry. TR_033's Fix 4 helper does
+  the full atomic sequence (phase failed + feature blocked +
+  plan log + alert). Unify by routing the evaluator's escalate
+  verdict through the same `markFeatureBlockedAfterEscalation`
+  helper.
+- **(STILL HIGH — promoted from TR_033)** gpt-5.5 + Aider
+  produces zero source code. TR_034 was supposed to give the
+  model a more focused message so it would actually generate.
+  Did NOT happen — the scoped block was empty because
+  designPhase returned empty arrays. With non-empty scoped
+  architecture the behaviour might be different; the HIGH NEW
+  follow-up above unblocks the next test of this.
+- **(STILL HIGH — promoted from TR_033)** Auto-merge pipeline
+  pushes `.aider.*` history + `.gestalt/<id>/` metadata +
+  PLAN.md to project main. Trackeros has been garbage-collected
+  manually after every cycle.
+
+Carryover follow-ups (status updates):
+
+- **(ADDRESSED by TR_034 architecture rewrite — but blocked on
+  architecture-agent's empty output)** TR_033 finding: Aider
+  hallucinates module paths like `../../shared/db` because the
+  architecture description references modules by name. TR_034
+  architecturally fixes this — Aider would see exact file paths
+  if the scoped architecture had content. Need the architecture-
+  agent JSON-emission gap fixed first.
+- **(STILL OPEN — HIGH)** TR_033 finding: Fix 4 race condition
+  (waiting-for-clarification used for both pause-during-fix-
+  intent and cascade-brake-terminal). Not addressed this session.
+- **(STILL OPEN — MEDIUM)** TR_033 finding: `classifyError`
+  treats `TypeError: fetch failed` as `retryable: false`.
+- **(STILL OPEN — MEDIUM)** TR_014: Aider token-spend capture
+  in `agent_executions.tokens_used`.
+
+Build status: `pnpm -r build` clean across all 13 packages.
+Server Docker image rebuilt with TR_034 code. Template
+auto-refreshes to `0.19.0` on next server boot.
+
+Files changed:
+- `packages/agents/generate/src/adapters/aider-message-builder.ts`
+- `packages/agents/generate/src/agents/aider-code-agent.ts`
+- `packages/agents/planning/src/orchestrator/planning-orchestrator.ts`
+- `packages/core/src/repository/index.ts`
+- `packages/adapters/postgres/src/repositories/features.ts`
+- `packages/adapters/oracle/src/repositories/features.ts`
+- `packages/adapters/mssql/src/repositories/features.ts`
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
+- `templates/corporate-ops-web-mobile/harness/agents.yaml`
+- `templates/corporate-ops-web-mobile/template.json`
+- `/Users/amrmohamed/Work/trackeros/HARNESS.json` (separate repo)
+- `/Users/amrmohamed/Work/trackeros/agents.yaml` (separate repo)
+
+---
 ### Session 2026-06-10 — Claude Code (TR_033: Phase 3 quality gaps — package.json/tsconfig.json on --read, language-agnostic code-agent rules, phase-evaluator routes-cite rule, escalation→blocked structural fix)
 
 Brief: four targeted fixes pushing for full autonomous feature
@@ -428,341 +645,4 @@ Files changed:
 - `packages/core/src/agents/self-healing-agent.ts`
 - `templates/corporate-ops-web-mobile/harness/HARNESS.json`
 - `templates/corporate-ops-web-mobile/template.json`
-
----
-### Session 2026-06-09 — Claude Code (TR_030 + TR_031: combat Aider DTO drift via Aider-message-builder additions and PLAN.md "What has been built" + context-only fix-intent — structural mechanisms verified, Aider compliance still partial)
-
-Two consecutive briefs in one day, both targeting the
-TR_028/TR_029 blocker: Aider doesn't read existing files
-before generating, drifts on type names, and creates
-references to non-existent sibling modules. TR_030 added
-two generic prose instructions to the Aider message;
-TR_031 added a structured "What has been built" section
-to PLAN.md and reshaped the self-healing fix-intent
-contract per ADR-042.
-
-What TR_030 changed (commit `bb70cf7`):
-
-- **`packages/agents/generate/src/adapters/aider-message-builder.ts`** —
-  added two generic behavioural instructions:
-  - `## Before generating any code` — "Read every existing
-    file in the repository that your generated code will
-    import from or extend. Confirm the exact field names,
-    exported types, and function signatures before
-    referencing them. Do not assume a type's shape — read
-    its definition."
-  - `## Important — architecture context is reference only` —
-    appended after the design context: "The architecture
-    and design context above describes the intended system
-    design. Many modules and types it mentions DO NOT EXIST
-    YET in the repository — they are planned for future
-    phases. Only import from files that actually exist in
-    the repository."
-- No file names, no project-specific content. Aider decides
-  which files to read based on its repository map.
-- Pure platform mechanic. No HARNESS change, no migration.
-
-What TR_031 changed (commits `626957b…ff7a75c…89ba9b8…`):
-
-- **`packages/agents/generate/src/adapters/aider-message-builder.ts`** —
-  added `## Read PLAN.md first` section telling Aider to
-  read PLAN.md and use the "What has been built" sub-
-  sections under completed phases as the source of truth
-  for what files + exports exist. Platform mechanic per
-  ADR-042 (every Gestalt planning project has a PLAN.md
-  committed by the orchestrator — instruction is not
-  project-specific).
-- **`packages/agents/planning/src/types.ts`** —
-  `PhaseEvaluation.builtFiles` field added: `Array<{ path,
-  exports? }>` populated by the phase-evaluator-agent from
-  its existing git diff + readFile pass.
-- **`packages/agents/planning/src/prompts/evaluator-prompt.ts`** —
-  prompt extended: ask the agent to also extract KEY
-  EXPORTS for every non-metadata file the git diff shows.
-  Schema example uses placeholder strings (`"<title of a
-  remaining phase>"`) instead of literal-looking paths so
-  the LLM doesn't copy them verbatim. Added an emphatic
-  "you MUST run executeScript BEFORE writing your JSON
-  response" line after the first verification cycle's
-  phase-evaluator hallucinated "Aider wrote 0 files
-  (confirmed by git diff)" with `toolCallCount: 0`.
-- **`packages/agents/planning/src/agents/phase-evaluator-agent.ts`** —
-  `parsePhaseEvaluation` now extracts `builtFiles` from
-  the LLM JSON output with defensive type guards.
-- **`packages/agents/planning/src/orchestrator/planning-orchestrator.ts`** —
-  `rewritePlanMd` renders a `**What has been built:**`
-  bullet list under each `deployed` phase. Also moved
-  PLAN.md re-emit OUT of the `if (adjustments.length > 0)`
-  guard so the "What has been built" block lands on
-  EVERY successful phase, not just ones that produced
-  scope adjustments.
-- **`packages/core/src/agents/self-healing-agent.ts`** —
-  the `fixIntent` field in the diagnostician's response
-  JSON schema was rewritten from prescriptive ("complete
-  Aider-ready intent text") to context-only: "describe the
-  CONTEXT and FAILURE that needs resolving. Include the CI
-  error text, which files are involved, and what the code
-  was trying to do. Do NOT write prescriptive instructions
-  telling Aider what code to write. Provide context — let
-  Aider decide the fix." Verbatim WRONG/CORRECT examples
-  embedded in the schema string.
-- **HARNESS.json `agentConfig.self-healing-agent.rules`**
-  (template + trackeros): added a project-tunable
-  preservation rule — "Fix-intent context must end with a
-  preservation statement. For TypeScript projects: 'Do not
-  remove or rename existing exports, types, or interfaces.
-  Only add or modify what is needed to resolve the CI
-  failure.'" Operators on Python projects swap the
-  TypeScript-specific clause for their language.
-- **`templates/corporate-ops-web-mobile/template.json`** —
-  version `0.15.0` → `0.16.0`.
-
-Live verification timeline (interleaved TR_030 + TR_031):
-
-- **TR_030 first attempt** (feature `cb51d8fa`) — Phase 1
-  deployed cleanly (Aider produced an internally-consistent
-  model + repository with `leaveType: LeaveType`). Then
-  feature got marked `blocked` not by Aider quality but by
-  a transient DNS blip in the container (`Could not resolve
-  host: github.com`) at the planning orchestrator's
-  Phase-2 clone time. Once DNS recovered, the orchestrator
-  had already retried twice and given up.
-- **TR_030 second attempt** (feature `7d2acd20`) — Phase 1
-  deployed via PR #93. Phase 2 (service) hit:
-  - Aider hallucinated `ILeaveRepository` (Phase 1 exports
-    `LeaveRepository`)
-  - Imports `../balance/balance.model` and
-    `../employee/employee.model` from the architecture
-    description (Aider treats it as ground truth)
-  - Added a `reason` field to LeaveRequest destructure
-  - Renamed class `LeaveRepository` → `LeaveRequestRepository`
-  Self-healing chose `fix-intent` on phase retry 2/2 —
-  fix-intent's prompt was prescriptive ("Update LeaveRequest
-  to add reason, updatedAt, leaveType"). Aider received it
-  and wholesale-rewrote `leave.model.ts`, **dropping
-  `CreateLeaveRequestDto`** which existing tests imported.
-  Cascade fix-intent failed at depth 2 → TR_025 brake.
-  Feature blocked.
-
-This second attempt was the seed for the TR_031 brief —
-the diagnostician's prescriptive prompts cause Aider to do
-wholesale rewrites instead of surgical edits, dropping
-sibling exports. The fix-intent contract needs to be
-context-only.
-
-- **TR_031 verification cycle 1** (feature `2998ff5e`) —
-  Phase 1 deployed (PR #99 squash-merged). Then **the new
-  phase-evaluator-agent hallucinated** `verdict:
-  "escalate"` with `summary: "Aider completed but wrote 0
-  files (confirmed by git diff)"` despite `toolCallCount:
-  0` in the log. The model didn't run the executeScript
-  tool — it lied about having checked. Caused by my added
-  schema example using literal-looking paths
-  (`src/modules/leave/leave.model.ts`) which the model
-  treated as a pre-filled hint. Patched: replaced with
-  placeholders + emphatic "you MUST run executeScript"
-  line, rebuilt.
-- **TR_031 verification cycle 2** (feature `0a9b14f6`) —
-  Phase 1 deployed cleanly. Phase 2 (service) failed CI:
-  same DTO drift family as TR_030. But this time **the
-  test file on trackeros main was stale** from earlier
-  cycles (`tests/unit/leave.model.test.ts` referenced
-  `leaveType` while the new Phase 1's model wrote `reason`
-  + no `leaveType`). Self-healing chose retry → retry →
-  retry across phase retries 1/2 + 2/2 — never picked
-  fix-intent. Phase 1 blocked.
-- **Cleanup commit** `d196fc66` on trackeros main:
-  `git rm src/modules/leave/ tests/unit/leave.model.test.ts`
-  to clear cross-feature contamination from prior TR_028/
-  TR_029/TR_030 cycles. The stale-test-pollution-on-main
-  issue is a real operational gap — captured below as a
-  new MEDIUM follow-up.
-- **TR_031 verification cycle 3** (feature `35fb580e`) —
-  with a clean trackeros main:
-  - Phase 1 deployed cleanly (Aider 12s → CI pass →
-    PR-Agent 37s → gate (constraint-agent only) → squash-
-    merge).
-  - **Phase-evaluator-agent ran git diff + readFile** and
-    populated `builtFiles` correctly:
-    ```
-    **What has been built:**
-    - `src/modules/leave/leave.model.ts` — `interface LeaveRequest`, `interface CreateLeaveRequestDto`
-    - `src/modules/leave/leave.repository.ts` — `class LeaveRepository`
-    ```
-    Committed in PLAN.md on main. **TR_031 "What has been
-    built" verified ✓**.
-  - Phase 2 (service) CI failed — Aider drifted again:
-    `ILeaveRepository` hallucination + sibling-module
-    imports (`../balance/balance.model`,
-    `../employee/employee.model`). PLAN.md's "What has been
-    built" section was there but Aider didn't follow it.
-  - **Self-healing chose `fix-intent` immediately on the
-    first CI failure** (TR_028/TR_029 pattern took 3 attempts).
-    Fix-intent text:
-    > "CI failed: TypeScript errors in leave.service.ts.
-    > The service references '../employee/employee.model'
-    > and '../balance/balance.model', which cannot be
-    > found. Additionally, it incorrectly references
-    > 'ILeaveRepository' from './leave.repository', which
-    > does not exist. Analyze and fix these import issues
-    > to ensure the leave.service.ts file compiles
-    > correctly."
-    **Context-only, no prescriptive instructions.
-    TR_031 fixIntent JSON-schema rewrite verified ✓**.
-  - Fix-intent's Aider then **inverted the prompt** — it
-    READ "ILeaveRepository does not exist" and CREATED
-    `ILeaveRepository` interface anyway, plus introduced a
-    `Leave` type undefined anywhere. Second fix-intent
-    dispatched with identical text. **TR_025 cascade-depth
-    brake fired at depth 2 — escalating ✓**. Feature
-    blocked.
-
-What's VERIFIED:
-
-- ✅ `What has been built` populated correctly in PLAN.md
-  after Phase 1 (cycle 3). Phase-evaluator-agent runs git
-  diff + readFile, emits `builtFiles` JSON, orchestrator
-  renders it.
-- ✅ Fix-intent text is now context-only ("CI failed: TS
-  errors in X. References Y. Analyse and fix.") — not
-  prescriptive ("Update X to add Y"). Confirmed across
-  both fix-intents in cycle 3.
-- ✅ TR_025 cascade-depth brake fires at depth 2 — verified
-  in cycle 3.
-- ✅ Aider message-builder now includes `## Read PLAN.md
-  first` + `## Before generating any code` + `## Important
-  — architecture context is reference only`. Code path
-  shipped; the prompt reaches Aider on every code-agent
-  run (verified by the Phase 1 successful generation).
-- ✅ HARNESS preservation rule landed on template + trackeros.
-
-What's NOT VERIFIED end-to-end:
-
-- ❌ Aider compliance with `## Before generating any code`.
-  Phase 2 of cycle 3 still drifted (`ILeaveRepository`
-  hallucinated, sibling modules imported). The prompt
-  instruction is in Aider's context but Aider doesn't
-  follow it consistently. This is the same conclusion as
-  TR_029.
-- ❌ HARNESS preservation rule reaching the dispatched
-  fix-intent text. The HARNESS rule says "Fix-intent
-  context must end with a preservation statement" but
-  neither of the two fix-intents in cycle 3 had the
-  preservation footer. The diagnostician LLM didn't append
-  it — the HARNESS rule didn't translate into runtime
-  behaviour. **The preservation requirement may need to
-  live in the JSON-schema `fixIntent` description**
-  (platform mechanic) rather than a HARNESS bullet
-  (configurable). ADR-042 split argued for the latter; in
-  practice the LLM doesn't reliably honour configurable
-  HARNESS rules over schema descriptions.
-- ❌ Aider's reaction to negated phrases. The fix-intent
-  said "X does not exist" — Aider read that and CREATED
-  X. This is a classic LLM-inversion behaviour that no
-  amount of prompt engineering reliably fixes.
-
-Decisions made:
-
-- **Cleaned trackeros main between cycles 2 and 3.** Stale
-  files from TR_028/TR_029/TR_030 (`src/modules/leave/`,
-  `tests/unit/leave.model.test.ts`) were contaminating
-  every fresh cycle because Aider reads them as ground
-  truth. The cleanup unblocked cycle 3. This is a real
-  ops gap — captured below.
-- **Did not extend `BaseLLMAgent.callLLMWithTools` to
-  reject responses without tool calls.** The phase-
-  evaluator-agent hallucinated `toolCallCount: 0` in
-  cycle 1. Could be enforced by the harness (reject + retry
-  if the model emits a final answer without invoking
-  required tools), but that's a bigger change deferred to
-  a follow-up. For now: emphatic prompt line + placeholder
-  schema strings reduce the chance.
-- **Did not change Aider's invocation flags.** Aider has
-  a `--read <file>` CLI flag that forces a file into its
-  context. Could pass the PLAN.md `What has been built`
-  paths via `--read` to make Aider literally have to read
-  them. Deferred — keep the chain of changes narrow.
-
-Pending follow-ups (NEW from TR_030 / TR_031):
-
-- **(HIGH — NEW from TR_031)** Move the preservation
-  requirement from HARNESS bullet into the `fixIntent`
-  JSON-schema description in `buildDiagnosisPrompt`. The
-  HARNESS rule was not honoured by the LLM in two
-  consecutive fix-intent dispatches. Schema-string
-  guidance reliably influences output; HARNESS bullets are
-  more advisory.
-- **(HIGH — NEW from TR_031)** Aider invocation could use
-  `--read <file>` for every path the planner's scope cites
-  under `_Depends on:_`. Forcing the file into Aider's
-  context is stronger than a prose "please read this
-  first" instruction. Same logic for the PLAN.md path —
-  pass `--read PLAN.md` always.
-- **(MEDIUM — NEW from TR_031)** Stale-file pollution on
-  trackeros main from failed prior cycles contaminates
-  every fresh attempt. When a feature gets blocked, the
-  files committed in deployed phases stay on main. The
-  next cycle's Aider reads them as ground truth and tries
-  to compose around them, often introducing new conflicts.
-  Options: (a) `gestalt feature` reset command that
-  un-merges deployed phases of a blocked feature; (b)
-  PLAN.md tracks "files this feature owns" and the
-  rewritePlanMd cleanup-on-block step git-rm them.
-- **(MEDIUM — NEW from TR_031)** Phase-evaluator-agent
-  hallucinated `verdict: escalate` with
-  `toolCallCount: 0` in cycle 1. The
-  `callLLMWithTools` loop should reject responses where
-  the agent's JSON claims tool-derived evidence (e.g.
-  "confirmed by git diff") but the model didn't invoke
-  any tools. A simple check: if the prompt says "you MUST
-  run X" and the model returned a final answer without
-  invoking X, retry once.
-- **(MEDIUM — NEW from TR_030/TR_031)** Aider doesn't
-  reliably parse negated assertions. Fix-intent said "X
-  does not exist" — Aider created X. The diagnostician's
-  prompt should be framed as POSITIVE assertions: "The
-  service should use `LeaveRepository` (which exists at
-  `src/modules/leave/leave.repository.ts`)" rather than
-  "ILeaveRepository does not exist". This is a fixIntent
-  schema-description change, not a HARNESS change.
-- **(LOW — NEW from TR_031)** The phase-branch is deleted
-  on squash-merge before the phase-evaluator runs against
-  it. `git diff origin/<default>...origin/<phaseBranch>`
-  returns empty when the branch is already gone, leading
-  the evaluator to a false "0 files" verdict (caught here
-  by the emphatic-tool-use prompt fix, but a more robust
-  path is to pass the merge SHA in `branchContext`).
-
-Carryover follow-ups (status updates):
-
-- **(STILL OPEN — HIGH, promoted again)** Aider DTO drift.
-  TR_030's prose instruction + TR_031's PLAN.md "What has
-  been built" both shipped; neither produced reliable
-  end-to-end multi-phase completion. The Aider-invocation
-  change (`--read <file>`) is now the leading candidate.
-- **(STILL OPEN — HIGH)** TR_018/020: restore TR_010
-  mandatory `executeScript tsc --noEmit` code-agent rule
-  on trackeros's HARNESS.json. Pre-emit TS check on each
-  Aider run would catch most of the drift before commit.
-- **(STILL OPEN — MEDIUM)** TR_014: Aider token-spend
-  capture in `agent_executions.tokens_used`.
-
-Build status: `pnpm -r build` clean across all 13 packages
-on each iteration. Docker server rebuilt twice (once per
-TR_030 + TR_031). All builds clean. Server `/health` 200
-throughout. Template auto-refreshes on next server boot to
-`0.16.0`.
-
-trackeros operator commits in this session:
-- TR_030: HARNESS edits (no new). Stranded PRs closed.
-- TR_031: `7d94746a` — HARNESS preservation rule added.
-  `d196fc66` — `git rm` stale leave module + test (cycle
-  3 cleanup).
-
-trackeros planning-loop commits (auto-merged on main):
-- Cycle 2: PR #93 Phase 1 deploy.
-- Cycle 3: PR (Phase 1 deploy with new model+repo).
-
-Multiple stranded PRs closed during cleanup: #94–#107
-range across the day.
 

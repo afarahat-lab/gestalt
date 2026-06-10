@@ -54,6 +54,52 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_034 — Scoped per-phase architecture replaces full architecture context in Aider message (template 0.19.0, mechanisms verified)
+
+Replaces the heavyweight `## Project architecture` + `## Design
+context` blocks in the Aider message with a single
+`## Scoped architecture for this phase` block built from
+architecture-agent's `designPhase()` JSON (interfaces +
+importStatements + sqlSchema + successCriteria). Closes the
+TR_033 root cause where Aider hallucinated `../../shared/db`
+from module-name references in the full ARCHITECTURE.md.
+
+- `buildAiderMessage` signature: `(intentSpec, phaseArchitecture:
+  string | null, snapshot)`. New `renderPhaseArchitecture()` helper.
+- New `FeatureRepository.updatePhaseArchitecture` method (no
+  migration — uses existing column). Postgres impl + oracle/mssql
+  stubs.
+- `runPerPhaseArchitecture` persists JSON to `phase.architecture`.
+- `aider-code-agent.loadPhaseArchitectureForCycle` resolves
+  correlationId → intent → phase → architecture, parses with
+  shape guard.
+- Template HARNESS + agents.yaml gain new architecture-agent
+  scoping rules (architectureGuidance + prompt_extensions) with
+  WRONG/CORRECT examples banning module-name-only references.
+
+Template bumped 0.18.0 → 0.19.0. **Verified live on trackeros
+2026-06-10** — per-phase architecture pass fires,
+`updatePhaseArchitecture` persists JSON, message body shrank
+5705 → 2922 bytes, Phase 1 deployed via PR #119. **Feature did
+NOT complete** — gpt-5.5 + Aider produced zero source code
+(same TR_033 mode), and architecture-agent's `designPhase`
+returned empty arrays so the scoped block was empty too.
+
+**Operator action — trackeros:** none new beyond the brief's
+HARNESS + agents.yaml edits (committed by the verification
+cycle as `e7db89dd` + `4eb7637c` cleanup).
+
+**Operator action — other projects:** Existing projects can
+opt into the per-phase architecture pass by setting
+`HARNESS.json.planner.architectureReviewPerPhase: true` and
+ensuring `architectureGuidance` includes the path/exports/
+import-statement rules from the template. Template auto-
+refreshes at server boot to `0.19.0`. The Aider message
+behaviour change is fully backward-compatible — projects
+without per-phase architecture get `null` from
+`loadPhaseArchitectureForCycle` and the message drops the
+section entirely.
+
 ### TR_033 — Phase 3 quality gaps + escalation→blocked structural fix (template 0.18.0, partially verified)
 
 Four targeted fixes pushing toward full autonomous feature
