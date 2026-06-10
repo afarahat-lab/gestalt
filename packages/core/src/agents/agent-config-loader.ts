@@ -30,8 +30,9 @@ import { createContextLogger } from '../logger/index';
 import type {
   AgentConfig, AgentLlmConfig, AgentsYaml,
   AgentToolConfig, McpServerConfig,
-  CustomAgentDefinition,
+  CustomAgentDefinition, ReasoningEffort,
 } from './agent-config';
+import { VALID_REASONING_EFFORTS } from './agent-config';
 import type { BuiltInToolName } from '../types';
 
 const log = createContextLogger({ module: 'agent-config-loader' });
@@ -304,6 +305,7 @@ export async function loadAgentConfig(
   }
 
   const llmIn = (entry.llm ?? {}) as Record<string, unknown>;
+  const reasoningEffort = extractReasoningEffort(llmIn);
   return {
     role: entry.role ?? baseline.role,
     goal: entry.goal ?? baseline.goal,
@@ -313,10 +315,26 @@ export async function loadAgentConfig(
       ...(typeof llmIn['maxTokens'] === 'number' ? { maxTokens: llmIn['maxTokens'] as number } : {}),
       ...(typeof llmIn['max_tokens'] === 'number' ? { maxTokens: llmIn['max_tokens'] as number } : {}),
       ...(typeof llmIn['model'] === 'string' ? { model: llmIn['model'] as string } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
     },
     promptExtensions: extractPromptExtensions(entry),
     tools: extractTools(entry, baseline.tools ?? { builtin: [] }),
   };
+}
+
+/**
+ * Accepts both `reasoning_effort` (snake_case, matches OpenAI wire
+ * spelling — preferred in YAML) and `reasoningEffort` (camelCase, for
+ * consistency with the rest of the config). Unknown values fall
+ * through to `undefined` so the agent inherits the model's default
+ * thinking behaviour rather than the platform crashing on a typo.
+ */
+function extractReasoningEffort(llmIn: Record<string, unknown>): ReasoningEffort | undefined {
+  const raw = llmIn['reasoning_effort'] ?? llmIn['reasoningEffort'];
+  if (typeof raw !== 'string') return undefined;
+  return VALID_REASONING_EFFORTS.has(raw as ReasoningEffort)
+    ? (raw as ReasoningEffort)
+    : undefined;
 }
 
 // TEST_REPORT_010 — `executeScript` was missing from this set. The
@@ -452,11 +470,13 @@ function normaliseCustomAgent(input: unknown): CustomAgentDefinition | null {
     : typeof e['runs_after'] === 'string' ? (e['runs_after'] as string)
     : undefined;
   const llmIn = (e['llm'] ?? {}) as Record<string, unknown>;
+  const reasoningEffort = extractReasoningEffort(llmIn);
   const llm: AgentLlmConfig = {
     ...(typeof llmIn['temperature'] === 'number' ? { temperature: llmIn['temperature'] as number } : {}),
     ...(typeof llmIn['maxTokens'] === 'number' ? { maxTokens: llmIn['maxTokens'] as number } : {}),
     ...(typeof llmIn['max_tokens'] === 'number' ? { maxTokens: llmIn['max_tokens'] as number } : {}),
     ...(typeof llmIn['model'] === 'string' ? { model: llmIn['model'] as string } : {}),
+    ...(reasoningEffort ? { reasoningEffort } : {}),
   };
   return {
     name,

@@ -842,6 +842,7 @@ async function runWithObservability<T extends GateAgentResult>(
       budgetExpansions: number;
       finalMaxTokens: number;
       truncationOccurred: boolean;
+      reasoningEffort: 'xhigh' | 'high' | 'medium' | 'low' | 'non-reasoning' | null;
     } | null;
   };
   await executionLogs.save({

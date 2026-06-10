@@ -76,8 +76,9 @@ export type { EvidenceLogger } from './agents/evidence-requirement';
 export type {
   AgentConfig, AgentLlmConfig, AgentToolConfig, AgentsYaml,
   CustomAgentDefinition, CustomAgentNode,
-  LlmCallFn,
+  LlmCallFn, ReasoningEffort,
 } from './agents/agent-config';
+export { VALID_REASONING_EFFORTS } from './agents/agent-config';
 
 // Config
 export type { GestaltConfig, ServerConfig, DatabaseConfig, QueueConfig, LLMConfig, AuthConfig } from './config/index';

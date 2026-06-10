@@ -25,6 +25,15 @@
 #                       The override reuses the platform's baseUrl +
 #                       apiKey — only the model name changes on the wire.
 #   llm.temperature, llm.max_tokens — override the platform defaults
+#   llm.reasoning_effort — controls how much internal thinking the model
+#                       does before responding (GPT-5.5+ family only).
+#                       Values: xhigh | high | medium | low | non-reasoning
+#                       Use 'high' for high-stakes decisions (architecture,
+#                       self-healing); 'medium' for planning and evaluation;
+#                       'low' for deterministic gate checks (temperature 0.0).
+#                       Omit on agents whose model doesn't use the
+#                       'responses' API shape — the parameter is silently
+#                       dropped on classic chat-completions endpoints.
 #   prompt_extensions — list of standing project rules appended to every
 #                       prompt under a "Project-specific instructions"
 #                       heading

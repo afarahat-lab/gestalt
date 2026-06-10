@@ -113,6 +113,19 @@ export interface TokenManagementLog {
   budgetExpansions: number;
   finalMaxTokens: number;
   truncationOccurred: boolean;
+  /**
+   * `reasoning_effort` value sent on the wire for this call. Captured
+   * from `agentConfig.llm.reasoningEffort` regardless of apiShape so
+   * operators can observe drift between intended and effective
+   * behaviour. `null` when the agent's config didn't set one.
+   */
+  reasoningEffort:
+    | 'xhigh'
+    | 'high'
+    | 'medium'
+    | 'low'
+    | 'non-reasoning'
+    | null;
 }
 
 /**
@@ -444,6 +457,7 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
       const result = await client.complete({
         messages: reducedMessages,
         ...(agentConfig.llm.temperature !== undefined ? { temperature: agentConfig.llm.temperature } : {}),
+        ...(agentConfig.llm.reasoningEffort ? { reasoningEffort: agentConfig.llm.reasoningEffort } : {}),
         maxTokens: effectiveMaxTokens,
         correlationId,
       });
@@ -492,6 +506,7 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
       budgetExpansions: attempt - 1,
       finalMaxTokens: effectiveMaxTokens,
       truncationOccurred,
+      reasoningEffort: agentConfig.llm.reasoningEffort ?? null,
     };
     return finalContent;
   }
@@ -745,6 +760,7 @@ export abstract class BaseLLMAgent<TTask = unknown, TResult = unknown> {
         messages: history,
         tools: capStruck ? [] : tools,
         ...(agentConfig.llm.temperature !== undefined ? { temperature: agentConfig.llm.temperature } : {}),
+        ...(agentConfig.llm.reasoningEffort ? { reasoningEffort: agentConfig.llm.reasoningEffort } : {}),
         maxTokens: effectiveMaxTokens,
         correlationId,
       });

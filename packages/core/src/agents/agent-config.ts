@@ -21,12 +21,41 @@ export type { McpServerConfig };
  * default are optional — when present they override the default for
  * THIS agent's calls only. `model` is the explicit model name; null
  * (or omitted) means "use platform default from .env LLM_MODEL".
+ *
+ * `reasoningEffort` controls how much internal thinking the model
+ * does before responding (GPT-5.5+ family). Only applied when the
+ * resolved client's `apiShape === 'responses'`; standard
+ * chat-completions calls silently drop the field — no error.
  */
 export interface AgentLlmConfig {
   temperature?: number;
   maxTokens?: number;
   model?: string;
+  reasoningEffort?: ReasoningEffort;
 }
+
+/**
+ * Reasoning-effort levels accepted by the OpenAI responses API for
+ * GPT-5.5+ family. Use `high` for high-stakes decisions
+ * (architecture, self-healing), `medium` for planning / evaluation,
+ * `low` for deterministic gate checks, and `non-reasoning` to force
+ * the model out of the thinking pass entirely.
+ */
+export type ReasoningEffort =
+  | 'xhigh'
+  | 'high'
+  | 'medium'
+  | 'low'
+  | 'non-reasoning';
+
+/**
+ * Used by the agent-config loader to validate operator-supplied
+ * values from `agents.yaml`. An unknown value is dropped so the LLM
+ * call falls back to the model's default reasoning behaviour.
+ */
+export const VALID_REASONING_EFFORTS: ReadonlySet<ReasoningEffort> = new Set([
+  'xhigh', 'high', 'medium', 'low', 'non-reasoning',
+]);
 
 /**
  * Tool surface an agent can call during its run. `builtin` is the

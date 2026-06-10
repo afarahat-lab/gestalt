@@ -37,6 +37,13 @@ export interface LLMRequest {
   responseFormat?: 'text' | 'json';   // 'json' enforces JSON output
   maxTokens?: number;
   temperature?: number;
+  /**
+   * GPT-5.5+ "responses" API only — controls how much internal
+   * thinking the model does before responding. Silently dropped on
+   * `chat-completions` clients; no error. See
+   * `AgentLlmConfig.reasoningEffort`.
+   */
+  reasoningEffort?: 'xhigh' | 'high' | 'medium' | 'low' | 'non-reasoning';
   correlationId?: string;             // for log tracing
 }
 
@@ -85,6 +92,9 @@ export interface CompleteWithToolsRequest {
   tools: ToolDefinition[];
   temperature?: number;
   maxTokens?: number;
+  /** Same semantics as `LLMRequest.reasoningEffort` — only applied
+   *  when the resolved client's `apiShape === 'responses'`. */
+  reasoningEffort?: 'xhigh' | 'high' | 'medium' | 'low' | 'non-reasoning';
   correlationId?: string;
 }
 
@@ -257,6 +267,7 @@ export class LLMClient {
       messages: request.messages,
       ...tokenLimitField(this.config.apiShape, request.maxTokens ?? 4096),
       ...temperatureField(this.config.apiShape, request.temperature ?? 0.2),
+      ...reasoningEffortField(this.config.apiShape, request.reasoningEffort),
       ...(request.responseFormat === 'json'
         ? { response_format: { type: 'json_object' } }
         : {}),
@@ -335,6 +346,7 @@ export class LLMClient {
       ...(tools.length > 0 ? { tools, tool_choice: 'auto' as const } : {}),
       ...tokenLimitField(this.config.apiShape, request.maxTokens ?? 4096),
       ...temperatureField(this.config.apiShape, request.temperature ?? 0.2),
+      ...reasoningEffortField(this.config.apiShape, request.reasoningEffort),
     };
 
     const controller = new AbortController();
@@ -664,6 +676,21 @@ function temperatureField(
   // Reasoning models silently ignore temperature; omit it to avoid
   // log noise + future stricter validation on the provider side.
   return apiShape === 'responses' ? {} : { temperature };
+}
+
+/**
+ * GPT-5.5+ "responses" body field. Only emitted when the client's
+ * `apiShape === 'responses'` AND the caller supplied a value; the
+ * field is invalid on classic chat-completions endpoints and on
+ * non-reasoning models. Returning an empty object lets the caller
+ * spread unconditionally.
+ */
+function reasoningEffortField(
+  apiShape: 'chat-completions' | 'responses' | undefined,
+  reasoningEffort: 'xhigh' | 'high' | 'medium' | 'low' | 'non-reasoning' | undefined,
+): Record<string, string> {
+  if (apiShape !== 'responses' || !reasoningEffort) return {};
+  return { reasoning_effort: reasoningEffort };
 }
 
 interface OpenAIResponse {

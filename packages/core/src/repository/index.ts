@@ -399,6 +399,16 @@ export interface TokenManagementLogRecord {
   budgetExpansions: number;
   finalMaxTokens: number;
   truncationOccurred: boolean;
+  /** GPT-5.5+ `reasoning_effort` sent on the wire for this call —
+   *  observable per-agent thinking-mode telemetry. `null` when the
+   *  agent's config didn't set one. */
+  reasoningEffort:
+    | 'xhigh'
+    | 'high'
+    | 'medium'
+    | 'low'
+    | 'non-reasoning'
+    | null;
 }
 
 export interface AgentExecutionLogRepository extends BaseRepository {
