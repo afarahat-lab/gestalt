@@ -18,7 +18,7 @@ docker-compose logs -f server
 |---|---|
 | `pnpm -r build` | ✅ clean (13 packages) |
 | `docker-compose up -d` | ✅ healthy (server / postgres / redis) |
-| Migrations applied | 029 (latest: `029_token_management_and_phase_merge`) |
+| Migrations applied | 029 (latest: `029_token_management_and_phase_merge`) — no new migration in TR_036 |
 | Server reachable | `http://localhost:3000/health` returns 200 |
 | Dashboard | served at `http://localhost:3000/app/` |
 
@@ -53,6 +53,70 @@ None blocking the build. Areas to keep in mind:
 ---
 
 ## Pending operator actions
+
+### TR_036 — Abstract gate rules + auto-generated project-structure brief + maxPhaseRetries alert path (template 0.21.0, build clean, live verification partial)
+
+Four fixes against TR_035 verification findings:
+
+- **Fix 1** — HARNESS `constraint-agent.rules` + `review-agent.rules`
+  rewritten to abstract layer-role language (data access layer,
+  business logic layer, presentation/routing layer). Both agents'
+  `verificationGuidance` rewritten to "read ARCHITECTURE.md first;
+  a finding is only valid if it violates a rule given the actual
+  structure of this project". The HARNESS no longer hardcodes
+  paths, class names, or method names — ARCHITECTURE.md is the
+  authoritative source for layer boundaries.
+- **Fix 2** — new `buildProjectStructureBrief(projectRoot)` helper
+  in `gate-orchestrator.ts`. Reads `ARCHITECTURE.md` (truncated to
+  2000 chars) + enumerates a depth-2 directory tree under `src/`
+  using Node's `readdir` (equivalent to `find src -maxdepth 2
+  -type d`, bounded to 30 entries). Set on
+  `GateTask.projectStructureBrief` (new optional field on the
+  type); constraint-agent injects it before the rules section,
+  llm-review-agent injects it at the top of the prompt. Empty
+  string when neither source exists — section is omitted.
+- **Fix 3** — planner's `maxPhaseRetries` exhaustion path in
+  `planning-orchestrator.ts` now creates a `feature-blocked`
+  alert + emits `alert.created` SSE. Previously this path was
+  silent on the alerts feed (operators only saw the block via
+  `gestalt feature show` / dashboard).
+- **Fix 4** — trackeros `agents.yaml` `test-agent.goal` switched
+  from Vitest → Jest to align with the rest of the project's
+  Jest-only tooling.
+
+Template bumped 0.20.0 → 0.21.0. `pnpm -r build` clean across
+all 13 packages.
+
+**Live verification — partial:** trackeros feature
+`b58ee152-4f5b-4dd5-8d72-39816149fbae` ran on `chat-latest`,
+produced a 7-phase plan (model+repo bundled into Phase 1) with
+non-empty per-phase architecture (2 interfaces + 5 criteria),
+then escalated at intent-agent on an upstream
+planner-vs-architecture-agent symbol-name inconsistency
+(`LeaveStatus` vs `LeaveRequestStatus`, `CreateLeaveRequestDto`
+vs `CreateLeaveRequestInput`). Self-healing → cascade brake →
+`feature-blocked` alert `430ed09a` created via the EXISTING
+TR_033 helper. Gate never ran, so Fixes 1 + 2 did not get an
+LLM-level test. Fix 3's new alert call sat alongside the
+existing one; the cycle escalated via the existing path so my
+new code didn't fire.
+
+**New HIGH follow-up:** cross-check planner-agent vs
+architecture-agent symbol names. Both currently emit type/field
+names independently; nothing reconciles them. This blocks every
+cycle on chat-latest at intent-agent before the gate-side
+TR_036 fixes get exercised.
+
+**Operator action — trackeros:** none new beyond the
+already-pushed `b5396160 chore(TR_036): abstract
+constraint+review rules + align test-agent to Jest`.
+
+**Operator action — other projects:** Existing projects can
+adopt the abstract rules by replacing their
+`HARNESS.json.agentConfig.constraint-agent.rules` +
+`review-agent.rules` blocks with the abstract versions from
+the template. Template auto-refreshes to `0.21.0` at next
+server boot.
 
 ### TR_035 — Dynamic token budget management + phase merge SHA (ADR-057, template 0.20.0, build clean, live verification pending)
 
