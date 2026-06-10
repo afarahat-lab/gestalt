@@ -54,6 +54,82 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_046 — Architecture-agent rule + 6th review-checklist item: new domain concepts must appear in architectureMdUpdate (template 0.31.0, build clean, cycle reached the GATE for the 2nd time across TR_036 → TR_046)
+
+One HARNESS rule + one platform-code rule. Closes TR_045's 7th
+intent-agent rigor bar (architecture-agent introducing
+`CANCELLED` to support a cancel workflow phase but the project
+context's documented lifecycle had only three other states).
+
+- **Fix 1** —
+  `agentConfig.architecture-agent.rules` in template + trackeros
+  HARNESS gains: "When your architecture introduces any new
+  domain concept that does not appear in the existing project
+  documentation (new lifecycle states, new enum values, new
+  entity types, new relationships), you MUST include it in
+  architectureMdUpdate so the project documentation stays
+  consistent with the architecture. Never introduce a concept
+  in code interfaces that is absent from the project docs."
+- **Fix 2** —
+  `packages/agents/planning/src/prompts/architecture-prompt.ts`
+  both `buildArchitectureReviewPrompt` (feature) and
+  `buildPhaseArchitectureReviewPrompt` (per-phase) gain a 6th
+  checklist item ("Documentation consistency") asking the
+  review pass to ensure every new domain concept lands in
+  `architectureMdUpdate` (feature) or surfaces in a
+  `successCriteria` line (per-phase).
+
+Template `0.30.0 → 0.31.0`. `pnpm -r build` clean across all
+13 packages.
+
+**Live verification — TR_045 7th-bar CLOSED + cycle reached
+the gate (2nd time across TR_036 → TR_046):** trackeros
+feature `795e1069-b25f-4426-bdc3-227aa160f3a9` on
+`chat-latest`:
+- ✅ Architecture-agent did NOT introduce `CANCELLED` this
+  cycle. `architectureMdUpdate` documents the lifecycle
+  exactly as the project context defines it (Pending /
+  Approved / Rejected). No "Create AND cancel" phase in
+  the plan.
+- ✅ Tightest plan yet — **6 phases** (vs TR_045's 7,
+  TR_044's 10). Phase 1 bundles `LeaveRequest AND
+  AuditRecord domain models with persistence` — TR_044's
+  goldenPrinciples injection enabling cross-cutting
+  concern integration.
+- ✅ Phase 1 architecture: **5 interfaces + 6 criteria**
+  — richest yet across the TR_036 → TR_046 sequence. The
+  6th criterion is the new doc-consistency item from Fix
+  2 surfacing in the per-phase pass.
+- ✅ **Cycle reached the gate — SIX gate runs across
+  two phase-retry attempts** with violation counts
+  trending **5 → 4 → 1 → 3 → 3 → 3** CONSTRAINT_VIOLATION.
+  The single-violation run is the closest the cycle has
+  ever been to a gate pass.
+
+**Cycle still blocked on the 8th intent-agent rigor bar:**
+> "Transaction behavior for createLeaveRequest and AuditRecord
+> creation is not explicitly defined."
+
+This is a genuine architectural concern surfaced by TR_044's
+`AuditRecord` cross-cutting integration landing in Phase 1
+ALONGSIDE `LeaveRequest`. When two domain mutations land in
+the same phase, transaction semantics (atomic vs distributed
+vs eventual consistency) become a real choice the
+architecture should pin down.
+
+**New HIGH follow-up for TR_047:** architecture-agent should
+explicitly state transaction semantics (atomic / non-atomic /
+compensating) for every cross-cutting operation that lands in
+the same phase as a primary domain mutation.
+
+**Operator action — trackeros:** none beyond the
+already-pushed `645cd7cd chore(TR_046): architecture-agent
+rule — new domain concepts must appear in architectureMdUpdate`.
+
+**Operator action — other projects:** Append the new
+architecture-agent rule to existing projects' HARNESS.
+Template auto-refreshes to `0.31.0` at next server boot.
+
 ### TR_045 — Third intent-agent rule: interface signatures are contracts (template 0.30.0, build clean, TR_044 6th-bar CLOSED)
 
 One abstract rule appended to
