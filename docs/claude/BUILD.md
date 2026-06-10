@@ -54,6 +54,88 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_042 — Per-phase architecture review pass + planner file-list mirroring (template 0.28.0, build clean, mixed verification: review-pass plumbing + planner file-count rule both verified; per-phase Vitest leak persists)
+
+Two stopgap fixes (ADR-056) extending TR_041's TOP-positioned
+stack compliance treatment from the FEATURE-level architecture
+pass to the PER-PHASE architecture pass, plus a HARNESS-side
+planner rule to stop the scope-vs-architecture file-count
+mismatch surfaced by TR_041.
+
+- **Fix 1a** — new `buildPhaseArchitectureReviewPrompt` in
+  `architecture-prompt.ts` mirroring
+  `buildArchitectureReviewPrompt` for the per-phase
+  `PhaseArchitecture` shape. Stack compliance section
+  rendered FIRST (per TR_041 finding); 5-point review
+  checklist adapted to per-phase concerns (stack /
+  file-list completeness / interface completeness / import
+  accuracy / success-criteria accuracy).
+- **Fix 1b** — `ArchitectureAgent.reviewPhaseDesign` method
+  with same safety semantics as `reviewDesign` (return
+  original draft on ANY failure path). Logs before/after
+  counts for `interfaces`, `importStatements`,
+  `successCriteria`.
+- **Fix 1c** — orchestrator wires `designPhase →
+  reviewPhaseDesign → persist` with a STOPGAP (ADR-056)
+  comment block above the call site telling the next
+  session to delete this when the LangGraph
+  architecture-crew lands.
+- **Fix 2** — two new abstract
+  `agentConfig.planner-agent.phaseScopingRules` items in
+  template + trackeros HARNESS: "The file list in each
+  phase scope is an estimate. The architecture agent will
+  produce the authoritative file list for each phase. Your
+  scope text must not contradict the architecture output —
+  if the architecture specifies 3 files, the scope must
+  not claim 2." + "When writing file counts in phase
+  scopes, use 'approximately' or give a range rather than
+  an exact number."
+
+Template `0.26.0 → 0.28.0`. `pnpm -r build` clean across all
+13 packages.
+
+**Live verification — MIXED:** trackeros feature
+`ec42e085-47b8-4475-99cb-e8a718ed63cb` on `chat-latest`:
+- ✅ `reviewPhaseDesign` log fires at 18:37:47 (~4s after
+  `designPhase`). Before/after counts logged:
+  `interfaces: 3→3, imports: 3→3, criteria: 5→5`. Same
+  shape, empty-fallback didn't trip, reviewed output
+  persisted.
+- ✅ Fix 2 worked — intent-agent did NOT escalate on the
+  scope-vs-architecture file-count mismatch this cycle.
+  TR_041's HIGH NEW follow-up CLOSED.
+- ❌ Per-phase Vitest STILL leaks: `Vitest=2 + vitest=1
+  = 3 mentions` in Phase 1's persisted architecture (all
+  in `successCriteria`). The TR_041 prompt-top effect at
+  the FEATURE-level scale didn't transfer to per-phase —
+  the LLM judged the per-phase draft compliant and didn't
+  rewrite. Likely needs regex post-processing.
+- ❌ Cycle blocked at intent-agent on a NEW (fifth)
+  rigor bar: "Platform standards require audit records
+  for state-changing operations, but no audit module,
+  interface, or file scope is provided for this phase."
+
+**New HIGH follow-ups for TR_043:**
+- Per-phase framework binding via regex post-processing in
+  `reviewPhaseDesign` — read `HARNESS.stack.testFramework`,
+  substitute any other test-framework name in the result
+  JSON. The LLM-only approach has now failed twice at
+  per-phase scale.
+- Feed `goldenPrinciples` (or `agentConfig` extension)
+  into the architecture-agent prompt so it can pre-empt
+  cross-cutting concerns like audit logging that
+  intent-agent will otherwise flag as ambiguity.
+
+**Operator action — trackeros:** none new beyond the
+already-pushed `7512ced5 chore(TR_042): planner
+phaseScopingRules — file list is an estimate; architecture
+is authoritative`.
+
+**Operator action — other projects:** Append the two new
+`planner-agent.phaseScopingRules` items to existing
+projects' HARNESS. Template auto-refreshes to `0.28.0` at
+next server boot.
+
 ### TR_041 — Stack compliance check at TOP of review prompt + lifecycle coverage as 5th checklist item + lifecycle architectureGuidance rule (template 0.26.0, build clean, feature-level pipeline fully cleaned of framework leak)
 
 Three fixes against TR_040's two HIGH NEW follow-ups (Vitest
