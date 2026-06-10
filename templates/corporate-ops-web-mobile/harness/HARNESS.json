@@ -91,7 +91,8 @@
       "rules": [
         "High-level architecture must fit within the existing module structure defined in ARCHITECTURE.md",
         "Do not introduce circular dependencies between modules",
-        "Per-phase designs must only reference files that exist or are being created in that phase"
+        "Per-phase designs must only reference files that exist or are being created in that phase",
+        "When reviewing a draft architecture: check that every interface or abstraction has a named concrete implementation, all symbol names are consistent, and no implementation choice is left open for a developer to decide."
       ],
       "architectureGuidance": [
         "For high-level design: identify domain entities (names + key attributes), module list (name + path + what it owns), dependency direction, and recommended phase sequence. Nothing more.",
@@ -99,7 +100,8 @@
         "Phase designs must reference only files that already exist OR files being created in this phase — never assume future phases exist.",
         "Keep per-phase designs focused on the phase scope — do not redesign the whole feature.",
         "Per-phase design must include for each dependency: exact file path, exact exported names, exact import statement. Scope: only files that exist now + files being created this phase. Nothing else.",
-        "Never reference a module by name alone — always by its exact file path relative to the file being created."
+        "Never reference a module by name alone — always by its exact file path relative to the file being created.",
+        "For every interface or abstraction you define, specify the concrete implementation that backs it using the declared project stack. Do not leave implementation choices ambiguous — specify enough detail that a developer can implement without asking clarifying questions."
       ]
     },
     "planner-agent": {

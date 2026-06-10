@@ -383,9 +383,23 @@ async function handlePlanningStart(
 
     // ── 1. architecture-agent (feature-level) ─────────────────────
     childLog.info({ featureId: feature.id }, 'Invoking architecture-agent for feature-level design');
-    const architecture = await new ArchitectureAgent().designFeature(
+    const architectureAgent = new ArchitectureAgent();
+    const draftArchitecture = await architectureAgent.designFeature(
       feature, archMd, workDir, harnessConfig, correlationId,
     );
+
+    // STOPGAP (ADR-056): This single-agent review step is a
+    // lightweight stand-in for the LangGraph architecture crew
+    // (domain + data + application architects deliberating in
+    // parallel under a chief-architect supervisor) that Phase 1
+    // of the migration will introduce. When the crew lands,
+    // delete `reviewDesign()`, `buildArchitectureReviewPrompt`,
+    // and this call site.
+    childLog.info({ featureId: feature.id }, 'Invoking architecture-agent reviewDesign (TR_038 stopgap)');
+    const architecture = await architectureAgent.reviewDesign(
+      draftArchitecture, feature, workDir, harnessConfig, correlationId,
+    );
+
     await features.appendLog({
       featureId: feature.id,
       phaseIndex: null,

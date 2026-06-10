@@ -15,6 +15,41 @@
 
 import type { AgentConfig, HarnessConfig, FeatureRecord, FeaturePhaseRecord } from '@gestalt/core';
 import { renderHarnessAgentRules } from '@gestalt/core';
+import type { FeatureArchitecture } from '../types';
+
+/**
+ * TR_038 — Render the project's declared stack from
+ * `HARNESS.json.stack` as a markdown section the architecture-agent
+ * reads BEFORE the task description. The agent uses this to specify
+ * concrete implementations (`pg` Pool, Express handler, …) for every
+ * interface or abstraction it emits, rather than leaving the choice
+ * open for a developer to ask about.
+ *
+ * Platform mechanics per ADR-042 — the rule telling the agent to
+ * USE the stack lives in
+ * `HARNESS.json.agentConfig['architecture-agent'].architectureGuidance`;
+ * the stack VALUES live in `HARNESS.json.stack`. This function only
+ * surfaces what is already declared elsewhere.
+ *
+ * Returns empty string when `HARNESS.json.stack` is absent — callers
+ * test `length > 0` and omit the section cleanly.
+ */
+function renderStackSection(harnessConfig: HarnessConfig | null): string {
+  const stack = harnessConfig?.stack;
+  if (!stack || Object.keys(stack).length === 0) return '';
+  return [
+    '## Project stack',
+    '',
+    'Use the following declared stack to specify concrete',
+    'implementations for every interface or abstraction',
+    'you define. Do not leave implementation choices open.',
+    '',
+    '```json',
+    JSON.stringify(stack, null, 2),
+    '```',
+    '',
+  ].join('\n');
+}
 
 /**
  * Build the feature-level architecture prompt — high-level domain
@@ -28,6 +63,7 @@ export function buildFeatureArchitecturePrompt(
   harnessConfig: HarnessConfig | null,
 ): string {
   const harnessSection = renderHarnessAgentRules('architecture-agent', harnessConfig);
+  const stackSection = renderStackSection(harnessConfig);
   const archExcerpt = existingArchitectureMd.slice(0, 3000);
   const extensions = agentCfg.promptExtensions ?? [];
 
@@ -36,6 +72,7 @@ export function buildFeatureArchitecturePrompt(
     `Goal: ${agentCfg.goal}.`,
     '',
     harnessSection,
+    stackSection,
     '## Existing project architecture (docs/ARCHITECTURE.md, truncated to 3000 chars)',
     archExcerpt || '(no existing architecture file)',
     '',
@@ -91,6 +128,7 @@ export function buildPhaseArchitecturePrompt(
   harnessConfig: HarnessConfig | null,
 ): string {
   const harnessSection = renderHarnessAgentRules('architecture-agent', harnessConfig);
+  const stackSection = renderStackSection(harnessConfig);
   const extensions = agentCfg.promptExtensions ?? [];
   const priorPhasesBlock = priorPhases.length
     ? priorPhases.map((p, i) => `  ${i + 1}. ${p.title} (${p.status}) — ${oneLine(p.scope)}`).join('\n')
@@ -101,6 +139,7 @@ export function buildPhaseArchitecturePrompt(
     `Goal: ${agentCfg.goal}.`,
     '',
     harnessSection,
+    stackSection,
     '## Feature',
     `Title: ${feature.title}`,
     `Description: ${oneLine(feature.description)}`,
@@ -146,4 +185,79 @@ export function buildPhaseArchitecturePrompt(
 
 function oneLine(s: string): string {
   return s.replace(/\s+/g, ' ').trim().slice(0, 400);
+}
+
+/**
+ * TR_038 — Architecture review prompt. The architecture-agent emits
+ * a draft feature architecture; this prompt asks the SAME agent to
+ * re-read its draft and check completeness / consistency / ambiguity
+ * / feasibility before the planner is allowed to read the design.
+ *
+ * STOPGAP (ADR-056): A single-agent self-review is a lightweight
+ * stand-in for the architecture crew (domain + data + application
+ * architects deliberating in parallel under a chief-architect
+ * supervisor) that the LangGraph migration will introduce. Delete
+ * this builder + `ArchitectureAgent.reviewDesign()` + the
+ * orchestrator call site when the crew lands.
+ *
+ * The review returns the SAME JSON schema as the original design
+ * (`FeatureArchitecture`) — not a delta. On parse failure the
+ * caller returns the original draft unchanged so the pipeline is
+ * never blocked on a review-only error.
+ */
+export function buildArchitectureReviewPrompt(
+  draft: FeatureArchitecture,
+  feature: FeatureRecord,
+  agentCfg: AgentConfig,
+  harnessConfig: HarnessConfig | null,
+): string {
+  const harnessSection = renderHarnessAgentRules('architecture-agent', harnessConfig);
+  const stackSection = renderStackSection(harnessConfig);
+  const draftJson = JSON.stringify(draft, null, 2).slice(0, 3000);
+
+  return [
+    `You are ${agentCfg.role} performing a design review.`,
+    `Goal: ${agentCfg.goal}.`,
+    '',
+    harnessSection,
+    stackSection,
+    '## Draft architecture to review',
+    '```json',
+    draftJson,
+    '```',
+    '',
+    '## Feature description',
+    feature.description,
+    '',
+    '## Your review task',
+    'Review the draft architecture above for:',
+    '1. Completeness — every interface has a concrete implementation backed by the declared project stack.',
+    '2. Consistency — symbol names (types, interfaces, modules) are consistent throughout the design.',
+    '3. Ambiguity — no open questions a developer would need to ask before implementing.',
+    '4. Feasibility — the design can be implemented with the declared stack.',
+    '',
+    'If the draft is complete and correct, return it unchanged.',
+    'If it has gaps, fix them and return the corrected version.',
+    'Return the COMPLETE architecture JSON — not just the changes.',
+    '',
+    'Return ONLY a single JSON object — no preamble, no markdown fences — in the same schema as the input:',
+    '',
+    '```json',
+    '{',
+    '  "domainEntities": [',
+    '    { "name": "...", "attributes": ["..."], "purpose": "..." }',
+    '  ],',
+    '  "modules": [',
+    '    { "name": "...", "path": "src/modules/...", "owns": ["..."] }',
+    '  ],',
+    '  "dependencyMap": [',
+    '    { "from": "...", "to": "..." }',
+    '  ],',
+    '  "recommendedPhases": [',
+    '    { "title": "...", "rationale": "...", "estimatedFiles": 3 }',
+    '  ],',
+    '  "architectureMdUpdate": "markdown to append to ARCHITECTURE.md"',
+    '}',
+    '```',
+  ].filter(Boolean).join('\n');
 }

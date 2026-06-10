@@ -24,6 +24,7 @@ import {
 import type { HarnessConfig, FeatureRecord, FeaturePhaseRecord } from '@gestalt/core';
 import {
   buildFeatureArchitecturePrompt, buildPhaseArchitecturePrompt,
+  buildArchitectureReviewPrompt,
 } from '../prompts/architecture-prompt';
 import type { FeatureArchitecture, PhaseArchitecture } from '../types';
 
@@ -61,6 +62,80 @@ export class ArchitectureAgent extends BaseLLMAgent {
     );
     const raw = await this.callLLM(prompt, agentCfg, correlationId);
     return parseFeatureArchitecture(raw, correlationId);
+  }
+
+  /**
+   * TR_038 — STOPGAP (ADR-056). Re-reads the architecture-agent's
+   * own draft and asks the SAME agent to check completeness,
+   * consistency, ambiguity, and feasibility against the declared
+   * project stack. Returns the corrected JSON when the review
+   * fires; returns the original draft unchanged on ANY failure
+   * (parse error, LLM call error) so the pipeline is never
+   * blocked on a review-only error.
+   *
+   * This single-agent self-review will be replaced by the
+   * LangGraph architecture crew (domain + data + application
+   * architects deliberating in parallel with a chief-architect
+   * supervisor) in Phase 1 of the migration. Delete this method
+   * + `buildArchitectureReviewPrompt` + the orchestrator call
+   * site when the crew lands.
+   */
+  async reviewDesign(
+    draft: FeatureArchitecture,
+    feature: FeatureRecord,
+    projectRoot: string,
+    harnessConfig: HarnessConfig | null,
+    correlationId: string,
+  ): Promise<FeatureArchitecture> {
+    this.lastTokensUsed = 0;
+    this.setHarnessConfigForRun(harnessConfig);
+    let agentCfg;
+    try {
+      agentCfg = await loadAgentConfig(projectRoot, 'architecture-agent');
+    } catch (err) {
+      log.warn(
+        { err: err instanceof Error ? err.message : String(err), correlationId },
+        'architecture-agent reviewDesign could not load agent config — returning original draft',
+      );
+      return draft;
+    }
+    const prompt = this.addJsonResponseGuard(
+      buildArchitectureReviewPrompt(draft, feature, agentCfg, harnessConfig),
+    );
+    let raw: string;
+    try {
+      raw = await this.callLLM(prompt, agentCfg, correlationId);
+    } catch (err) {
+      log.warn(
+        { err: err instanceof Error ? err.message : String(err), correlationId },
+        'architecture-agent reviewDesign LLM call failed — returning original draft',
+      );
+      return draft;
+    }
+    const reviewed = parseFeatureArchitecture(raw, correlationId);
+    // `parseFeatureArchitecture` never throws — it returns an
+    // empty-fields fallback object on JSON-parse failure. Detect
+    // that case explicitly and return the original draft instead
+    // of an empty review (the empty-fallback would discard the
+    // legitimate work the design pass just produced).
+    if (reviewed.domainEntities.length === 0 && reviewed.modules.length === 0) {
+      log.warn(
+        { correlationId },
+        'architecture-agent reviewDesign parsed to empty — returning original draft',
+      );
+      return draft;
+    }
+    log.info(
+      {
+        correlationId,
+        beforeEntities: draft.domainEntities.length,
+        afterEntities: reviewed.domainEntities.length,
+        beforeModules: draft.modules.length,
+        afterModules: reviewed.modules.length,
+      },
+      'architecture-agent reviewDesign complete',
+    );
+    return reviewed;
   }
 
   /**
