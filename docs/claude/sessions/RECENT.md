@@ -86,7 +86,7 @@ What changed:
 - **`templates/corporate-ops-web-mobile/template.json`** —
   version `0.17.0` → `0.18.0`.
 
-What's verified (build only):
+What's verified (build):
 
 - ✅ `pnpm -r build` clean across all 13 packages.
 - ✅ AlertType union extension picks up cleanly across
@@ -94,18 +94,135 @@ What's verified (build only):
 - ✅ Planning orchestrator new branch + helper compile without
   lint regressions.
 
-What's NOT verified yet (live cycle pending):
+What's verified live (cycle on trackeros feature `7ab81ea3`,
+2026-06-10 22:08-22:15):
 
-- ❌ End-to-end multi-phase autonomous completion (the brief's
-  milestone).
-- ❌ Aider compliance with the expanded `--read` set — whether
-  seeing `tsconfig.json` strict mode causes it to narrow
-  `unknown` catches and import Express types.
-- ❌ Phase 3 routes phase only calling methods that exist on
-  LeaveService (depends on the new template rules; trackeros
-  needs manual HARNESS patching first to test).
-- ❌ Fix 4 in action — whether an escalated phase immediately
-  drops the feature to `blocked` without manual cleanup.
+- ✅ **Fix 1** — Aider invocation at 22:12:43 logged
+  `readFiles: ["PLAN.md", "package.json", "tsconfig.json",
+  "pyproject.toml", "requirements.txt", "go.mod", "pom.xml",
+  ...]`. The `existsSync` filter dropped the Python/Go/Java
+  manifests cleanly on the TypeScript project. Language-
+  agnostic behavior confirmed.
+- ✅ **Fix 4 (the structural milestone)** — Phase 1 escalated
+  to `waiting-for-clarification`; the planning subscriber
+  immediately routed to `markFeatureBlockedAfterEscalation`,
+  which:
+  - Marked phase failed (plan log: `phase-escalated [phase 1]
+    Phase 1 (Create balance domain model and repository)
+    escalated to 'waiting-for-clarification' — feature blocked
+    automatically. Self-healing budget exhausted; human
+    clarification required to resume.`)
+  - Marked feature `blocked` (`Status: blocked`, `Phases: 0/5`)
+  - Created the `feature-blocked` alert (`446a1c83`, severity
+    high, title "Feature blocked at phase 1")
+  - All in one atomic sequence — **no manual operator cleanup
+    needed**.
+- ✅ Trackeros HARNESS.json carries Fix 2 + Fix 3 rules
+  (operator re-applied per session question after the earlier
+  revert).
+
+What's NOT verified (couldn't reach):
+
+- ❌ Phase 3 routes-phase behavior — feature blocked at
+  Phase 1, never reached Phase 3.
+- ❌ Compiler settings actually respected by Aider — the
+  `tsconfig.json` was in `--read` context but the failure
+  came from `'Cannot find module ../../shared/db'`, a path
+  Aider invented from the planner's prose, not from `tsconfig`
+  settings.
+- ❌ End-to-end multi-phase autonomous completion — the
+  brief's milestone goal.
+
+What ELSE the live cycle surfaced (unrelated to TR_033 fixes):
+
+- **gpt-5.5 needs `responses` apiShape** — the brief said
+  "no registry change needed", but gpt-5.5 rejected
+  `max_tokens` with `Use 'max_completion_tokens' instead`.
+  Added `gpt-5.5` to `platform_llms` with
+  `apiShape='responses'` mid-cycle.
+- **gpt-5.5 token budget for reasoning** — `max_tokens: 3000`
+  truncated planner JSON at 74s wall-clock (reasoning tokens
+  count toward the same budget). Bumped architecture→6k,
+  planner→12k, phase-evaluator→8k, self-healing→6k. Planner
+  parsed cleanly after that.
+- **gpt-5.5 + Aider produced ZERO source code across 4
+  attempts** — every PR added `.aider.chat.history.md`,
+  `.aider.input.history`, `.gestalt/<id>/{aider-output.md,
+  design-spec.json, intent-spec.json}` and DOMAIN.md edits,
+  but **nothing in `src/`**. CI passed each time because
+  there was nothing to compile, but the planner kept seeing
+  "Cannot find module '../../shared/db'" because the Aider
+  message referenced that path while writing zero actual
+  code. New failure mode — not the TR_028-32 hallucination
+  pattern, this is "Aider with gpt-5.5 doesn't write files
+  at all".
+- **One `TypeError: fetch failed`** during architecture-agent
+  — transient (next attempt succeeded). `classifyError` in
+  `llm/index.ts` currently treats this as
+  `retryable: false`, so a single transient TCP drop kills
+  the whole feature.
+
+Decisions made (during verification):
+
+- **Did not auto-retry the cycle after each gpt-5.5 hiccup.**
+  Each failure was a separate diagnostic step — fix the
+  apiShape, fix the token budget, fix the fetch flake — then
+  move forward.
+- **Did not revert to gpt-4o-mini on Aider.** The brief
+  explicitly chose gpt-5.5; the verification surfaces that
+  gpt-5.5 + Aider has a code-generation gap. That's a finding
+  for the operator to act on, not a platform-mechanic fix.
+- **Cleaned 71 files / 19030 lines of cycle metadata off
+  trackeros main** (`.aider.*`, `.gestalt/<correlationId>/`,
+  PLAN.md). The platform's auto-merge pipeline shouldn't be
+  pushing these to main — that's a separate gitignore /
+  pre-commit follow-up.
+
+Pending follow-ups (NEW from TR_033 verification):
+
+- **(HIGH — NEW from TR_033)** gpt-5.5 + Aider produces zero
+  source code. Each verification attempt's PR added only
+  meta-files (`.aider.*`, `.gestalt/`, design specs) and
+  documentation edits — nothing in `src/`. Either Aider's
+  prompting doesn't translate to gpt-5.5's reasoning model
+  output shape, or gpt-5.5 spends its entire token budget on
+  reasoning before deciding to invoke Aider's file-edit tool.
+  Investigate via Aider's stdout / chat history files
+  (committed under `.gestalt/<correlationId>/aider-output.md`).
+- **(MEDIUM — NEW from TR_033)** Fix 4 race condition.
+  `waiting-for-clarification` is used by self-healing for
+  TWO distinct things: (a) pausing the parent while a fix-
+  intent is dispatched (recoverable — `onSuccessDispatch`
+  resumes the parent later), (b) cascade-brake exhaustion
+  (genuinely terminal). The current Fix 4 treats both as
+  terminal, so the feature flips to `blocked` the moment
+  self-healing pauses the parent for a fix-intent —
+  prematurely. Mitigation: check whether an in-flight
+  fix-intent child exists before marking terminal, OR add a
+  distinct `escalated-cascade-brake` status to disambiguate.
+  The current cycle still showed Fix 4 firing correctly
+  (alert created, plan log written) — but it fired earlier
+  than the brief intended.
+- **(MEDIUM — NEW from TR_033)** Platform pushes
+  `.aider.chat.history.md`, `.aider.input.history`,
+  `.gestalt/<correlationId>/` JSON, and PLAN.md to project
+  main as part of auto-merge. Across many cycles trackeros
+  accumulated 71 files / 19k lines of this metadata. Either
+  add these paths to the project's `.gitignore` at init
+  time, or have pr-agent skip them when staging the PR's
+  commit set.
+- **(LOW — NEW from TR_033)** `classifyError` treats
+  `TypeError: fetch failed` as `retryable: false`. A
+  transient TCP drop or DNS blip kills the whole feature
+  with no retry. The existing retry loop in
+  `LLMClient.complete` would handle this if the classifier
+  returned `retryable: true`.
+- **(LOW — NEW from TR_033)** The brief said "gpt-5.5 uses
+  standard chat-completions shape — no registry change
+  needed". Wrong — gpt-5.5 is a reasoning model that needs
+  `responses` apiShape. Documented in trackeros's
+  `platform_llms` row; doc the pattern for the next operator
+  picking a reasoning model.
 
 Decisions made:
 

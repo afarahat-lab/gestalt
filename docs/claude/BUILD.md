@@ -54,10 +54,16 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
-### TR_033 — Phase 3 quality gaps + escalation→blocked structural fix (template 0.18.0)
+### TR_033 — Phase 3 quality gaps + escalation→blocked structural fix (template 0.18.0, partially verified)
 
 Four targeted fixes pushing toward full autonomous feature
-completion. Fixes 1-3 are language-agnostic rule additions;
+completion. **Verified live on trackeros feature `7ab81ea3`
+(2026-06-10)**: Fix 1 + Fix 4 confirmed end-to-end; Fix 2 +
+Fix 3 shipped but not reached (feature blocked at Phase 1
+before routes phase). Feature did not reach `completed` —
+gpt-5.5 + Aider produced zero source code across 4 attempts
+(new failure mode separate from TR_028-32 hallucination).
+Full report in `sessions/RECENT.md`. Fixes 1-3 are language-agnostic rule additions;
 Fix 4 is the structural follow-up to the TR_032 verification
 gap (escalated intents leaving features stuck `in-progress`).
 
