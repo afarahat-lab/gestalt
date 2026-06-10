@@ -2,30 +2,34 @@
  * Build the Aider message from the cycle's context snapshot (TR_014).
  *
  * The Aider message is intentionally MINIMAL: the task, the success
- * criteria, the project rules, and the architecture context.
- * **No implementation instructions.** Aider decides how — that's the
- * whole point of using it. We provide the "what" and "why"; Aider
- * provides the "how".
+ * criteria, the project rules, and — TR_034 — the SCOPED PER-PHASE
+ * architecture (exact file paths + exports + import statements).
  *
- * TR_032 — the prose "Read PLAN.md first" and "Before generating any
- * code, read every file you import from" sections were removed.
- * Across TR_029 / TR_030 / TR_031 Aider repeatedly ignored those
- * instructions and hallucinated against deployed phase artifacts.
- * The `runAider` adapter now passes those files via the `--read`
- * flag, which forces Aider to PROCESS them — not a polite request.
- * This builder returns the list of paths to inject alongside the
- * message; the caller wires them into the Aider invocation.
+ * Pre-TR_034 the message used two heavyweight context blocks:
+ *   - `## Project architecture` (full `docs/ARCHITECTURE.md`)
+ *   - `## Design context`       (full `design-spec.json` from design-agent)
+ *
+ * Both described modules by NAME (e.g. "Use the `shared/db` module"),
+ * not by file path. TR_033 verification confirmed Aider on gpt-5.5
+ * hallucinated import paths like `../../shared/db` straight from the
+ * architecture's module-name references. TR_034 replaces both blocks
+ * with the architecture-agent's per-phase `PhaseArchitecture` rendered
+ * as exact file paths + exports + import statements — produced by
+ * `designPhase()` when `HARNESS.json planner.architectureReviewPerPhase
+ * === true` and persisted onto `feature_phases.architecture`.
+ *
+ * The caller (`aider-code-agent.ts`) looks up the phase row via
+ * `findPhaseByIntent` and renders the JSON through
+ * `renderPhaseArchitecture` before calling this builder.
  *
  * This is the opposite contract from the Gestalt-native code-agent
- * (which receives a fully spec'd JSON-output prompt with file paths
- * + expected schema). Aider operates on prose tasks and writes
- * files via its own tool loop.
+ * (fully spec'd JSON-output prompt). Aider operates on prose tasks
+ * and writes files via its own tool loop.
  */
 
 import type { ContextSnapshot, IntentSpec } from '../types';
 
-const MAX_ARCHITECTURE_BYTES = 2000;
-const MAX_DESIGN_BYTES = 2000;
+const MAX_PHASE_ARCH_BYTES = 4000;
 
 /**
  * TR_032 — matches any token that looks like a relative project
@@ -43,7 +47,7 @@ const FILE_PATH_RE =
   /(?<![\w/])([a-zA-Z0-9_\-./]+\.(?:ts|tsx|js|jsx|json|md|yaml|yml|py|sql))(?![\w/])/g;
 
 /**
- * Result of building an Aider message — TR_032 splits the previous
+ * Result of building an Aider message — TR_032 split the previous
  * single-string return into the message body plus the file list to
  * pass to `runAider` via `--read`.
  */
@@ -51,32 +55,35 @@ export interface AiderMessage {
   message: string;
   /**
    * Paths (relative to the project root) the caller should pass to
-   * `runAider`'s `readFiles` parameter. PLAN.md is always present.
-   * The `runAider` adapter is responsible for filtering this list
-   * against `existsSync` before invoking Aider — over-inclusion here
-   * is intentional.
+   * `runAider`'s `readFiles` parameter. PLAN.md + cross-language
+   * compiler/dependency manifests are always present (TR_033). The
+   * `runAider` adapter is responsible for filtering against
+   * `existsSync` before invoking Aider — over-inclusion here is
+   * intentional.
    */
   readFiles: string[];
 }
 
 export function buildAiderMessage(
   intentSpec: IntentSpec,
-  designSpec: string | null,
+  /**
+   * TR_034 — the per-phase scoped architecture (rendered as markdown)
+   * produced by `architecture-agent.designPhase()` and rendered by
+   * `renderPhaseArchitecture()` in the caller. `null` when
+   * `architectureReviewPerPhase` is off or the design step failed —
+   * the message then drops to task + rules only, which is better
+   * than the pre-TR_034 full-architecture block that drove the
+   * module-name hallucinations.
+   */
+  phaseArchitecture: string | null,
   snapshot: ContextSnapshot,
 ): AiderMessage {
   const codeAgentRules =
     snapshot.harness.agentConfig?.['code-agent']?.rules ?? [];
-  const architecture = snapshot.architectureMd ?? '';
 
-  // TR_032 — PLAN.md is always cited; scope-mentioned paths are
-  // appended. The adapter's existsSync filter handles the case
-  // where PLAN.md doesn't exist yet (Phase 1 of a feature).
-  // TR_033 — also always cite the common compiler-config + dependency-
-  // manifest filenames so Aider sees the project's strictness settings
-  // and available dependencies before generating. The existsSync filter
-  // naturally drops the ones a project doesn't use (e.g. tsconfig.json
-  // on a Python project, pyproject.toml on a TypeScript project), so
-  // the list can over-cover languages without harm.
+  // TR_032 + TR_033 — base readFiles list spans cross-language
+  // compiler/dependency manifests; existsSync naturally drops files
+  // a project doesn't use.
   const scopePaths = extractMentionedPaths(intentSpec.rawIntent ?? '');
   const readFiles = dedupe([
     'PLAN.md',
@@ -114,32 +121,89 @@ export function buildAiderMessage(
     sections.push(codeAgentRules.map((r) => `- ${r}`).join('\n'));
   }
 
-  if (architecture.trim().length > 0) {
+  if (phaseArchitecture && phaseArchitecture.trim().length > 0) {
     sections.push('');
-    sections.push('## Project architecture');
-    sections.push(architecture.slice(0, MAX_ARCHITECTURE_BYTES));
-  }
-
-  if (designSpec && designSpec.trim().length > 0) {
+    sections.push('## Scoped architecture for this phase');
+    sections.push(
+      'The following describes ONLY what exists now and what you\n' +
+        'are building in this phase. Use these exact file paths,\n' +
+        'exact export names, and exact import statements. Do not\n' +
+        'invent paths or imports — if it is not listed here, it\n' +
+        'does not exist.',
+    );
     sections.push('');
-    sections.push('## Design context');
-    sections.push(designSpec.slice(0, MAX_DESIGN_BYTES));
+    sections.push(phaseArchitecture.slice(0, MAX_PHASE_ARCH_BYTES));
   }
-
-  sections.push('');
-  sections.push('## Important — architecture context is reference only');
-  sections.push(
-    'The architecture and design context above describes the intended\n' +
-      'system design. Many modules and types it mentions DO NOT EXIST\n' +
-      'YET in the repository — they are planned for future phases.\n' +
-      'Only import from files that actually exist in the repository.\n' +
-      'Use your repository map to verify a file exists before importing it.',
-  );
 
   return {
     message: sections.join('\n').trim(),
     readFiles,
   };
+}
+
+/**
+ * TR_034 — render the architecture-agent's `PhaseArchitecture`
+ * JSON into a markdown block Aider can read. Free function so the
+ * caller stays decoupled from the planning package's types — the
+ * shape is structural.
+ *
+ * Returns an empty string when the input is null / empty so the
+ * caller can pass the result straight into `buildAiderMessage`'s
+ * `phaseArchitecture` parameter.
+ */
+export function renderPhaseArchitecture(
+  pa: PhaseArchitectureShape | null,
+): string {
+  if (!pa) return '';
+  const parts: string[] = [];
+
+  if (pa.importStatements && pa.importStatements.length > 0) {
+    parts.push('### Existing dependencies — use these exact imports');
+    parts.push('');
+    for (const stmt of pa.importStatements) {
+      parts.push(stmt);
+    }
+    parts.push('');
+  }
+
+  if (pa.interfaces && pa.interfaces.length > 0) {
+    parts.push('### Interfaces / types this phase implements');
+    parts.push('');
+    for (const iface of pa.interfaces) {
+      parts.push(iface);
+      parts.push('');
+    }
+  }
+
+  if (pa.sqlSchema && pa.sqlSchema.trim().length > 0) {
+    parts.push('### SQL schema this phase introduces');
+    parts.push('');
+    parts.push(pa.sqlSchema);
+    parts.push('');
+  }
+
+  if (pa.successCriteria && pa.successCriteria.length > 0) {
+    parts.push('### Success criteria for this phase');
+    parts.push('');
+    for (const sc of pa.successCriteria) {
+      parts.push(`- ${sc}`);
+    }
+  }
+
+  return parts.join('\n').trim();
+}
+
+/**
+ * Structural shape of `PhaseArchitecture` — duplicated locally so
+ * `@gestalt/agents-generate` does not import from `@gestalt/agents-planning`
+ * (the architecture rule forbids agents from importing each other).
+ * Keep in sync with `packages/agents/planning/src/types.ts`.
+ */
+export interface PhaseArchitectureShape {
+  interfaces: string[];
+  importStatements: string[];
+  sqlSchema?: string;
+  successCriteria: string[];
 }
 
 /**

@@ -37,6 +37,7 @@ export class MssqlFeatureRepository implements FeatureRepository {
   async updatePhaseStatus(_phaseId: string, _status: PhaseStatus): Promise<FeaturePhaseRecord> { return notImplemented(); }
   async savePhaseResult(_phaseId: string, _result: unknown): Promise<FeaturePhaseRecord> { return notImplemented(); }
   async findPhaseByIntent(_intentId: string): Promise<FeaturePhaseRecord | null> { return notImplemented(); }
+  async updatePhaseArchitecture(_phaseId: string, _architecture: string | null): Promise<FeaturePhaseRecord> { return notImplemented(); }
   async incrementPhaseRetry(_phaseId: string): Promise<number> { return notImplemented(); }
   async appendLog(
     _entry: Omit<FeaturePlanLogRecord, 'id' | 'createdAt'>,

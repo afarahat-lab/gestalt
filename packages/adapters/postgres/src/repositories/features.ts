@@ -174,6 +174,18 @@ export class PostgresFeatureRepository implements FeatureRepository {
     return this.hydratePhase(row);
   }
 
+  async updatePhaseArchitecture(phaseId: string, architecture: string | null): Promise<FeaturePhaseRecord> {
+    const db = getDb();
+    const [row] = await db<FeaturePhaseRecord[]>`
+      UPDATE feature_phases
+      SET architecture = ${architecture}, updated_at = NOW()
+      WHERE id = ${phaseId}
+      RETURNING *
+    `;
+    if (!row) throw new Error(`Feature phase ${phaseId} not found`);
+    return this.hydratePhase(row);
+  }
+
   async savePhaseResult(phaseId: string, result: unknown): Promise<FeaturePhaseRecord> {
     const db = getDb();
     const [row] = await db<FeaturePhaseRecord[]>`

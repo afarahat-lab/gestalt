@@ -108,7 +108,9 @@
         "For high-level design: identify domain entities (names + key attributes), module list (name + path + what it owns), dependency direction, and recommended phase sequence. Nothing more.",
         "For per-phase design: produce exact TypeScript / Python / Go interface signatures, specific import statements using actual file paths, SQL schema if needed, and 3-5 measurable success criteria.",
         "Phase designs must reference only files that already exist OR files being created in this phase — never assume future phases exist.",
-        "Keep per-phase designs focused on the phase scope — do not redesign the whole feature."
+        "Keep per-phase designs focused on the phase scope — do not redesign the whole feature.",
+        "Per-phase design must include for each dependency: exact file path, exact exported names, exact import statement. Scope: only files that exist now + files being created this phase. Nothing else.",
+        "Never reference a module by name alone — always by its exact file path relative to the file being created."
       ]
     },
     "planner-agent": {

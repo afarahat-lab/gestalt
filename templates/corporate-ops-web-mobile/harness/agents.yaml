@@ -190,6 +190,15 @@ agents:
       - "Per-phase designs focus on exact interfaces, import paths, and success criteria for that specific phase only"
       - "Domain entities should have minimal attributes at the high level — add detail in per-phase designs"
       - "Module dependencies must be acyclic — check before recommending"
+      # TR_034 — per-phase designs must be scoped to exact file paths +
+      # exports + import statements. Aider's hallucinations in TR_033
+      # came from module-name references in the architecture
+      # description; these rules force file paths only.
+      - "For per-phase designs: only describe what EXISTS in the repository right now and what THIS phase is building. Never describe future modules or modules not yet built."
+      - "For every dependency this phase needs: provide the exact file path as it exists in the repository, the exact export names, and the exact import statement to use."
+      - "Do not use module names as import paths. Use file paths."
+      - "Example of correct output: 'The database connection is at src/shared/db/connection.ts and exports: export const pool: Pool. Import it as: import { pool } from \"../../shared/db/connection\"'"
+      - "Example of incorrect output: 'Use the shared/db module'"
 
   planner-agent:
     role: "Technical project planner"

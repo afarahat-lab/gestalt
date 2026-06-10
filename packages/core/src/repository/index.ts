@@ -687,6 +687,18 @@ export interface FeatureRepository extends BaseRepository {
    */
   findPhaseByIntent(intentId: string): Promise<FeaturePhaseRecord | null>;
 
+  /**
+   * TR_034 — persist the architecture-agent's per-phase design (the
+   * scoped `PhaseArchitecture` JSON) onto `feature_phases.architecture`.
+   * Called by the planning orchestrator when `architectureReviewPerPhase`
+   * fires. Downstream `aider-code-agent` reads this back via
+   * `findPhaseByIntent(intentId)` to render a scoped Aider message
+   * (replacing the full `design-spec.json` that pre-TR_034 fed the
+   * Aider message — and was the source of module-name hallucinations).
+   * Passing `null` clears the column.
+   */
+  updatePhaseArchitecture(phaseId: string, architecture: string | null): Promise<FeaturePhaseRecord>;
+
   // ── feature_plan_log append-only log ────────────────────────────
   appendLog(entry: Omit<FeaturePlanLogRecord, 'id' | 'createdAt'>): Promise<FeaturePlanLogRecord>;
   listLog(featureId: string): Promise<FeaturePlanLogRecord[]>;

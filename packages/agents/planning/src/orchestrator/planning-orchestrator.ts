@@ -567,7 +567,14 @@ async function runPerPhaseArchitecture(
       feature, phase.title, phase.architecture ?? phase.scope,
       archMd, priorPhases, workDir, harnessConfig, correlationId,
     );
-    const summary = JSON.stringify(pa, null, 2);
+    const summary = JSON.stringify(pa);
+    // TR_034 — persist the scoped PhaseArchitecture JSON onto
+    // `feature_phases.architecture` so `aider-code-agent` can read it
+    // back via `findPhaseByIntent` and render the Aider message's
+    // "Scoped architecture for this phase" block. The planner's
+    // optional initial architecture text is overwritten — it was
+    // already consumed by `designPhase()` as input.
+    await features.updatePhaseArchitecture(phase.id, summary);
     await features.appendLog({
       featureId: feature.id,
       phaseIndex: phase.phaseIndex,

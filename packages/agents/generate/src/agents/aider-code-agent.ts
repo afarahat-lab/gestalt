@@ -32,7 +32,11 @@ import type { AgentTask, AgentResult, GeneratedArtifact } from '../types';
 import { BaseLLMAgent } from './base-llm-agent';
 import { getLLMClientForModel, createContextLogger, getRepositories } from '@gestalt/core';
 import { runAider } from '../adapters/aider-adapter';
-import { buildAiderMessage } from '../adapters/aider-message-builder';
+import {
+  buildAiderMessage,
+  renderPhaseArchitecture,
+} from '../adapters/aider-message-builder';
+import type { PhaseArchitectureShape } from '../adapters/aider-message-builder';
 
 const log = createContextLogger({ module: 'aider-code-agent' });
 
@@ -55,11 +59,24 @@ export class AiderCodeAgent extends BaseLLMAgent {
     const apiKey = client.getApiKey();
     this.lastModelUsed = modelString;
 
-    // Pull the latest design-spec from the artifacts table — it was
-    // produced upstream by design-agent in the same cycle. Missing
-    // design-spec is non-fatal (the message builder simply omits the
-    // section) so Aider still runs.
-    const designSpec = await loadLatestDesignSpec(correlationId);
+    // TR_034 — the per-phase scoped architecture (file paths +
+    // exports + import statements from architecture-agent's
+    // `designPhase()` output) replaces the design-agent's
+    // `design-spec.json` as Aider's primary architecture context.
+    // Look it up via the phase row the planning orchestrator linked
+    // to this intent; falls back to `null` when:
+    //   - no phase is linked (non-planning intents like
+    //     pipeline-feedback resumes)
+    //   - `architectureReviewPerPhase` is off so phase.architecture
+    //     still holds the planner's free-form text (treat as
+    //     "scoped architecture not available")
+    //   - the column is empty
+    // `null` makes `buildAiderMessage` drop the architecture block
+    // entirely — better than the pre-TR_034 full-architecture block
+    // that drove module-name hallucinations.
+    const phaseArchitecture = await loadPhaseArchitectureForCycle(
+      correlationId,
+    );
 
     // TR_032 — buildAiderMessage now returns both the message body
     // and the list of files to inject into Aider's context window
@@ -68,7 +85,7 @@ export class AiderCodeAgent extends BaseLLMAgent {
     // creates it) is silently dropped rather than failing the run.
     const { message, readFiles } = buildAiderMessage(
       intentSpec,
-      designSpec,
+      phaseArchitecture,
       task.contextSnapshot,
     );
     this.lastPrompt = message;
@@ -181,23 +198,68 @@ function buildRunContext(task: AgentTask): {
   };
 }
 
-async function loadLatestDesignSpec(correlationId: string): Promise<string | null> {
+/**
+ * TR_034 — load and render the per-phase scoped architecture for
+ * the current cycle.
+ *
+ * Resolution chain: `correlationId` → intent (via
+ * `findByCorrelationId`) → phase (via `findPhaseByIntent`) →
+ * `phase.architecture`. The planning orchestrator populates
+ * `phase.architecture` with the JSON-stringified `PhaseArchitecture`
+ * in `runPerPhaseArchitecture` when
+ * `HARNESS.planner.architectureReviewPerPhase === true`.
+ *
+ * Returns `null` on any of:
+ *   - no intent matching this correlationId (non-planner intent)
+ *   - no phase linked to that intent (same)
+ *   - `phase.architecture` is null / empty
+ *   - the column contains text that isn't `PhaseArchitecture` JSON
+ *     (architectureReviewPerPhase off → planner's free-form text)
+ *
+ * Best-effort throughout: any DB error logs a warning and falls back
+ * to `null`. The Aider message builder treats `null` as
+ * "no scoped architecture available" and drops the section entirely.
+ */
+async function loadPhaseArchitectureForCycle(
+  correlationId: string,
+): Promise<string | null> {
   try {
-    const { artifacts } = getRepositories();
-    const all = await artifacts.findByCorrelationId(correlationId);
-    // Walk newest-first so a self-healing retry sees the freshest
-    // design-spec. The design-agent writes its artifact at
-    // `.gestalt/<correlationId>/design-spec.json` by convention.
-    const sorted = [...all].sort(
-      (a, b) => (b.createdAt?.getTime?.() ?? 0) - (a.createdAt?.getTime?.() ?? 0),
+    const { intents, features } = getRepositories();
+    const intent = await intents.findByCorrelationId(correlationId);
+    if (!intent) return null;
+    const phase = await features.findPhaseByIntent(intent.id);
+    if (!phase || !phase.architecture) return null;
+    const text = phase.architecture.trim();
+    if (text.length === 0 || !text.startsWith('{')) {
+      // Planner's free-form architecture text — not the
+      // `PhaseArchitecture` JSON shape this helper renders.
+      return null;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return null;
+    }
+    if (!isPhaseArchitectureShape(parsed)) return null;
+    return renderPhaseArchitecture(parsed);
+  } catch (err) {
+    log.warn(
+      { err: err instanceof Error ? err.message : String(err), correlationId },
+      'loadPhaseArchitectureForCycle failed — falling back to no scoped architecture',
     );
-    const designArtifact = sorted.find((a) =>
-      a.path.endsWith('/design-spec.json') || a.path.endsWith('design-spec.json'),
-    );
-    return designArtifact?.content ?? null;
-  } catch {
     return null;
   }
+}
+
+function isPhaseArchitectureShape(value: unknown): value is PhaseArchitectureShape {
+  if (typeof value !== 'object' || value === null) return false;
+  const obj = value as Record<string, unknown>;
+  return (
+    Array.isArray(obj['interfaces']) &&
+    Array.isArray(obj['importStatements']) &&
+    Array.isArray(obj['successCriteria'])
+  );
 }
 
 /**
