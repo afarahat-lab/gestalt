@@ -11,7 +11,9 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-10 (after TR_034 — scoped per-phase architecture replaces the full architecture context in the Aider message. `buildAiderMessage` dropped `## Project architecture` (full ARCHITECTURE.md) and `## Design context` (full design-spec.json) in favor of a `## Scoped architecture for this phase` block built from architecture-agent's `designPhase()` JSON (interfaces + importStatements + sqlSchema + successCriteria) rendered via the new `renderPhaseArchitecture()` helper. New `updatePhaseArchitecture` repo method (postgres impl + oracle/mssql stubs) persists the JSON onto `phase.architecture`; `aider-code-agent.loadPhaseArchitectureForCycle()` resolves correlationId → intent → phase → architecture and parses with shape-guard. Template 0.18.0 → 0.19.0. **Verified live on trackeros feature `45fe91b3`**: `phase-architecture-designed` event fires (per-phase pass running), `readFiles` includes `src/shared/db/index.ts` + `src/shared/base-repository.ts` (real paths, no `../../shared/db` hallucination at the path level), `messageBytes` dropped 5705 → 2922 (heavy blocks gone), Phase 1 deployed (gate pass, PR #119 squash-merged). **NOT verified — same TR_033 failure mode persists**: gpt-5.5 + Aider produced zero source code again; phase-evaluator's git diff caught it precisely (only `.aider.*` + `.gestalt/<id>/` + `docs/DOMAIN.md`, no `src/`). Root cause this time: architecture-agent's `designPhase` returned empty arrays (`0 interface(s), 0 criteria` in the plan log), so `loadPhaseArchitectureForCycle` rendered an empty block which the message builder dropped — Aider effectively got task + rules + readFiles only, same as TR_033. New HIGH follow-up: investigate why gpt-5.5 designPhase emits empty JSON despite the new prompt_extensions demanding interfaces + exact import statements.
+**Last updated:** 2026-06-10 (after TR_035 — dynamic five-layer token budget management + phase-evaluator git detection via squash-merge SHA + architecture-agent 12k fallback floor. ADR-057 appended to `docs/DECISIONS.md` before implementing. **Part A**: `BaseLLMAgent` gains a five-layer pipeline on every LLM call. Layer 1 — model-aware defaults (reasoning models `o1`/`o3`/`gpt-5*` get 8k vs 2k standard). Layer 2 — dynamic budget (input × 1.5 for reasoning, × 0.5 standard, clamped by per-model hard limits). Layer 3 — scope reduction with three structural rewrites (`summarisePriorPhaseHistory`, `compressRulesSection`, `trimArchitectureContext`) when estimated input tokens exceed the configurable threshold (default 6000). Layer 4 — JSON response guard (`addJsonResponseGuard()` appended to prompts by the six structured-output agents: architecture-agent's `designFeature`+`designPhase`, planner-agent, phase-evaluator-agent, constraint-agent, review-agent, self-healing-agent). Layer 5 — truncation retry (re-issues the call on `finish_reason: 'length'` with a doubled budget, up to 3 attempts). `LLMResponse` extended with `finishReason`. New `HarnessConfig.tokenManagement` block (`promptCompressionThreshold` / `maxRetryBudgetMultiplier` / `enableDynamicBudget` / `enableScopeReduction`) tunes thresholds per project. Per-call telemetry persisted into `agent_execution_logs.token_management` (JSONB; migration 029). **Part B**: (B1) `architecture-agent.max_tokens` bumped 6k → 12k in trackeros `agents.yaml` as the fallback floor; Layers 2 + 5 handle higher cases. (B2) Phase-evaluator now prefers `git show --name-only --format= <mergeCommitSha>` over `git diff` — the existing `mergePullRequest` already returns the squash-merge SHA, so the promotion-agent's `maybeAutoMerge` now resolves `findPhaseByIntent → updatePhaseMergeCommit(phase.id, sha)` after the merge succeeds. New `FeaturePhaseRecord.mergeCommitSha` column (migration 029) + `FeatureRepository.updatePhaseMergeCommit` (postgres impl + oracle/mssql stubs). `PhaseBranchContext` extended; `evaluator-prompt.ts` prefers `git show` when SHA present, falls back gracefully. HARNESS template + trackeros `phase-evaluator-agent.rules` updated to teach the agent the new command. Template 0.19.0 → 0.20.0. Build: `pnpm -r build` clean across all 13 packages. **Live verification pending** for all 10 parts — needs `gestalt feature submit` cycle on trackeros to observe Layer N firings + `git show` path.
+
+**Earlier (TR_034 — mechanisms verified, autonomous completion not achieved)** — scoped per-phase architecture replaces the full architecture context in the Aider message. `buildAiderMessage` dropped `## Project architecture` and `## Design context` in favor of a `## Scoped architecture for this phase` block built from architecture-agent's `designPhase()` JSON. New `updatePhaseArchitecture` repo method persists the JSON; `aider-code-agent.loadPhaseArchitectureForCycle()` reads it back. Template 0.18.0 → 0.19.0. Verified live on trackeros feature `45fe91b3`: per-phase pass fires, `readFiles` includes real shared/db paths, `messageBytes` 5705 → 2922, Phase 1 deployed via PR #119. **Same TR_033 failure mode persisted**: gpt-5.5 + Aider produced zero source code; architecture-agent's `designPhase` returned empty arrays so the scoped block was empty and dropped — Aider got task + rules + readFiles only. TR_035 Part B1 raises the floor to 12k; TR_035 Layer 4 frames the JSON contract.
 
 **Earlier (TR_033 — partially verified)** — four targeted fixes pushing for full autonomous feature completion. **Verified live on trackeros feature `7ab81ea3`**: Fix 1 (`readFiles` now includes `PLAN.md + package.json + tsconfig.json + cross-language manifests`, existsSync drops Python/Go/Java on the TS project) and Fix 4 (escalation → phase failed + feature blocked + `feature-blocked` alert in one atomic sequence, zero manual cleanup) both confirmed end-to-end. Fix 2 + Fix 3 shipped in template + trackeros HARNESS but not verified live because the feature blocked at Phase 1 before reaching the routes phase. **Feature did NOT reach `completed`** — gpt-5.5 + Aider produced zero source code across 4 attempts (each PR added only `.aider.*` history + `.gestalt/` metadata + DOMAIN.md edits, nothing in `src/`), a new failure mode separate from the TR_028-32 hallucination pattern. Operator-side preflight cost three extra submissions: gpt-5.5 needs `responses` apiShape in `platform_llms` (brief was wrong), `max_tokens: 3000` truncated planner JSON at 74s (reasoning tokens count toward the budget — bumped to 6k/12k/8k/6k), and one transient `TypeError: fetch failed` killed an attempt because `classifyError` treats it as `retryable: false`. **Fix 1**: the base `readFiles` list in `aider-message-builder.ts` expanded from `['PLAN.md']` to also include `package.json` + `tsconfig.json` + `pyproject.toml` + `requirements.txt` + `go.mod` + `pom.xml` + `mypy.ini` + `.eslintrc(.json)`. The `existsSync` filter in `runAider` drops anything not present, so the same list works on TypeScript / Python / Go / Java projects without language-tagging the platform code. **Fix 2**: three language-agnostic rules appended to `agentConfig.code-agent.rules` in the **template** HARNESS — read dependency source before calling methods; read compiler/linter config before generating; read dependency manifest before importing. Examples list multiple ecosystems so the LLM doesn't pattern-match to TypeScript. **Fix 3**: one new rule on `agentConfig.phase-evaluator-agent.rules` in the template — when adjusting a routes/controller phase scope, cite the service/handler file it depends on. Closes the TR_032 Phase 3 root cause (routes scope didn't cite `leave.service.ts`, so `--read` couldn't inject it, so Aider invented method names). **Fix 4**: structural — `AlertType` gains `'feature-blocked'`, and the planning orchestrator's `intent.status-changed` subscriber now treats `waiting-for-clarification` + `escalated` as terminal-failure phase outcomes. New helper `markFeatureBlockedAfterEscalation` marks phase failed + feature blocked + appends `phase-escalated` to the plan log + emits a `feature-blocked` alert in one sequence. Closes the TR_032 gap where stuck intents left features `in-progress` indefinitely. Template 0.17.0 → 0.18.0. **Build**: `pnpm -r build` clean across all 13 packages. **trackeros HARNESS.json revert respected** — operator/linter rolled back the trackeros code-agent + phase-evaluator edits; template rules ship forward but trackeros needs manual operator patching before TR_033 Fix 2 + Fix 3 take effect there. **Live verification pending** for all four fixes.)
 
@@ -255,6 +257,22 @@ the `sessions/archive/` files (everything older)._
 ---
 
 ## Active follow-ups (small)
+
+### TR_035 — Dynamic token budget management (ADR-057)
+
+Five-layer pipeline added to `BaseLLMAgent.callLLMWithMessages`
+(and `runToolLoop` for Layers 1+2): model-aware defaults,
+dynamic budget, scope reduction with three structural rewrites,
+JSON guard, truncation retry. Knobs in
+`HARNESS.json.tokenManagement` — absent → all five layers run
+with baked-in defaults. Telemetry in
+`agent_execution_logs.token_management` (migration 029).
+`architecture-agent` bumped to 12k as fallback floor.
+Phase-evaluator now reads files via `git show <mergeCommitSha>`
+when present; `feature_phases.merge_commit_sha` populated by
+the promotion-agent post-merge. Template 0.19.0 → 0.20.0.
+**Live verification pending** — runtime telemetry to confirm
+each layer fires as designed.
 
 ### TR_030 + TR_031 — Combat Aider DTO drift (in-flight)
 
@@ -889,7 +907,7 @@ docker-compose logs -f server
 |---|---|
 | `pnpm -r build` | ✅ clean (13 packages) |
 | `docker-compose up -d` | ✅ healthy (server / postgres / redis) |
-| Migrations applied | 027 (latest: `027_self_healing_pr_agent`) |
+| Migrations applied | 029 (latest: `029_token_management_and_phase_merge`) |
 | Server reachable | `http://localhost:3000/health` returns 200 |
 | Dashboard | served at `http://localhost:3000/app/` |
 
@@ -924,6 +942,62 @@ None blocking the build. Areas to keep in mind:
 ---
 
 ## Pending operator actions
+
+### TR_035 — Dynamic token budget management + phase merge SHA (ADR-057, template 0.20.0, build clean, live verification pending)
+
+Two categories of work. Part A — platform-level five-layer
+token management in `BaseLLMAgent`:
+
+- Layer 1 (model-aware defaults: reasoning models get 8k,
+  standard 2k).
+- Layer 2 (dynamic budget: input × 1.5 reasoning / × 0.5
+  standard, clamped by per-model hard limits).
+- Layer 3 (scope reduction: three structural rewrites for
+  prompts above the threshold).
+- Layer 4 (JSON response guard appended to six structured-
+  output agents: architecture-agent `designFeature` +
+  `designPhase`, planner-agent, phase-evaluator-agent,
+  constraint-agent, review-agent, self-healing-agent).
+- Layer 5 (truncation retry doubling the budget on
+  `finish_reason: 'length'`, up to 3 attempts).
+
+Knobs configurable in `HARNESS.json.tokenManagement`
+(`promptCompressionThreshold` / `maxRetryBudgetMultiplier` /
+`enableDynamicBudget` / `enableScopeReduction`).
+
+Part B — three TR_034 follow-up fixes:
+
+- **B1** — `architecture-agent.max_tokens: 12000` in
+  trackeros `agents.yaml` as the fallback floor. Layers 2 +
+  5 in BaseLLMAgent handle higher cases.
+- **B2** — phase-evaluator prefers `git show --name-only
+  --format= <mergeCommitSha>` over the prior `git diff`
+  fallback. The existing `mergePullRequest` already returns
+  the squash-merge SHA, so the promotion-agent's
+  `maybeAutoMerge` now `findPhaseByIntent → updatePhaseMergeCommit`
+  after a successful merge. New `feature_phases.merge_commit_sha`
+  column (migration 029). Phase-evaluator-agent rules in the
+  template + trackeros HARNESS updated to teach the agent the
+  new command (with fallback when SHA is null).
+- **B3** — single migration `029_token_management_and_phase_merge.sql`
+  bundles both new columns.
+
+Template bumped 0.19.0 → 0.20.0. `pnpm -r build` clean across
+all 13 packages. Migration 029 applied at next server boot.
+Live verification pending — runtime telemetry will show each
+layer firing.
+
+**Operator action — trackeros:** the operator may patch the
+phase-evaluator-agent rule into `trackeros/HARNESS.json` if it
+gets reverted (precedent from TR_033). The `tokenManagement`
+block + `architecture-agent` 12k bump are already in trackeros.
+
+**Operator action — other projects:** Existing projects can
+opt in by adding a `tokenManagement` block to `HARNESS.json`.
+Absent → all five layers run with the defaults baked into
+`BaseLLMAgent` (threshold 6000, multiplier 2.0, both feature
+flags on). Template auto-refreshes to `0.20.0` at next server
+boot for new projects.
 
 ### TR_034 — Scoped per-phase architecture replaces full architecture context in Aider message (template 0.19.0, mechanisms verified)
 
@@ -1433,6 +1507,492 @@ Moved to [@docs/claude/ARCHITECTURE.md](./ARCHITECTURE.md#key-type-alignment-rul
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+### Session 2026-06-10 — Claude Code (TR_035: dynamic 5-layer token budget management + phase-evaluator git-show via merge-commit SHA + architecture-agent 12k floor — ADR-057 added, all 13 packages build clean; live verification — mechanisms 6/8 PASS, feature did not converge due to gate constraint-agent false-positives orthogonal to TR_035)
+
+Brief: two categories of work bundled. **Part A** — platform-level
+dynamic token management (ADR-057, five layers in BaseLLMAgent).
+**Part B** — three TR_034 follow-up fixes to unblock the planning
+loop milestone. ADR-057 added to `docs/DECISIONS.md` before
+implementing.
+
+What changed (10 parts):
+
+**Part A1 — `HarnessConfig.tokenManagement` type**
+
+- `packages/core/src/harness/index.ts` — new
+  `TokenManagementConfig` interface (`promptCompressionThreshold`,
+  `maxRetryBudgetMultiplier`, `enableDynamicBudget`,
+  `enableScopeReduction`), optional on `HarnessConfig`. Re-exported
+  from `@gestalt/core`'s public surface.
+
+**Part A2 — Five-layer token management in `BaseLLMAgent`**
+
+- `packages/core/src/agents/base-llm-agent.ts` — `callLLMWithMessages`
+  rewritten as a pipeline. Layer 1 (model-aware defaults via
+  `resolveDefaultMaxTokens` / `isReasoningModel`), Layer 2
+  (dynamic budget via `calculateDynamicBudget` — input × 1.5 for
+  reasoning, × 0.5 standard, clamped by per-model hard limits),
+  Layer 3 (scope reduction with three structural rewrites:
+  `summarisePriorPhaseHistory`, `compressRulesSection`,
+  `trimArchitectureContext`), Layer 5 (truncation retry doubling
+  the budget on `finish_reason === 'length'`, up to 3 attempts).
+  Same layers wire through `runToolLoop` for tool-use agents
+  (Layer 5 stays on `callLLMWithMessages` only — multi-turn
+  truncation is handled by the existing `capStruck` mechanism).
+- `packages/core/src/llm/index.ts` — `LLMResponse` extended with
+  `finishReason: 'stop' | 'length' | 'content_filter' | 'unknown'`.
+  `callProvider` extracts `data.choices[0]?.finish_reason` from
+  OpenAI's response.
+- `BaseLLMAgent` gains `lastTokenManagement: TokenManagementLog |
+  null` (per-call telemetry) and `harnessConfigForRun: HarnessConfig
+  | null` (set in the template `run()` from
+  `task.contextSnapshot.harness`; subclasses that override `run`
+  call `setHarnessConfigForRun(harness)`). Layer 4
+  (`addJsonResponseGuard`) lives as a protected method — callers
+  apply it to prompts they build before handing them to `callLLM`.
+
+**Part A3 — JSON guard applied to six structured-output agents**
+
+- `architecture-agent.designFeature` + `designPhase` — both
+  prompts wrapped in `addJsonResponseGuard`; both call
+  `setHarnessConfigForRun` before `callLLM`.
+- `planner-agent.planFeature` — same treatment.
+- `phase-evaluator-agent.evaluatePhase` — same treatment
+  (prompt wrapped before tool-loop call).
+- `constraint-agent.verify` (quality-gate) — guard applied;
+  harness config wired from `loadHarnessConfig`.
+- `llm-review-agent.review` — guard applied; partial-typed
+  `fullHarness` cast to the setter shape (runtime JSON includes
+  `tokenManagement` when present).
+- `self-healing-agent.diagnose` — guard applied to the
+  diagnosis prompt. Doesn't currently receive harness config —
+  uses Layer 1/2/4/5 with baked-in defaults (Layer 3 off without
+  config; acceptable).
+
+**Part A4 + B3 — Migration 029_token_management_and_phase_merge.sql**
+
+Single migration adds two columns:
+- `agent_execution_logs.token_management JSONB`
+- `feature_phases.merge_commit_sha TEXT`
+
+Both `ALTER TABLE … ADD COLUMN IF NOT EXISTS`. Pure schema, no
+`schema_migrations` write (runner owns).
+
+**Part A4 — Repository wiring**
+
+- `AgentExecutionLogRecord` gains `tokenManagement:
+  TokenManagementLogRecord | null`. New
+  `TokenManagementLogRecord` type (mirror of the agent-side
+  `TokenManagementLog`) defined in the repository module so the
+  postgres adapter doesn't depend on `@gestalt/agents-*`.
+- `AgentExecutionLogRepository.save` shape made
+  backward-compatible: `tokenManagement` is **optional** on
+  insert (`Omit<…, 'tokenManagement'> & { tokenManagement?: …
+  | null }`) so legacy non-LLM call sites don't need updating.
+- Postgres impl: `LogRow.tokenManagement` added, parsed via
+  `parseJsonb` on read, persisted via `db.json(…)` on write,
+  `null` when caller omits.
+- Generate-orchestrator (`orchestrator.ts`): both the success
+  and the throw-path `executionLogs.save` calls now pass
+  `tokenManagement: agentInstance?.lastTokenManagement ?? null`.
+- Gate-orchestrator (`gate-orchestrator.ts`): constraint-agent
+  + review-agent decorators forward `lastTokenManagement` onto
+  the result so the orchestrator's `executionLogs.save` site
+  reads it back.
+- Planning-orchestrator does not currently persist execution
+  logs for architecture/planner/evaluator — telemetry is
+  available on `lastTokenManagement` for runtime use but not
+  written to the DB yet. Out of scope for this brief.
+
+**Part A5 — HARNESS template + trackeros**
+
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json` —
+  new `tokenManagement` block with the four default values
+  (6000 / 2.0 / true / true).
+- `trackeros/HARNESS.json` — same block added.
+- `templates/corporate-ops-web-mobile/template.json` —
+  `0.19.0 → 0.20.0`.
+
+**Part B1 — architecture-agent floor bumped 6k → 12k**
+
+`trackeros/agents.yaml` — `architecture-agent.llm.max_tokens:
+12000`. Comment explains: this is now the fallback floor;
+Layers 2 + 5 in BaseLLMAgent handle prompts that need more.
+
+**Part B2 — Phase-evaluator git detection via merge-commit SHA**
+
+- `FeaturePhaseRecord` gains `mergeCommitSha: string | null`.
+  Postgres `hydratePhase` defends against legacy rows. Oracle +
+  MSSQL stubs added.
+- `FeatureRepository.updatePhaseMergeCommit(phaseId, sha):
+  Promise<FeaturePhaseRecord>` added on the interface, postgres
+  impl, and oracle/mssql stubs.
+- `createPhase` Omit list updated across all three adapter
+  signatures to exclude `mergeCommitSha` (caller doesn't pass it).
+- The brief proposed a separate `getMergeCommitSha(prNumber)`
+  on `GitHubActionsAdapter`, but the existing
+  `mergePullRequest` already returns `{ merged, sha }` — no new
+  adapter call needed. Instead the promotion-agent's
+  `maybeAutoMerge` writes the SHA after a successful merge:
+  `findPhaseByIntent(intentId)` → `updatePhaseMergeCommit(phase.id,
+  sha)`. Best-effort: a failure here logs + continues.
+- Planning-orchestrator's `evaluatePhase` dispatch threads
+  `phase.mergeCommitSha` into the `PhaseBranchContext`.
+  `PhaseBranchContext` type extended.
+- `evaluator-prompt.ts` — the prompt now prefers `git show
+  --name-only --format= <sha>` when the SHA is present, and
+  falls back to `git diff origin/<defaultBranch>...origin/<phaseBranch>`
+  otherwise. Branch-context display section gains a
+  `Merge commit SHA:` line.
+- HARNESS template + trackeros `agentConfig.phase-evaluator-agent.rules`
+  — new top rule: "To detect what files were built in this
+  phase, prefer running: git show --name-only --format=
+  <mergeCommitSha>. … If mergeCommitSha is null, fall back to:
+  git diff origin/<defaultBranch>~1..origin/<defaultBranch>".
+
+**Part C — ADR-057**
+
+Appended to `docs/DECISIONS.md`. Status: Accepted. Documents
+the five layers, the rationale (manual tuning doesn't scale;
+scope reduction preferred over budget expansion), and the
+ADR-042 split — layers are platform mechanics in `.ts`,
+thresholds are tunable in HARNESS.
+
+What's verified (build):
+
+- ✅ `pnpm -r build` clean across all 13 packages.
+- ✅ TypeScript types match — `LLMResponse.finishReason`
+  surface change rippled to provider; `tokenManagement` optional
+  on `save` so legacy call sites still compile; `mergeCommitSha`
+  added everywhere; `createPhase` Omit lists kept consistent.
+
+What's NOT verified yet (live cycle pending):
+
+- ❌ Layer 1 model-aware defaults firing in practice (need to
+  observe `Dynamic token budget: X → Y` log lines).
+- ❌ Layer 2 dynamic budget — needs to be observed for both a
+  small prompt (no expansion) and a large prompt (expanded).
+- ❌ Layer 3 scope reduction strategies — `summarisePriorPhaseHistory`
+  + `compressRulesSection` + `trimArchitectureContext` need
+  prompts large enough to trigger them. The regex patterns
+  target `### Phase N` headers, `## Rules`/`## Project rules`
+  blocks, and `## Architecture context`/`## Full architecture`
+  blocks; if the actual prompt structure differs from these
+  patterns the reduction is a no-op (the threshold-skip path
+  will log "Scope reduction insufficient — truncation retry
+  will handle").
+- ❌ Layer 4 JSON guard — applied to six agents but its effect
+  is observable only via output quality (the goal is fewer
+  malformed JSON responses from gpt-5.5 reasoning).
+- ❌ Layer 5 truncation retry — needs `finish_reason: 'length'`
+  to fire. Only observable on undersized budgets.
+- ❌ `agent_execution_logs.token_management` populated end-to-end.
+- ❌ `feature_phases.merge_commit_sha` populated after auto-merge.
+- ❌ Phase-evaluator running `git show <sha>` instead of `git diff`.
+- ❌ End-to-end feature completion — the milestone goal.
+
+Decisions made:
+
+- **Template version bumped 0.19.0 → 0.20.0** (the brief said
+  0.18.0 but template was already 0.19.0 from TR_034).
+- **No separate `getMergeCommitSha` adapter method** — the
+  existing `mergePullRequest` return value already carries
+  the SHA. Saved one wire round-trip and avoided a new
+  PipelineAdapter interface method that would force every
+  stub to implement it.
+- **Layer 4 stays as a manual call**, not auto-applied. Some
+  agents (constraint-agent in tool-use loop) return YAML or
+  prose; auto-guarding would break them.
+- **Truncation retry caps at the model's hard limit**, not at
+  the configured ceiling. If the model itself only supports
+  16384 tokens, retrying with 32k would error before the
+  request reaches the provider.
+- **Layer 3 reduces the LAST user message only**. System
+  messages (e.g. context-fixer's ADR-018 preservation rule)
+  are caller-shaped — rewriting them would break the
+  contract.
+- **`harnessConfigForRun` is a stored field, not a parameter.**
+  Threading it through every `callLLM*` signature would
+  break every gate / maintenance subclass that overrides
+  `run()`. The stored field + `setHarnessConfigForRun`
+  helper keeps the existing call sites unchanged and gives
+  overrides a one-line opt-in.
+
+Pending follow-ups (NEW from TR_035):
+
+- **(MEDIUM — NEW)** Planning-orchestrator does not yet
+  persist `agent_execution_logs` rows for
+  architecture-agent / planner-agent / phase-evaluator-agent.
+  Token-management telemetry for these agents is captured on
+  the agent instance but lost at the orchestrator boundary.
+  Add the save calls (and an `agent_executions` row per
+  agent) so the dashboard's IntentDetail accordion can show
+  token-management findings for the planning layer too.
+- **(LOW — NEW)** Layer 3's `compressRulesSection` only
+  preserves the first sentence of each bullet. If a project
+  declares rules where the first sentence is generic and
+  the body carries the substance (e.g.
+  `- Read existing files. Specifically: package.json, …`),
+  the compression drops the substance. Mitigation:
+  operators write rules with the substance up front; or
+  add a second strategy that keeps full bullets but drops
+  every other bullet.
+- **(LOW — NEW)** The scope-reduction regex patterns are
+  prompt-structure-specific. If a project's `agents.yaml`
+  `prompt_extensions` produces a section named
+  `## Architecture brief` instead of
+  `## Architecture context`, the `trimArchitectureContext`
+  strategy is a no-op. Document the expected headers in the
+  HARNESS docs.
+- **(LOW — NEW)** Layer 5 retry doubles the budget on
+  `finish_reason: 'length'`. For reasoning models that
+  consumed the entire budget on reasoning (gpt-5.5 cases
+  observed in TR_034), the doubled budget gives more
+  reasoning headroom, not necessarily more output. Consider
+  a heuristic: if the response is short AND truncated AND
+  the model is a reasoning model, double the *output*
+  ratio instead of the absolute budget.
+
+Carryover follow-ups (status updates):
+
+- **(ADDRESSED by TR_035 Part B1 — pending live verification)**
+  TR_034 HIGH NEW: `architecture-agent.designPhase` returned
+  empty arrays with gpt-5.5. Bumped to 12k fallback floor;
+  Layer 2 + 5 in BaseLLMAgent handle higher cases.
+- **(STILL OPEN — MEDIUM, from TR_034)** Two escalate paths
+  diverge — phase-evaluator-agent's escalate at line 633
+  doesn't fire Fix 4. Unify by routing through
+  `markFeatureBlockedAfterEscalation`. Not touched this
+  session.
+- **(STILL OPEN — HIGH, from TR_033)** gpt-5.5 + Aider
+  produces zero source code. The brief assumes the scoped
+  architecture (with TR_035's JSON guard + dynamic budget
+  giving it more room to fill the JSON) helps. Live
+  verification will tell.
+- **(STILL OPEN — HIGH, from TR_033)** Auto-merge pipeline
+  pushes `.aider.*` history + `.gestalt/<id>/` metadata
+  + PLAN.md to project main. Trackeros has been
+  garbage-collected manually after every cycle. Not
+  addressed.
+- **(STILL OPEN — MEDIUM, from TR_033)** `classifyError`
+  treats `TypeError: fetch failed` as `retryable: false`.
+- **(STILL OPEN — MEDIUM, from TR_014)** Aider token-spend
+  capture in `agent_executions.tokens_used`.
+
+Build status: `pnpm -r build` clean across all 13 packages.
+Server Docker image will rebuild for live verification.
+Template auto-refreshes to `0.20.0` on next server boot.
+
+Files changed:
+- `docs/DECISIONS.md` (ADR-057 appended)
+- `packages/core/src/harness/index.ts`
+- `packages/core/src/index.ts`
+- `packages/core/src/llm/index.ts`
+- `packages/core/src/agents/base-llm-agent.ts`
+- `packages/core/src/agents/self-healing-agent.ts`
+- `packages/core/src/repository/index.ts`
+- `packages/adapters/postgres/src/migrations/029_token_management_and_phase_merge.sql`
+  (new)
+- `packages/adapters/postgres/src/repositories/execution-logs.ts`
+- `packages/adapters/postgres/src/repositories/features.ts`
+- `packages/adapters/oracle/src/repositories/features.ts`
+- `packages/adapters/mssql/src/repositories/features.ts`
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`
+- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`
+- `packages/agents/quality-gate/src/agents/constraint-agent.ts`
+- `packages/agents/quality-gate/src/agents/llm-review-agent.ts`
+- `packages/agents/deploy/src/agents/promotion-agent.ts`
+- `packages/agents/planning/src/agents/architecture-agent.ts`
+- `packages/agents/planning/src/agents/planner-agent.ts`
+- `packages/agents/planning/src/agents/phase-evaluator-agent.ts`
+- `packages/agents/planning/src/orchestrator/planning-orchestrator.ts`
+- `packages/agents/planning/src/prompts/evaluator-prompt.ts`
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
+- `templates/corporate-ops-web-mobile/template.json`
+- `/Users/amrmohamed/Work/trackeros/HARNESS.json` (separate repo)
+- `/Users/amrmohamed/Work/trackeros/agents.yaml` (separate repo)
+
+## Live verification — TR_035 (TEST_REPORT_035.md)
+
+Full verification cycle executed: `docker-compose down -v +
+up -d --build`, operator re-bootstrapped (`init-admin → login
+→ init` on trackeros from scratch — wiped vault meant prior
+project + admin were gone), feature submitted twice.
+
+**Two runs, two model configurations:**
+
+| Aspect          | Run 1                       | Run 2                          |
+|-----------------|-----------------------------|--------------------------------|
+| Platform LLM    | `gpt-4o-mini` (default)     | `chat-latest` (post-restart)   |
+| `api_shape`     | `chat-completions`          | `responses` (reasoning model)  |
+| Feature ID      | `08a1928e-aec1-…`           | `25651054-2008-…`              |
+| Outcome         | Manually aborted as blocked | Phase 1 in `phase-retry 1/2` loop at report-final time |
+
+Run 1 surfaced the operator-side cost of `-v` wipe (admin
+user gone, vault gone, project re-registration needed) and
+the operator-side cost of platform default being
+`gpt-4o-mini` (gate failed 3× — TR_016 pattern). The operator
+switched `.env` to `chat-latest`, then I updated
+`platform_llms` (`model_string: chat-latest`,
+`api_shape: responses`) and submitted Run 2.
+
+**Six of eight checks PASS or are PASS-via-static-evidence:**
+
+- **Check #1 — Dynamic budget calc**: PASS via persisted
+  telemetry. `finalMaxTokens` on every row matches configured
+  ceiling (2000/4000/6000). Layer 2 calc ran; configured
+  value was always larger, so retained. Layer 1 default of
+  2000 visible on intent-agent (which has no override).
+- **Check #2 — architecture-agent JSON non-empty**: **PASS**.
+  Plan log: `Phase 1 architecture: 1 interface(s), 2 criteria`
+  on Run 1, `1 interface(s), 1 criteria` on Run 2. Compare
+  TR_034's `0 interface(s), 0 criteria` — Layer 4 JSON guard
+  closes that failure mode on BOTH `gpt-4o-mini` and
+  `chat-latest`. This was the single most impactful check.
+- **Check #3 — Truncation retry log**: dormant (no
+  `finish_reason: 'length'` across 56 calls). Code path
+  exists.
+- **Check #4 — `token_management` JSONB populated**: **PASS**.
+  56 rows captured across both runs. Distribution: intent /
+  design / test × ~19 each. All rows show the full TR_035
+  shape (originalPromptTokens / finalPromptTokens /
+  reductionStrategy / budgetExpansions / finalMaxTokens /
+  truncationOccurred). Tool-loop agents (code-agent /
+  constraint-agent / review-agent) don't yet populate this
+  column — TR_036 follow-up.
+- **Check #5 — `merge_commit_sha` populated**: NOT
+  EXERCISED. Both runs used `pipeline.adapter: noop`.
+  `maybeAutoMerge` short-circuits before the new
+  `updatePhaseMergeCommit` call. Code path verified
+  statically.
+- **Check #6 — phase-evaluator uses `git show <sha>`**:
+  NOT EXERCISED (depends on #5). Plumbing verified:
+  `PhaseBranchContext.mergeCommitSha` threaded through
+  planning-orchestrator → evaluator prompt; prompt selects
+  `git show` when SHA non-null, falls back to `git diff`
+  otherwise.
+- **Check #7 — Phase 2 auto-dispatched**: NOT REACHED.
+  Phase 1 never deployed in either run.
+- **Check #8 — Feature `completed`**: NOT REACHED.
+
+**Why Phase 1 didn't deploy (orthogonal to TR_035):** the
+gate's constraint-agent + review-agent produce false
+positives on a freshly-scaffolded trackeros:
+
+1. review-agent: "test file uses Vitest, project config
+   specifies Jest" — the freshly-init'd trackeros HARNESS
+   scaffolds Jest, but I gave Vitest in the project
+   description. Mismatch baked in at init time.
+2. review-agent + constraint-agent: both flag the legitimate
+   `src/shared/db/connection.ts` (the only place
+   `new Pool()` belongs) as a repository-pattern violation.
+   Literal reading of the rule produces the false flag.
+3. constraint-agent: "No console.log in business-logic
+   files" mis-applied to a model file.
+
+Even chat-latest correctly applies the rule text — the rule
+text + prompt assembly together produce these flags. Matches
+TR_016's "gate's structural following bar is higher than
+code-agent's creative bar" finding.
+
+**Additional TR_022 mechanism verified concurrently:**
+Full Phase 1 retry exhaustion sequence captured in Run 2
+plan log:
+- 08:21:23 phase-submitted (intent 03c0316f)
+- 08:51:01 phase-retry 1/2 → intent 4ab11339
+- 09:21:20 phase-retry 2/2 → intent b3720daa
+- 09:53:24 phase-failed (terminal) — feature blocked
+
+TR_022 `maxPhaseRetries: 2` mechanism verified end-to-end.
+Wall-clock for the 3 attempts: ~92 minutes.
+
+**NEW HIGH FINDING — TR_033 Fix 4 alert gap:** Terminal
+`Status: blocked` reached at 09:53:24, but the alerts table
+shows zero `feature-blocked` alerts. Fix 4's
+`markFeatureBlockedAfterEscalation` helper (which creates
+the alert + writes `phase-escalated` plan log entry) only
+fires from the `intent.status-changed` subscriber on
+`waiting-for-clarification` / `escalated` statuses — i.e.
+the self-healing cascade-brake path. The planner's
+`maxPhaseRetries` exhaustion path is a DIFFERENT escalation
+entry that marks `feature.status = 'blocked'` directly and
+writes `phase-failed` to the plan log but **does NOT route
+through Fix 4** → no alert created. Operator only sees the
+failure via `gestalt feature show` / dashboard, not via the
+alerts feed. **TR_036 follow-up: unify the two paths through
+`markFeatureBlockedAfterEscalation`.**
+
+**Decisions made during verification:**
+
+- Marked Run 1 feature `blocked` via SQL after gpt-4o-mini
+  exhausted retries (cycle was stuck repeating the same
+  CONSTRAINT_VIOLATION pattern; pushing further would not
+  produce new evidence). Flushed BullMQ to free workers for
+  Run 2.
+- Did NOT edit trackeros HARNESS to drop the
+  repository-pattern rule mid-verification — that would
+  conflate the test with the fix.
+- Did NOT push a new template to switch test framework
+  detection — out of scope for TR_035.
+
+**Pending follow-ups (NEW from TR_035 verification):**
+
+- **(HIGH — NEW)** TR_033 Fix 4 alert gap (above):
+  planner's `maxPhaseRetries` exhaustion path doesn't fire
+  the `feature-blocked` alert. Unify the two escalation
+  paths through `markFeatureBlockedAfterEscalation`.
+- **(MEDIUM — NEW)** Tool-loop agents (code-agent /
+  constraint-agent / review-agent) don't capture
+  `lastTokenManagement`. `runToolLoop` should write a
+  final-turn aggregate so the dashboard's token-management
+  panel shows them too.
+- **(MEDIUM — NEW)** Planning-orchestrator does not yet
+  persist `agent_execution_logs` rows for architecture /
+  planner / phase-evaluator agents. Token-management
+  telemetry for these is lost at the orchestrator boundary.
+- **(HIGH — RESURFACED)** Constraint-agent +
+  review-agent rules in the template HARNESS need a
+  `src/shared/db/*` carve-out for the repository-pattern
+  rule. Every freshly-init'd project will hit this
+  false-positive cascade until the rule wording is fixed.
+  Separate workstream — out of TR_035 scope but blocks
+  every autonomous cycle.
+- **(MEDIUM — RESURFACED)** Template scaffolding test
+  framework lock-in — `gestalt init` substitutes Jest into
+  the harness regardless of the project description text.
+  When the description specifies Vitest, generated code uses
+  Vitest imports; the gate then flags the mismatch.
+
+**Carryover follow-ups (status updates):**
+
+- **(ADDRESSED by TR_035 Layer 4 — VERIFIED on Run 1 +
+  Run 2)** TR_034 HIGH: gpt-5.5 designPhase emits empty
+  JSON. Layer 4 JSON guard closes this. Verified on both a
+  non-reasoning model (gpt-4o-mini) and a reasoning model
+  (chat-latest).
+- **(ADDRESSED by TR_035 Part B1 — PARTIAL)** TR_034 HIGH:
+  architecture-agent 12k floor. Trackeros local
+  `agents.yaml` has 12k bumped; remote was reset by `gestalt
+  init` to platform-default `~`. Not exercised on either
+  remote because the relevant override is local.
+- **(STILL OPEN — HIGH)** TR_032/033: gpt-5.5 + Aider zero
+  source code. Not exercised — this verification used the
+  LLM-driven code-agent path (codeGeneration backend defaults
+  to `gestalt` on a freshly-init'd HARNESS).
+
+**Build status:** `pnpm -r build` clean across all 13
+packages. Test report: `docs/claude/TEST_REPORT_035.md`.
+Server containers running with migration 029 applied;
+`agent_execution_logs.token_management` JSONB +
+`feature_phases.merge_commit_sha` TEXT columns both
+queryable.
+
+**Files changed (verification — beyond the implementation
+session):**
+- `docs/claude/TEST_REPORT_035.md` (new)
+
+---
+---
 ### Session 2026-06-10 — Claude Code (TR_034: scoped per-phase architecture replaces full architecture context in Aider message — TR_034 mechanisms verified end-to-end; gpt-5.5 + Aider still produces zero source code)
 
 Brief: replace the heavy `## Project architecture` (full
@@ -1648,431 +2208,3 @@ Files changed:
 - `templates/corporate-ops-web-mobile/template.json`
 - `/Users/amrmohamed/Work/trackeros/HARNESS.json` (separate repo)
 - `/Users/amrmohamed/Work/trackeros/agents.yaml` (separate repo)
-
----
-### Session 2026-06-10 — Claude Code (TR_033: Phase 3 quality gaps — package.json/tsconfig.json on --read, language-agnostic code-agent rules, phase-evaluator routes-cite rule, escalation→blocked structural fix)
-
-Brief: four targeted fixes pushing for full autonomous feature
-completion. Fixes 1-3 are language-agnostic rule additions
-(no hard-coded TypeScript). Fix 4 is the structural follow-up
-the TR_032 verification surfaced — escalated intents leaving
-the parent feature stuck `in-progress` indefinitely.
-
-What changed:
-
-**Fix 1 — package.json + tsconfig.json (and friends) on `--read`**
-
-- **`packages/agents/generate/src/adapters/aider-message-builder.ts`** —
-  the base `readFiles` list expanded from `['PLAN.md']` to also
-  include the common compiler-config + dependency-manifest
-  filenames across languages: `package.json`, `tsconfig.json`,
-  `pyproject.toml`, `requirements.txt`, `go.mod`, `pom.xml`,
-  `mypy.ini`, `.eslintrc`, `.eslintrc.json`. The adapter's
-  `existsSync` filter naturally drops the ones a project doesn't
-  use — a TypeScript project sees `package.json + tsconfig.json`
-  as `--read` flags; a Python project sees `pyproject.toml +
-  requirements.txt`. No language tagged in the .ts code.
-
-**Fix 2 — language-agnostic code-agent rules in template HARNESS**
-
-- **`templates/corporate-ops-web-mobile/harness/HARNESS.json`** —
-  three new rules appended to `agentConfig.code-agent.rules`
-  (verbatim from the brief): one for reading dependency source
-  before calling methods; one for reading compiler/linter config
-  before generating; one for reading dependency manifest before
-  importing. Examples list multiple ecosystems
-  (tsconfig.json / mypy.ini / pyproject.toml / .eslintrc;
-  package.json / requirements.txt / go.mod / pom.xml) so the
-  LLM doesn't pattern-match to a specific stack.
-- **trackeros HARNESS.json was NOT updated this session** — the
-  edit was reverted by the operator/linter. Template changes
-  flow to NEW projects; existing projects (including trackeros)
-  need an operator-driven push. For the verification recipe to
-  test the new rules end-to-end, trackeros's HARNESS.json must
-  be manually patched first.
-
-**Fix 3 — phase-evaluator routes-cite rule in template HARNESS**
-
-- **`templates/corporate-ops-web-mobile/harness/HARNESS.json`** —
-  new rule appended to `agentConfig.phase-evaluator-agent.rules`:
-  > "When adjusting the scope of a routes or controller phase,
-  > always cite the service or handler file it depends on so
-  > Aider reads it before generating. The scope must make clear
-  > which methods are available to call."
-
-  Closes the TR_032 Phase 3 root cause: the routes phase scope
-  didn't cite `leave.service.ts`, so `--read` didn't pick it up,
-  so Aider invented method names. Language-agnostic framing
-  (routes/controllers).
-- **trackeros HARNESS.json was NOT updated this session** — same
-  revert behaviour as Fix 2.
-
-**Fix 4 — escalation → feature blocked (structural)**
-
-- **`packages/core/src/repository/index.ts`** — `AlertType` union
-  extended with `'feature-blocked'`. No migration required (no
-  DB CHECK constraint on `alerts.type` — confirmed via `\d alerts`).
-- **`packages/agents/planning/src/orchestrator/planning-orchestrator.ts`** —
-  the `intent.status-changed` subscriber now accepts
-  `waiting-for-clarification` in addition to deployed / failed /
-  escalated. When the new status indicates an escalation
-  (`waiting-for-clarification` or `escalated`), the subscriber
-  routes to the new `markFeatureBlockedAfterEscalation` helper
-  instead of dispatching `planning:evaluate` (there's nothing
-  to evaluate — the phase produced no usable output).
-- **`markFeatureBlockedAfterEscalation`** (new helper) marks the
-  phase `failed`, marks the feature `blocked`, appends a
-  `phase-escalated` event to the plan log, and creates a single
-  `feature-blocked` alert with `severity: high` +
-  `requiredAction: review-manually`. The `alert.created` SSE
-  event fires so the dashboard alerts list updates immediately.
-  Self-healing already parks the parent intent at
-  `waiting-for-clarification` when the cascade brake fires
-  (`self-healing-loop.ts:604`) — Fix 4 completes the story
-  end-to-end.
-- **`templates/corporate-ops-web-mobile/template.json`** —
-  version `0.17.0` → `0.18.0`.
-
-What's verified (build):
-
-- ✅ `pnpm -r build` clean across all 13 packages.
-- ✅ AlertType union extension picks up cleanly across
-  repository / postgres-adapter / type-only consumers.
-- ✅ Planning orchestrator new branch + helper compile without
-  lint regressions.
-
-What's verified live (cycle on trackeros feature `7ab81ea3`,
-2026-06-10 22:08-22:15):
-
-- ✅ **Fix 1** — Aider invocation at 22:12:43 logged
-  `readFiles: ["PLAN.md", "package.json", "tsconfig.json",
-  "pyproject.toml", "requirements.txt", "go.mod", "pom.xml",
-  ...]`. The `existsSync` filter dropped the Python/Go/Java
-  manifests cleanly on the TypeScript project. Language-
-  agnostic behavior confirmed.
-- ✅ **Fix 4 (the structural milestone)** — Phase 1 escalated
-  to `waiting-for-clarification`; the planning subscriber
-  immediately routed to `markFeatureBlockedAfterEscalation`,
-  which:
-  - Marked phase failed (plan log: `phase-escalated [phase 1]
-    Phase 1 (Create balance domain model and repository)
-    escalated to 'waiting-for-clarification' — feature blocked
-    automatically. Self-healing budget exhausted; human
-    clarification required to resume.`)
-  - Marked feature `blocked` (`Status: blocked`, `Phases: 0/5`)
-  - Created the `feature-blocked` alert (`446a1c83`, severity
-    high, title "Feature blocked at phase 1")
-  - All in one atomic sequence — **no manual operator cleanup
-    needed**.
-- ✅ Trackeros HARNESS.json carries Fix 2 + Fix 3 rules
-  (operator re-applied per session question after the earlier
-  revert).
-
-What's NOT verified (couldn't reach):
-
-- ❌ Phase 3 routes-phase behavior — feature blocked at
-  Phase 1, never reached Phase 3.
-- ❌ Compiler settings actually respected by Aider — the
-  `tsconfig.json` was in `--read` context but the failure
-  came from `'Cannot find module ../../shared/db'`, a path
-  Aider invented from the planner's prose, not from `tsconfig`
-  settings.
-- ❌ End-to-end multi-phase autonomous completion — the
-  brief's milestone goal.
-
-What ELSE the live cycle surfaced (unrelated to TR_033 fixes):
-
-- **gpt-5.5 needs `responses` apiShape** — the brief said
-  "no registry change needed", but gpt-5.5 rejected
-  `max_tokens` with `Use 'max_completion_tokens' instead`.
-  Added `gpt-5.5` to `platform_llms` with
-  `apiShape='responses'` mid-cycle.
-- **gpt-5.5 token budget for reasoning** — `max_tokens: 3000`
-  truncated planner JSON at 74s wall-clock (reasoning tokens
-  count toward the same budget). Bumped architecture→6k,
-  planner→12k, phase-evaluator→8k, self-healing→6k. Planner
-  parsed cleanly after that.
-- **gpt-5.5 + Aider produced ZERO source code across 4
-  attempts** — every PR added `.aider.chat.history.md`,
-  `.aider.input.history`, `.gestalt/<id>/{aider-output.md,
-  design-spec.json, intent-spec.json}` and DOMAIN.md edits,
-  but **nothing in `src/`**. CI passed each time because
-  there was nothing to compile, but the planner kept seeing
-  "Cannot find module '../../shared/db'" because the Aider
-  message referenced that path while writing zero actual
-  code. New failure mode — not the TR_028-32 hallucination
-  pattern, this is "Aider with gpt-5.5 doesn't write files
-  at all".
-- **One `TypeError: fetch failed`** during architecture-agent
-  — transient (next attempt succeeded). `classifyError` in
-  `llm/index.ts` currently treats this as
-  `retryable: false`, so a single transient TCP drop kills
-  the whole feature.
-
-Decisions made (during verification):
-
-- **Did not auto-retry the cycle after each gpt-5.5 hiccup.**
-  Each failure was a separate diagnostic step — fix the
-  apiShape, fix the token budget, fix the fetch flake — then
-  move forward.
-- **Did not revert to gpt-4o-mini on Aider.** The brief
-  explicitly chose gpt-5.5; the verification surfaces that
-  gpt-5.5 + Aider has a code-generation gap. That's a finding
-  for the operator to act on, not a platform-mechanic fix.
-- **Cleaned 71 files / 19030 lines of cycle metadata off
-  trackeros main** (`.aider.*`, `.gestalt/<correlationId>/`,
-  PLAN.md). The platform's auto-merge pipeline shouldn't be
-  pushing these to main — that's a separate gitignore /
-  pre-commit follow-up.
-
-Pending follow-ups (NEW from TR_033 verification):
-
-- **(HIGH — NEW from TR_033)** gpt-5.5 + Aider produces zero
-  source code. Each verification attempt's PR added only
-  meta-files (`.aider.*`, `.gestalt/`, design specs) and
-  documentation edits — nothing in `src/`. Either Aider's
-  prompting doesn't translate to gpt-5.5's reasoning model
-  output shape, or gpt-5.5 spends its entire token budget on
-  reasoning before deciding to invoke Aider's file-edit tool.
-  Investigate via Aider's stdout / chat history files
-  (committed under `.gestalt/<correlationId>/aider-output.md`).
-- **(MEDIUM — NEW from TR_033)** Fix 4 race condition.
-  `waiting-for-clarification` is used by self-healing for
-  TWO distinct things: (a) pausing the parent while a fix-
-  intent is dispatched (recoverable — `onSuccessDispatch`
-  resumes the parent later), (b) cascade-brake exhaustion
-  (genuinely terminal). The current Fix 4 treats both as
-  terminal, so the feature flips to `blocked` the moment
-  self-healing pauses the parent for a fix-intent —
-  prematurely. Mitigation: check whether an in-flight
-  fix-intent child exists before marking terminal, OR add a
-  distinct `escalated-cascade-brake` status to disambiguate.
-  The current cycle still showed Fix 4 firing correctly
-  (alert created, plan log written) — but it fired earlier
-  than the brief intended.
-- **(MEDIUM — NEW from TR_033)** Platform pushes
-  `.aider.chat.history.md`, `.aider.input.history`,
-  `.gestalt/<correlationId>/` JSON, and PLAN.md to project
-  main as part of auto-merge. Across many cycles trackeros
-  accumulated 71 files / 19k lines of this metadata. Either
-  add these paths to the project's `.gitignore` at init
-  time, or have pr-agent skip them when staging the PR's
-  commit set.
-- **(LOW — NEW from TR_033)** `classifyError` treats
-  `TypeError: fetch failed` as `retryable: false`. A
-  transient TCP drop or DNS blip kills the whole feature
-  with no retry. The existing retry loop in
-  `LLMClient.complete` would handle this if the classifier
-  returned `retryable: true`.
-- **(LOW — NEW from TR_033)** The brief said "gpt-5.5 uses
-  standard chat-completions shape — no registry change
-  needed". Wrong — gpt-5.5 is a reasoning model that needs
-  `responses` apiShape. Documented in trackeros's
-  `platform_llms` row; doc the pattern for the next operator
-  picking a reasoning model.
-
-Decisions made:
-
-- **No new migration for Fix 4.** `alerts.type` has no DB CHECK
-  constraint, so adding `feature-blocked` is type-only.
-- **No new HARNESS rules for Fix 1.** Adding rules like "read
-  package.json before importing" would duplicate the `--read`
-  mechanism. Fewer overlapping guidance channels means less
-  for the LLM to reconcile.
-- **Respected the trackeros HARNESS.json revert.** The operator
-  rolled back my Fix 2 + Fix 3 edits on the trackeros repo;
-  re-applying would be hostile. Template changes flow forward;
-  trackeros is opt-in.
-- **Did not normalise the `--read` list to a config-driven set.**
-  A future change could move the list to
-  `HARNESS.codeGeneration.readFiles` so operators tune it per
-  project; today the platform-default list is fine.
-
-Pending follow-ups (NEW from TR_033):
-
-- (none yet — these will emerge from live verification)
-
-Carryover follow-ups (status updates):
-
-- **(ADDRESSED by TR_033 Fix 4 — pending live verification)**
-  TR_032 finding: escalated intents leave the parent feature
-  stuck `in-progress` indefinitely. Structural fix landed.
-- **(ADDRESSED by TR_033 Fix 1 — pending live verification)**
-  TR_032 Phase 3 finding: Aider didn't know the project was
-  TypeScript-strict (`unknown` catch types). `tsconfig.json`
-  now goes via `--read`.
-- **(ADDRESSED in TEMPLATE by TR_033 Fix 2 + Fix 3 — trackeros
-  needs operator push)** TR_032 Phase 3 finding: Aider invented
-  service methods. Template rules tighten the contract;
-  trackeros's HARNESS.json needs the same rules patched in.
-- **(STILL OPEN — HIGH)** TR_018/020: restore TR_010 mandatory
-  `executeScript tsc --noEmit` code-agent rule on trackeros's
-  HARNESS.json. Not bundled here — TR_033's new code-agent
-  rule about reading tsconfig.json should reduce most of the
-  same errors at generation time.
-- **(STILL OPEN — MEDIUM)** TR_014: Aider token-spend capture
-  in `agent_executions.tokens_used`.
-
-Build status: `pnpm -r build` clean across all 13 packages.
-Server Docker image will rebuild for live verification.
-Template auto-refreshes to `0.18.0` on next server boot.
-
-Files changed:
-- `packages/agents/generate/src/adapters/aider-message-builder.ts`
-- `packages/core/src/repository/index.ts`
-- `packages/agents/planning/src/orchestrator/planning-orchestrator.ts`
-- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
-- `templates/corporate-ops-web-mobile/template.json`
-
----
-### Session 2026-06-09 — Claude Code (TR_032: three targeted Aider compliance fixes — `--read` flag, preservation rule in .ts schema, fix-intent broken-state framing — built clean, awaiting live verification)
-
-Brief: three surgical fixes for the remaining TR_028 → TR_031
-Aider DTO-drift blocker. No new HARNESS rules added, no new
-migrations — all three fixes are platform mechanics in `.ts`
-(ADR-042 compliant).
-
-What changed:
-
-**Fix 1 — Aider `--read` flag (promotes the TR_031 follow-up)**
-
-- **`packages/agents/generate/src/adapters/aider-adapter.ts`** —
-  `runAider` accepts a new optional `readFiles?: string[]`
-  parameter. Each path is filtered with
-  `existsSync(join(workDir, path))` before being added (passing
-  a not-yet-created file would make Aider error out). Surviving
-  paths render as repeated `--read "<file>"` flags in the
-  command, sitting between `--no-git` and `--model`. Empty list
-  → flag omitted entirely (the argv filter drops empty parts).
-- **`packages/agents/generate/src/adapters/aider-message-builder.ts`** —
-  `buildAiderMessage` return type changed from `string` to
-  `{ message: string; readFiles: string[] }`. PLAN.md is always
-  in `readFiles`; additional paths come from a new
-  `extractMentionedPaths` regex that pulls file-path-shaped
-  tokens out of `intentSpec.rawIntent` (the planner emits paths
-  per the TR_029 phaseScopingRules — they're now read-injected,
-  not merely cited in prose). Removed the prior `## Read PLAN.md
-  first` and `## Before generating any code` prose sections —
-  the `--read` flag enforces what they only asked.
-- **`packages/agents/generate/src/agents/aider-code-agent.ts`** —
-  destructures `{ message, readFiles }` from `buildAiderMessage`,
-  passes `readFiles` to `runAider` as the new last param. Logs
-  `readFiles` on the "Running Aider code generation" line so
-  operators can see what was injected.
-
-**Fix 2 — Preservation requirement hard-coded in `.ts` schema**
-
-- **`packages/core/src/agents/self-healing-agent.ts`** — the
-  `fixIntent` field's description in the diagnostician's
-  response JSON schema now ends with: _"ALWAYS end the fixIntent
-  with this exact sentence: 'Preserve all existing exports,
-  types, interfaces, and imports. Only add or modify what is
-  needed to resolve the CI failure shown above.'"_ This is
-  platform mechanics — every Aider-targeted fix-intent must
-  preserve exports; there's no project-specific variant — so
-  it lives in the .ts schema not in HARNESS rules (ADR-042
-  split). TR_031 verification showed the HARNESS bullet was
-  inconsistently honoured by the LLM; schema-string guidance
-  reliably reaches the model.
-- **`templates/corporate-ops-web-mobile/harness/HARNESS.json`** —
-  removed the now-redundant preservation rule from
-  `agentConfig.self-healing-agent.rules`.
-
-**Fix 3 — Fix-intent framing: broken state, not missing state**
-
-- **`packages/core/src/agents/self-healing-agent.ts`** — same
-  `fixIntent` description gains a BROKEN STATE vs MISSING
-  STATE framing rule with verbatim WRONG/CORRECT examples:
-  > WRONG: "ILeaveRepository does not exist in the module"
-  > CORRECT: "The service imports ILeaveRepository but the
-  > repository file exports LeaveRepository (no I prefix).
-  > The import path is wrong."
-
-  Addresses the TR_031 cycle-3 finding that Aider inverts
-  negation — "X does not exist" → CREATES X. Reframing the
-  failure as a broken / wrong import or type rename gives Aider
-  a fixable shape instead of a missing-thing-to-create.
-
-- **`templates/corporate-ops-web-mobile/template.json`** —
-  version `0.16.0` → `0.17.0`.
-
-What's verified (build only):
-
-- ✅ `pnpm -r build` clean across all 13 packages.
-- ✅ TypeScript types match — `runAider` signature change picks
-  up the new optional param; `buildAiderMessage` callers
-  destructure correctly; no unused-binding errors.
-
-What's NOT verified yet (live cycle pending):
-
-- ❌ End-to-end multi-phase autonomous completion.
-- ❌ Aider compliance with `--read`-injected PLAN.md +
-  dependency files. The brief's verification recipe
-  (`gestalt feature submit "Build the leave management
-  module..." --project trackeros`) hasn't been run yet —
-  operator to execute.
-- ❌ Fix-intent preservation footer presence on each dispatch.
-- ❌ Fix-intent broken-state framing on each dispatch.
-
-Decisions made:
-
-- **`extractMentionedPaths` is a regex, not an AST.** The
-  planner's scope text is prose; a regex over file-path-shaped
-  tokens (`[a-z0-9_\-./]+\.(ts|tsx|js|jsx|json|md|yaml|yml|py|sql)`)
-  catches what we need. The `existsSync` filter in `runAider`
-  is the safety net for over-extraction.
-- **Removed the TR_030 + TR_031 prose `## Read PLAN.md first`
-  and `## Before generating any code` sections.** The `--read`
-  flag enforces what they could only ask. Keeping both would
-  duplicate the instruction at two strengths — the `--read`
-  flag is the strong form.
-- **Preservation requirement promoted to .ts schema (ADR-042
-  reinterpretation).** The split rule reads "platform mechanics
-  in .ts, project-tunable guidance in HARNESS/agents.yaml".
-  Preservation is a hard invariant of every Aider fix-intent
-  — no project-specific variant makes sense. Move to .ts.
-- **Did not modify trackeros HARNESS.json.** The redundant
-  preservation rule on trackeros is harmless (the .ts schema
-  rule fires too). Operator can prune it on next HARNESS edit.
-- **Did not run live verification.** The cycle takes ~15
-  minutes and needs the server up + a clean trackeros main.
-  Operator to run the brief's recipe.
-
-Pending follow-ups (NEW from TR_032):
-
-- (none yet — these will emerge from live verification)
-
-Carryover follow-ups (status updates):
-
-- **(ADDRESSED by TR_032 Fix 1 — pending live verification)**
-  TR_031 follow-up: Aider `--read <file>` for PLAN.md + cited
-  paths. Implemented; awaiting end-to-end confirmation.
-- **(ADDRESSED by TR_032 Fix 2 — pending live verification)**
-  TR_031 follow-up: preservation requirement in schema not
-  HARNESS bullet.
-- **(ADDRESSED by TR_032 Fix 3 — pending live verification)**
-  TR_031 finding: Aider inverts negated fixIntent text.
-- **(STILL OPEN — HIGH)** TR_029 follow-up: architecture-agent's
-  module-level description still feeds into Phase N code-agent
-  context. Aider may still import from sibling modules. Fix 1's
-  `--read` flag doesn't address this directly — that's a
-  separate prompt-scoping change.
-- **(STILL OPEN — HIGH)** TR_018/020: restore TR_010 mandatory
-  `executeScript tsc --noEmit` code-agent rule on trackeros's
-  HARNESS.json.
-- **(STILL OPEN — MEDIUM)** TR_031 follow-up: stale-file
-  pollution on trackeros main from failed prior cycles.
-- **(STILL OPEN — MEDIUM)** TR_014: Aider token-spend capture.
-
-Build status: `pnpm -r build` clean across all 13 packages.
-Server state unchanged. Docker image unchanged. Template
-auto-refreshes to `0.17.0` on next server boot.
-
-Files changed:
-- `packages/agents/generate/src/adapters/aider-adapter.ts`
-- `packages/agents/generate/src/adapters/aider-message-builder.ts`
-- `packages/agents/generate/src/agents/aider-code-agent.ts`
-- `packages/core/src/agents/self-healing-agent.ts`
-- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
-- `templates/corporate-ops-web-mobile/template.json`
-
