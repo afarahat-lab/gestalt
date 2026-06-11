@@ -340,8 +340,17 @@ export function buildArchitectureReviewPrompt(
     // review pass introduces must land in `architectureMdUpdate`
     // so the project docs stay consistent with the architecture.
     '6. Documentation consistency — every new domain concept introduced in this architecture (lifecycle states, enum values, entity types, relationships) that does not appear in the existing project documentation must appear in `architectureMdUpdate`. If a new concept is defined in `domainEntities` or `modules` but missing from `architectureMdUpdate`, ADD it before returning.',
+    // TR_047 — closes the 8th intent-agent rigor bar surfaced by
+    // TR_046 verification (architecture-agent bundled
+    // `LeaveRequest` + `AuditRecord` mutations into Phase 1 but
+    // didn't state whether they execute in one transaction;
+    // intent-agent caught the implicit-coordination gap). The
+    // review pass must explicitly pin transaction semantics
+    // (atomic / non-atomic / compensating) for every phase that
+    // groups two or more domain mutations.
+    '7. Transaction semantics — for every phase in `recommendedPhases` that includes multiple coordinated domain mutations (a primary operation plus an audit / event / cache concern), verify that the rationale or success-criterion line explicitly states whether the operations are atomic, non-atomic, or compensating. If transaction behavior is implicit, ADD an explicit statement to the relevant phase before returning.',
     '',
-    'If the draft passes all six checks, return it unchanged.',
+    'If the draft passes all seven checks, return it unchanged.',
     'If any check fails, fix the issue and return the corrected version.',
     'Return the COMPLETE architecture JSON — not just the changes.',
     '',
@@ -470,8 +479,16 @@ export function buildPhaseArchitectureReviewPrompt(
     // back in the per-phase scope text or — when the per-phase
     // pass has no scope-update surface — flagged for the operator.
     '6. Documentation consistency — every new domain concept introduced in this per-phase architecture (lifecycle states, enum values, entity types, relationships) that does not appear in the project context (ARCHITECTURE.md / GOLDEN_PRINCIPLES.md) must be flagged in a `successCriteria` line that asks for the doc update. Do not introduce a concept silently — surface it where downstream agents can see it.',
+    // TR_047 — per-phase transaction semantics. When this phase
+    // includes multiple coordinated domain mutations (e.g. a
+    // primary entity write + an audit-record write), the
+    // `successCriteria` or interface signatures must explicitly
+    // declare whether the writes are atomic (single DB
+    // transaction), separate (two transactions), or compensating
+    // (saga). Implicit coordination is the TR_046 finding.
+    '7. Transaction semantics — if this phase performs multiple coordinated domain mutations (a primary write plus a cross-cutting concern such as audit logging, event publishing, or cache invalidation), at least one `successCriteria` line must explicitly state the transaction behavior (atomic in a single DB transaction, separate transactions, or compensating). If transaction behavior is implicit, ADD an explicit success criterion before returning.',
     '',
-    'If the draft passes all six checks, return it unchanged.',
+    'If the draft passes all seven checks, return it unchanged.',
     'If any check fails, fix the issue and return the corrected version.',
     'Return the COMPLETE PhaseArchitecture JSON — not just the changes.',
     '',
