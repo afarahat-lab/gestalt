@@ -425,8 +425,18 @@ export function buildArchitectureReviewPrompt(
     // (atomic / non-atomic / compensating) for every phase that
     // groups two or more domain mutations.
     '7. Transaction semantics — for every phase in `recommendedPhases` that includes multiple coordinated domain mutations (a primary operation plus an audit / event / cache concern), verify that the rationale or success-criterion line explicitly states whether the operations are atomic, non-atomic, or compensating. If transaction behavior is implicit, ADD an explicit statement to the relevant phase before returning.',
+    // TR_049 — promote SQL schema output from "if needed" to a
+    // hard required-output rule when the declared stack includes
+    // a relational database. The LLM determines whether the
+    // declared stack qualifies; no DB names hardcoded here.
+    '9. SQL schema completeness — if the declared stack',
+    '   includes a relational database, verify that every',
+    '   persistent domain entity defined in this architecture',
+    '   has a corresponding SQL table definition. If any',
+    '   entity is missing a table definition, add it before',
+    '   returning.',
     '',
-    'If the draft passes all seven checks, return it unchanged.',
+    'If the draft passes all eight checks, return it unchanged.',
     'If any check fails, fix the issue and return the corrected version.',
     'Return the COMPLETE architecture JSON — not just the changes.',
     '',
@@ -576,8 +586,18 @@ export function buildPhaseArchitectureReviewPrompt(
     // per-phase `sqlSchema` field MUST match it byte-for-byte for
     // any column it duplicates.
     '8. Schema consistency — if a `## Canonical SQL schemas` block was provided above, your `sqlSchema` field MUST use the EXACT same column names, types, and constraints for every column of every table that overlaps with the canonical definition. Any drift (e.g. `TIMESTAMP` vs `TIMESTAMPTZ`, `VARCHAR(32)` vs `VARCHAR(20)`) must be corrected to match the canonical version. If no canonical block is provided, define the schema as you see fit.',
+    // TR_049 — promote SQL schema output from "if needed" to a
+    // hard required-output rule when the declared stack includes
+    // a relational database. The LLM determines whether the
+    // declared stack qualifies; no DB names hardcoded here.
+    '9. SQL schema completeness — if the declared stack',
+    '   includes a relational database, verify that every',
+    '   persistent domain entity defined in this architecture',
+    '   has a corresponding SQL table definition. If any',
+    '   entity is missing a table definition, add it before',
+    '   returning.',
     '',
-    'If the draft passes all eight checks, return it unchanged.',
+    'If the draft passes all nine checks, return it unchanged.',
     'If any check fails, fix the issue and return the corrected version.',
     'Return the COMPLETE PhaseArchitecture JSON — not just the changes.',
     '',
