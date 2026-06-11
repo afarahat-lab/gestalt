@@ -3,6 +3,233 @@
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+### Session 2026-06-11 — Claude Code (TR_049: mandatory SQL schema for relational-DB stacks — closes TR_048's 10th rigor bar end-to-end; architecture-agent emitted 6 CREATE TABLE statements; TR_048 canonical-schema-reuse machinery FIRED for the first time; Phase 1 cleared the FULL Gestalt agent pipeline intent → code → gate → promotion — first phase to do so across TR_036 → TR_049; Phase 2 escalated on a NEW 11th rigor bar — cross-phase class definition drift)
+
+Brief: two changes — append SQL-mandatory rule to
+`architecture-agent.rules` in HARNESS, and add a 9th
+checklist item to both review prompts. Make SQL schema
+output mandatory whenever the declared stack includes a
+relational database, so TR_048's canonical schema reuse
+has something to work with.
+
+What changed (2 fixes):
+
+**Fix 1 — Mandatory SQL schema rule on architecture-agent (HARNESS)**
+
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
+  and `/Users/amrmohamed/Work/trackeros/HARNESS.json` —
+  `agentConfig.architecture-agent.rules` appended with:
+  "When the declared stack includes a relational database,
+  you MUST include a complete SQL schema in your output
+  for every persistent domain entity you define. A domain
+  entity without a corresponding table definition is
+  incomplete. The schema must include column names, types,
+  constraints, and indices relevant to the entity's
+  lifecycle."
+- Abstract — no specific DB names hardcoded. The LLM
+  determines whether the declared stack qualifies as
+  relational.
+
+**Fix 2 — 9th review-checklist item in both review prompts**
+
+- `packages/agents/planning/src/prompts/architecture-prompt.ts`
+  both `buildArchitectureReviewPrompt` (feature-level) and
+  `buildPhaseArchitectureReviewPrompt` (per-phase) gain
+  item 9:
+  > "9. SQL schema completeness — if the declared stack
+  > includes a relational database, verify that every
+  > persistent domain entity defined in this architecture
+  > has a corresponding SQL table definition. If any
+  > entity is missing a table definition, add it before
+  > returning."
+- Feature-level closing updated to "all eight checks" (the
+  feature-level review skips item 8 — schema consistency
+  was per-phase-only since TR_048). Per-phase closing
+  updated to "all nine checks".
+
+**Template version bumped 0.33.0 → 0.34.0.** No new
+migration. `pnpm -r build` clean across all 13 packages.
+
+What's verified live (trackeros feature
+`dca0cb06-98bd-4720-913e-83f43359a23d` on `chat-latest`):
+
+- ✅ **TR_048's 10th rigor bar CLOSED end-to-end.**
+  Architecture-agent emitted SIX CREATE TABLE statements
+  in `architectureMdUpdate` (employees, leave_policies,
+  leave_balances, leave_requests, notifications,
+  audit_records) — DB-confirmed. Compare to TR_048
+  verification where the count was zero.
+- ✅ **TR_048 canonical-schema-reuse machinery FIRED for
+  the first time across the sequence.** Server logs show
+  `TR_048 — injecting canonical SQL schemas into per-phase
+  prompts` THREE times (once per phase-architecture pass —
+  Phase 1 initial, Phase 1 review-pass, Phase 2 initial),
+  consistent with the orchestrator's per-phase call site.
+- ✅ **Phase 1 sqlSchema populated** with
+  `CREATE TABLE leave_requests (id UUID PRIMARY KEY,
+  employee_id UUID NOT NULL, leave_type VARCHAR(20)
+  NOT NULL, status VARCHAR(20) NOT NULL, CONSTRAINT
+  fk_leave_requests_employee FOREIGN KEY (employee_id)
+  REFERENCES employees(id));`
+- ✅ **Phase 2 sqlSchema populated** with
+  `CREATE TABLE audit_records (id UUID PRIMARY KEY,
+  entity_type VARCHAR(100) NOT NULL, entity_id UUID
+  NOT NULL, action VARCHAR(100) NOT NULL);`
+- ✅ **Plan: 10 phases.** The architect fanned out
+  persistence into discrete per-entity phases rather than
+  bundling them — likely a response to the mandatory-SQL
+  rule combined with TR_048's canonical schema reuse,
+  where dedicating one phase per entity gives the cleanest
+  schema-consistency story. Plan width back to TR_044's
+  10 after TR_048's 5 (the architect chose narrower
+  scopes vs lifecycle bundling).
+- ✅ **Phase 1 architecture: 3 interfaces + 7 criteria**
+  — 7 criteria is one above TR_048's 6, consistent with
+  the new 9th-item check producing an extra
+  success-criterion at design time.
+- ✅ **Phase 1 cleared the FULL Gestalt agent pipeline
+  end-to-end** — `intent-agent → design-agent →
+  lint-config-agent → context-agent → code-agent (Aider)
+  → test-agent → pr-agent → pipeline-agent →
+  constraint-agent (PASSED) → review-agent (PASSED) →
+  promotion-agent`. **First phase across TR_036 → TR_049
+  to make it intent → promotion without escalation.**
+  Wall-clock from `phase-submitted` (18:34:14) to
+  `phase-evaluated: success` (18:41:17) was 7m 03s.
+
+**Verification caveat — NoOp pipeline adapter on trackeros:**
+trackeros's `HARNESS.json` is currently on
+`pipeline.adapter: noop` (operator state since TR_043
+rapid iteration). So while Phase 1 made it through the
+full Gestalt agent cycle including constraint-agent and
+review-agent, the actual deploy stage was a no-op — no
+PR was created on GitHub, no CI ran, no merge happened
+on trackeros's `main`. Phase 1 has `status: deployed`
+because the NoOp adapter advertises success. The
+agent-cycle validation is real; the pipeline plumbing
+ran on the noop path.
+
+What blocked the verification cycle (NEW 11th rigor bar
+at Phase 2):
+
+After Phase 1 deployed cleanly, Phase 2 (`Create
+AuditRecord domain model and repository contracts`) hit
+a retry then escalated. The retry intent (`d6b7feca`)
+got further than the first attempt — it cleared
+intent-agent → code-agent → CI → pr-agent →
+constraint-agent (PASSED) → review-agent (FAILED), and
+self-healing's diagnostician routed to a fix-intent.
+The fix-intent itself hit intent-agent which escalated
+with one new high-impact ambiguity:
+
+> **amb-001**: "The architecture notes define
+> `PostgreSqlAuditRepository` as an abstract class,
+> while the detailed architecture defines it as a
+> concrete class with stubbed methods throwing 'Not
+> implemented in Phase 2'."
+
+Two views of the same class drifted between the
+high-level architectureMdUpdate (architecture-agent
+designFeature) and the per-phase architecture
+(architecture-agent designPhase). This is symbolically
+identical to TR_036's "symbol-name conflict" finding —
+but at the level of class shape (abstract vs concrete)
+rather than name, and across phases rather than within
+a single phase.
+
+This is the **11th distinct intent-agent rigor bar**
+across TR_036 → TR_049:
+
+| Session | Intent-agent escalation reason | Scope |
+|---------|--------------------------------|-------|
+| TR_036  | Symbol-name conflict | Architectural |
+| TR_037  | Concrete persistence implementation | Architectural |
+| TR_038  | Repository missing CRUD methods | Architectural |
+| TR_041  | Scope-vs-architecture file-count mismatch | Structural |
+| TR_042  | Audit records for state-changing operations | Cross-cutting |
+| TR_044  | Method signatures as "Not implemented" stubs | Semantic |
+| TR_045  | Undocumented lifecycle state | Documentation drift |
+| TR_046  | Transaction semantics | Architectural (narrow) |
+| TR_047  | SQL schema column-type drift between two views | Internal consistency |
+| TR_048  | SQL schema missing entirely for persisted entities | Required-output |
+| **TR_049** | **Class shape drift between high-level + per-phase architecture views (abstract vs concrete + stub)** | Cross-phase consistency |
+
+**Pending follow-ups (NEW from TR_049 verification):**
+
+- **(HIGH — NEW)** Architecture-agent's high-level
+  `architectureMdUpdate` and per-phase architecture
+  outputs disagree on the shape of the same class
+  (abstract vs concrete). The high-level view treats
+  `PostgreSqlAuditRepository` as an abstract class to
+  be implemented later; the per-phase view treats it as
+  a concrete class with stub methods. Options:
+  (a) `architecture-agent.architectureGuidance` rule:
+  "When the same class is mentioned in both the
+  high-level architecture and a per-phase architecture,
+  its shape (abstract/concrete) and method bodies
+  (stubbed vs implemented) MUST be consistent. The
+  per-phase architecture is authoritative for the phase
+  that creates the class; do not introduce a different
+  shape elsewhere"; OR
+  (b) New review-checklist item: "Class shape
+  consistency — if a class is mentioned in both views,
+  its shape (abstract / concrete / interface) and
+  method-body status (stubbed / implemented / signature
+  only) MUST be identical"; OR
+  (c) Per-phase architecture for the phase that
+  CREATES a class supersedes the high-level mention —
+  surface this rule in both planner-agent and
+  intent-agent rules.
+- **(MEDIUM — OBSERVATION)** Plan width grew from
+  TR_048's 5 phases to TR_049's 10 phases. This is the
+  architect responding to the new mandatory-SQL rule by
+  isolating each persistent entity into its own phase —
+  which makes the canonical-schema-reuse story
+  cleanest. It also means more cross-phase
+  consistency surfaces to check (this is what surfaced
+  the 11th rigor bar). The trade-off is real but
+  manageable.
+- **(MEDIUM — OPERATOR)** trackeros pipeline adapter is
+  on `noop`. To verify a full deploy chain (PR → CI →
+  PR-Agent → gate → squash-merge) the operator should
+  switch to `github-actions` before the next cycle.
+  Until then, "Phase deployed" means "Gestalt agent
+  cycle passed" not "code on main".
+
+Carryover follow-ups (status updates):
+
+- **(RESOLVED by TR_049)** TR_048 HIGH NEW: SQL schema
+  output is now categorical for relational-DB stacks.
+  Verified end-to-end on this cycle — 6 CREATE TABLE
+  statements emitted; TR_048's canonical-reuse machinery
+  fires.
+- **(STILL OPEN — HIGH from TR_036)** Gate-side
+  verification reached for the THIRD time in the
+  sequence (Phase 1 cleared the gate this cycle; TR_046
+  + TR_047 also reached). TR_036's mechanism continues
+  to verify.
+
+Build status: `pnpm -r build` clean across all 13
+packages. Template auto-refreshes to `0.34.0` at next
+server boot.
+
+Files changed:
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
+- `templates/corporate-ops-web-mobile/template.json`
+- `packages/agents/planning/src/prompts/architecture-prompt.ts`
+- `/Users/amrmohamed/Work/trackeros/HARNESS.json` (separate
+  repo, pushed at `fc4954ac`)
+
+Live URLs:
+- Dashboard: http://localhost:3000/app/
+- TR_049 verification feature:
+  http://localhost:3000/app/features/dca0cb06-98bd-4720-913e-83f43359a23d
+- trackeros PLAN.md:
+  https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
+- trackeros TR_049 HARNESS commit:
+  https://github.com/afarahat-lab/trackeros/commit/fc4954ac
+
+---
 ### Session 2026-06-11 — Claude Code (TR_048: canonical SQL schema reuse across feature-level and per-phase architecture views — plumbing verified, but architect emitted NO SQL at all this cycle so the canonical block was empty; intent-agent escalates on the 10th rigor bar — explicit SQL schema for persisted entities is missing entirely; plan shrunk to 5 phases — tightest yet)
 
 Brief: three platform fixes + one HARNESS rule closing
@@ -399,173 +626,5 @@ Live URLs:
 - trackeros TR_047 HARNESS commit:
   https://github.com/afarahat-lab/trackeros/commit/b50cb7f8
 
----
----
-### Session 2026-06-10 — Claude Code (TR_046: architecture-agent rule + 6th review-checklist item — closes TR_045's documentation-drift bar; cycle REACHED THE GATE for the 2nd time across TR_036 → TR_046 and ran 6 times with violation counts trending from 5 → 4 → 1 → 3 → 3 → 3; intent-agent now blocks on a transaction-semantics ambiguity)
-
-Brief: one HARNESS rule + one platform-code rule. Closes
-TR_045's 7th intent-agent rigor bar
-(architecture-agent introduced `CANCELLED` lifecycle state
-to support Phase 2's cancel workflow but the project
-documentation listed only Pending/Approved/Rejected).
-
-What changed (2 fixes):
-
-**Fix 1 — Doc-consistency rule on architecture-agent (HARNESS)**
-
-- `templates/corporate-ops-web-mobile/harness/HARNESS.json` and
-  `/Users/amrmohamed/Work/trackeros/HARNESS.json` —
-  `agentConfig.architecture-agent.rules` appended with: "When
-  your architecture introduces any new domain concept that
-  does not appear in the existing project documentation (new
-  lifecycle states, new enum values, new entity types, new
-  relationships), you MUST include it in
-  architectureMdUpdate so the project documentation stays
-  consistent with the architecture. Never introduce a concept
-  in code interfaces that is absent from the project docs."
-- Abstract — no specific state names hardcoded; applies to
-  any new concept in any language.
-
-**Fix 2 — 6th review-checklist item in both review prompts**
-
-- `packages/agents/planning/src/prompts/architecture-prompt.ts`
-  `buildArchitectureReviewPrompt` (feature-level review) and
-  `buildPhaseArchitectureReviewPrompt` (per-phase review) both
-  gain a 6th checklist item:
-  - Feature-level: "Documentation consistency — every new
-    domain concept introduced in this architecture
-    (lifecycle states, enum values, entity types,
-    relationships) that does not appear in the existing
-    project documentation must appear in
-    `architectureMdUpdate`. If a new concept is defined in
-    `domainEntities` or `modules` but missing from
-    `architectureMdUpdate`, ADD it before returning."
-  - Per-phase: "Documentation consistency — every new
-    domain concept introduced in this per-phase
-    architecture … must be flagged in a `successCriteria`
-    line that asks for the doc update. Do not introduce a
-    concept silently — surface it where downstream agents
-    can see it."
-- Both prompts updated to say "If the draft passes all SIX
-  checks, return it unchanged" (from "all five" in TR_041).
-
-**Template version bumped 0.30.0 → 0.31.0.** No new
-migration. Build clean across all 13 packages.
-
-What's verified live (trackeros feature
-`795e1069-b25f-4426-bdc3-227aa160f3a9` on `chat-latest`):
-
-- ✅ **TR_045's 7th bar CLOSED.** The architecture-agent
-  did NOT introduce `CANCELLED` this cycle. The
-  `architectureMdUpdate` field documents the lifecycle as
-  exactly the three project-context states (`PENDING /
-  APPROVED / REJECTED`) and the plan stays within that
-  set — no `Phase: Create AND cancel leave requests`.
-- ✅ **Tightest plan yet — 6 phases.** Compare TR_045's
-  7, TR_044's 10, TR_042's 8, TR_038's 5, TR_037's 5.
-  Phase 1 bundles
-  `LeaveRequest AND AuditRecord domain models with
-  persistence` — cross-cutting concern integration that
-  TR_044's goldenPrinciples injection enabled is now
-  paying off in a tight Phase 1.
-- ✅ **Phase 1 per-phase architecture: 5 interfaces + 6
-  criteria** (richest yet across TR_036 → TR_046; was 5
-  in TR_045, 3 in TR_044). The 6th criterion is the new
-  doc-consistency item from TR_046 Fix 2 surfacing in
-  the per-phase pass.
-- ✅ **CYCLE REACHED THE GATE — second time across the
-  entire TR_036 → TR_046 sequence.** First was TR_039.
-  The gate ran SIX times across two phase-retry attempts
-  with verdicts: **5 → 4 → 1 → 3 → 3 → 3** CONSTRAINT_VIOLATION.
-  The single-violation run is the closest we have ever
-  been to passing the gate. The cycle is no longer
-  intent-agent-bound; it is now generate ↔ gate ↔
-  self-healing iterating toward convergence.
-
-What blocked the verification cycle (NEW orthogonal finding):
-
-After the second phase-retry, intent-agent escalated on a
-NEW (8th) rigor bar:
-
-> "High-impact ambiguity: Transaction behavior for
-> createLeaveRequest and AuditRecord creation is not
-> explicitly defined."
-
-This is a genuine architectural concern surfaced by
-TR_044's `AuditRecord` cross-cutting concern integration
-landing in Phase 1 ALONGSIDE `LeaveRequest`. When two
-domain operations land in the same phase, transaction
-semantics (atomic vs distributed vs eventual consistency)
-become a real choice the architecture should pin down.
-
-This is the 8th distinct intent-agent rigor bar across
-TR_036 → TR_046:
-
-| Session | Intent-agent escalation reason | Scope |
-|---------|--------------------------------|-------|
-| TR_036  | Symbol-name conflict | Architectural |
-| TR_037  | Concrete persistence implementation | Architectural |
-| TR_038  | Repository missing CRUD methods | Architectural |
-| TR_041  | Scope-vs-architecture file-count mismatch | Structural |
-| TR_042  | Audit records for state-changing operations | Cross-cutting |
-| TR_044  | Method signatures interpreted as "Not implemented" stubs | Semantic |
-| TR_045  | Undocumented lifecycle state | Documentation drift |
-| **TR_046** | **Transaction semantics for cross-cutting operations** | Architectural (narrow) |
-
-The bars are now in highly specific architectural
-territory — transaction boundaries between domain
-operations. Each session is closing in on full
-convergence.
-
-**Pending follow-ups (NEW from TR_046 verification):**
-
-- **(HIGH — NEW)** Intent-agent escalates when a phase
-  bundles two domain mutations without specifying
-  transaction semantics. The architecture-agent should
-  either (a) explicitly state "atomic" / "non-atomic" /
-  "compensating" for every cross-cutting operation that
-  lands in the same phase as a primary domain mutation,
-  OR (b) the planner should split cross-cutting concerns
-  into their own phase with explicit dependencies (but
-  that contradicts TR_044's lifecycle-coverage that
-  encouraged Phase 1 to bundle AuditRecord WITH
-  LeaveRequest).
-- **(HIGH — STILL OPEN from TR_036)** Gate-side
-  verification was reached for the SECOND time in this
-  cycle. With a 1-violation gate verdict observed, the
-  cycle is one or two more architectural tightenings
-  away from a full gate pass. Bundle this with the
-  transaction-semantics fix in TR_047 and the next
-  cycle may converge.
-
-Carryover follow-ups (status updates):
-
-- **(RESOLVED by TR_046)** TR_045 HIGH NEW: undocumented
-  `CANCELLED` lifecycle state. Architecture-agent now
-  documents the lifecycle exactly as the project context
-  defines it; no `CANCELLED` introduced this cycle.
-- **(STILL OPEN — HIGH from TR_036)** Gate-side
-  verification still has 1-3 CONSTRAINT_VIOLATION
-  signals per run; needs to reach 0 to deploy.
-
-Build status: `pnpm -r build` clean across all 13
-packages. Template auto-refreshes to `0.31.0` at next
-server boot.
-
-Files changed:
-- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
-- `templates/corporate-ops-web-mobile/template.json`
-- `packages/agents/planning/src/prompts/architecture-prompt.ts`
-- `/Users/amrmohamed/Work/trackeros/HARNESS.json` (separate
-  repo, pushed at `645cd7cd`)
-
-Live URLs:
-- Dashboard: http://localhost:3000/app/
-- TR_046 verification feature:
-  http://localhost:3000/app/features/795e1069-b25f-4426-bdc3-227aa160f3a9
-- trackeros PLAN.md:
-  https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
-- trackeros TR_046 HARNESS commit:
-  https://github.com/afarahat-lab/trackeros/commit/645cd7cd
 
 ---

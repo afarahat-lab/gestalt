@@ -54,6 +54,149 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_049 — Mandatory SQL schema for relational-database stacks (template 0.34.0, build clean, TR_048's 10th bar CLOSED end-to-end, Phase 1 cleared the full Gestalt agent pipeline for the first time; 11th rigor bar surfaced — class shape drift across phases)
+
+Two changes — one HARNESS rule + one platform-code
+review-checklist item — closing TR_048's 10th
+intent-agent rigor bar. SQL schema output is now
+categorical when the declared stack includes a relational
+database.
+
+- **Fix 1** —
+  `agentConfig.architecture-agent.rules` in template +
+  trackeros HARNESS appended with: "When the declared
+  stack includes a relational database, you MUST include
+  a complete SQL schema in your output for every
+  persistent domain entity you define. A domain entity
+  without a corresponding table definition is incomplete.
+  The schema must include column names, types,
+  constraints, and indices relevant to the entity's
+  lifecycle." Abstract — no DB names hardcoded; the LLM
+  determines whether the declared stack qualifies.
+- **Fix 2** —
+  `packages/agents/planning/src/prompts/architecture-prompt.ts`
+  both `buildArchitectureReviewPrompt` and
+  `buildPhaseArchitectureReviewPrompt` gain a 9th item:
+  "SQL schema completeness — if the declared stack
+  includes a relational database, verify that every
+  persistent domain entity defined in this architecture
+  has a corresponding SQL table definition. If any
+  entity is missing a table definition, add it before
+  returning." Feature-level closing → "all eight
+  checks". Per-phase closing → "all nine checks".
+
+Template `0.33.0 → 0.34.0`. No new migration.
+`pnpm -r build` clean across all 13 packages.
+
+**Live verification — TR_048's 10th bar CLOSED
+end-to-end:** trackeros feature
+`dca0cb06-98bd-4720-913e-83f43359a23d` on `chat-latest`:
+
+- ✅ Architecture-agent emitted **6 CREATE TABLE
+  statements** in `architectureMdUpdate` (employees,
+  leave_policies, leave_balances, leave_requests,
+  notifications, audit_records) — DB-confirmed. Compare
+  TR_048's zero. The mandatory-SQL rule worked.
+- ✅ **TR_048's canonical-schema-reuse machinery FIRED
+  for the first time across the entire TR_036 → TR_049
+  sequence.** Server logs show
+  `TR_048 — injecting canonical SQL schemas into
+  per-phase prompts` three times (once per
+  phase-architecture pass).
+- ✅ **Phase 1 `sqlSchema`** populated:
+  `CREATE TABLE leave_requests (id UUID PRIMARY KEY,
+  employee_id UUID NOT NULL, leave_type VARCHAR(20)
+  NOT NULL, status VARCHAR(20) NOT NULL, CONSTRAINT
+  fk_leave_requests_employee FOREIGN KEY (employee_id)
+  REFERENCES employees(id));`
+- ✅ **Phase 2 `sqlSchema`** populated:
+  `CREATE TABLE audit_records (id UUID PRIMARY KEY,
+  entity_type VARCHAR(100) NOT NULL, entity_id UUID
+  NOT NULL, action VARCHAR(100) NOT NULL);`
+- ✅ **Plan: 10 phases.** Architect fanned out
+  persistence into discrete per-entity phases (vs
+  TR_048's 5-phase bundling) — likely a response to the
+  mandatory-SQL rule combined with TR_048's
+  canonical-schema-reuse, where one entity per phase
+  gives the cleanest reuse story.
+- ✅ Phase 1 per-phase architecture: 3 interfaces + 7
+  criteria (one extra criterion from the new 9th-item
+  check).
+- ✅ **Phase 1 cleared the FULL Gestalt agent pipeline
+  end-to-end** — intent-agent → design-agent →
+  lint-config-agent → context-agent → code-agent
+  (Aider) → test-agent → pr-agent → pipeline-agent →
+  constraint-agent PASSED → review-agent PASSED →
+  promotion-agent. **First phase across the entire
+  TR_036 → TR_049 sequence to make it from intent →
+  promotion without escalation.** Wall-clock 7m 03s
+  (`phase-submitted 18:34:14` → `phase-evaluated:
+  success 18:41:17`).
+
+**Verification caveat — NoOp pipeline adapter on
+trackeros:** trackeros's `HARNESS.json` is currently on
+`pipeline.adapter: noop` (operator state since TR_043
+rapid iteration). So while Phase 1 cleared every Gestalt
+agent stage including constraint-agent and review-agent,
+the deploy stage was a no-op — no PR created on GitHub,
+no CI ran, no merge on trackeros's `main`. Phase 1 has
+`status: deployed` because the NoOp adapter advertises
+success. The agent-cycle validation is real; the
+pipeline plumbing ran on the noop path.
+
+**Cycle blocked at Phase 2 on a NEW 11th rigor bar
+(orthogonal):**
+
+> **amb-001 (high impact)**: "The architecture notes
+> define `PostgreSqlAuditRepository` as an abstract
+> class, while the detailed architecture defines it as
+> a concrete class with stubbed methods throwing 'Not
+> implemented in Phase 2'."
+
+Class shape drift between the high-level
+architectureMdUpdate (architecture-agent designFeature)
+and the per-phase architecture (architecture-agent
+designPhase). Symbolically identical to TR_036's
+"symbol-name conflict" but at the level of class shape
+rather than name, and across phases. The fix-intent
+went all the way through to review-agent before
+intent-agent clarification escalated.
+
+**New HIGH follow-up for TR_050:** architecture-agent
+must keep class shape (abstract / concrete /
+interface-only) and method-body status (stubbed /
+implemented / signature only) consistent for the same
+class across both high-level + per-phase views.
+Options:
+
+- (a) New `architectureGuidance` rule: "When the same
+  class appears in both the high-level architecture
+  and a per-phase architecture, its shape and
+  method-body status MUST be identical"; OR
+- (b) New review-checklist item: "Class shape
+  consistency"; OR
+- (c) Per-phase architecture for the phase that
+  CREATES a class is authoritative and supersedes the
+  high-level mention — emit this rule in planner-agent
+  and intent-agent.
+
+**New MEDIUM follow-up for the operator:** switch
+trackeros pipeline adapter from `noop` back to
+`github-actions` so the next cycle's Phase 1 verifies
+the full deploy chain (PR → CI → PR-Agent → gate →
+squash-merge). Until then, "Phase deployed" means
+"Gestalt agent cycle passed" not "code on main".
+
+**Operator action — trackeros:** my edits to
+`HARNESS.json` are already pushed at `fc4954ac
+chore(TR_049): architecture-agent rule — SQL schema
+mandatory for relational DB stacks`.
+
+**Operator action — other projects:** Append the new
+architecture-agent rule to existing projects' HARNESS.
+Template auto-refreshes to `0.34.0` at next server
+boot.
+
 ### TR_048 — Canonical SQL schema reuse across feature-level + per-phase architecture views (template 0.33.0, build clean, plumbing verified, architect emitted no SQL this cycle; 10th rigor bar surfaced — explicit SQL output is required-but-optional in guidance)
 
 Three platform fixes + one HARNESS rule closing TR_047's 9th
