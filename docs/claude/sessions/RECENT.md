@@ -3,6 +3,216 @@
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+### Session 2026-06-11 — Claude Code (TR_048: canonical SQL schema reuse across feature-level and per-phase architecture views — plumbing verified, but architect emitted NO SQL at all this cycle so the canonical block was empty; intent-agent escalates on the 10th rigor bar — explicit SQL schema for persisted entities is missing entirely; plan shrunk to 5 phases — tightest yet)
+
+Brief: three platform fixes + one HARNESS rule closing
+TR_047's 9th intent-agent rigor bar (architecture-agent
+emitted two views of the same `leave_requests` table with
+drifted column types — `TIMESTAMP vs TIMESTAMPTZ`,
+`VARCHAR(32) vs VARCHAR(20)`). Single source of truth for
+SQL schema: the feature-level architecture is canonical;
+every per-phase pass references it instead of redefining.
+
+What changed (3 fixes):
+
+**Fix 1 — extractCanonicalSqlSchemas + Canonical SQL section
+in per-phase prompts**
+
+- `packages/agents/planning/src/prompts/architecture-prompt.ts`
+  gains `extractCanonicalSqlSchemas(featureArchitectureJson)`
+  helper (exported). Source 1: explicit `sqlSchemas[]` field
+  on FeatureArchitecture (forward-compatible for future
+  architect output shapes). Source 2: regex
+  `/CREATE\s+TABLE[\s\S]+?;/gi` against
+  `architectureMdUpdate`. Empty array on parse failure,
+  missing field, or no matches — section omitted cleanly.
+- New `renderCanonicalSqlSchemaSection(schemas)` helper
+  rendering "## Canonical SQL schemas (already defined — use
+  these exactly)" with a sql code fence. Empty string when
+  schemas is `[]`.
+- `buildPhaseArchitecturePrompt` and
+  `buildPhaseArchitectureReviewPrompt` accept new
+  `canonicalSqlSchemas: string[] = []` parameter (last
+  positional) and inject the section between
+  `goldenPrinciplesSection` and the task block.
+
+**Fix 1b — Thread canonicalSqlSchemas through architecture
+agent + orchestrator**
+
+- `ArchitectureAgent.designPhase` and `reviewPhaseDesign`
+  accept new `canonicalSqlSchemas: string[] = []` parameter
+  (last positional) threaded into the prompt builders.
+- `runPerPhaseArchitecture` in the planning orchestrator
+  extracts `canonicalSqlSchemas` from `feature.architecture`
+  ONCE per phase and passes it to BOTH `designPhase` and
+  `reviewPhaseDesign`. Logs schemaCount when > 0.
+
+**Fix 2 — 8th review-checklist item**
+
+- `buildPhaseArchitectureReviewPrompt` gains an 8th item:
+  "Schema consistency — if a `## Canonical SQL schemas`
+  block was provided above, your `sqlSchema` field MUST use
+  the EXACT same column names, types, and constraints for
+  every column of every table that overlaps with the
+  canonical definition. Any drift (e.g. `TIMESTAMP` vs
+  `TIMESTAMPTZ`, `VARCHAR(32)` vs `VARCHAR(20)`) must be
+  corrected to match the canonical version. If no canonical
+  block is provided, define the schema as you see fit."
+- Closing line updated to "all EIGHT checks".
+
+**Fix 3 — Canonical-schema HARNESS rule on architecture-agent**
+
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
+  and `/Users/amrmohamed/Work/trackeros/HARNESS.json` —
+  `agentConfig.architecture-agent.rules` appended with:
+  "When a canonical schema is provided for a table, use it
+  exactly. Do not redefine column types, sizes, or
+  constraints. A table must have one definition across all
+  architecture views."
+
+**Template version bumped 0.32.0 → 0.33.0.** No new
+migration. `pnpm -r build` clean across all 13 packages.
+
+What's verified live (trackeros feature
+`f070332a-b048-41c9-875f-0f7a4fe6a192` on `chat-latest`):
+
+- ✅ **Plumbing wired correctly.** Server boot picks up the
+  new code (`runPerPhaseArchitecture` ran cleanly for Phase
+  1 without error). `extractCanonicalSqlSchemas`
+  short-circuited to an empty array — verified by absence
+  of the "TR_048 — injecting canonical SQL schemas" log
+  line and by direct DB inspection.
+- ✅ **Plan shrunk to 5 phases** (vs TR_047's 8, TR_046's
+  6, TR_045's 7, TR_044's 10) — tightest plan across the
+  TR_036 → TR_048 sequence. Phase 1 bundles
+  `LeaveRequest AND LeaveAuditRecord domain models with
+  persistence + atomic transaction semantics + Vitest
+  repository tests` — the architect packed the workflow
+  layer tightly with the goldenPrinciples + transaction
+  semantics from TR_044/TR_047 all visible at design time.
+- ✅ **Phase 1 per-phase architecture: 4 interfaces + 6
+  criteria** (4 + 7 in TR_047, 5 + 6 in TR_046). One
+  criterion (sc-005) explicitly states "atomically within a
+  single PostgreSQL transaction with rollback on failure" —
+  TR_047's 7th checklist surfacing in the per-phase pass.
+
+What blocked the verification cycle (NEW 10th rigor bar):
+
+After Phase 1 ran for 39s, intent-agent escalated with one
+high-impact ambiguity:
+
+> **amb-001**: "The exact PostgreSQL schema and table
+> definitions for LeaveRequest and LeaveAuditRecord
+> persistence are not specified."
+
+Direct DB inspection of `features.architecture` for the
+verification feature confirms:
+- `architectureMdUpdate` documents the entities at the
+  conceptual level (entities, status values, audit actions,
+  module ownership, dependency direction, workflow rules)
+  but contains **zero `CREATE TABLE` statements**.
+- `feature_phases[0].architecture` has **no `sqlSchema`
+  field at all** (only `interfaces`, `successCriteria`,
+  `importStatements`).
+
+So architecture-agent never authored a canonical SQL schema
+in the first place — and TR_048's machinery, designed to
+share a canonical version, had nothing to share. The TR_048
+plumbing is correct (verified by absence of warnings and
+clean per-phase run) but the architect skipped the entire
+SQL surface that the per-phase pass would have reused.
+
+The architectureGuidance text says "SQL schema if needed"
+which on a multi-domain feature the LLM read as
+"recommended but optional". With 4 interface signatures
+pointing at PostgreSQL Pool + a `PostgreSqlLeaveRepository`
+class, the architect should have produced `CREATE TABLE`
+statements, but the instruction wasn't categorical.
+
+This is the **10th distinct intent-agent rigor bar** across
+TR_036 → TR_048, and the first bar where the prior fix's
+machinery worked correctly but had no input to act on:
+
+| Session | Intent-agent escalation reason | Scope |
+|---------|--------------------------------|-------|
+| TR_036  | Symbol-name conflict | Architectural |
+| TR_037  | Concrete persistence implementation | Architectural |
+| TR_038  | Repository missing CRUD methods | Architectural |
+| TR_041  | Scope-vs-architecture file-count mismatch | Structural |
+| TR_042  | Audit records for state-changing operations | Cross-cutting |
+| TR_044  | Method signatures as "Not implemented" stubs | Semantic |
+| TR_045  | Undocumented lifecycle state | Documentation drift |
+| TR_046  | Transaction semantics | Architectural (narrow) |
+| TR_047  | SQL schema column-type drift between two views | Internal consistency |
+| **TR_048** | **SQL schema missing entirely for persisted entities** | Required-output (categorical) |
+
+**Pending follow-ups (NEW from TR_048 verification):**
+
+- **(HIGH — NEW)** Architecture-agent must categorically
+  produce explicit SQL schemas for every persisted entity
+  when the project stack declares a relational database.
+  Options:
+  (a) `architecture-agent.architectureGuidance` rule:
+  "When the declared stack includes a relational database
+  (Postgres, MySQL, SQL Server, Oracle), every domain
+  entity that persists state MUST have a CREATE TABLE
+  statement in `architectureMdUpdate` (feature-level) or
+  in a `sqlSchemas[]` field. Do not leave persistence
+  schemas implicit. The interface signatures alone do not
+  define the persistence shape."; OR
+  (b) Add `sqlSchemas?: string[]` as a first-class field
+  on `FeatureArchitecture` and update the JSON output
+  schema in `buildFeatureArchitecturePrompt` to require it
+  for stacks with `database` set; OR
+  (c) Per-phase review's 8th item already enforces
+  consistency WHEN a canonical block exists — promote it
+  to "if a `sqlSchema` field is empty on a phase that
+  creates persistence interfaces, REQUEST the canonical
+  schema from the feature level or write the schema here".
+- **(MEDIUM — OBSERVATION)** TR_048 machinery (helper +
+  threading + section + checklist + HARNESS rule) is in
+  place and will start firing the moment a downstream fix
+  forces architecture-agent to emit `CREATE TABLE` text.
+  The plumbing is ready; the upstream gap is now the
+  required-output rule.
+
+Carryover follow-ups (status updates):
+
+- **(STILL OPEN — HIGH from TR_036)** Gate-side
+  verification. Cycle did NOT reach the gate this time —
+  blocked at intent-agent on the new 10th bar. The two
+  consecutive 1-violation gate runs from TR_047 remain
+  the closest the cycle has ever been.
+- **(STILL OPEN — TR_047 HIGH NEW)** Schema-consistency
+  guardrail. TR_048 implemented option (c) (platform-side
+  canonical reuse) but the cycle didn't surface the drift
+  again — the architect simply skipped SQL entirely. The
+  TR_047 guardrail is dormant but verified-by-absence
+  (no drift errors because no schemas were emitted).
+
+Build status: `pnpm -r build` clean across all 13
+packages. Template auto-refreshes to `0.33.0` at next
+server boot.
+
+Files changed:
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
+- `templates/corporate-ops-web-mobile/template.json`
+- `packages/agents/planning/src/prompts/architecture-prompt.ts`
+- `packages/agents/planning/src/agents/architecture-agent.ts`
+- `packages/agents/planning/src/orchestrator/planning-orchestrator.ts`
+- `/Users/amrmohamed/Work/trackeros/HARNESS.json` (separate
+  repo, pushed at `b1d6c878`)
+
+Live URLs:
+- Dashboard: http://localhost:3000/app/
+- TR_048 verification feature:
+  http://localhost:3000/app/features/f070332a-b048-41c9-875f-0f7a4fe6a192
+- trackeros PLAN.md:
+  https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
+- trackeros TR_048 HARNESS commit:
+  https://github.com/afarahat-lab/trackeros/commit/b1d6c878
+
+---
 ### Session 2026-06-11 — Claude Code (TR_047: architecture-agent rule + 7th review-checklist item for transaction semantics — closes TR_046's 8th bar by structural redesign (architect SPLIT AuditRecord into own phase rather than answering the question); cycle reached the GATE three times with last two runs at 1 violation each — closest to passing yet; intent-agent now blocks on the 9th narrowest bar yet, SQL schema column-type drift between two views of the same table)
 
 Brief: one HARNESS rule + one platform-code rule closing
@@ -358,152 +568,4 @@ Live URLs:
 - trackeros TR_046 HARNESS commit:
   https://github.com/afarahat-lab/trackeros/commit/645cd7cd
 
----
----
-### Session 2026-06-10 — Claude Code (TR_045: one-rule HARNESS edit — interface signatures are CONTRACTS, not stubs — closes TR_044's 6th intent-agent rigor bar; cycle now blocks on a 7th bar — undocumented `CANCELLED` lifecycle state introduced by architecture-agent vs project context's three documented states)
-
-Brief: single abstract rule appended to
-`agentConfig.intent-agent.rules` in template + trackeros
-HARNESS. Closes the TR_044 finding where intent-agent
-interpreted TypeScript interface signatures (no method bodies,
-correct for an architecture phase) as "stubs throwing 'Not
-implemented'".
-
-What changed (1 fix):
-
-**Fix — Third intent-agent rule (interface signatures are contracts)**
-
-- `templates/corporate-ops-web-mobile/harness/HARNESS.json` and
-  `/Users/amrmohamed/Work/trackeros/HARNESS.json` gain a third
-  item under `agentConfig.intent-agent.rules`:
-  > "Interface method signatures in per-phase architecture
-  > specifications are CONTRACTS to be implemented by the
-  > code-agent during this phase. They are not stubs. An
-  > interface showing method signatures without bodies is
-  > correct and complete — do not flag missing method bodies as
-  > ambiguity or missing implementation."
-- Abstract — no TypeScript-specific language; applies to
-  interfaces, abstract classes, or any contract pattern in any
-  language.
-- No platform code change. No new migration.
-
-**Template version bumped 0.29.0 → 0.30.0.** Build clean across
-all 13 packages.
-
-What's verified live (trackeros feature
-`48aa490e-4142-442c-bab4-41c03e21e4b9` on `chat-latest`):
-
-- ✅ **Interface-signatures rigor bar (TR_044 finding) CLOSED.**
-  Intent-agent did NOT escalate on "method stubs throwing 'Not
-  implemented'" this cycle. The phase-1 intent
-  (`5910f943-b7b3-4949-b3ef-de1c2b7529b7`) transitioned cleanly
-  from `pending` → `generating` immediately on dispatch — no
-  intermediate clarification escalation.
-- ✅ **Plan tightened to 7 phases** (vs TR_044's 10): Phase 2
-  bundles "Create AND cancel leave requests" — the planner is
-  packing related operations more efficiently with TR_044's
-  goldenPrinciples + TR_045's contract-clarity context. Phase 7
-  bundles "Employee integration, RBAC, balance consumption, and
-  compliance coverage" — cross-cutting concerns still planned
-  for but more efficiently scoped.
-- ✅ **Phase 1 per-phase architecture: 5 interfaces + 5
-  criteria** (richest yet — vs TR_044's 3 interfaces, TR_042's
-  3, TR_041's 3, TR_038's 1). Per-phase pass keeps improving
-  with each iteration's HARNESS layer.
-
-What blocked the verification cycle (NEW orthogonal finding):
-
-After Phase 1 generated for ~5 minutes, intent-agent escalated
-on a NEW (7th) rigor bar:
-
-> "High-impact ambiguity: The project context defines
-> LeaveRequest lifecycle states as **Pending, Approved,
-> Rejected**, while the phase architecture specifies repository
-> model status values **PENDING, APPROVED, REJECTED, and
-> CANCELLED**."
-
-This is a genuine, narrow concern — the architecture-agent
-introduced a `CANCELLED` lifecycle state that is NOT mentioned
-in the project's documented `ARCHITECTURE.md` or
-`GOLDEN_PRINCIPLES.md`, but Phase 2 of the plan is "Create AND
-cancel leave requests". So the architecture-agent expanded the
-documented lifecycle to support the planned cancel workflow,
-and intent-agent caught the divergence between project
-documentation and architecture-agent output.
-
-This is the 7th distinct intent-agent rigor bar across the
-TR_036 → TR_045 sequence:
-
-| Session | Intent-agent escalation reason |
-|---------|--------------------------------|
-| TR_036  | Symbol-name conflict |
-| TR_037  | Concrete persistence implementation not specified |
-| TR_038  | Repository missing CRUD methods |
-| TR_041  | Scope-vs-architecture file-count mismatch |
-| TR_042  | Audit records for state-changing operations |
-| TR_044  | Method signatures interpreted as "Not implemented" stubs |
-| **TR_045** | **Undocumented lifecycle state introduced by architecture** |
-
-Each fix closes one bar; intent-agent finds another. The bars
-are getting more specific — TR_045's escalation is on a single
-state name (`CANCELLED`) not in the documentation, which is a
-narrower complaint than TR_036's "symbol-name conflict" or
-TR_038's "missing CRUD methods".
-
-**Pending follow-ups (NEW from TR_045 verification):**
-
-- **(HIGH — NEW)** Intent-agent escalates when
-  architecture-agent introduces lifecycle states not in
-  `docs/ARCHITECTURE.md` or `GOLDEN_PRINCIPLES.md`. The
-  architecture-agent introduced `CANCELLED` because Phase 2
-  requires it ("Create AND cancel leave requests"), but the
-  project docs only list `Pending, Approved, Rejected`.
-  Options: (a) architecture-agent rule: "If a feature requires
-  a lifecycle state not documented in the project context, add
-  the new state to `architectureMdUpdate` so docs are updated
-  in lockstep"; (b) intent-agent rule: "If a phase introduces
-  a state value implied by the feature scope (e.g. 'cancel'
-  implies a CANCELLED state), treat the new value as
-  consistent with the documented lifecycle, not as a
-  conflict"; (c) regex post-processing in architecture-agent
-  that normalises lifecycle state names against the
-  documented set.
-- **(MEDIUM — NEW)** Architecture-agent uses UPPERCASE
-  (PENDING / APPROVED / REJECTED / CANCELLED) while the
-  project context uses TitleCase (Pending / Approved /
-  Rejected). Even setting aside the CANCELLED issue, the
-  casing mismatch is itself something intent-agent could
-  pick up on. Either (a) standardise on one casing across all
-  documentation + architecture output; (b) intent-agent
-  treats case-insensitive matches as consistent.
-
-Carryover follow-ups (status updates):
-
-- **(RESOLVED by TR_045)** TR_044 HIGH NEW: intent-agent
-  reading interface signatures as "Not implemented" stubs.
-  Verified end-to-end on this cycle — no escalation on that
-  pattern.
-- **(STILL OPEN — HIGH from TR_036)** Gate-side verification.
-  Cycle did not reach the gate again (intent-agent blocked
-  first on the new lifecycle-state bar).
-
-Build status: `pnpm -r build` clean across all 13 packages.
-Template auto-refreshes to `0.30.0` at next server boot.
-
-Files changed:
-- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
-- `templates/corporate-ops-web-mobile/template.json`
-- `/Users/amrmohamed/Work/trackeros/HARNESS.json` (separate
-  repo, pushed at `b49b65c8`)
-
-Live URLs:
-- Dashboard: http://localhost:3000/app/
-- TR_045 verification feature:
-  http://localhost:3000/app/features/48aa490e-4142-442c-bab4-41c03e21e4b9
-- trackeros PLAN.md:
-  https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
-- trackeros TR_045 HARNESS commit:
-  https://github.com/afarahat-lab/trackeros/commit/b49b65c8
-
----
 ---

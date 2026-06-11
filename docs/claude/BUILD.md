@@ -54,6 +54,107 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_048 — Canonical SQL schema reuse across feature-level + per-phase architecture views (template 0.33.0, build clean, plumbing verified, architect emitted no SQL this cycle; 10th rigor bar surfaced — explicit SQL output is required-but-optional in guidance)
+
+Three platform fixes + one HARNESS rule closing TR_047's 9th
+intent-agent rigor bar (architecture-agent emitted two views
+of the same `leave_requests` table with drifted column
+types — `TIMESTAMP vs TIMESTAMPTZ`, `VARCHAR(32) vs
+VARCHAR(20)`). The fix establishes a single source of truth:
+the feature-level architecture is canonical; per-phase
+references it instead of redefining.
+
+- **Fix 1a** — `extractCanonicalSqlSchemas` helper +
+  `renderCanonicalSqlSchemaSection` helper +
+  `canonicalSqlSchemas: string[] = []` parameter on
+  `buildPhaseArchitecturePrompt` and
+  `buildPhaseArchitectureReviewPrompt`. Source 1: explicit
+  `sqlSchemas[]` field (forward-compatible). Source 2:
+  regex `/CREATE\s+TABLE[\s\S]+?;/gi` against
+  `architectureMdUpdate`. Empty array → section omitted.
+- **Fix 1b** — `designPhase` + `reviewPhaseDesign` accept
+  the parameter; `runPerPhaseArchitecture` orchestrator
+  extracts once and passes to BOTH.
+- **Fix 2** — 8th review-checklist item ("Schema
+  consistency — if a `## Canonical SQL schemas` block was
+  provided, your `sqlSchema` field MUST use the EXACT same
+  column names, types, and constraints…") + closing line
+  "all EIGHT checks".
+- **Fix 3** — `agentConfig.architecture-agent.rules` in
+  template + trackeros HARNESS appended: "When a canonical
+  schema is provided for a table, use it exactly. Do not
+  redefine column types, sizes, or constraints. A table
+  must have one definition across all architecture views."
+
+Template `0.32.0 → 0.33.0`. No new migration.
+`pnpm -r build` clean across all 13 packages.
+
+**Live verification — TR_048 plumbing CORRECT, but
+architect emitted NO SQL this cycle:** trackeros feature
+`f070332a-b048-41c9-875f-0f7a4fe6a192` on `chat-latest`:
+
+- ✅ `runPerPhaseArchitecture` ran cleanly without errors
+  for Phase 1.
+- ✅ `extractCanonicalSqlSchemas` returned an empty array
+  (no "TR_048 — injecting canonical SQL schemas" log line),
+  consistent with `architectureMdUpdate` containing zero
+  CREATE TABLE statements (DB-confirmed) and
+  `feature_phases[0].architecture` having no `sqlSchema`
+  field at all (only `interfaces`, `successCriteria`,
+  `importStatements`).
+- ✅ **Plan: 5 phases — tightest plan yet** across
+  TR_036 → TR_048 (vs TR_047's 8, TR_046's 6, TR_045's 7,
+  TR_044's 10).
+- ✅ Phase 1 architecture: 4 interfaces + 6 criteria; one
+  criterion explicitly states atomic single-PostgreSQL-
+  transaction semantics — TR_047's 7th checklist surfacing
+  in the per-phase pass.
+
+**Cycle blocked on a 10th intent-agent rigor bar:**
+
+> **amb-001 (high impact)**: "The exact PostgreSQL schema
+> and table definitions for LeaveRequest and
+> LeaveAuditRecord persistence are not specified."
+
+First bar in the sequence where the prior fix's machinery
+worked correctly but had no input to act on. The architect
+read `architectureGuidance`'s "SQL schema if needed" as
+optional even with 4 interface signatures referencing a
+PostgreSQL `Pool` and a `PostgreSqlLeaveRepository` class.
+
+**New HIGH follow-up for TR_049:** architecture-agent must
+categorically produce explicit CREATE TABLE statements
+for every persisted entity when the project stack declares
+a relational database. Options:
+
+- (a) `architecture-agent.architectureGuidance` rule:
+  "When the declared stack includes a relational database
+  (Postgres, MySQL, SQL Server, Oracle), every domain
+  entity that persists state MUST have a CREATE TABLE
+  statement in `architectureMdUpdate` (or a
+  `sqlSchemas[]` field). Do not leave persistence schemas
+  implicit."; OR
+- (b) Add `sqlSchemas?: string[]` as a first-class field
+  on `FeatureArchitecture` with the JSON output schema
+  requiring it when `HARNESS.stack.database` is set; OR
+- (c) Per-phase review's 8th item promoted: "if
+  `sqlSchema` is empty on a phase that creates
+  persistence interfaces, REQUEST the canonical schema
+  from the feature level or write the schema here".
+
+**Observation:** TR_048's machinery (helper + threading +
+section + checklist + HARNESS rule) is in place and will
+fire the moment a downstream fix forces architecture-agent
+to emit `CREATE TABLE` text. Verified by absence.
+
+**Operator action — trackeros:** none beyond the
+already-pushed `b1d6c878 chore(TR_048): architecture-agent
+rule — canonical schema reuse across views`.
+
+**Operator action — other projects:** Append the new
+architecture-agent rule to existing projects' HARNESS.
+Template auto-refreshes to `0.33.0` at next server boot.
+
 ### TR_047 — Architecture-agent rule + 7th review-checklist item: transaction semantics for cross-cutting operations (template 0.32.0, build clean, cycle reached the gate for the 3rd time with TWO consecutive 1-violation runs)
 
 One HARNESS rule + one platform-code rule closing TR_046's
