@@ -67,6 +67,79 @@ function renderGoldenPrinciplesSection(goldenPrinciplesMd: string): string {
   ].join('\n');
 }
 
+/**
+ * TR_048 — Extract canonical SQL CREATE TABLE statements from a
+ * feature-level architecture so the per-phase pass can reference
+ * them instead of regenerating drifted versions.
+ *
+ * Three sources, tried in order:
+ *   1. Explicit `FeatureArchitecture.sqlSchemas` field — populated
+ *      by the architecture-agent's `designFeature` when the LLM
+ *      emits structured schemas. Most reliable.
+ *   2. Regex-extracted `CREATE TABLE … ;` statements from
+ *      `architectureMdUpdate` markdown. The architecture-agent
+ *      routinely embeds schema fragments in the markdown summary;
+ *      the regex catches those.
+ *   3. Returns empty array when neither source yields anything —
+ *      callers test `length > 0` and omit the canonical section.
+ *
+ * Pure utility. Accepts the JSON-serialized feature architecture
+ * string the orchestrator stores in `features.architecture`; tries
+ * to parse, falls through silently on any failure.
+ */
+export function extractCanonicalSqlSchemas(
+  featureArchitectureJson: string | null | undefined,
+): string[] {
+  if (!featureArchitectureJson || featureArchitectureJson.length === 0) {
+    return [];
+  }
+  let parsed: { sqlSchemas?: unknown; architectureMdUpdate?: unknown };
+  try {
+    parsed = JSON.parse(featureArchitectureJson) as typeof parsed;
+  } catch {
+    return [];
+  }
+
+  // Source 1: explicit `sqlSchemas` field.
+  if (Array.isArray(parsed.sqlSchemas)) {
+    const direct = parsed.sqlSchemas.filter((s): s is string =>
+      typeof s === 'string' && s.trim().length > 0,
+    );
+    if (direct.length > 0) return direct;
+  }
+
+  // Source 2: regex extraction from `architectureMdUpdate` text.
+  if (typeof parsed.architectureMdUpdate === 'string') {
+    const matches = parsed.architectureMdUpdate.match(/CREATE\s+TABLE[\s\S]+?;/gi);
+    if (matches) return matches.map((m) => m.trim());
+  }
+
+  return [];
+}
+
+/**
+ * TR_048 — Render the canonical SQL schemas block to inject into
+ * both the per-phase design prompt and the per-phase review
+ * prompt. Empty string when the input array is empty; callers
+ * concatenate unconditionally.
+ */
+function renderCanonicalSqlSchemaSection(canonicalSqlSchemas: string[]): string {
+  if (canonicalSqlSchemas.length === 0) return '';
+  return [
+    '## Canonical SQL schemas (already defined — use these exactly)',
+    '',
+    'The following SQL schemas were defined at the feature level.',
+    'Use these EXACT column names, types, and constraints in your',
+    'per-phase `sqlSchema`. Do not redefine or modify them. If a',
+    'table you need is shown here, copy its definition verbatim.',
+    '',
+    '```sql',
+    canonicalSqlSchemas.join('\n\n'),
+    '```',
+    '',
+  ].join('\n');
+}
+
 function renderStackSection(harnessConfig: HarnessConfig | null): string {
   const stack = harnessConfig?.stack;
   if (!stack || Object.keys(stack).length === 0) return '';
@@ -163,10 +236,12 @@ export function buildPhaseArchitecturePrompt(
   agentCfg: AgentConfig,
   harnessConfig: HarnessConfig | null,
   goldenPrinciplesMd: string = '',
+  canonicalSqlSchemas: string[] = [],
 ): string {
   const harnessSection = renderHarnessAgentRules('architecture-agent', harnessConfig);
   const stackSection = renderStackSection(harnessConfig);
   const goldenPrinciplesSection = renderGoldenPrinciplesSection(goldenPrinciplesMd);
+  const canonicalSchemaSection = renderCanonicalSqlSchemaSection(canonicalSqlSchemas);
   const extensions = agentCfg.promptExtensions ?? [];
   const priorPhasesBlock = priorPhases.length
     ? priorPhases.map((p, i) => `  ${i + 1}. ${p.title} (${p.status}) — ${oneLine(p.scope)}`).join('\n')
@@ -179,6 +254,7 @@ export function buildPhaseArchitecturePrompt(
     harnessSection,
     stackSection,
     goldenPrinciplesSection,
+    canonicalSchemaSection,
     '## Feature',
     `Title: ${feature.title}`,
     `Description: ${oneLine(feature.description)}`,
@@ -409,10 +485,12 @@ export function buildPhaseArchitectureReviewPrompt(
   agentCfg: AgentConfig,
   harnessConfig: HarnessConfig | null,
   goldenPrinciplesMd: string = '',
+  canonicalSqlSchemas: string[] = [],
 ): string {
   const harnessSection = renderHarnessAgentRules('architecture-agent', harnessConfig);
   const stackSection = renderStackSection(harnessConfig);
   const goldenPrinciplesSection = renderGoldenPrinciplesSection(goldenPrinciplesMd);
+  const canonicalSchemaSection = renderCanonicalSqlSchemaSection(canonicalSqlSchemas);
   const draftJson = JSON.stringify(draft, null, 2).slice(0, 2000);
 
   // TR_042 — Stack compliance check rendered FIRST. TR_041 verified
@@ -453,6 +531,7 @@ export function buildPhaseArchitectureReviewPrompt(
     harnessSection,
     stackSection,
     goldenPrinciplesSection,
+    canonicalSchemaSection,
     '## Phase being reviewed',
     `Feature: ${feature.title}`,
     `Phase ${phase.phaseIndex + 1}: ${phase.title}`,
@@ -487,8 +566,18 @@ export function buildPhaseArchitectureReviewPrompt(
     // transaction), separate (two transactions), or compensating
     // (saga). Implicit coordination is the TR_046 finding.
     '7. Transaction semantics — if this phase performs multiple coordinated domain mutations (a primary write plus a cross-cutting concern such as audit logging, event publishing, or cache invalidation), at least one `successCriteria` line must explicitly state the transaction behavior (atomic in a single DB transaction, separate transactions, or compensating). If transaction behavior is implicit, ADD an explicit success criterion before returning.',
+    // TR_048 — closes the 9th intent-agent rigor bar surfaced by
+    // TR_047 verification (architecture-agent emitted two views of
+    // the same `leave_requests` table — one in feature-level
+    // architectureMdUpdate, another in per-phase sqlSchema — with
+    // drifted column types: TIMESTAMP vs TIMESTAMPTZ, VARCHAR(32)
+    // vs VARCHAR(20)). When a canonical SQL schema is provided
+    // above (via the `## Canonical SQL schemas` block), the
+    // per-phase `sqlSchema` field MUST match it byte-for-byte for
+    // any column it duplicates.
+    '8. Schema consistency — if a `## Canonical SQL schemas` block was provided above, your `sqlSchema` field MUST use the EXACT same column names, types, and constraints for every column of every table that overlaps with the canonical definition. Any drift (e.g. `TIMESTAMP` vs `TIMESTAMPTZ`, `VARCHAR(32)` vs `VARCHAR(20)`) must be corrected to match the canonical version. If no canonical block is provided, define the schema as you see fit.',
     '',
-    'If the draft passes all seven checks, return it unchanged.',
+    'If the draft passes all eight checks, return it unchanged.',
     'If any check fails, fix the issue and return the corrected version.',
     'Return the COMPLETE PhaseArchitecture JSON — not just the changes.',
     '',

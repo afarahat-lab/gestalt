@@ -48,7 +48,7 @@ import type {
 import { ArchitectureAgent } from '../agents/architecture-agent';
 import { PlannerAgent } from '../agents/planner-agent';
 import { PhaseEvaluatorAgent } from '../agents/phase-evaluator-agent';
-import { applyStackSubstitutions } from '../prompts/architecture-prompt';
+import { applyStackSubstitutions, extractCanonicalSqlSchemas } from '../prompts/architecture-prompt';
 import type { FeatureArchitecture, FeaturePlan, PhaseEvaluation } from '../types';
 
 const log = createContextLogger({ module: 'planning-orchestrator' });
@@ -618,10 +618,30 @@ async function runPerPhaseArchitecture(
     // each per-phase design + review pass sees cross-cutting
     // concerns the same way intent-agent does.
     const goldenPrinciplesMd = await readFileSafe(join(workDir, 'docs/GOLDEN_PRINCIPLES.md'));
+    // TR_048 — extract canonical SQL CREATE TABLE statements from
+    // the feature-level architecture once (either an explicit
+    // `sqlSchemas[]` field or regex-pulled from
+    // `architectureMdUpdate`). Pass to both designPhase and
+    // reviewPhaseDesign so the per-phase pass references the
+    // canonical definition instead of regenerating a drifted one.
+    // Empty array when no canonical schemas yet — both prompts
+    // render the section as empty string and the LLM defines
+    // schemas freely.
+    const canonicalSqlSchemas = extractCanonicalSqlSchemas(archMd);
+    if (canonicalSqlSchemas.length > 0) {
+      childLog.info(
+        {
+          featureId: feature.id, phaseId: phase.id,
+          phaseIndex: phase.phaseIndex,
+          schemaCount: canonicalSqlSchemas.length,
+        },
+        'TR_048 — injecting canonical SQL schemas into per-phase prompts',
+      );
+    }
     const architectureAgent = new ArchitectureAgent();
     const draftPa = await architectureAgent.designPhase(
       feature, phase.title, phase.architecture ?? phase.scope,
-      archMd, priorPhases, workDir, harnessConfig, correlationId, goldenPrinciplesMd,
+      archMd, priorPhases, workDir, harnessConfig, correlationId, goldenPrinciplesMd, canonicalSqlSchemas,
     );
 
     // STOPGAP (ADR-056): per-phase review pass. TR_041's verification
@@ -636,7 +656,7 @@ async function runPerPhaseArchitecture(
       'Invoking architecture-agent reviewPhaseDesign (TR_042 stopgap)',
     );
     const reviewedPa = await architectureAgent.reviewPhaseDesign(
-      draftPa, phase, feature, workDir, harnessConfig, correlationId, goldenPrinciplesMd,
+      draftPa, phase, feature, workDir, harnessConfig, correlationId, goldenPrinciplesMd, canonicalSqlSchemas,
     );
 
     // TR_044 — deterministic stack substitution. Read the

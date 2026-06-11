@@ -156,6 +156,7 @@ export class ArchitectureAgent extends BaseLLMAgent {
     harnessConfig: HarnessConfig | null,
     correlationId: string,
     goldenPrinciplesMd: string = '',
+    canonicalSqlSchemas: string[] = [],
   ): Promise<PhaseArchitecture> {
     this.lastTokensUsed = 0;
     this.setHarnessConfigForRun(harnessConfig);
@@ -163,7 +164,7 @@ export class ArchitectureAgent extends BaseLLMAgent {
     const prompt = this.addJsonResponseGuard(
       buildPhaseArchitecturePrompt(
         feature, phaseTitle, phaseRationale, featureArchitecture,
-        priorPhases, agentCfg, harnessConfig, goldenPrinciplesMd,
+        priorPhases, agentCfg, harnessConfig, goldenPrinciplesMd, canonicalSqlSchemas,
       ),
     );
     const raw = await this.callLLM(prompt, agentCfg, correlationId);
@@ -200,6 +201,7 @@ export class ArchitectureAgent extends BaseLLMAgent {
     harnessConfig: HarnessConfig | null,
     correlationId: string,
     goldenPrinciplesMd: string = '',
+    canonicalSqlSchemas: string[] = [],
   ): Promise<PhaseArchitecture> {
     this.lastTokensUsed = 0;
     this.setHarnessConfigForRun(harnessConfig);
@@ -214,7 +216,7 @@ export class ArchitectureAgent extends BaseLLMAgent {
       return draft;
     }
     const prompt = this.addJsonResponseGuard(
-      buildPhaseArchitectureReviewPrompt(draft, phase, feature, agentCfg, harnessConfig, goldenPrinciplesMd),
+      buildPhaseArchitectureReviewPrompt(draft, phase, feature, agentCfg, harnessConfig, goldenPrinciplesMd, canonicalSqlSchemas),
     );
     let raw: string;
     try {
