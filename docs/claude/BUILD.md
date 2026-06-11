@@ -54,6 +54,95 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_047 — Architecture-agent rule + 7th review-checklist item: transaction semantics for cross-cutting operations (template 0.32.0, build clean, cycle reached the gate for the 3rd time with TWO consecutive 1-violation runs)
+
+One HARNESS rule + one platform-code rule closing TR_046's
+8th intent-agent rigor bar (architecture-agent bundled
+`LeaveRequest` + `AuditRecord` mutations into Phase 1 without
+explicit transaction semantics).
+
+- **Fix 1** —
+  `agentConfig.architecture-agent.rules` in template + trackeros
+  HARNESS gains: "When a phase includes multiple domain
+  mutations that must be coordinated (a primary operation plus
+  a cross-cutting concern such as audit logging, event
+  publishing, or cache invalidation), explicitly state the
+  transaction semantics: whether the operations execute
+  atomically in a single transaction, as separate
+  transactions, or via a compensating pattern. Do not leave
+  transaction behavior implicit."
+- **Fix 2** —
+  `packages/agents/planning/src/prompts/architecture-prompt.ts`
+  `buildArchitectureReviewPrompt` (feature) and
+  `buildPhaseArchitectureReviewPrompt` (per-phase) gain a 7th
+  checklist item ("Transaction semantics") asking the review
+  pass to ensure every phase with multiple coordinated
+  mutations explicitly declares its transaction behavior. Both
+  prompts updated to "If the draft passes all SEVEN checks,
+  return it unchanged".
+
+Abstract — no specific patterns hardcoded; the LLM picks
+atomic/saga/eventual based on the stack and operations
+involved.
+
+Template `0.31.0 → 0.32.0`. `pnpm -r build` clean across all
+13 packages.
+
+**Live verification — TR_046 8th-bar CLOSED (by structural
+redesign):** trackeros feature
+`d90d14b5-3632-4b6e-8711-7d7ebb846efd` on `chat-latest`:
+- ✅ Architecture-agent saw the transaction-semantics
+  constraint at design time and responded by SPLITTING
+  `AuditRecord` into its own Phase 2 (separate from Phase
+  1's `LeaveRequest`). Phase 1 became a clean single-
+  mutation phase — no coordinated mutations → no
+  transaction-semantics question. This is a valid
+  architectural answer different from the brief's intent
+  ("state the semantics") but it closes the bar.
+- ✅ Phase 1 architecture: **4 interfaces + 7 criteria**
+  on first attempt (the 7th criterion is the new TR_047
+  transaction-semantics check).
+- ✅ Plan: 8 phases with the AuditRecord-LeaveRequest
+  split visible.
+- ✅ **Cycle reached the gate — THIRD time across TR_036 →
+  TR_047.** Gate ran 3 times with verdicts: 6 → **1**
+  → **1** CONSTRAINT_VIOLATION. Two consecutive
+  1-violation gate runs — closest to a clean gate pass
+  the cycle has ever been.
+
+**Cycle still blocked on the 9th and narrowest intent-agent
+rigor bar yet:** "The provided SQL schemas conflict on column
+types and sizes: one version uses TIMESTAMP and VARCHAR(32),
+while another uses DATE/TIMESTAMPTZ and VARCHAR(20)."
+Architecture-agent emitted TWO views of the same
+`leave_requests` table — one in the feature-level
+`architectureMdUpdate`, another in Phase 1's `sqlSchema` —
+with drifted column types. Intent-agent caught the internal
+inconsistency.
+
+**New HIGH follow-up for TR_048:** schema-consistency
+guardrail. Options:
+- (a) architectureGuidance rule: "When the same database
+  table is described in both the feature-level architecture
+  and a per-phase architecture, the column types and sizes
+  MUST match byte-for-byte"; OR
+- (b) 8th review checklist item: "Schema consistency —
+  every SQL schema mentioned across the architecture for
+  the same table must declare identical column types and
+  sizes"; OR
+- (c) platform-side: store one canonical schema per table
+  in `FeatureArchitecture.sqlSchemas` and render it the
+  same way in both prompts.
+
+**Operator action — trackeros:** none beyond the
+already-pushed `b50cb7f8 chore(TR_047): architecture-agent
+rule — explicit transaction semantics for coordinated
+mutations`.
+
+**Operator action — other projects:** Append the new
+architecture-agent rule to existing projects' HARNESS.
+Template auto-refreshes to `0.32.0` at next server boot.
+
 ### TR_046 — Architecture-agent rule + 6th review-checklist item: new domain concepts must appear in architectureMdUpdate (template 0.31.0, build clean, cycle reached the GATE for the 2nd time across TR_036 → TR_046)
 
 One HARNESS rule + one platform-code rule. Closes TR_045's 7th
