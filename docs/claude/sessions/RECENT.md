@@ -3,6 +3,270 @@
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
+### Session 2026-06-12/13 — Claude Code (TR_050: DeepInfra integration + Aider-as-default + 5 cascading timeout fixes — Phase 1 deployed end-to-end on Kimi-K2.6/DeepSeek-V3.2/Aider for the FIRST EVER autonomous source-file generation on DeepInfra; Phase 2 escalated on a fresh round of intent-agent rigor bars on DeepSeek-driven architecture — same TR_036-TR_047 class, deferred to TR_051)
+
+Brief (multi-stage): operator registers DeepInfra LLMs
+(`deepinfra-kimi-k2` / `deepinfra-deepseek-v3` /
+`deepinfra-qwen-tiny` — all `chat-completions` apiShape,
+`https://api.deepinfra.com/v1/openai`); trackeros agents.yaml
+matrix swap; Aider must be the only code-generation backend
+("this should be the only option").
+
+What changed (8 platform + harness changes across the session):
+
+**Fix 1 — trackeros agents.yaml: 9-agent DeepInfra matrix**
+
+- architecture-agent → moonshotai/Kimi-K2.6 (then DeepSeek-V3.2
+  after Kimi's 12k-token design call hit 50% timeout rate)
+- self-healing-agent → moonshotai/Kimi-K2.6 (short prompts)
+- planner-agent / phase-evaluator / constraint / review /
+  intent / design → deepseek-ai/DeepSeek-V3.2
+- code-agent → deepseek-ai/DeepSeek-V3.2 (then
+  moonshotai/Kimi-K2.6 after DeepSeek wouldn't emit Aider's
+  SEARCH/REPLACE blocks reliably)
+- `reasoning_effort` fields removed (DeepInfra OpenAI-compat
+  endpoint doesn't support the field; helper only emits on
+  `apiShape === 'responses'`)
+
+**Fix 2 — platform default flipped (`gestalt platform llms
+set-default deepinfra-deepseek-v3`)**: every agent on
+`model: ~` (context-agent, test-agent, drift / alignment /
+gc) now inherits DeepSeek-V3.2 (was Kimi-K2.6 — which
+caused test-agent to retry-storm).
+
+**Fix 3 — Aider is the ONLY code-generation backend (platform
++ HARNESS)**
+
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`
+  both `aiderBackend` checks changed from
+  `harnessConfig?.codeGeneration?.backend === 'aider'` to
+  `(harnessConfig?.codeGeneration?.backend ?? 'aider') === 'aider'`.
+  Absent block → Aider. Gestalt-native CodeAgent reachable only
+  by explicit `backend: 'gestalt'` opt-out.
+- `packages/core/src/harness/index.ts` JSDoc rewritten to
+  document Aider as the default and `'gestalt'` as
+  deprecated-but-retained for backwards compatibility.
+- Template HARNESS.json + trackeros HARNESS.json now carry
+  `codeGeneration.backend: 'aider'` explicitly for clarity.
+- Template `0.34.0 → 0.35.0`.
+
+**Fix 4 — `.env` corrections + LLM_TIMEOUT_MS bump**
+
+- Fixed `LLM_MOCEL` typo → `LLM_MODEL`. Set `LLM_API_KEY` to
+  the DeepInfra key (loadConfig requires both; server was in
+  restart loop without them).
+- `LLM_TIMEOUT_MS=300000` (5 min, was 120s default). Kimi-
+  K2.6 at 12k max_tokens routinely takes 4-10 min per call;
+  300s lets the architecture-agent at least try.
+
+**Fix 5 — BullMQ stalled-retry storm fix**
+
+- `packages/core/src/queue/index.ts` adds
+  `lockDuration: 600000` (10 min) and
+  `maxStalledCount: 0` to every Worker. BullMQ's defaults
+  (30s lockDuration, 1 stalledCount) marked long-running
+  planning:start as stalled and dispatched a duplicate
+  handler — both inserted feature_phases rows and the
+  second hit the `feature_phases_feature_id_phase_index_key`
+  unique constraint, killing the cycle with a duplicate-key
+  error.
+
+**Fix 6 — transient `fetch failed` errors retryable**
+
+- `packages/core/src/llm/index.ts` `classifyError` extended
+  to recognise `TypeError: fetch failed` and the standard
+  Node socket errors (`ECONNRESET`, `ENOTFOUND`, `ETIMEDOUT`,
+  `EAI_AGAIN`, `socket hang up`) as `retryable: true`. Closes
+  the TR_033 follow-up "one transient TypeError: fetch failed
+  killed an attempt because classifyError treats it as
+  retryable: false".
+
+**Fix 7 — litellm provider prefix for Aider**
+
+- `packages/agents/generate/src/adapters/aider-adapter.ts`
+  prepends `openai/` to the model string when it lacks a
+  known litellm provider prefix (allowlist of 17 prefixes:
+  openai, anthropic, azure, vertex_ai, bedrock, together_ai,
+  fireworks_ai, huggingface, replicate, cohere, ollama,
+  groq, mistral, deepseek, perplexity, gemini, xai). litellm
+  errored with `LLM Provider NOT provided. You passed
+  model=deepseek-ai/DeepSeek-V3.2` because the wire model
+  name carries no provider. With the prefix, litellm routes
+  via OpenAI provider + the `OPENAI_API_BASE` env var,
+  which points at DeepInfra's endpoint. Validated by Aider
+  stdout showing `Model: openai/moonshotai/Kimi-K2.6 with
+  whole edit format`.
+
+**Fix 8 — Aider subprocess timeout cascade**
+
+Three nested timeouts each needed bumping (each one capped
+the layers below it):
+
+1. `aider-adapter.ts` `DEFAULT_AIDER_TIMEOUT_MS`: 120000 →
+   900000 (15 min). Adapter ceiling.
+2. `aider-adapter.ts` Aider CLI flag `--timeout 600` added
+   (Aider's own per-LLM-call HTTP timeout; litellm/httpx
+   default 120s).
+3. `packages/core/src/tools/file-tools.ts`
+   `MAX_SCRIPT_TIMEOUT_MS`: 120000 → 900000. THE actual
+   ceiling — `executeScript` (which Aider runs through)
+   clamped any timeout above 120s back down to 120s. This
+   was the silent killer that made the previous two fixes
+   look like they hadn't taken effect.
+
+**Build clean across all 13 packages** after each change.
+
+What's verified live (trackeros feature
+`523e9824-b189-42e7-9b11-efa453133db7`, the final cycle of
+the session, run on DeepInfra-only):
+
+- ✅ **TR_050 milestone: Phase 1 DEPLOYED end-to-end on
+  DeepInfra/Aider for the FIRST EVER autonomous source-file
+  generation across TR_036 → TR_050.** Wall-clock from
+  `phase-submitted` (22:07:29) to `phase-evaluated:
+  success` (22:27:32) was 20m 03s. Path:
+  intent-agent (DeepSeek) → design-agent (DeepSeek) →
+  context-agent (DeepSeek) → code-agent (Aider/Kimi —
+  REAL files written) → test-agent (skipped per Aider
+  backend) → pr-agent → pipeline-agent (noop) →
+  constraint-agent (DeepSeek, PASSED) → review-agent
+  (DeepSeek, PASSED) → promotion-agent.
+- ✅ **3 DeepInfra LLMs registered + reachable**
+  (`gestalt platform llms test` returned 753ms / 1644ms /
+  339ms for Kimi / DeepSeek / Qwen-tiny respectively).
+- ✅ **Aider with `openai/moonshotai/Kimi-K2.6` + whole
+  edit format produced real source files** for Phase 1
+  (vs the empty-output of DeepSeek+diff-format and
+  pre-prefix runs). Architecture: 3 interfaces + 7 criteria.
+- ✅ Plan tightened to 6 phases.
+
+**Cycles before the working stack landed (data for
+SUMMARY.md/STATE.md): session ran 10 cycles** with each
+one identifying a different blocker in the cascade:
+
+1. `a88cfb44` — LLM timed out 120s (default LLM_TIMEOUT_MS)
+2. `0b39864a` — Phase 1 reached test-agent; test-agent
+   retry-stormed on Kimi (timeout on inheriting platform
+   default)
+3. `b560bec5` — architecture-agent timed out on Kimi (50%
+   rate)
+4. `e3298836` — DeepSeek code-agent → 144k tokens but
+   Phase 1 retry escalated at evaluator after gate review
+   found 9 CONSTRAINT_VIOLATIONs (Express vs Fastify,
+   Jest vs Vitest framework leak)
+5. `a57e62c3` — Aider backend now enabled but planning:start
+   ran TWICE (BullMQ stalled-retry) → duplicate-key
+   feature-failed
+6. `9a0df185` — `TypeError: fetch failed` from DeepInfra
+7. `1f24e41f` — Aider's `code-agent` 3.8s (zero source
+   files — litellm prefix issue)
+8. `ae9bd00b` — `openai/` prefix worked, Phase 1 hit gate,
+   review-agent found 9 violations → escalate
+9. `4cd459c6` → `1a6a0bc1` → `530d359e` — successive
+   timeout cascade fixes (120s → 600s → 900s subprocess →
+   MAX_SCRIPT_TIMEOUT_MS)
+10. `523e9824` — **Phase 1 deploys.** Phase 2 escalates on
+    new rigor bars (below).
+
+**Phase 2 blocker (new intent-agent rigor bars, deferred
+to TR_051):**
+
+Phase 2 (`Leave request service with validation`)
+escalated 1m 50s after dispatch on three high-impact
+ambiguities:
+
+- **amb-001**: "The intent mentions 'Jest unit tests' but
+  the project uses Vitest. Should tests be written for
+  Jest or Vitest?" — `testFramework` binding regressed
+  vs TR_040/TR_041 because DeepSeek-V3.2 (architecture-
+  agent) doesn't internalise HARNESS.stack the way
+  gpt-5.5 did.
+- **amb-002**: "The ILeaveService interface shows state
+  transitions (PENDING → APPROVED/REJECTED) but the success
+  criteria only mention creation. Should approval/rejection
+  methods be included in this phase?" — interface vs scope
+  description mismatch (lifecycle coverage rigor bar
+  TR_041 closed for architecture-agent; recurring on
+  DeepSeek).
+- **amb-003**: "The architecture mentions 'atomic
+  transactions' but doesn't specify transaction management
+  approach (manual vs repository pattern with transaction
+  support)" — TR_046 transaction-semantics rigor bar
+  resurfacing on DeepSeek (architecture-agent says "atomic"
+  but doesn't pin the implementation strategy).
+
+These three ambiguities are the **same class** TR_036-TR_047
+worked through. The HARNESS rules and review-checklist items
+that closed them on gpt-5.5 are still in place — but DeepSeek-
+V3.2 doesn't follow them as crisply. Either (a) the rules need
+re-strengthening (more imperative wording), or (b) the
+architecture-agent should run on a stronger model.
+Deferred to TR_051.
+
+**Pending follow-ups (NEW from TR_050 verification):**
+
+- **(HIGH — NEW)** TR_036-TR_047 architectural rules still
+  in HARNESS but DeepSeek-V3.2 doesn't internalise them as
+  crisply as gpt-5.5. Three options for TR_051:
+  (a) re-strengthen rule wording (more imperative); OR
+  (b) switch architecture-agent back to Kimi-K2.6 with
+  smaller max_tokens (4-6k) + the 5-min LLM timeout to
+  manage cost; OR (c) introduce a deterministic
+  post-process pass that catches `testFramework` /
+  lifecycle / transaction-semantics drift before intent-
+  agent sees it.
+- **(MEDIUM — NEW)** Aider model warnings on DeepInfra:
+  litellm doesn't recognise `deepseek-ai/DeepSeek-V3.2` or
+  `moonshotai/Kimi-K2.6` as known models, so it falls back
+  to "sane defaults" for context window + cost computation.
+  Functionally harmless (the `openai/` prefix routes
+  correctly) but noisy in stdout and may affect Aider's
+  internal token-budget heuristics.
+- **(LOW — NEW)** Three deprecated noisy warnings to
+  silence in Aider stdout (already-functional):
+  `--no-show-model-warnings` flag could be added.
+
+Carryover follow-ups (status updates):
+
+- **(STILL OPEN from TR_036)** Gate verdicts still trend
+  down with each cycle — but TR_050's verification ran on
+  the noop pipeline adapter (no GitHub). The trackeros
+  operator should switch to `github-actions` to verify the
+  full deploy chain end-to-end.
+- **(STILL OPEN from TR_049)** 11th rigor bar (class
+  shape drift between high-level + per-phase architecture
+  views) — not surfaced this session because the
+  DeepSeek-driven architect emits simpler 2-3 interface
+  Phase 1 outputs.
+
+Build status: `pnpm -r build` clean across all 13 packages.
+Template auto-refreshes to `0.35.0` at next server boot.
+
+Files changed (gestalt repo):
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`
+- `packages/agents/generate/src/adapters/aider-adapter.ts`
+- `packages/core/src/llm/index.ts`
+- `packages/core/src/queue/index.ts`
+- `packages/core/src/tools/file-tools.ts`
+- `packages/core/src/harness/index.ts`
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
+- `templates/corporate-ops-web-mobile/template.json`
+- `.env`
+
+Files changed (trackeros repo):
+- `HARNESS.json` (codeGeneration.backend=aider)
+- `agents.yaml` (9-agent DeepInfra matrix)
+
+Live URLs:
+- Dashboard: http://localhost:3000/app/
+- TR_050 final-cycle feature:
+  http://localhost:3000/app/features/523e9824-b189-42e7-9b11-efa453133db7
+- trackeros PLAN.md:
+  https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
+- trackeros TR_050 commits:
+  https://github.com/afarahat-lab/trackeros/commits/main
+
+---
 ### Session 2026-06-11 — Claude Code (TR_049: mandatory SQL schema for relational-DB stacks — closes TR_048's 10th rigor bar end-to-end; architecture-agent emitted 6 CREATE TABLE statements; TR_048 canonical-schema-reuse machinery FIRED for the first time; Phase 1 cleared the FULL Gestalt agent pipeline intent → code → gate → promotion — first phase to do so across TR_036 → TR_049; Phase 2 escalated on a NEW 11th rigor bar — cross-phase class definition drift)
 
 Brief: two changes — append SQL-mandatory rule to
@@ -438,193 +702,6 @@ Live URLs:
   https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
 - trackeros TR_048 HARNESS commit:
   https://github.com/afarahat-lab/trackeros/commit/b1d6c878
-
----
-### Session 2026-06-11 — Claude Code (TR_047: architecture-agent rule + 7th review-checklist item for transaction semantics — closes TR_046's 8th bar by structural redesign (architect SPLIT AuditRecord into own phase rather than answering the question); cycle reached the GATE three times with last two runs at 1 violation each — closest to passing yet; intent-agent now blocks on the 9th narrowest bar yet, SQL schema column-type drift between two views of the same table)
-
-Brief: one HARNESS rule + one platform-code rule closing
-TR_046's 8th intent-agent rigor bar (architecture-agent
-bundled `LeaveRequest` + `AuditRecord` mutations into Phase 1
-without explicit transaction semantics).
-
-What changed (2 fixes):
-
-**Fix 1 — Transaction-semantics rule on architecture-agent (HARNESS)**
-
-- `templates/corporate-ops-web-mobile/harness/HARNESS.json` and
-  `/Users/amrmohamed/Work/trackeros/HARNESS.json` —
-  `agentConfig.architecture-agent.rules` appended with: "When
-  a phase includes multiple domain mutations that must be
-  coordinated (a primary operation plus a cross-cutting
-  concern such as audit logging, event publishing, or cache
-  invalidation), explicitly state the transaction semantics:
-  whether the operations execute atomically in a single
-  transaction, as separate transactions, or via a
-  compensating pattern. Do not leave transaction behavior
-  implicit."
-- Abstract — no specific patterns hardcoded; the LLM decides
-  atomic/saga/eventual based on the stack and operations
-  involved.
-
-**Fix 2 — 7th review-checklist item in both review prompts**
-
-- `packages/agents/planning/src/prompts/architecture-prompt.ts`
-  `buildArchitectureReviewPrompt` (feature-level review) and
-  `buildPhaseArchitectureReviewPrompt` (per-phase review)
-  both gain a 7th checklist item:
-  - Feature-level: "Transaction semantics — for every phase
-    in `recommendedPhases` that includes multiple coordinated
-    domain mutations … verify that the rationale or
-    success-criterion line explicitly states whether the
-    operations are atomic, non-atomic, or compensating. If
-    transaction behavior is implicit, ADD an explicit
-    statement to the relevant phase before returning."
-  - Per-phase: "Transaction semantics — if this phase
-    performs multiple coordinated domain mutations … at least
-    one `successCriteria` line must explicitly state the
-    transaction behavior (atomic in a single DB transaction,
-    separate transactions, or compensating). If transaction
-    behavior is implicit, ADD an explicit success criterion
-    before returning."
-- Both prompts updated to "If the draft passes all SEVEN
-  checks, return it unchanged" (from "all six").
-
-**Template version bumped 0.31.0 → 0.32.0.** No new
-migration. Build clean across all 13 packages.
-
-What's verified live (trackeros feature
-`d90d14b5-3632-4b6e-8711-7d7ebb846efd` on `chat-latest`):
-
-- ✅ **TR_046's 8th bar CLOSED — by structural redesign,
-  not by stating the semantics.** The architect saw the
-  transaction-semantics constraint at design time and
-  responded by SPLITTING `AuditRecord` into its own Phase 2
-  (separate from Phase 1's `LeaveRequest`). Phase 1 became
-  a clean single-mutation phase — no coordinated mutations
-  → no transaction-semantics question. This is a valid
-  architectural response: when the architect can't easily
-  pin transaction behavior, separating concerns into
-  discrete phases is a reasonable alternative.
-- ✅ **Phase 1 architecture: 4 interfaces + 7 criteria**
-  on the first attempt (then 4 + 6 on retry). The 7th
-  criterion is the new TR_047 transaction-semantics check
-  even though Phase 1 has only one mutation (the criterion
-  likely says "N/A — single-table write" or marks the
-  default atomic behavior of the single Postgres
-  transaction).
-- ✅ **Plan: 8 phases** with the AuditRecord-LeaveRequest
-  split visible:
-  - Phase 1: Establish LeaveRequest model and repository
-  - Phase 2: Establish AuditRecord model and repository
-  - Phase 3: Implement leave request submission workflow
-    service ← this is where transaction semantics return
-    when the service writes both LeaveRequest + AuditRecord
-- ✅ **CYCLE REACHED THE GATE — third time across the
-  TR_036 → TR_047 sequence.** Gate ran THREE times with
-  verdicts:
-  - 1st: 6 CONSTRAINT_VIOLATION
-  - 2nd: **1 CONSTRAINT_VIOLATION**
-  - 3rd: **1 CONSTRAINT_VIOLATION**
-
-  Two consecutive 1-violation runs is the closest the
-  cycle has ever been to a clean gate pass.
-
-What blocked the verification cycle (NEW orthogonal finding):
-
-After 1 retry, intent-agent escalated on a NEW (9th) rigor
-bar:
-
-> "High-impact ambiguity: The provided SQL schemas conflict
-> on column types and sizes: one version uses TIMESTAMP and
-> VARCHAR(32), while another uses DATE/TIMESTAMPTZ and
-> VARCHAR(20)."
-
-The architecture-agent emitted TWO views of the same
-`leave_requests` table — one in `feature.architecture.architectureMdUpdate`
-(or a similar markdown surface) and another in
-`feature_phases[0].architecture.sqlSchema` — with
-different column types (`TIMESTAMP` vs `TIMESTAMPTZ`,
-`VARCHAR(32)` vs `VARCHAR(20)`). Intent-agent caught the
-internal inconsistency in the architecture's own
-self-presentation.
-
-This is the 9th distinct intent-agent rigor bar across
-TR_036 → TR_047, and the narrowest yet:
-
-| Session | Intent-agent escalation reason | Scope |
-|---------|--------------------------------|-------|
-| TR_036  | Symbol-name conflict | Architectural |
-| TR_037  | Concrete persistence implementation | Architectural |
-| TR_038  | Repository missing CRUD methods | Architectural |
-| TR_041  | Scope-vs-architecture file-count mismatch | Structural |
-| TR_042  | Audit records for state-changing operations | Cross-cutting |
-| TR_044  | Method signatures as "Not implemented" stubs | Semantic |
-| TR_045  | Undocumented lifecycle state | Documentation drift |
-| TR_046  | Transaction semantics | Architectural (narrow) |
-| **TR_047** | **SQL schema column-type drift between two views of the same table** | Internal consistency |
-
-The bars are converging — TR_047's is on column type/size
-agreement between two views of the same SQL table, the
-narrowest concern yet.
-
-**Pending follow-ups (NEW from TR_047 verification):**
-
-- **(HIGH — NEW)** Architecture-agent emits the same SQL
-  schema in two places (feature-level
-  `architectureMdUpdate` and per-phase `sqlSchema`) and
-  drifts between them. Options:
-  (a) `architecture-agent.architectureGuidance` rule:
-  "When the same database table is described in both the
-  feature-level architecture and a per-phase architecture,
-  the column types and sizes MUST match byte-for-byte"; OR
-  (b) review pass's 8th checklist item: "Schema
-  consistency — every SQL schema mentioned across the
-  architecture (feature-level + per-phase) for the same
-  table must declare identical column types and sizes. If
-  the same table is shown twice with different types, fix
-  one to match the other before returning"; OR
-  (c) platform-side: de-duplicate by storing one
-  canonical schema per table in
-  `FeatureArchitecture.sqlSchemas` and rendering it the
-  same way in both prompts.
-- **(MEDIUM — OBSERVATION)** Gate is now at 1
-  CONSTRAINT_VIOLATION for two consecutive runs. With one
-  or two more architectural tightenings (the SQL-schema
-  consistency fix above + whatever surfaces) the cycle
-  may produce a 0-violation gate pass — the first
-  successful deployment across the entire TR_036 → TR_047
-  sequence.
-
-Carryover follow-ups (status updates):
-
-- **(RESOLVED by TR_047 structural response)** TR_046
-  HIGH NEW: transaction semantics for cross-cutting
-  operations. The architect's response (SPLIT) was not
-  the brief's intent (STATE), but it is a valid
-  architectural answer that closes the bar.
-- **(STILL OPEN — HIGH from TR_036)** Gate-side
-  verification continues to climb closer to a pass with
-  each cycle that reaches it. 6 violations → 1 → 1.
-
-Build status: `pnpm -r build` clean across all 13
-packages. Template auto-refreshes to `0.32.0` at next
-server boot.
-
-Files changed:
-- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
-- `templates/corporate-ops-web-mobile/template.json`
-- `packages/agents/planning/src/prompts/architecture-prompt.ts`
-- `/Users/amrmohamed/Work/trackeros/HARNESS.json` (separate
-  repo, pushed at `b50cb7f8`)
-
-Live URLs:
-- Dashboard: http://localhost:3000/app/
-- TR_047 verification feature:
-  http://localhost:3000/app/features/d90d14b5-3632-4b6e-8711-7d7ebb846efd
-- trackeros PLAN.md:
-  https://github.com/afarahat-lab/trackeros/blob/main/PLAN.md
-- trackeros TR_047 HARNESS commit:
-  https://github.com/afarahat-lab/trackeros/commit/b50cb7f8
 
 
 ---

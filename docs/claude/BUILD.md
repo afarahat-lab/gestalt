@@ -54,6 +54,194 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
+### TR_050 — DeepInfra integration + Aider as the only code-generation backend + 5 cascading timeout fixes (template 0.35.0, build clean, Phase 1 deployed end-to-end on Kimi-K2.6/DeepSeek-V3.2/Aider for the FIRST EVER autonomous source-file generation on DeepInfra)
+
+Multi-stage migration off OpenAI/Azure onto DeepInfra-hosted
+open models, with 8 platform + harness changes layered to
+unblock progressively-deeper timeout / config issues. The
+session ran 10 cycles, each one identifying a different
+layer in the cascade.
+
+- **Operator action — LLM registry**: 3 DeepInfra LLMs
+  registered via `gestalt platform llms add`:
+  `deepinfra-kimi-k2` (moonshotai/Kimi-K2.6),
+  `deepinfra-deepseek-v3` (deepseek-ai/DeepSeek-V3.2),
+  `deepinfra-qwen-tiny` (Qwen/Qwen3.5-0.8B). All
+  `chat-completions` apiShape on
+  `https://api.deepinfra.com/v1/openai`, key env
+  `DEEPINFRA_API_KEY`.
+- **Operator action — platform default**: flipped from
+  `chat-latest` → `deepinfra-deepseek-v3` via
+  `gestalt platform llms set-default`. Every agent on
+  `model: ~` (context-agent / test-agent / drift /
+  alignment / gc) now inherits DeepSeek-V3.2.
+- **trackeros agents.yaml — 9-agent matrix**:
+  architecture-agent → DeepSeek-V3.2; self-healing-agent →
+  Kimi-K2.6 (short prompts); planner / phase-evaluator /
+  constraint / review / intent / design → DeepSeek-V3.2;
+  code-agent (Aider) → Kimi-K2.6. `reasoning_effort` fields
+  removed (DeepInfra OpenAI-compat doesn't support).
+
+**Fix 1 — Aider is the only code-generation backend**
+
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`
+  both `aiderBackend` checks: `(harnessConfig?.codeGeneration?.backend ?? 'aider') === 'aider'`.
+  Absent block → Aider. Gestalt-native CodeAgent reachable
+  only by explicit `backend: 'gestalt'` opt-out.
+- `packages/core/src/harness/index.ts` JSDoc rewritten —
+  Aider documented as default; `'gestalt'` value marked
+  deprecated-but-retained.
+- Template HARNESS.json + trackeros HARNESS.json carry
+  `codeGeneration.backend: 'aider'` explicitly.
+
+**Fix 2 — `.env` and timeouts**
+
+- Fixed `LLM_MOCEL` typo → `LLM_MODEL`. Set `LLM_API_KEY` to
+  the DeepInfra key (loadConfig requires both; server
+  was in restart loop).
+- `LLM_TIMEOUT_MS=300000` (5 min; default 120s was killing
+  Kimi-K2.6 architecture-agent calls).
+
+**Fix 3 — BullMQ Worker stall-retry storm fix**
+
+- `packages/core/src/queue/index.ts` adds
+  `lockDuration: 600000` (10 min) and
+  `maxStalledCount: 0` to every Worker. BullMQ's default
+  (30s lock + 1 stalledCount) marked long planning:start
+  as stalled and dispatched a duplicate handler — both
+  inserted feature_phases rows, second hit unique
+  constraint, cycle died with duplicate-key error.
+
+**Fix 4 — Retryable fetch errors**
+
+- `packages/core/src/llm/index.ts` `classifyError` extended
+  to mark `TypeError: fetch failed`, `ECONNRESET`,
+  `ENOTFOUND`, `ETIMEDOUT`, `EAI_AGAIN`, `socket hang up`
+  as `retryable: true`. Closes the TR_033 follow-up.
+
+**Fix 5 — Aider litellm provider prefix**
+
+- `packages/agents/generate/src/adapters/aider-adapter.ts`
+  prepends `openai/` to the model string when it lacks
+  one of 17 known litellm provider prefixes. Closes the
+  `LLM Provider NOT provided. You passed model=deepseek-
+  ai/DeepSeek-V3.2` error that killed every DeepInfra/
+  Aider call before Phase 1 could write any source.
+  Validated by Aider stdout: `Model: openai/moonshotai/
+  Kimi-K2.6 with whole edit format`.
+
+**Fix 6-8 — Aider subprocess timeout cascade**
+
+THREE nested ceilings, each one needed bumping in turn
+because the inner-most was clamping all the outer
+adjustments:
+
+6. `DEFAULT_AIDER_TIMEOUT_MS`: 120_000 → 900_000 in
+   aider-adapter.ts (adapter ceiling — irrelevant until
+   the inner ceilings were lifted).
+7. Aider CLI flag `--timeout 600` added (Aider's own
+   per-LLM HTTP timeout; litellm/httpx default 120s).
+8. `MAX_SCRIPT_TIMEOUT_MS` in `core/src/tools/file-tools.ts`:
+   120_000 → 900_000. THE actual ceiling.
+   `executeScript` (which Aider runs through) was
+   clamping every timeout to 120s. Container-confirmed
+   the compiled `dist/tools/file-tools.js` carries the
+   new value before Phase 1 success.
+
+Template `0.34.0 → 0.35.0`. No new migration.
+`pnpm -r build` clean across all 13 packages.
+
+**Live verification — Phase 1 DEPLOYED on DeepInfra/Aider:**
+trackeros feature `523e9824-b189-42e7-9b11-efa453133db7`,
+the 10th cycle of the session:
+
+- ✅ Wall-clock 20m 03s phase-submitted → phase-evaluated:
+  success.
+- ✅ Path: intent-agent (DeepSeek, no escalation) →
+  design-agent (DeepSeek) → context-agent (DeepSeek) →
+  code-agent (Aider/Kimi — REAL source files written) →
+  test-agent (skipped per Aider backend) → pr-agent →
+  pipeline-agent (noop) → constraint-agent (DeepSeek,
+  PASSED) → review-agent (DeepSeek, PASSED) →
+  promotion-agent.
+- ✅ **First successful autonomous source-file generation
+  cycle on DeepInfra across TR_036 → TR_050.**
+- ✅ Architecture: 3 interfaces + 7 criteria. Plan:
+  6 phases.
+
+**Cycles before the working stack landed:** session ran
+10 cycles, each one revealing a different layer:
+
+1. `a88cfb44` — default 120s LLM_TIMEOUT_MS too tight
+2. `0b39864a` — test-agent retry-stormed on Kimi
+3. `b560bec5` — architecture-agent timed out on Kimi (50%)
+4. `e3298836` — DeepSeek code-agent worked (144k tokens)
+   but gate found 9 violations → retry-exhaust
+5. `a57e62c3` — BullMQ duplicate planning:start
+6. `9a0df185` — transient `TypeError: fetch failed`
+7. `1f24e41f` — Aider returned 3.8s (litellm prefix bug)
+8. `ae9bd00b` — prefix fix landed, Phase 1 reached gate
+   but review-agent found 9 violations → escalate
+9. `4cd459c6` → `1a6a0bc1` → `530d359e` — three
+   successive timeout layers identified
+10. `523e9824` — **Phase 1 deploys.** Phase 2 escalates
+    on new rigor bars (below).
+
+**Phase 2 blocker (deferred to TR_051):**
+
+Phase 2 (`Leave request service with validation`)
+escalated 1m 50s after dispatch on three high-impact
+ambiguities:
+
+- **amb-001**: intent mentions "Jest unit tests" but the
+  project uses Vitest — `testFramework` binding
+  regressed vs TR_040/TR_041 because DeepSeek-V3.2 doesn't
+  internalise HARNESS.stack as crisply as gpt-5.5.
+- **amb-002**: ILeaveService interface shows state
+  transitions but success criteria only mention
+  creation — interface vs scope mismatch (lifecycle
+  coverage rigor bar TR_041 closed for architecture-
+  agent; recurring on DeepSeek).
+- **amb-003**: architecture mentions "atomic
+  transactions" without pinning the implementation
+  approach — TR_046 transaction-semantics rigor bar
+  resurfacing on DeepSeek.
+
+These are the **same class** TR_036-TR_047 worked
+through. HARNESS rules and review-checklist items still
+in place — but DeepSeek-V3.2 doesn't follow them as
+crisply.
+
+**New HIGH follow-up for TR_051:** TR_036-TR_047
+architectural rules need re-strengthening for DeepSeek-
+V3.2. Three options: (a) more imperative rule wording;
+(b) switch architecture-agent back to Kimi-K2.6 with
+smaller max_tokens to manage cost; (c) deterministic
+post-process pass catching framework/lifecycle/
+transaction drift before intent-agent sees it.
+
+**New MEDIUM follow-ups:**
+- Aider model warnings on DeepInfra (litellm doesn't
+  recognise the model names → falls back to "sane
+  defaults" for context window / cost; functionally
+  harmless, noisy in stdout).
+- Switch trackeros pipeline adapter from `noop` to
+  `github-actions` to verify the full deploy chain.
+
+**Operator action — trackeros:** my commits already
+pushed (HARNESS.json `de2f82c2`, agents.yaml `8985531e`,
+two follow-up matrix swaps `533de072` and `823e9e66`).
+
+**Operator action — other projects:** Existing projects
+need to add `codeGeneration.backend: 'aider'` to their
+HARNESS.json IF they want to be explicit about the now-
+default backend, OR they can leave the block absent and
+inherit the new default. Existing projects on the
+Gestalt-native CodeAgent path must add
+`backend: 'gestalt'` explicitly or they will silently
+migrate to Aider. Template auto-refreshes to `0.35.0` at
+next server boot.
+
 ### TR_049 — Mandatory SQL schema for relational-database stacks (template 0.34.0, build clean, TR_048's 10th bar CLOSED end-to-end, Phase 1 cleared the full Gestalt agent pipeline for the first time; 11th rigor bar surfaced — class shape drift across phases)
 
 Two changes — one HARNESS rule + one platform-code
