@@ -45,7 +45,15 @@ export interface AiderResult {
   timedOut: boolean;
 }
 
-const DEFAULT_AIDER_TIMEOUT_MS = 120_000;
+// TR_050 — bumped from 120_000 (2 min) to 900_000 (15 min).
+// Aider's subprocess wraps one or more model round-trips
+// (initial response + diff application + retry on parse error)
+// and on slower DeepInfra-hosted models (Kimi-K2.6 at 8k+ tokens
+// per response) a single Aider session can easily exceed the
+// per-LLM-call timeout. The previous 2 min ceiling killed every
+// Kimi-driven Aider run at exactly 120s before any source files
+// were written.
+const DEFAULT_AIDER_TIMEOUT_MS = 900_000;
 
 /**
  * Run Aider against the supplied work-dir with the supplied message.
@@ -105,12 +113,55 @@ export async function runAider(
   //                registry; uses the same routing as the rest of
   //                the code-agent path.
   // --message    — single-shot prompt; Aider exits after applying.
+  // TR_050 — Aider routes its API call through litellm, which
+  // requires a provider prefix to know which backend to use. The
+  // platform LLM registry stores wire-level model names
+  // (e.g. `deepseek-ai/DeepSeek-V3.2`) without a provider prefix
+  // because the Gestalt-native LLM client talks to the provider's
+  // OpenAI-compatible endpoint directly (POST {baseUrl}/chat/
+  // completions). litellm cannot infer the provider from the
+  // model alone for non-OpenAI models, so when we hand the model
+  // off to Aider we prepend `openai/` — that tells litellm to
+  // use the OpenAI provider, which then honours OPENAI_API_BASE
+  // and routes to whatever provider the registry pointed us at
+  // (DeepInfra, Together, Fireworks, etc.). Models that already
+  // carry a litellm provider prefix (`openai/...`, `anthropic/...`,
+  // `vertex_ai/...`, etc.) are passed through untouched.
+  // Known litellm provider prefixes — strings starting with any
+  // of these are already routed correctly and pass through
+  // untouched. The slash after the prefix is intentional: it
+  // distinguishes `openai/gpt-4o` (litellm prefix) from a wire
+  // model name like `openai-text/foo` that happens to start
+  // with the same letters.
+  const LITELLM_PROVIDER_PREFIXES = [
+    'openai/', 'anthropic/', 'azure/', 'vertex_ai/', 'bedrock/',
+    'together_ai/', 'fireworks_ai/', 'huggingface/', 'replicate/',
+    'cohere/', 'ollama/', 'groq/', 'mistral/', 'deepseek/',
+    'perplexity/', 'gemini/', 'xai/',
+  ];
+  const hasLitellmPrefix = LITELLM_PROVIDER_PREFIXES.some(
+    (prefix) => modelString.startsWith(prefix),
+  );
+  const aiderModelString = hasLitellmPrefix
+    ? modelString
+    : `openai/${modelString}`;
+  // --timeout    — TR_050: Aider's own per-LLM-call HTTP timeout
+  //                (passed through to litellm/httpx). Defaults to
+  //                120 seconds which is too tight for Kimi-K2.6 +
+  //                DeepSeek-V3.2 on DeepInfra (single Aider turn
+  //                generates 4-10k output tokens and frequently
+  //                exceeds 2 min). 600s aligns with the
+  //                LLM_TIMEOUT_MS the platform's native client
+  //                uses, and stays well under the 900s subprocess
+  //                ceiling (DEFAULT_AIDER_TIMEOUT_MS) so retries
+  //                still fit.
   const command = [
     'aider',
     '--yes-always',
     '--no-git',
+    '--timeout 600',
     readFlags,
-    `--model "${modelString}"`,
+    `--model "${aiderModelString}"`,
     `--message "${escapedMessage}"`,
   ]
     .filter((part) => part.length > 0)

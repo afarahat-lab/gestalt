@@ -43,7 +43,15 @@ const MAX_TREE_DEPTH = 4;
 const MAX_SCRIPT_STDOUT = 10_000;   // 10 KB — truncated past this
 const MAX_SCRIPT_STDERR = 5_000;    // 5 KB
 const DEFAULT_SCRIPT_TIMEOUT_MS = 30_000;
-const MAX_SCRIPT_TIMEOUT_MS = 120_000;
+// TR_050 — raised from 120_000 (2 min) to 900_000 (15 min).
+// The previous 2-min ceiling clamped Aider subprocess
+// invocations (executeScript-wrapped) back to 120s
+// regardless of the adapter's DEFAULT_AIDER_TIMEOUT_MS,
+// so Kimi-K2.6 + DeepSeek-V3.2 runs were killed mid-
+// generation. 15 min matches the Aider adapter ceiling
+// and gives modern LLM-driven scripts (tsc --noEmit,
+// vitest, semgrep) room without risking unbounded runs.
+const MAX_SCRIPT_TIMEOUT_MS = 900_000;
 
 const BLOCKED_PATTERNS: ReadonlyArray<RegExp> = [
   /rm\s+-rf/,

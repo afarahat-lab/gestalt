@@ -391,7 +391,11 @@ async function handleIntentTask(
     // the freshly-Aider-edited files (out of order with the design
     // spec). Merged with the self-healing skip list so both signals
     // are respected.
-    const aiderBackend = harnessConfig?.codeGeneration?.backend === 'aider';
+    // TR_050 — Aider is now the default code-generation backend.
+    // Code generation is always delegated to an external tool;
+    // the Gestalt-native CodeAgent path is retained as an explicit
+    // opt-out only (codeGeneration.backend === 'gestalt').
+    const aiderBackend = (harnessConfig?.codeGeneration?.backend ?? 'aider') === 'aider';
     const skipAgents = aiderBackend
       ? Array.from(new Set([...(selfHealingSkipAgents ?? []), 'test-agent']))
       : selfHealingSkipAgents;
@@ -1069,7 +1073,11 @@ function newAgentForRole(
   // Gestalt-native code-agent for the AiderCodeAgent. The test-agent
   // step is removed from the plan by `opts.skipAgents` earlier in
   // `handleIntentTask`, so we don't need a separate branch here.
-  const aiderBackend = harnessConfig?.codeGeneration?.backend === 'aider';
+  // TR_050 — Aider is now the default backend. An absent
+  // codeGeneration block resolves to Aider; the Gestalt-native
+  // CodeAgent is reachable only by explicitly setting
+  // `codeGeneration.backend: 'gestalt'`.
+  const aiderBackend = (harnessConfig?.codeGeneration?.backend ?? 'aider') === 'aider';
   switch (agentRole) {
     case 'intent-agent':      return new IntentAgent();
     case 'design-agent':      return new DesignAgent();

@@ -195,6 +195,19 @@ export function createWorker<TPayload = unknown, TOutput = unknown>(
     {
       ...buildConnection(config),
       concurrency: 1,
+      // TR_050 — bump the lock duration far above LLM call wall
+      // times. BullMQ's default `lockDuration: 30000` marks any
+      // job whose handler runs for more than ~30s as STALLED and
+      // requeues it; with LLM calls (DeepInfra Kimi/DeepSeek)
+      // routinely taking 5-25 minutes, this triggered duplicate
+      // execution of planning:start and broke the unique
+      // (feature_id, phase_index) constraint. 600000ms = 10 min
+      // covers the LLM_TIMEOUT_MS=300000 + retries + scope
+      // reduction headroom. `maxStalledCount: 0` blocks the
+      // stalled-retry mechanism entirely so a single stall is
+      // never re-dispatched into a duplicate handler invocation.
+      lockDuration: 600000,
+      maxStalledCount: 0,
       ...options,
     },
   );

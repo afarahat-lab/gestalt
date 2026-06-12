@@ -731,6 +731,23 @@ function classifyError(error: unknown): LLMError {
     }
     return { type: 'provider-error', message: error.message, retryable: false };
   }
+  // TR_050 — transient network errors raised by the underlying
+  // `fetch` (TypeError: fetch failed / ECONNRESET / ENOTFOUND /
+  // socket hang up) are intermittent provider blips, not
+  // permanent failures. Mark them retryable so the LLM call's
+  // existing exponential-backoff retry loop covers them rather
+  // than killing the whole cycle on a single hiccup. Closes the
+  // TR_033 follow-up "transient fetch failed killed an attempt
+  // because classifyError treats it as retryable: false".
+  if (error instanceof TypeError && /fetch failed/i.test(error.message)) {
+    return { type: 'provider-error', message: error.message, retryable: true };
+  }
+  if (
+    error instanceof Error
+    && /ECONNRESET|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|socket hang up/i.test(error.message)
+  ) {
+    return { type: 'provider-error', message: error.message, retryable: true };
+  }
   return { type: 'provider-error', message: String(error), retryable: false };
 }
 

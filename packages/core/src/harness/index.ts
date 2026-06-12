@@ -170,15 +170,23 @@ export interface HarnessConfig {
     }>;
   };
   /**
-   * Code-generation backend (TR_014). Default `'gestalt'` keeps the
-   * existing code-agent + test-agent path. Setting `'aider'` makes
-   * the generate-orchestrator dispatch the Aider CLI for the
+   * Code-generation backend.
+   *
+   * TR_050 — Aider is the platform default. An absent
+   * `codeGeneration` block resolves to `'aider'`. The
+   * generate-orchestrator dispatches the Aider CLI for the
    * code-agent step (Aider writes files directly to the cycle's
    * cloned work-dir; the adapter then re-reads them as artifacts so
-   * the gate + deploy layers see them unchanged) and skip the
+   * the gate + deploy layers see them unchanged) and skips the
    * test-agent step (Aider produces tests inline as part of the
-   * same session). Opt-in per project. Existing projects with no
-   * `codeGeneration` block continue to run on the `gestalt` backend.
+   * same session).
+   *
+   * The legacy Gestalt-native CodeAgent path is reachable only as
+   * an explicit opt-out via `backend: 'gestalt'`. Per the platform
+   * design direction, code generation is always delegated to an
+   * external tool — Aider today, alternative tools (e.g. Qodo Gen
+   * per ADR-053) in future. The `'gestalt'` value is retained for
+   * backwards compatibility but should be treated as deprecated.
    */
   codeGeneration?: {
     backend: 'gestalt' | 'aider';
