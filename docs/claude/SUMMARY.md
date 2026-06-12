@@ -2,7 +2,7 @@
 
 _Auto-regenerated after every session by Claude Code. Do not edit by hand._
 
-_Generated: 2026-06-11_
+_Generated: 2026-06-12_
 
 ---
 
@@ -239,6 +239,14 @@ the `sessions/archive/` files (everything older)._
   but full end-to-end against a real IdP only exercised once.
   Kerberos provider compiles; not exercised end-to-end (needs a
   real AD + krb5.keytab).
+- **test-agent skip (ADR-043)** — when Aider mode is enabled,
+  test-agent is skipped because Aider generates tests inline
+  with implementation. Aider's tests are sufficient to pass CI.
+  The skip is intentional. The gap: Aider writes opportunistic
+  tests, not comprehensive coverage. Qodo Gen (ADR-053) will
+  replace test-agent with a purpose-built test generation pass
+  after Aider completes. Until Qodo Gen is integrated, test
+  coverage quality depends on Aider's judgment.
 
 ---
 
