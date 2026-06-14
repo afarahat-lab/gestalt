@@ -121,6 +121,15 @@ export const GateGraphState = Annotation.Root({
     reducer: (_a, b) => b,
     default: () => false,
   }),
+  // TR_056 Part 2c — legacy pre-push field forwarded into the
+  // deploy:pr dispatch so pr-agent's resume leg pushes the fix
+  // commit to an existing branch + re-uses the open PR instead of
+  // opening a second one. Only relevant on the legacy
+  // `readFromBranch=false` pass-path.
+  resumeOnBranch: Annotation<string | null>({
+    reducer: (_a, b) => b,
+    default: () => null,
+  }),
 
   // ─── Artifacts (legacy pre-CI path) ──────────────────────────────
   artifacts: Annotation<GateArtifactJson[]>({

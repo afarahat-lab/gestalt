@@ -57,10 +57,12 @@ import { tmpdir } from 'os';
 import { simpleGit } from 'simple-git';
 import {
   getRepositories, createContextLogger, emitLiveEvent,
+  dispatch, getQueueConfig,
 } from '@gestalt/core';
 import type {
   Artifact, FeedbackSignal,
   AlertType, AlertRequiredAction,
+  TaskPriority,
 } from '@gestalt/core';
 
 import {
@@ -103,6 +105,160 @@ function syntheticFailureVerdict(reason: string, durationMs: number): GateVerdic
     summary: `gateNode infrastructure failure: ${reason}`,
     durationMs,
   };
+}
+
+/**
+ * TR_056 Part 2c — pass-path dispatch from inside the graph.
+ *
+ * Lifts the verdict-tail dispatch from
+ * `gate-orchestrator.handleGateTask:702→722` (the
+ * `dispatchPromotion` / `dispatchDeployPR` call sites) into a single
+ * leaf action invoked from `gateNode`'s pass branch.
+ *
+ * Architectural note (per brief §2): this is BullMQ dispatch from
+ * inside the graph and it is a LEAF action — the graph emits the
+ * deploy task and then `gateNode` returns; the conditional edge
+ * routes to END. The gate graph never awaits the deploy lifecycle.
+ * Deploy continues to be its own pipeline (today via BullMQ; later
+ * via DeployGraph when the deploy session lands).
+ *
+ * Branch condition mirrors the legacy handler exactly:
+ *
+ *   readFromBranch === true   → deploy:promotion (ADR-041 post-CI)
+ *   readFromBranch === false  → deploy:pr        (legacy pre-CI)
+ *
+ * Failure modes match the legacy helpers verbatim:
+ *
+ *   - missing projectId → warn + skip (intent stays approved; operator
+ *     re-runs).
+ *   - legacy path: missing intentText or empty artifacts → warn + skip.
+ *
+ * The dispatch itself returns the BullMQ job id; we drop it (the
+ * deploy-orchestrator owns the lifecycle from there).
+ */
+async function dispatchPostGateFromGraph(args: {
+  state: GateGraphStateType;
+  intentText: string | undefined;
+  childLog: ReturnType<typeof createContextLogger>;
+}): Promise<void> {
+  const { state, intentText, childLog } = args;
+  const correlationId = state.correlationId;
+
+  // Resolve projectId — preferred from state, fallback to a DB read
+  // (mirrors `dispatchPromotion` and `dispatchDeployPR` in the legacy
+  // helper).
+  let projectId: string | null = state.projectId;
+  if (!projectId) {
+    const row = await getRepositories().intents.findById(state.intentId);
+    projectId = row?.projectId ?? null;
+  }
+
+  // Resolve intent text — preferred from arg (gateNode already
+  // resolved it once), fallback to a DB read.
+  let textForDispatch: string | undefined = intentText;
+  if (!textForDispatch) {
+    const row = await getRepositories().intents.findById(state.intentId);
+    textForDispatch = row?.text ?? undefined;
+  }
+
+  const priority: TaskPriority = 'normal';
+  const queueConfig = getQueueConfig();
+
+  if (state.readFromBranch) {
+    // ADR-041 post-CI path → promotion (staging first; promotion-agent
+    // dispatches the production leg itself).
+    if (!projectId) {
+      childLog.warn(
+        { intentId: state.intentId },
+        'gateNode pass (post-CI) — cannot resolve projectId; skipping deploy:promotion',
+      );
+      return;
+    }
+
+    await dispatch({
+      id: crypto.randomUUID(),
+      correlationId,
+      type: 'deploy:promotion',
+      sourceAgent: 'review-agent',
+      targetAgent: 'promotion-agent',
+      priority,
+      payload: {
+        intentId: state.intentId,
+        projectId,
+        targetEnvironment: 'staging',
+        prNumber: state.prNumber ?? undefined,
+        branch: state.branch ?? undefined,
+        intentText: textForDispatch,
+      },
+      createdAt: new Date(),
+      expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),
+    }, queueConfig);
+
+    childLog.info(
+      {
+        intentId: state.intentId,
+        prNumber: state.prNumber ?? null,
+        branch: state.branch ?? null,
+        dispatchedBy: 'gate-graph',
+      },
+      'gateNode pass (post-CI) — dispatched deploy:promotion (staging) via graph',
+    );
+    return;
+  }
+
+  // Legacy pre-CI artifact-based path → deploy:pr so pr-agent can open
+  // the PR.
+  if (!projectId || !textForDispatch) {
+    childLog.warn(
+      { intentId: state.intentId },
+      'gateNode pass (legacy pre-CI) — cannot reconstruct deploy payload; skipping deploy:pr',
+    );
+    return;
+  }
+  if (!state.artifacts || state.artifacts.length === 0) {
+    childLog.info(
+      { intentId: state.intentId },
+      'gateNode pass (legacy pre-CI) — no artifacts in state; skipping deploy:pr',
+    );
+    return;
+  }
+
+  await dispatch({
+    id: crypto.randomUUID(),
+    correlationId,
+    type: 'deploy:pr',
+    sourceAgent: 'review-agent',
+    targetAgent: 'pr-agent',
+    priority,
+    payload: {
+      intentId: state.intentId,
+      projectId,
+      intentText: textForDispatch,
+      artifacts: state.artifacts.map((a) => ({
+        id: a.id,
+        type: a.type,
+        path: a.path,
+        content: a.content,
+      })),
+      // Pipeline-feedback resume — forwarded so pr-agent pushes to
+      // the existing branch + reuses the open PR instead of opening
+      // a new one (mirrors legacy `dispatchDeployPR`).
+      resumeOnBranch: state.resumeOnBranch ?? undefined,
+      prNumber: state.prNumber ?? undefined,
+      prUrl: state.prUrl ?? undefined,
+    },
+    createdAt: new Date(),
+    expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000),
+  }, queueConfig);
+
+  childLog.info(
+    {
+      intentId: state.intentId,
+      artifactCount: state.artifacts.length,
+      dispatchedBy: 'gate-graph',
+    },
+    'gateNode pass (legacy pre-CI) — dispatched deploy:pr via graph',
+  );
 }
 
 /**
@@ -441,9 +597,27 @@ export async function gateNode(
     //            chain in handleGateTask — left untouched.
     if (result.verdict === 'pass') {
       await transitionIntent(state.intentId, state.correlationId, 'approved');
-      // TODO(TR_056 Part 2b): wire `pass → DeployGraph entry`
-      // edge. Until then, intent stays at `approved` and the
-      // operator/legacy path picks it up.
+      // TR_056 Part 2c — pass-path dispatch from inside the graph.
+      // Branches on `readFromBranch` exactly like the legacy
+      // `dispatchPromotion` / `dispatchDeployPR` call sites. Leaf
+      // action: graph emits the deploy task and ends; deploy owns
+      // the lifecycle from here. NEVER throws — internal try/catch
+      // mirrors the legacy "best-effort" semantics.
+      try {
+        await dispatchPostGateFromGraph({
+          state,
+          intentText,
+          childLog,
+        });
+      } catch (err) {
+        childLog.error(
+          { err: err instanceof Error ? err.message : String(err), intentId: state.intentId },
+          'gateNode pass — post-gate dispatch threw; intent remains approved but deploy was not enqueued',
+        );
+        errors.push(
+          `post-gate-dispatch: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     } else if (result.verdict === 'escalate') {
       await transitionIntent(state.intentId, state.correlationId, 'escalated');
       await createBreachAlertInGraph({

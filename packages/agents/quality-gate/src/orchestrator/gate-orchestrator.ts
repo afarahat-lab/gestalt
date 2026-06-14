@@ -47,6 +47,7 @@ import { synthesiseGateResult, summariseGateResult } from '../agents/review-agen
 import type {
   GateAgentResult, GateAgentRole, GateHarnessConfig, GateResult, GateSignal, GateTask, ArtifactRef,
 } from '../types';
+import { runGateGraph } from '../graphs/gate/graph';
 
 /**
  * Maximum number of gate retries before the orchestrator gives up and
@@ -398,7 +399,152 @@ export function startGateWorker(queueConfig: QueueConfig): void {
   log.info('Quality-gate worker started');
 }
 
+/**
+ * TR_056 Part 2c — thin invoker.
+ *
+ * The verdict / dispatch / self-healing logic now lives in the
+ * GateGraph (graphs/gate/{state.ts,nodes.ts,graph.ts,
+ * ../shared/self-healing-node.ts}). `handleGateTask` is reduced to:
+ *
+ *   1. Resolve the payload into a `RunGateGraphStartInput`.
+ *   2. Call `runGateGraph({mode: 'start', ...})`.
+ *   3. Return a `TaskResult` — the BullMQ worker's success-or-throw
+ *      contract (see `packages/core/src/queue/index.ts:184-189`)
+ *      treats any non-throwing return as job COMPLETED. Per TR_053
+ *      Fix 5: this is exactly how the planning graph's
+ *      `handleGraphStart` already behaves.
+ *
+ * Routing decisions (pass→deploy:promotion/deploy:pr, fail→
+ * self-healing, escalate→alert) all live inside the graph. The
+ * legacy body (cloned-repo path, agent run, verdict synthesis,
+ * dispatch helpers, self-healing wiring) is preserved as
+ * `legacyHandleGateTask` below — **strictly dead** under this
+ * routing but kept callable so a one-line revert is possible if
+ * the 2c live smoke turns up trouble:
+ *
+ *   // TR_056 Part 2c revert: replace the runGateGraph() call with
+ *   //   return legacyHandleGateTask(message);
+ *   // The legacy helpers (dispatchPromotion / dispatchDeployPR /
+ *   // maybeDispatchRetry / attemptSelfHealingForGate /
+ *   // createBreachAlert) are still present and reachable from
+ *   // legacyHandleGateTask. Deletion of the legacy body lives in
+ *   // TR_056 Part 2d, after the 2c smoke passes live.
+ */
 async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<TaskResult> {
+  const { correlationId } = message;
+  const payload = message.payload;
+  const childLog = createContextLogger({ module: 'gate-orchestrator', correlationId });
+  const startedAt = new Date();
+
+  childLog.info(
+    { intentId: payload.intentId, routedBy: 'gate-graph (TR_056 Part 2c)' },
+    'Quality gate received task — invoking GateGraph',
+  );
+
+  // Pre-resolve the intent text so the graph node doesn't repeat
+  // the DB read when the payload already carries it.
+  let intentText: string | undefined = payload.text;
+  if (!intentText) {
+    try {
+      const intentRow = await getRepositories().intents.findById(payload.intentId);
+      intentText = intentRow?.text ?? undefined;
+    } catch (err) {
+      childLog.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'Thin invoker: intent-text pre-lookup failed; graph will retry inside gateNode',
+      );
+    }
+  }
+
+  // Pre-resolve projectId from the intent if absent from payload —
+  // same fallback the legacy body uses, surfaced once here so the
+  // graph state is fully populated before invoke.
+  let projectId: string | undefined = payload.projectId;
+  if (!projectId) {
+    try {
+      const intentRow = await getRepositories().intents.findById(payload.intentId);
+      projectId = intentRow?.projectId ?? undefined;
+    } catch {
+      // Best-effort; the graph node will re-resolve.
+    }
+  }
+
+  const graphResult = await runGateGraph({
+    mode: 'start',
+    correlationId,
+    intentId: payload.intentId,
+    projectId: projectId ?? null,
+    intentText: intentText ?? null,
+    branch: payload.branch ?? null,
+    prNumber: payload.prNumber ?? null,
+    prUrl: payload.prUrl ?? null,
+    ciRunId: payload.ciRunId ?? null,
+    readFromBranch: payload.readFromBranch === true,
+    resumeOnBranch: payload.resumeOnBranch ?? null,
+    artifacts: payload.artifacts.map((a) => ({
+      id: a.id,
+      correlationId: a.correlationId,
+      type: a.type,
+      path: a.path,
+      content: a.content,
+      producedBy: a.producedBy,
+      createdAt: typeof a.createdAt === 'string'
+        ? a.createdAt
+        : a.createdAt instanceof Date
+          ? a.createdAt.toISOString()
+          : undefined,
+    })),
+    retryCount: payload.retryCount ?? 0,
+  });
+
+  childLog.info(
+    {
+      intentId: payload.intentId,
+      verdict: graphResult.verdict,
+      selfHealingOutcome: graphResult.selfHealingOutcome,
+      interrupted: graphResult.interrupted,
+      errorCount: graphResult.errors.length,
+    },
+    'GateGraph step returned — completing BullMQ job (interrupt-return = job success per TR_053 Fix 5)',
+  );
+
+  // Map the graph's verdict to a BullMQ TaskResult shape. The worker
+  // treats any non-throwing return as COMPLETED; status:'failed' here
+  // is observability-only (mirrors the planning graph's pattern).
+  // `interrupted: true` from runGateGraph today means "human-feedback
+  // node ran with no interrupt() call" — terminal-acceptable per §3
+  // until the resume signal is wired.
+  return {
+    taskId: message.id,
+    correlationId,
+    agentRole: 'review-agent',
+    status: graphResult.verdict === 'pass' ? 'completed' : 'failed',
+    output: {
+      verdict: graphResult.verdict ?? 'unknown',
+      selfHealingOutcome: graphResult.selfHealingOutcome ?? null,
+      reachedEnd: graphResult.reachedEnd,
+      interrupted: graphResult.interrupted,
+    },
+    signals: [],
+    tokensUsed: 0,
+    durationMs: Date.now() - startedAt.getTime(),
+    completedAt: new Date(),
+  };
+}
+
+/**
+ * TR_056 Part 2c — preserved legacy body. STRICTLY DEAD under the
+ * current routing (handleGateTask above routes 100% of traffic to
+ * runGateGraph). Kept callable so a one-line revert is possible:
+ * swap the runGateGraph call in `handleGateTask` for
+ * `return legacyHandleGateTask(message)`. Deleted in TR_056 Part 2d
+ * after the 2c live smoke passes.
+ *
+ * The helpers it calls (dispatchPromotion, dispatchDeployPR,
+ * maybeDispatchRetry, attemptSelfHealingForGate, createBreachAlert)
+ * are also kept in place for the same reason.
+ */
+export async function legacyHandleGateTask(message: TaskMessage<GateTaskPayload>): Promise<TaskResult> {
   const { correlationId } = message;
   const payload = message.payload;
   const childLog = createContextLogger({ module: 'gate-orchestrator', correlationId });

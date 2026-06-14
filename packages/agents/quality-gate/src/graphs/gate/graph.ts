@@ -60,7 +60,7 @@
  * thread-id-collision concern doesn't apply here.
  */
 
-import { StateGraph, START, END, Command, interrupt } from '@langchain/langgraph';
+import { StateGraph, START, END, Command } from '@langchain/langgraph';
 import { createContextLogger, getCheckpointer } from '@gestalt/core';
 import { GateGraphState } from './state';
 import type { GateGraphStateType, GateArtifactJson } from './state';
@@ -72,21 +72,42 @@ const log = createContextLogger({ module: 'gate-graph' });
 let cachedGraph: ReturnType<typeof compileGraph> | null = null;
 
 /**
- * Minimal humanFeedbackNode for the gate graph. Per TR_053 Fix 6:
- * interrupt nodes contain ONLY log + `interrupt(...)`. No DB writes,
- * no event emits before the interrupt call — LangGraph re-executes
- * any node from the top on resume, so side effects would double up.
+ * Minimal humanFeedbackNode for the gate graph.
  *
- * The GP_BREACH alert is created upstream by `gateNode` on
- * `verdict === 'escalate'`; the self-healing alert is created by the
- * loop's `escalateToHuman`. By the time this node runs, the
- * operator-facing surface is already in place.
+ * TR_056 Part 2c — terminal-acceptable state, NOT an interrupt.
  *
- * No event-bus subscriber is wired this session to fire the resume,
- * so reaching this node parks the graph until either (a) a future
- * 2c session adds the resume signal, or (b) the thread is dropped
- * when the cleanup window expires. Acceptable during the transition
- * because the legacy `handleGateTask` is still the live path.
+ * The brief's §3 minimum bar: an escalate path that reaches human-
+ * feedback MUST NOT hang. By the time this node runs, the operator-
+ * facing alert is already in place:
+ *
+ *   - GP_BREACH alerts are created upstream by `gateNode` on
+ *     `verdict === 'escalate'` (TR_053 Fix-6 — deciding node owns
+ *     the alert).
+ *   - gate-max-retries / unrecoverable / cascade-depth-brake alerts
+ *     are created by the self-healing loop's `escalateToHuman`
+ *     helper before `selfHealingGateNode` returns
+ *     `outcome: 'escalated'`.
+ *
+ * So this node is a logging passthrough: the graph terminates at END,
+ * the operator interacts through the alert UI, and any future "retry
+ * from operator feedback" plumbing routes via a fresh BullMQ
+ * `gate:start` cycle (legacy transport bridge during the TR_056
+ * transition window).
+ *
+ * Full `interrupt()` + `Command({resume})` operator-resume wiring is
+ * deferred until the TR_054 restart-resume verification (`#39`/`#40`)
+ * passes. At that point this node becomes:
+ *
+ *   interrupt({
+ *     type: 'human-feedback', layer: 'gate',
+ *     intentId, correlationId, outcome: state.selfHealingOutcome,
+ *   });
+ *
+ * + a `gate:resume` BullMQ task type whose handler calls
+ * `runGateGraph({mode:'resume', resumeValue})`. The `RunGateGraphResumeInput`
+ * envelope below is already in shape for that wiring.
+ *
+ * Fix-6 rule still holds — no DB writes / event emits here.
  */
 async function humanFeedbackNode(
   state: GateGraphStateType,
@@ -97,16 +118,8 @@ async function humanFeedbackNode(
       correlationId: state.correlationId,
       outcome: state.selfHealingOutcome,
     },
-    'gate-graph humanFeedbackNode interrupting — awaiting operator clarification',
+    'gate-graph humanFeedbackNode — escalated; alert already created upstream; terminating at END (TR_056 Part 2c minimum bar; resume wiring deferred)',
   );
-  // Fix-6 rule: NO side effects before the interrupt call.
-  interrupt({
-    type: 'human-feedback',
-    layer: 'gate',
-    intentId: state.intentId,
-    correlationId: state.correlationId,
-    outcome: state.selfHealingOutcome,
-  });
   return {};
 }
 
@@ -176,6 +189,13 @@ export interface RunGateGraphStartInput {
   readFromBranch: boolean;
   artifacts: GateArtifactJson[];
   retryCount?: number;
+  /**
+   * TR_056 Part 2c — legacy pre-push field forwarded to gateNode so the
+   * pass-branch `deploy:pr` dispatch can route pr-agent's resume leg
+   * back to the existing branch. Only used on the legacy
+   * `readFromBranch=false` path.
+   */
+  resumeOnBranch?: string | null;
 }
 
 export interface RunGateGraphResumeInput {
@@ -257,6 +277,7 @@ export async function runGateGraph(
         prUrl: input.prUrl ?? null,
         ciRunId: input.ciRunId ?? null,
         readFromBranch: input.readFromBranch,
+        resumeOnBranch: input.resumeOnBranch ?? null,
         artifacts: input.artifacts,
         retryCount: input.retryCount ?? 0,
       };
