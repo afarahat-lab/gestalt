@@ -962,7 +962,7 @@ export async function runWithObservability<T extends GateAgentResult>(
  * `PlatformSignal` shape (drop `agentRole`, rename to `sourceAgent`,
  * ensure `createdAt`).
  */
-function gateSignalToPlatformSignal(s: GateSignal): PlatformSignal {
+export function gateSignalToPlatformSignal(s: GateSignal): PlatformSignal {
   const out: PlatformSignal = {
     id: s.id,
     correlationId: s.correlationId,
