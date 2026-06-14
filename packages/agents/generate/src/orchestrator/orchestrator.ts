@@ -149,8 +149,14 @@ async function transitionIntent(
   status: 'generating' | 'in-review' | 'failed' | 'waiting-for-clarification',
 ): Promise<void> {
   const { intents } = getRepositories();
-  await intents.updateStatus(intentId, status);
-  emitLiveEvent('intent.status-changed', correlationId, { intentId, status });
+  const updated = await intents.updateStatus(intentId, status);
+  // TR_053 amendment — enrich event payload with the persisted
+  // parent context (PlanningGraph reads this to route resume signals).
+  emitLiveEvent('intent.status-changed', correlationId, {
+    intentId,
+    status,
+    parentContext: updated.parentContext ?? null,
+  });
 }
 
 /**

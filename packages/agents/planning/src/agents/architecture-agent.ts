@@ -21,11 +21,10 @@
 import {
   BaseLLMAgent, loadAgentConfig, extractJsonObject, createContextLogger,
 } from '@gestalt/core';
-import type { HarnessConfig, FeatureRecord, FeaturePhaseRecord, AgentConfig } from '@gestalt/core';
+import type { HarnessConfig, FeatureRecord, FeaturePhaseRecord } from '@gestalt/core';
 import {
   buildFeatureArchitecturePrompt, buildPhaseArchitecturePrompt,
   buildArchitectureReviewPrompt, buildPhaseArchitectureReviewPrompt,
-  buildStackSubstitutionPrompt,
 } from '../prompts/architecture-prompt';
 import type { FeatureArchitecture, PhaseArchitecture } from '../types';
 
@@ -42,6 +41,15 @@ export class ArchitectureAgent extends BaseLLMAgent {
   }
 
   /**
+   * @deprecated TR_051 / ADR-056 Phase 1. Replaced by the
+   * LangGraph `ArchitectureGraph` crew (see
+   * `graphs/architecture/graph.ts`). The planning orchestrator now
+   * calls `runArchitectureGraph(...)` instead of this method. Kept
+   * exported as a fallback so non-orchestrator callers (tests,
+   * `gestalt feature show`) continue to compile until Phase 2 of
+   * the migration deletes it. Delete this method +
+   * `buildFeatureArchitecturePrompt` when Phase 2 lands.
+   *
    * Produce the high-level architecture for a feature. The result is
    * persisted into `features.architecture` and seeds the planner.
    */
@@ -67,20 +75,12 @@ export class ArchitectureAgent extends BaseLLMAgent {
   }
 
   /**
-   * TR_038 — STOPGAP (ADR-056). Re-reads the architecture-agent's
-   * own draft and asks the SAME agent to check completeness,
-   * consistency, ambiguity, and feasibility against the declared
-   * project stack. Returns the corrected JSON when the review
-   * fires; returns the original draft unchanged on ANY failure
-   * (parse error, LLM call error) so the pipeline is never
-   * blocked on a review-only error.
-   *
-   * This single-agent self-review will be replaced by the
-   * LangGraph architecture crew (domain + data + application
-   * architects deliberating in parallel with a chief-architect
-   * supervisor) in Phase 1 of the migration. Delete this method
-   * + `buildArchitectureReviewPrompt` + the orchestrator call
-   * site when the crew lands.
+   * @deprecated TR_051 / ADR-056 Phase 1. The architecture crew's
+   * `ChiefArchitectNode` (`graphs/architecture/agents.ts`)
+   * replaces this self-review pass. The planning orchestrator no
+   * longer calls this method. Kept exported as a fallback so non-
+   * orchestrator callers compile until Phase 2 of the migration
+   * deletes it.
    */
   async reviewDesign(
     draft: FeatureArchitecture,
@@ -258,87 +258,18 @@ export class ArchitectureAgent extends BaseLLMAgent {
     return reviewed;
   }
 
-  /**
-   * TR_044 — Ask the LLM to produce a `<canonical> → [alternatives]`
-   * map for the declared project stack. The platform code does NOT
-   * hardcode framework alternatives; the LLM knows which frameworks
-   * compete with which in any ecosystem.
-   *
-   * The map is generated ONCE per feature (in `planning:start`) and
-   * cached on `FeatureArchitecture.stackSubstitutions` so each
-   * per-phase pass reads the same map without paying an extra LLM
-   * call. Each per-phase pass then deterministically applies the
-   * substitutions to the reviewed `PhaseArchitecture` via
-   * `applyStackSubstitutions` (pure utility).
-   *
-   * Uses a deliberately cheap/fast model (gpt-4o-mini, no reasoning
-   * effort) — this is a one-shot classification call, not a
-   * judgement task. The substitution map should produce identical
-   * output regardless of model quality given the same stack input.
-   *
-   * Returns an empty Map on ANY failure path (loadAgentConfig
-   * throws → empty; callLLM throws → empty; JSON parse fails →
-   * empty). Empty Map means `applyStackSubstitutions` skips
-   * cleanly — the pipeline is never blocked on this.
-   */
-  async buildStackSubstitutions(
-    stack: Record<string, string> | undefined,
-    correlationId: string,
-  ): Promise<Map<string, string>> {
-    if (!stack || Object.keys(stack).length === 0) {
-      return new Map();
-    }
-    this.lastTokensUsed = 0;
-    // Inline a minimal AgentConfig — this call is a one-shot
-    // classification, not a reasoning task. gpt-4o-mini is fast,
-    // cheap, and deterministic enough for this output shape.
-    // Defining the config here keeps the substitution-map path
-    // independent of `loadAgentConfig` (which loads the
-    // architecture-agent's heavyweight model gpt-5.5) so the
-    // substitution lookup doesn't pay reasoning-tokens cost.
-    const minimalAgentConfig: AgentConfig = {
-      role: 'Software framework expert',
-      goal: 'Generate canonical-to-alternatives substitution maps',
-      llm: { model: 'gpt-4o-mini', temperature: 0.0, maxTokens: 1500 },
-      promptExtensions: [],
-    };
-    const prompt = this.addJsonResponseGuard(buildStackSubstitutionPrompt(stack));
-    let raw: string;
-    try {
-      raw = await this.callLLM(prompt, minimalAgentConfig, correlationId);
-    } catch (err) {
-      log.warn(
-        { err: err instanceof Error ? err.message : String(err), correlationId },
-        'architecture-agent buildStackSubstitutions LLM call failed — using empty map',
-      );
-      return new Map();
-    }
-    const substitutions = new Map<string, string>();
-    try {
-      const parsed = JSON.parse(extractJsonObject(raw)) as Record<string, unknown>;
-      for (const [canonical, alternatives] of Object.entries(parsed)) {
-        if (!Array.isArray(alternatives)) continue;
-        for (const alt of alternatives) {
-          if (typeof alt !== 'string') continue;
-          const altLower = alt.trim().toLowerCase();
-          if (altLower.length === 0) continue;
-          if (altLower === canonical.toLowerCase()) continue;
-          substitutions.set(altLower, canonical);
-        }
-      }
-    } catch (err) {
-      log.warn(
-        { err: err instanceof Error ? err.message : String(err), correlationId },
-        'architecture-agent buildStackSubstitutions JSON parse failed — using empty map',
-      );
-      return new Map();
-    }
-    log.info(
-      { correlationId, mapSize: substitutions.size },
-      'architecture-agent buildStackSubstitutions complete',
-    );
-    return substitutions;
-  }
+  // Removed in TR_053 — ChiefArchitectNode enforces stack compliance
+  // structurally (ADR-056 Phase 1). `buildStackSubstitutions` was a
+  // gpt-4o-mini-driven regex post-processing workaround that fixed
+  // single-agent LLM bias across TR_040 → TR_044 before the
+  // architecture crew landed. The crew's per-specialist HARNESS
+  // rules + chief reconciliation + ADR-042 stack section make the
+  // substitution machinery redundant. The hardcoded `gpt-4o-mini`
+  // model also failed on the DeepInfra registry (NRB-3 in TR_052
+  // verification), making the call a no-op even when invoked.
+  // `FeatureArchitecture.stackSubstitutions` field stays for
+  // backwards compatibility with feature.architecture JSON written
+  // by earlier sessions; new sessions will not populate it.
 }
 
 function parseFeatureArchitecture(raw: string, correlationId: string): FeatureArchitecture {

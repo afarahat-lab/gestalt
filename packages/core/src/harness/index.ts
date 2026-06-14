@@ -212,6 +212,34 @@ export interface HarnessConfig {
      * (one attempt, no retries).
      */
     maxPhaseRetries?: number;
+    /**
+     * TR_053 / ADR-056 Phase 2 — which planning engine drives this
+     * feature. Exactly one of:
+     *
+     *   - `'langgraph'` (default) — invoke the LangGraph
+     *     `PlanningGraph` from the planning worker. The graph runs
+     *     through architecture → planner → phase-dispatch and pauses
+     *     at `awaitPhaseNode`'s `interrupt()`; the planning worker
+     *     also handles `planning:graph-resume` to drive each phase
+     *     to completion.
+     *   - `'orchestrator'` — use the legacy `planning-orchestrator`
+     *     three-task chain (`planning:start` → `planning:phase` →
+     *     `planning:evaluate`). Kept callable until Phase 3 of the
+     *     migration deletes it.
+     *
+     * Brief amendment Fix 3 — `planning:start` reads this field at
+     * dispatch time and branches to exactly ONE engine for the
+     * feature's whole lifecycle. The other engine is genuinely inert
+     * for the feature (not merely idle). Absent → defaults to
+     * `'langgraph'`.
+     */
+    engine?: 'langgraph' | 'orchestrator';
+    /**
+     * @deprecated TR_053 amendment Fix 3 — superseded by `engine`.
+     * If set, treated as an alias: `true` → `'langgraph'`,
+     * `false` → `'orchestrator'`. New configs should use `engine`.
+     */
+    useLangGraph?: boolean;
   };
   /**
    * TR_027 / ADR-051 — CodiumAI PR-Agent integration. When the

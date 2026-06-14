@@ -152,7 +152,7 @@ interface GenerateRetryPayload {
  * Embed a Git PAT into an HTTPS clone URL. Mirrors the helper in
  * generate's orchestrator (same shape, same auth contract).
  */
-function authenticatedGitUrl(gitUrl: string, token: string): string {
+export function authenticatedGitUrl(gitUrl: string, token: string): string {
   if (!gitUrl.startsWith('http://') && !gitUrl.startsWith('https://')) {
     return gitUrl;
   }
@@ -166,14 +166,20 @@ function authenticatedGitUrl(gitUrl: string, token: string): string {
  * Set the intent's status, persist it, and broadcast the transition
  * over the in-process event bus.
  */
-async function transitionIntent(
+export async function transitionIntent(
   intentId: string,
   correlationId: string,
   status: IntentStatus,
 ): Promise<void> {
   const { intents } = getRepositories();
-  await intents.updateStatus(intentId, status);
-  emitLiveEvent('intent.status-changed', correlationId, { intentId, status });
+  const updated = await intents.updateStatus(intentId, status);
+  // TR_053 amendment — enrich event payload with the persisted
+  // parent context (PlanningGraph reads this to route resume signals).
+  emitLiveEvent('intent.status-changed', correlationId, {
+    intentId,
+    status,
+    parentContext: updated.parentContext ?? null,
+  });
 }
 
 /**
@@ -181,7 +187,7 @@ async function transitionIntent(
  * the gate worker can resolve the gitUrl + PAT without the generate
  * orchestrator having to redundantly thread projectId on the queue.
  */
-async function resolveProjectFor(intentId: string): Promise<{
+export async function resolveProjectFor(intentId: string): Promise<{
   gitUrl: string;
   defaultBranch: string;
   token: string;
@@ -200,7 +206,11 @@ async function resolveProjectFor(intentId: string): Promise<{
  * Default GateHarnessConfig used when no project-specific config exists.
  * Future iterations should read this from the project's HARNESS.json.
  */
-function defaultGateHarnessConfig(projectRoot: string): GateHarnessConfig {
+// TR_056 — helpers exported so the GateGraph nodes can reuse them
+// without copy-paste. The legacy `handleGateTask` is now a thin
+// invoker (see end of file); the agent-run logic lives in
+// `graphs/gate/nodes.ts`.
+export function defaultGateHarnessConfig(projectRoot: string): GateHarnessConfig {
   return {
     projectRoot,
     constraintRules: [],
@@ -225,7 +235,7 @@ function defaultGateHarnessConfig(projectRoot: string): GateHarnessConfig {
  * into the constraint-agent's dynamic rule set without each agent
  * having to re-implement the file read.
  */
-async function loadHarnessStack(projectRoot: string): Promise<GateHarnessConfig['stack'] | undefined> {
+export async function loadHarnessStack(projectRoot: string): Promise<GateHarnessConfig['stack'] | undefined> {
   try {
     const raw = await readFile(join(projectRoot, 'HARNESS.json'), 'utf8');
     const parsed = JSON.parse(raw) as { stack?: Record<string, string> };
@@ -248,7 +258,7 @@ async function loadHarnessStack(projectRoot: string): Promise<GateHarnessConfig[
  * already posted its review and pipeline-agent has already routed
  * `changes-requested` through self-healing).
  */
-async function shouldSkipReviewAgent(projectRoot: string): Promise<boolean> {
+export async function shouldSkipReviewAgent(projectRoot: string): Promise<boolean> {
   try {
     const raw = await readFile(join(projectRoot, 'HARNESS.json'), 'utf8');
     const parsed = JSON.parse(raw) as {
@@ -300,7 +310,7 @@ const MAX_FILE_BYTES = 64 * 1024;
  * at `MAX_GATE_FILES`; remaining files are dropped with a warning so
  * an operator-misconfigured project can't OOM the gate.
  */
-async function readSourceFilesFromWorkDir(
+export async function readSourceFilesFromWorkDir(
   projectRoot: string,
   correlationId: string,
   childLog: ReturnType<typeof createContextLogger>,
@@ -602,6 +612,67 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
       startedAt,
     );
 
+    // TR_053 NRB-1 — when the gate verdict is `pass` despite one of
+    // the agents having thrown mid-flight, the throwing agent's
+    // execution row currently reads `failed` (set by
+    // `runWithObservability`'s catch). That's misleading: the
+    // surrounding gate verdict was `pass`, so the failure was
+    // non-blocking. Patch the row to `completed-with-warning` and
+    // append the original error to the execution log so the
+    // dashboard shows a distinct visual state.
+    //
+    // Scope: review-agent only (the historical observed failure mode
+    // — large diff → DeepSeek tool-loop throws mid-turn). The patch
+    // applies symmetrically to either constraint-agent or
+    // review-agent because the synthesiser's `pass` verdict implies
+    // ANY surviving agent's verdict was clean.
+    if (result.verdict === 'pass') {
+      for (const r of agentResults) {
+        const decorated = r as unknown as {
+          status?: string;
+          _executionId?: string;
+          _errorMessage?: string;
+        };
+        if (decorated.status !== 'errored' || !decorated._executionId) continue;
+        const { executions, executionLogs } = getRepositories();
+        await executions
+          .updateStatus(decorated._executionId, 'completed-with-warning' as ExecutionStatus, {
+            durationMs: r.durationMs,
+            startedAt,
+            completedAt: new Date(),
+          })
+          .catch(() => undefined);
+        await executionLogs
+          .save({
+            executionId: decorated._executionId,
+            correlationId,
+            agentRole: r.agentRole,
+            prompt: null,
+            llmResponse: null,
+            resultStatus: 'completed-with-warning',
+            artifactPaths: [],
+            signalTypes: [],
+            errorMessage:
+              `${r.agentRole} non-blocking failure: ${
+                decorated._errorMessage ?? '(unknown)'
+              }. Gate verdict was 'pass' from the other gate agent — non-blocking per TR_053 NRB-1.`,
+            modelUsed: null,
+            toolCalls: [],
+          })
+          .catch(() => undefined);
+        emitLiveEvent('agent.completed', correlationId, {
+          executionId: decorated._executionId,
+          agentRole: r.agentRole,
+          status: 'completed-with-warning',
+          error: decorated._errorMessage ?? null,
+        });
+        childLog.info(
+          { agentRole: r.agentRole, executionId: decorated._executionId },
+          'TR_053 NRB-1 — gate agent failure reclassified as completed-with-warning (other agent passed)',
+        );
+      }
+    }
+
     childLog.info(
       { verdict: result.verdict, signalCount: result.signals.length },
       summariseGateResult(result),
@@ -723,7 +794,7 @@ async function handleGateTask(message: TaskMessage<GateTaskPayload>): Promise<Ta
  * and emits `agent.started` / `agent.completed` / `signal.emitted` along
  * the way.
  */
-async function runWithObservability<T extends GateAgentResult>(
+export async function runWithObservability<T extends GateAgentResult>(
   agentRole: GateAgentRole,
   taskType: string,
   correlationId: string,
@@ -786,11 +857,18 @@ async function runWithObservability<T extends GateAgentResult>(
     });
     // Re-shape the failure into a GateAgentResult so callers can keep
     // synthesising a verdict.
+    // TR_053 NRB-1 — attach the executionId + error message to the
+    // errored result so the orchestrator can patch the row to
+    // `completed-with-warning` post-verdict when the other gate
+    // agent's verdict was an independent `pass`. Keeps the cast
+    // contained to this single call site.
     return {
       agentRole,
       status: 'errored',
       signals: [],
       durationMs: completedAt.getTime() - startedAt.getTime(),
+      _executionId: executionId,
+      _errorMessage: err instanceof Error ? err.message : String(err),
     } as unknown as T;
   }
 
@@ -1315,7 +1393,7 @@ function queueConfigFromEnv(): QueueConfig {
  * Returns an empty string when neither source is present — callers
  * test `length > 0` and omit the section entirely in that case.
  */
-async function buildProjectStructureBrief(projectRoot: string): Promise<string> {
+export async function buildProjectStructureBrief(projectRoot: string): Promise<string> {
   let architectureMd = '';
   try {
     architectureMd = await readFile(join(projectRoot, 'ARCHITECTURE.md'), 'utf8');

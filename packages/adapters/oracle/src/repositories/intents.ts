@@ -18,7 +18,10 @@ const notImplemented = (): never => {
 export class OracleIntentRepository implements IntentRepository {
   async healthCheck(): Promise<boolean> { return notImplemented(); }
   async create(
-    _intent: Omit<IntentRecord, 'createdAt' | 'updatedAt' | 'resolvedAt' | 'clarification' | 'branchName' | 'prNumber' | 'prUrl' | 'attemptCount' | 'lastResumeContext' | 'parentIntentId' | 'onSuccessDispatch'> & { parentIntentId?: string | null },
+    _intent: Omit<IntentRecord, 'createdAt' | 'updatedAt' | 'resolvedAt' | 'clarification' | 'branchName' | 'prNumber' | 'prUrl' | 'attemptCount' | 'lastResumeContext' | 'parentIntentId' | 'onSuccessDispatch' | 'parentContext'> & {
+      parentIntentId?: string | null;
+      parentContext?: import('@gestalt/core').IntentParentContext | null;
+    },
   ): Promise<IntentRecord> { return notImplemented(); }
   async findById(_id: string): Promise<IntentRecord | null> { return notImplemented(); }
   async findByCorrelationId(_correlationId: string): Promise<IntentRecord | null> { return notImplemented(); }

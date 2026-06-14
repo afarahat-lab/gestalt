@@ -18,3 +18,15 @@ export type {
 } from './types';
 
 export { startPlanningWorker } from './orchestrator/planning-orchestrator';
+
+// TR_051 / ADR-056 Phase 1 — architecture crew (LangGraph)
+export {
+  runArchitectureGraph,
+  type RunArchitectureGraphInput,
+  type RunArchitectureGraphResult,
+} from './graphs/architecture/graph';
+export {
+  DomainArchitectAgent, DataArchitectAgent,
+  AppArchitectAgent, ChiefArchitectAgent,
+} from './graphs/architecture/agents';
+export type { DomainDesign, DataDesign, AppDesign } from './graphs/architecture/types';

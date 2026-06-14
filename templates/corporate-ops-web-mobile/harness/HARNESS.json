@@ -118,6 +118,40 @@
         "Every state transition described in the feature must have a corresponding method in at least one phase. If an entity changes state during the feature lifecycle, ensure the phase plan includes a method for each transition — not just the initial creation."
       ]
     },
+    "domain-architect-agent": {
+      "rules": [
+        "Define domain entities with exact field names, types, and lifecycle states",
+        "Every state transition must be named and documented in lifecycleStates",
+        "Do not define persistence or infrastructure concerns — focus on domain only. The data architect handles SQL schemas and repositories; the application architect handles modules and services.",
+        "Every lifecycle state you introduce must appear in domainNotes so the chief architect can fold it into architectureMdUpdate."
+      ]
+    },
+    "data-architect-agent": {
+      "rules": [
+        "Every domain entity that persists state requires a complete SQL table definition with column types, constraints, and indices",
+        "Every repository interface must name its concrete backing implementation using the declared stack — do not leave the choice open",
+        "Use the declared database client — do not substitute alternatives",
+        "When the same table appears in multiple repositories, its schema must be defined exactly once and referenced by name elsewhere"
+      ]
+    },
+    "app-architect-agent": {
+      "rules": [
+        "Define clear layer boundaries — presentation, application, domain, infrastructure",
+        "Dependencies flow inward only — outer layers depend on inner layers, never the reverse",
+        "Every public service method must be defined in an interface before the implementation",
+        "No circular dependencies between modules — verify your dependencyMap before returning"
+      ]
+    },
+    "chief-architect-agent": {
+      "rules": [
+        "Your role is reconciliation, not regeneration — work with what the specialists produced",
+        "Resolve symbol name conflicts by choosing one canonical name and applying it everywhere — across entities, repositories, services, and the markdown summary",
+        "Verify stack compliance across all three specialist designs before producing final output — if any specialist used a framework not in the declared stack, correct it",
+        "The final architecture must include: domain entities, SQL schemas, repository interfaces with concrete implementations, module boundaries, dependency map, and phase recommendations",
+        "If a specialist slice is missing (errors block in the prompt), reconcile around it — supply the minimum content needed to keep the feature buildable, not a fresh design",
+        "Every lifecycle state introduced by the domain architect must be reflected in architectureMdUpdate"
+      ]
+    },
     "planner-agent": {
       "rules": [
         "Maximum 5 files per phase",
@@ -192,7 +226,8 @@
     "maxPhasesPerFeature": 10,
     "maxFilesPerPhase": 5,
     "architectureReviewPerPhase": true,
-    "maxPhaseRetries": 2
+    "maxPhaseRetries": 2,
+    "engine": "langgraph"
   },
   "tokenManagement": {
     "promptCompressionThreshold": 6000,

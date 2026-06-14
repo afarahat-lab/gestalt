@@ -670,8 +670,16 @@ async function transitionIntent(
   status: IntentStatus,
 ): Promise<void> {
   const { intents } = getRepositories();
-  await intents.updateStatus(intentId, status);
-  emitLiveEvent('intent.status-changed', correlationId, { intentId, status });
+  const updated = await intents.updateStatus(intentId, status);
+  // TR_053 amendment — enrich the event payload with the persisted
+  // parent context so downstream subscribers (planning, self-healing,
+  // future MaintenanceGraph) can route without a DB JOIN. Field is
+  // null on intents that aren't part of a parent flow.
+  emitLiveEvent('intent.status-changed', correlationId, {
+    intentId,
+    status,
+    parentContext: updated.parentContext ?? null,
+  });
 }
 
 function buildTaskResult(

@@ -28,53 +28,141 @@ PlatformGraph
 
 ## Planning graph
 
+_**Implemented in TR_053 (ADR-056 Phase 2)** —
+`packages/agents/planning/src/graphs/planning/`. Live verification
+is the TR_054 carryover; both legacy and graph paths run in
+parallel during the rollout window, gated by
+`harnessConfig.planner.engine: 'langgraph' | 'orchestrator'`
+(default `'langgraph'` — TR_053 amendment)._
+
 ```
-PlanningGraph
-├── ArchitectureGraph (subgraph — see below)
+PlanningGraph (StateGraph — packages/agents/planning/src/graphs/planning/)
+├── ArchitectureGraph (subgraph — see below)  ← architectureNode invokes runArchitectureGraph()
 ├── PlannerNode
 │     reads: ArchitectureGraph output
+│     persists: feature_phases rows + saveArchitectureAndPlan
 │     emits: ordered phase list with deferred context
 ├── PhaseDispatchNode
-│     dispatches each phase as GenerateGraph input
-└── PhaseEvaluatorNode
-      reads: git diff of merged phase commit
-      decides: continue | adjust | escalate
+│     reads: current phase, prior built files
+│     (optional) per-phase architecture pass via designPhase + reviewPhaseDesign
+│     creates: intent row + dispatches generate:intent to BullMQ
+├── AwaitPhaseNode  ← LangGraph interrupt() — BullMQ job returns here
+│     resumes: when the intent reaches `deployed` (event-bus subscriber
+│              detects the LangGraph checkpoint exists and dispatches
+│              `planning:graph-resume`)
+├── PhaseEvaluatorNode
+│     reads: phase result envelope ({success, mergeCommitSha})
+│     runs: phase-evaluator-agent (tool-loop with git diff)
+│     decides: continue | adjust | complete | escalate
+└── HumanFeedbackNode  ← LangGraph interrupt()
+      surfaces: feature-blocked alert
+      resumes: when operator provides clarification via /interventions
 ```
+
+Implementation notes (TR_053):
+
+- Each node clones the project repository inside the node (not
+  across the interrupt boundary) because the graph runs across
+  multiple BullMQ jobs separated by `interrupt()`.
+- `awaitPhaseNode` and `humanFeedbackNode` call
+  `interrupt(payload)` — the call serialises state to the
+  PostgreSQL checkpointer keyed by `thread_id = featureId` and
+  returns the resume value on continuation. The BullMQ job
+  hosting the call completes normally when interrupt fires.
+- The event-bus subscriber in `planning-orchestrator.ts`
+  (kept alive on the legacy path) checks
+  `checkpointer.getTuple({thread_id: featureId})` on each
+  `intent.status-changed` event: if a checkpoint exists, dispatch
+  `planning:graph-resume`; otherwise dispatch `planning:evaluate`.
+- Resume happens via `graph.invoke(new Command({resume: value}))`.
+  The brief's "plain `graph.invoke({payload})`" snippet does NOT
+  resume an interrupt — that would re-enter the graph from START.
+  `Command({resume})` is the correct LangGraph TS API.
+- All 4 LangGraph checkpoint tables created in TR_052 are reused
+  by Phase 2 — same singleton `PostgresSaver`. Phase 1 (architecture
+  crew) uses `thread_id = correlationId`; Phase 2 (planning loop)
+  uses `thread_id = featureId`. The two thread spaces don't collide.
+- **Architecture invoked as a function call, not a nested subgraph
+  (TR_053 amendment Fix 8 — conscious choice).** The PlanningGraph's
+  `architectureNode` calls `runArchitectureGraph(...)` directly,
+  which compiles and invokes its own checkpointed graph keyed by
+  `thread_id = correlationId`. That gives the architecture crew its
+  own checkpoint thread; a planning resume that interrupts mid-
+  architecture would re-run architecture from scratch (~4 min on
+  the trackeros baseline). The alternative — nesting as a true
+  LangGraph subgraph under the parent feature thread — would let
+  partial architecture work survive restart but couples the two
+  thread namespaces and complicates `getState()` debugging.
+  Tradeoff accepted: architecture runs are short and rare relative
+  to phase runs (one per feature vs. one per phase); a mid-
+  architecture crash forces ~4m of re-work, which is a tolerable
+  cost during the rollout window. If empirical use shows
+  architecture crashes are common enough to matter, promote to a
+  true subgraph node in a follow-up.
 
 ---
 
 ## Architecture graph (subgraph of Planning)
 
-_Currently implemented as a single architecture-agent with
-a self-review pass. The LangGraph migration replaces this
-with a deliberating crew._
+_**Implemented in TR_051 (ADR-056 Phase 1).** Replaces the single
+architecture-agent's feature-level `designFeature` + `reviewDesign`
+pass with a LangGraph `StateGraph` crew. Per-phase `designPhase` +
+`reviewPhaseDesign` remain on the single architecture-agent until
+Phase 2 of the migration._
 
 ```
-ArchitectureGraph
+ArchitectureGraph (StateGraph — packages/agents/planning/src/graphs/architecture/)
 ├── [Parallel nodes]
 │     ├── DomainArchitectNode
-│     │     focus: entities, relationships, domain model
+│     │     focus: entities, relationships, lifecycle states, business rules
 │     ├── DataArchitectNode
-│     │     focus: schema, persistence, migrations
+│     │     focus: SQL schema, repositories, concrete implementations
 │     └── AppArchitectNode
-│           focus: layers, interfaces, dependencies
+│           focus: modules, services, dependency direction, phase plan
 └── ChiefArchitectNode (supervisor)
       receives: all three parallel outputs
       resolves: conflicts, naming inconsistencies,
                 missing implementations
       enforces: stack compliance, lifecycle coverage,
                 symbol name consistency
-      emits: single reviewed FeatureArchitecture
+      emits: single reviewed FeatureArchitecture (canonical shape)
 ```
 
 State flows:
-- All three architect nodes receive the same feature description
-  and HARNESS.json stack
-- ChiefArchitectNode receives all three outputs as graph state
-- ChiefArchitect's output flows to PlannerNode
+- All three architect nodes receive the same feature description,
+  existing ARCHITECTURE.md excerpt, GOLDEN_PRINCIPLES.md, and
+  HARNESS.json stack
+- LangGraph fan-in: ChiefArchitectNode runs after ALL three
+  specialists complete (regardless of order)
+- ChiefArchitect's output flows back to `planning-orchestrator.ts`
+  → planner-agent → planning:phase
 
-_Stopgap until migration: single architecture-agent with
-reviewDesign + reviewPhaseDesign methods (TR_038, TR_041, TR_042)_
+Implementation notes:
+- Every node extends `BaseLLMAgent` → ADR-057 token management
+  applies automatically
+- Each node has a `RetryPolicy` (3 attempts specialists, 2 attempts
+  chief, exponential backoff on transient errors)
+- PostgreSQL checkpointer reuses `DATABASE_URL` → LangGraph 0.2
+  creates **four** tables on first `setup()` call:
+  `checkpoints`, `checkpoint_writes`, `checkpoint_blobs`,
+  `checkpoint_migrations`. No Gestalt migration needed
+- Specialist errors don't throw — they surface as `state.errors` so
+  the chief can reconcile around a missing slice. **Caveat
+  (verified TR_052):** a JSON-parse failure on a non-empty LLM
+  response falls through to the parser's empty-fallback path
+  silently — `state.errors` stays empty even though the slice is
+  empty. The chief still reconciles successfully but operators
+  don't see the parse failure on the dashboard. TR_053 follow-up:
+  parsers should emit a sentinel error into `state.errors`.
+- All four agents declared in `agents.yaml` + `HARNESS.json` per
+  ADR-042 — only structural framing + JSON schemas in `.ts`
+- **TR_052 live verification result:** all four nodes fired
+  end-to-end on a fresh feature; specialists fan-out in parallel
+  (≤67s wall-clock for slowest); chief reconcile took 3m 19s on
+  Kimi-K2.6 (12k max_tokens). Phase 1 of the leave-management
+  feature deployed in 19m 27s end-to-end without any HARNESS-rule
+  intervention on intent-agent — TR_036→TR_050 rigor bars
+  structurally absorbed.
 
 ---
 
@@ -232,16 +320,72 @@ Tools available to nodes via LangChain StructuredTool:
 ## Migration order (ADR-056)
 
 ```
-Phase 1 — Architecture graph (CURRENT BLOCKER)
-  Replace: architecture-agent + reviewDesign stopgap
-  With: ArchitectureGraph subgraph
+Phase 1 — Architecture graph  ✅ DONE (TR_051; live-verified TR_052)
+  Replaced: architecture-agent.designFeature + reviewDesign stopgap
+  With: ArchitectureGraph subgraph in @gestalt/agents-planning
         (DomainArchitect + DataArchitect + AppArchitect
          + ChiefArchitect supervisor)
 
-Phase 2 — Planning graph
-  Replace: planning-orchestrator.ts
-  With: PlanningGraph StateGraph
-        (ArchitectureGraph + PlannerNode + PhaseEvaluatorNode)
+Phase 2 — Planning graph  ✅ CODE LANDED + amendment verified
+  (TR_053 initial + TR_053 amendment; full-feature live verification = TR_054 carryover)
+
+  Replaced: planning-orchestrator three-task chain
+  With: PlanningGraph StateGraph in @gestalt/agents-planning
+        (architecture subgraph + planner + phase-dispatch +
+         await-phase interrupt + phase-evaluator + human-feedback)
+
+  Engine routing: `harnessConfig.planner.engine` selects exactly one
+    of {`langgraph` (default), `orchestrator`} at feature-submit time.
+    The unchosen engine is genuinely inert for the feature.
+
+  Resume routing (event-based, no DB JOIN):
+    - `intents.parent_context` JSONB (migration 030) stamped by
+      `phaseDispatchNode` at intent create time:
+        `{kind: 'planning-phase', featureId, phaseIndex}`
+    - Every `transitionIntent` reads the column and enriches the
+      `intent.status-changed` event payload.
+    - The planning subscriber routes by `parentContext.kind`
+      WITHOUT a JOIN. Legacy intents (parent_context = NULL) fall
+      back to `findPhaseByIntent`.
+
+  Resume API:
+    - `Command({resume: value})` from `@langchain/langgraph` is the
+      correct API in v0.2.74 (smoke-tested against the installed
+      version). Plain `graph.invoke(state, config)` does NOT
+      resume an interrupted graph.
+    - Interrupt detection: `graph.getState(cfg).tasks[*].interrupts`
+      and/or `state.next` non-empty. NOT `result.__interrupt__`
+      (that key is not surfaced on the invoke return value in
+      v0.2.74).
+
+  Both terminal outcomes resume the graph:
+    - `deployed` → resume `{success:true, mergeCommitSha}`
+    - `failed`/`escalated`/`waiting-for-clarification` → resume
+      `{success:false, failureReason}`
+    - `phaseEvaluatorNode` handles the failure branch via the
+      `maxPhaseRetries` budget; exhaustion routes to
+      `human-feedback`.
+
+  Interrupt-node side-effect rule (Fix 6):
+    - LangGraph re-executes any node from the top on resume.
+    - Interrupt nodes (`awaitPhaseNode`, `humanFeedbackNode`) contain
+      ONLY structured log + `interrupt(...)`. NO DB writes, NO
+      event emits before the interrupt call.
+    - Side effects belong in the deciding node upstream
+      (`phaseEvaluatorNode`'s `escalate` branch creates the
+      `feature-blocked` alert).
+    - Comment block on each interrupt node documents this rule.
+
+  adjust/continue/escalate semantics (Fix 7):
+    - `continue`: phase succeeded, no plan changes → advance index.
+    - `adjust`:   phase succeeded, evaluator rewrote remaining
+                  phases (index+1..) → advance index.
+    - `escalate`: do NOT advance; route to human-feedback.
+
+  Carryover: per-phase designPhase + reviewPhaseDesign STILL on the
+             single architecture-agent class (called from
+             phaseDispatchNode). They become per-phase subgraph nodes
+             when Phase 3 lands.
 
 Phase 3 — Generate graph
   Replace: generate orchestrator
@@ -319,6 +463,6 @@ interface GestaltGraphState {
 
 ---
 
-_Last updated: 2026-06 (TR_042 session)_
+_Last updated: 2026-06-13 (TR_053 — PlanningGraph code landed + 3 NRB fixes from TR_052)._
 _Update this file whenever a new agent team is designed
 or an existing team changes structure._

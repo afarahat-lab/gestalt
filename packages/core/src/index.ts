@@ -84,6 +84,10 @@ export { VALID_REASONING_EFFORTS } from './agents/agent-config';
 export type { GestaltConfig, ServerConfig, DatabaseConfig, QueueConfig, LLMConfig, AuthConfig } from './config/index';
 export { loadConfig, GestaltConfigError } from './config/index';
 
+// LangGraph PostgreSQL checkpointer — singleton, shared across all
+// layer subgraphs (planning, gate, …). One pg.Pool per process.
+export { getCheckpointer } from './graphs/checkpointer';
+
 // Logger
 export type { LogLevel, LogContext } from './logger/index';
 export { logger, createContextLogger, logSignal } from './logger/index';
@@ -108,7 +112,7 @@ export {
 
 // Repository
 export type {
-  IntentRecord, IntentStatus, IntentListFilters,
+  IntentRecord, IntentStatus, IntentListFilters, IntentParentContext,
   AgentExecutionRecord, ExecutionStatus,
   AuditRecord,
   UserRecord,

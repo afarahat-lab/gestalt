@@ -18,7 +18,7 @@ docker-compose logs -f server
 |---|---|
 | `pnpm -r build` | ✅ clean (13 packages) |
 | `docker-compose up -d` | ✅ healthy (server / postgres / redis) |
-| Migrations applied | 029 (latest: `029_token_management_and_phase_merge`) — no new migration in TR_043 |
+| Migrations applied | 029 (latest: `029_token_management_and_phase_merge`) — no new Gestalt migration in TR_053 (PlanningGraph reuses TR_051 PostgresSaver tables; new `ExecutionStatus = 'completed-with-warning'` is additive on a column with no CHECK constraint) |
 | Server reachable | `http://localhost:3000/health` returns 200 |
 | Dashboard | served at `http://localhost:3000/app/` |
 
@@ -53,6 +53,605 @@ None blocking the build. Areas to keep in mind:
 ---
 
 ## Pending operator actions
+
+### TR_053 amendment — 8 correctness fixes to the PlanningGraph + refined event-based resume plumbing (no template bump; verification steps 1-2 LIVE-PASSED, 3-5 + full run = TR_054 carryover)
+
+The TR_053 initial brief had architectural bugs in the
+interrupt/resume path. This amendment fixes them and ships the
+verification mechanics. Step 0 trace report determined that the
+deploy pipeline does NOT propagate the parent `featureId` to the
+promotion-agent; it's reconstructed via SQL JOIN at the planning
+subscriber. User chose event-based routing (Refined Option 2) over
+DB lookup.
+
+**Refined Option 2 — event-based resume plumbing:**
+
+- **Migration 030** — `intents.parent_context JSONB` column.
+  Discriminated envelope `{kind: 'planning-phase', featureId,
+  phaseIndex}` stamped by `phaseDispatchNode` at intent create
+  time. Existing intents (parent_context = NULL) fall back to the
+  JOIN.
+- **`@gestalt/core` `IntentRecord`** gains optional `parentContext`
+  field; new `IntentParentContext` discriminated-union type.
+- **`IntentRepository.create`** signature accepts optional
+  `parentContext`; postgres adapter writes via `db.json(...)`.
+- **`transitionIntent`** (3 copies — deploy, gate, generate) reads
+  the persisted column on its `intents.updateStatus` return value
+  and includes `parentContext` in the `intent.status-changed`
+  event payload.
+- **Planning subscriber** routes by `event.parentContext.kind`
+  WITHOUT any DB JOIN on the hot path. Legacy fallback retained
+  for older intents.
+
+**8 correctness fixes per the amendment brief:**
+
+- **Fix 1 (resume API)** — `Command({resume})` is the correct API
+  in `@langchain/langgraph@0.2.74`. Smoke-tested with a throwaway
+  2-node graph: `interrupt()` pauses, `Command({resume:value})`
+  resumes, node observes the value. The earlier code's check on
+  `result.__interrupt__` was wrong — that key is NOT surfaced on
+  the invoke return value in v0.2.74. Correct detection:
+  `graph.getState(cfg).tasks[*].interrupts[*]` or
+  `state.next` non-empty. `runPlanningGraph` fixed.
+- **Fix 2 (both terminal outcomes resume)** — the subscriber now
+  dispatches `planning:graph-resume` on `deployed`
+  (`success:true`) AND on `failed`/`escalated`/
+  `waiting-for-clarification` (`success:false` +
+  `failureReason`). `phaseEvaluatorNode` handles the
+  `success:false` branch via the `maxPhaseRetries` budget. The
+  previous "deployed only" routing would have left the graph
+  parked at `awaitPhaseNode` forever on phase failure — the same
+  indefinite-hang class fixed in TR_032/TR_036 for the legacy
+  orchestrator.
+- **Fix 3 (single engine, default langgraph)** —
+  `harnessConfig.planner.engine: 'langgraph'|'orchestrator'`
+  (default `'langgraph'`) replaces the deprecated
+  `useLangGraph` boolean. `handlePlanningStart` logs
+  `planning engine selected: <engine>` then re-dispatches as
+  `planning:graph-start` when `langgraph`. The unchosen engine is
+  inert for the feature — `planning:phase`/`planning:evaluate`
+  never dispatched for graph features;
+  `planning:graph-start`/`graph-resume` never dispatched for
+  orchestrator features.
+- **Fix 4 (resume runs in planning worker via queue)** —
+  confirmed by inspection. Already implemented in TR_053 initial:
+  `planning:graph-resume` is a BullMQ task on the planning queue;
+  the deploy layer only emits `intent.status-changed`; deploy and
+  planning stay decoupled.
+- **Fix 5 (interrupt return is BullMQ success)** — confirmed in
+  `packages/core/src/queue/index.ts:184-189`. The worker treats
+  any non-throwing handler return as job COMPLETED;
+  `result.status: 'failed'` is observability-only. `runPlanningGraph`
+  returns normally on both END and interrupt paths. Comment in
+  `handleGraphStart` locks in the rule for future readers.
+- **Fix 6 (no side effects before interrupt)** — `humanFeedbackNode`
+  was creating a feature-blocked alert (DB write + SSE) BEFORE
+  the `interrupt()` call; on resume LangGraph re-executes the
+  node from the top → duplicate alert. Moved the alert creation
+  to `phaseEvaluatorNode`'s `escalate` branch (the deciding node,
+  runs exactly once per phase outcome). `awaitPhaseNode` reduced
+  to log + interrupt only. Explicit rule comments on both
+  interrupt nodes documenting the constraint. `phaseDispatchNode`
+  audited for crash-mid-node idempotency; documented as
+  acceptable tradeoff during rollout (mid-node window is ~ms;
+  the verified scenario is server-restart-while-parked, where
+  await-phase is the running node).
+- **Fix 7 (adjust/continue/escalate index semantics)** — explicit
+  comment block on `phaseEvaluatorNode`. `planningAction` now
+  returns `'adjust'` (vs `'continue'`) when the evaluator
+  applied scope adjustments to remaining phases. Both advance
+  the index identically; the distinction is observability-only.
+  `escalate` does not advance.
+- **Fix 8 (architecture function-call vs subgraph)** —
+  documented in `AGENT_TEAMS.md` as a conscious tradeoff:
+  `runArchitectureGraph` keeps its own `thread_id =
+  correlationId` (separate checkpoint thread), trading
+  non-resumable architecture (~4 min re-work on restart) for
+  simpler debugging. Promotion to a true subgraph deferred until
+  empirical use surfaces the need.
+
+**BullMQ lockDuration bump (discovered during verification):**
+
+- The platform default `lockDuration: 600000` (10 min, tuned for
+  legacy `planning:start`) was too short for `planning:graph-start`
+  (~24 min on the trackeros baseline, including the
+  ArchitectureGraph crew). BullMQ marked the job
+  `failed:stalled` AFTER successful handler return (observability
+  noise; not retried due to `maxStalledCount: 0`). Bumped to
+  `1800000` (30 min) on the planning queue worker.
+
+**trackeros chief-architect switched to DeepSeek-V3.2:**
+
+- During verification, Kimi-K2.6 timed out twice in a row on the
+  12k chief reconciliation call (TR_050 known issue; ~50% timeout
+  rate observed). Operator committed an `agents.yaml` change to
+  switch the chief to DeepSeek-V3.2 for verification cycles.
+  Pushed to trackeros `origin/main` as
+  `df04b85a chore(TR_053-verify): switch chief-architect to DeepSeek-V3.2`.
+
+**Live verification status:**
+
+- **Step 1 (throwaway interrupt/resume script)** — **PASSED**.
+- **Step 2 (graph parks + checkpoint written)** — **PASSED** on
+  trackeros feature `ff4e32f4-9385-4244-af78-f49f2458500b`:
+  engine selection logged
+  (`planning engine selected: langgraph`); ArchitectureGraph
+  fired through chief; planner ran (6 phases); Phase 1 intent
+  dispatched with `parent_context` JSONB correctly populated
+  (DB-confirmed: `{"kind":"planning-phase","featureId":"...","phaseIndex":0}`);
+  `planning-graph awaitPhaseNode interrupting` log fired;
+  `PlanningGraph step complete` confirms graph returned at
+  interrupt; `Task completed` confirms BullMQ saw success.
+  `p1_intent_count=1` — Phase 1 intent dispatched exactly once
+  (Fix 6 working).
+- **Step 3 (Phase 1 deploys → resume → Phase 2 dispatched)** —
+  IN FLIGHT at report-final. Phase 1 generation underway.
+  Carryover to TR_054.
+- **Steps 4-5** — pending verification by TR_054. Code paths
+  exist and were audited (Fix 2 for failure branch, Fix 6 for
+  restart-resume idempotency).
+- **Template version stays at 0.38.0** per the brief's "bump
+  only after verification passes" rule. **Template 0.39.0 bump
+  + full feature run = TR_054**.
+
+**Build status:** `pnpm -r build` clean across all 13 packages.
+Migration 030 applied at server boot.
+
+**Operator action — trackeros:** my edits pushed.
+- `0404a6e9 chore(TR_053): switch planner.engine to langgraph`
+- `df04b85a chore(TR_053-verify): switch chief-architect to DeepSeek-V3.2`
+
+### TR_053 — LangGraph migration Phase 2: PlanningGraph + three NRB fixes (ADR-056)
+
+_**Note (TR_054 reconciliation):**_ this entry describes the
+**TR_053 initial** design where the engine flag was a boolean
+`planner.useLangGraph` (default `false`) and the template
+proposed a `0.38.0 → 0.39.0` bump. The **TR_053 amendment**
+within the same session renamed the flag to `planner.engine:
+'langgraph' | 'orchestrator'` (default `'langgraph'`) and held
+the template at `0.38.0` until verification passes (TR_054 B6).
+The old `useLangGraph` mentions below are retained as a record
+of the initial design; the live shipped surface uses
+`planner.engine`. See the TR_053 amendment block above for the
+current as-shipped semantics.
+
+
+
+**Three TR_052 NRB fixes — done and clean:**
+
+- **NRB-1 — review-agent completed-with-warning in gate.**
+  `ExecutionStatus` gains the new value (additive — no
+  CHECK constraint on `agent_executions.status` so no
+  migration needed). `gate-orchestrator.ts`
+  `runWithObservability` attaches `_executionId` +
+  `_errorMessage` to the errored `GateAgentResult`. After
+  `synthesiseGateResult` returns a `pass` verdict, the
+  orchestrator iterates the agent results and patches any
+  with `status === 'errored'` to
+  `completed-with-warning` on `agent_executions` +
+  appends a `completed-with-warning` row to
+  `agent_execution_logs` explaining "non-blocking failure;
+  other gate agent passed". Emits `agent.completed` SSE
+  with the new status so the dashboard sees it. Symmetric
+  for constraint-agent or review-agent — whichever
+  threw, the surviving agent's pass is treated as
+  sufficient.
+- **NRB-2 — structured specialist errors in architecture
+  nodes.** New `SpecialistResponseError` class in
+  `graphs/architecture/agents.ts` with `kind:
+  'parse-failure' | 'parsed-to-empty'` + `role:
+  'domain' | 'data' | 'app'`. Parsers no longer swallow
+  failure — `parseDomainDesign`, `parseDataDesign`,
+  `parseAppDesign` throw on either kind. The existing
+  node `try/catch` (TR_051) catches and emits a structured
+  sentinel into `state.errors[]`. `chiefArchitectNode`
+  gains a new `log.info` showing slice presence
+  (`present` | `empty`) for each of the three inputs +
+  `priorErrors` before invoking the chief.
+- **NRB-3 — buildStackSubstitutions removed.**
+  `ArchitectureAgent.buildStackSubstitutions` method
+  deleted; `buildStackSubstitutionPrompt` +
+  `applyStackSubstitutions` deleted from
+  `architecture-prompt.ts`; the two
+  `planning-orchestrator` call sites deleted; the
+  `applyStackSubstitutions` import + the `architectureAgent`
+  outer instance removed.
+  `FeatureArchitecture.stackSubstitutions` kept as
+  `@deprecated` for back-compat with persisted JSON.
+  The architecture crew enforces stack compliance
+  structurally (`renderStackSection` + per-specialist
+  HARNESS rules + chief reconciliation); the regex
+  post-processing fallback was redundant after TR_051 +
+  failed on DeepInfra anyway.
+
+**Phase 2 of the LangGraph migration — PlanningGraph
+code landed (parallel rollout, flag-gated):**
+
+- **New package layout:**
+  ```
+  packages/agents/planning/src/graphs/planning/
+  ├── state.ts                — Annotation.Root schema
+  └── nodes.ts                — 6 node functions (with helpers)
+  graph.ts                    — StateGraph + runPlanningGraph()
+  ```
+  (`agents.ts` from the brief isn't needed — the existing
+  `PlannerAgent` + `PhaseEvaluatorAgent` + `ArchitectureAgent`
+  classes are called directly by the nodes.)
+- **State** (`PlanningGraphState`): `featureId`,
+  `correlationId`, `featureArchitecture` (JSON),
+  `phasesJson`, `currentPhaseIndex`, `currentIntentId`,
+  `phaseResult`, `currentPhaseRetries`, `planningAction`
+  (`continue|adjust|complete|escalate|null`),
+  `humanFeedback`, `errors[]` (with `[...a,...b]`
+  reducer), `tokensUsed` (with `a+b` reducer).
+- **Nodes** (`nodes.ts`):
+  - `architectureNode` — clones repo, calls
+    `runArchitectureGraph()` (Phase 1 subgraph),
+    persists architecture summary, appends to
+    `docs/ARCHITECTURE.md` when relevant.
+  - `plannerNode` — calls `PlannerAgent.planFeature`,
+    persists `feature_phases` rows + the architecture
+    summary via `saveArchitectureAndPlan`.
+  - `phaseDispatchNode` — clones repo, runs optional
+    per-phase architecture pass (designPhase +
+    reviewPhaseDesign), builds intent text incl.
+    TR_039 deferred section, creates intent row,
+    dispatches `generate:intent` to BullMQ.
+  - `awaitPhaseNode` — calls `interrupt({type:
+    'await-intent', featureId, phaseIndex, intentId})`.
+    BullMQ job returns; state checkpointed to postgres.
+  - `phaseEvaluatorNode` — clones repo, on
+    `result.success: false` honours `maxPhaseRetries`;
+    on success runs `PhaseEvaluatorAgent.evaluatePhase`,
+    persists evaluation, applies adjustments, marks phase
+    deployed, bumps `current_phase`, returns
+    `continue|complete|escalate`.
+  - `humanFeedbackNode` — creates a `feature-blocked`
+    alert, calls `interrupt({type: 'human-feedback'})`.
+- **Graph** (`graph.ts`): START → architecture → planner
+  → phase-dispatch → await-phase → phase-evaluator →
+  conditional edges (continue/adjust → phase-dispatch,
+  complete → END, escalate → human-feedback). The
+  conditional edge router reads `state.planningAction`.
+  `runPlanningGraph({mode, featureId, ...})` accepts
+  `start` or `resume`; on resume uses LangGraph's
+  `Command({resume: value})` API (the brief's plain
+  `graph.invoke(state)` would NOT have resumed — it
+  would re-enter from START).
+- **Two new BullMQ task types** added to `@gestalt/core`
+  `TaskType` union: `planning:graph-start` and
+  `planning:graph-resume`. Handlers live in the same
+  `planning-orchestrator` worker so both paths share the
+  process + queue.
+- **Routing — opt-in per project**:
+  - `HarnessConfig.planner.useLangGraph?: boolean`
+    (default false) added to `@gestalt/core` `harness`.
+  - In `handlePlanningStart`: a new
+    `projectOptsIntoLangGraph` helper shallow-clones
+    HARNESS.json (same pattern as `readMaxPhaseRetries`)
+    and re-dispatches as `planning:graph-start` when the
+    flag is true; legacy path runs otherwise.
+  - In the `intent.status-changed` event subscriber:
+    `featureHasGraphCheckpoint(featureId)` calls
+    `PostgresSaver.getTuple({thread_id: featureId})` to
+    detect whether the feature ran through the graph.
+    If yes → dispatch `planning:graph-resume`; if no →
+    legacy `planning:evaluate`. **Layering note**: the
+    brief asked for the deploy promotion-agent to invoke
+    the planning graph directly. Routing inside the
+    existing subscriber instead keeps deploy decoupled
+    from planning's internals — same outcome, cleaner
+    layering (deploy still only fires
+    `intent.status-changed`).
+- **planning-orchestrator.ts marked `@deprecated`**
+  (file-level JSDoc) per ADR-056 Phase 2 schedule. Kept
+  fully functional until Phase 3 verification.
+
+**Template + trackeros HARNESS:**
+
+- Template `corporate-ops-web-mobile` HARNESS.json gets
+  `"useLangGraph": false` under `planner`. Template bumped
+  `0.38.0 → 0.39.0`. trackeros HARNESS adds the same
+  explicit `false` so the opt-in surface is documented in
+  place even when off.
+
+**Build status:** `pnpm -r build` clean across all 13
+packages. No new migration. No new env var.
+
+**Live verification (TR_054 carryover):** trackeros HARNESS
+still has `useLangGraph: false`. To exercise the graph
+end-to-end:
+
+```bash
+# In trackeros HARNESS.json:
+#   "planner": { ..., "useLangGraph": true }
+# Push, then submit a feature:
+gestalt feature submit "..." --project trackeros
+
+# Watch for the new log lines:
+docker compose logs server | grep -E "planning-graph|planning:graph"
+# Expect:
+#   planning:start — project opted into LangGraph PlanningGraph
+#   planning-graph architectureNode invoking ArchitectureGraph
+#   planning-graph plannerNode invoking planner-agent
+#   planning-graph awaitPhaseNode interrupting
+#   (BullMQ job returns; later promotion-agent fires resume)
+#   PlanningGraph step complete
+```
+
+Check the checkpointer tables after a graph cycle:
+
+```sql
+SELECT thread_id, COUNT(*) FROM checkpoints
+WHERE created_at > NOW() - INTERVAL '30 minutes'
+GROUP BY thread_id;
+-- Each running feature gets one row per checkpoint
+-- (architecture subgraph thread_id = correlationId;
+--  planning thread_id = featureId).
+```
+
+**Operator action — trackeros:** None new. Operator flips
+`"useLangGraph": true` when ready to test the graph path
+on a new feature submission. In-flight features stay on
+the legacy path until they complete.
+
+**Operator action — other projects:** Template auto-refreshes
+to `0.39.0` at next server boot. Operators flip the flag
+per project when ready.
+
+### TR_052 — Live verification of LangGraph ArchitectureGraph (no code change; TEST_REPORT_052.md added; 3 new rigor bars surfaced as TR_053 follow-ups)
+
+Rebuilt the gestalt server with the TR_051 source tree
+(`docker compose down && docker compose up -d --build`),
+fast-forwarded trackeros's `origin/main` with the
+TR_051 HARNESS + agents.yaml edits as
+`1f498b5b chore(TR_051): architecture-crew agentConfig + agents.yaml entries`,
+then ran the leave-management verification recipe end-to-end.
+
+**Architecture graph — confirmed working as designed.**
+
+- Specialist fan-out parallel (all three started in the same
+  scheduler tick at 11:14:35 server time; completions
+  staggered 48s / 59s / 67s reflecting LLM latency only).
+- Chief fan-in: ran only after all three specialists complete;
+  took 198s on Kimi-K2.6 (12k max_tokens, 15,607 output
+  tokens). RetryPolicy not exercised (first attempt
+  succeeded).
+- `state.errors` worked structurally — one specialist
+  (domain-architect) returned a non-JSON response, the
+  empty-fallback fired silently, chief reconciled around
+  the missing slice and still emitted 6 entities.
+- LangGraph 0.2 created **4 tables** on first call:
+  `checkpoints`, `checkpoint_writes`, `checkpoint_blobs`,
+  `checkpoint_migrations` (the TR_051 blueprint mentioned
+  only the first two; corrected in AGENT_TEAMS.md).
+
+**Chief output structurally richer than single-agent baseline.**
+
+| Metric | TR_050 single-agent | TR_052 crew |
+|---|---|---|
+| domainEntities | 3 inferred | **6** named |
+| modules | not enumerated | **5** with `owns` |
+| dependencyMap edges | not enumerated | **7** |
+| sqlSchemas | inline in archMd | **6 first-class CREATE TABLE statements** |
+| architectureMdUpdate | ~750 chars | **3,396 chars**, GP-001/GP-002 references |
+
+`AuditLog` emerged as a 6th entity even though the feature
+description never mentions audit — the chief inferred it
+from GP-002 loaded via `renderGoldenPrinciplesSection`. The
+type-level contracts + golden-principles injection do exactly
+what the TR_044 follow-up asked for.
+
+**TR_036→TR_050 rigor bar accretion — structurally absorbed.**
+
+Phase 1 of the leave-management feature deployed in **19m 27s
+end-to-end** (vs TR_050's 20m for Phase 1 alone), with
+intent-agent passing on the first attempt and NO HARNESS rule
+firing to clear the symbol-name conflict / concrete-impl /
+framework leak / lifecycle / SQL schema rigor bars. The
+type-level contracts (`DomainDesign.lifecycleStates`,
+`DataDesign.repositories[].concreteName + backing`,
+`DataDesign.sqlSchemas[]`, etc.) absorb what 15+ HARNESS
+rules were doing across TR_036→TR_050.
+
+**Three new rigor bars surfaced as TR_053 follow-ups:**
+
+- NRB-1 (MEDIUM) — review-agent failed silently on the
+  large Phase 1 diff; constraint-agent's clean verdict was
+  enough for the gate to pass, but the failed review-agent
+  row is a confusing observable. Gate orchestrator should
+  mark `skipped-on-error` when constraint-agent passes.
+- NRB-2 (LOW) — specialist parse-to-empty fallback leaves
+  `state.errors` empty; operators can't see which slice
+  silently failed. Parsers in
+  `graphs/architecture/agents.ts` should emit a sentinel
+  string into `state.errors` when the response was non-empty
+  but produced an empty Design.
+- NRB-3 (LOW) — TR_044 `buildStackSubstitutions` hardcoded
+  to `gpt-4o-mini`; fails on DeepInfra registry. Graceful
+  empty-map fallback works. Now redundant since chief
+  enforces stack compliance structurally — candidate for
+  removal.
+
+**Pipeline continues in background.** Phases 2-10 take an
+estimated ~3 hours wall-clock and are not closed by this
+session. Full completion verification is the **TR_053
+carryover**.
+
+**No platform code change. Build status unchanged from TR_051.**
+
+**Operator action:** none new beyond the trackeros push at
+`1f498b5b` (HARNESS + agents.yaml landed on `origin/main`).
+TEST_REPORT_052.md added at `docs/claude/TEST_REPORT_052.md`.
+
+### TR_051 — LangGraph migration Phase 1: ArchitectureGraph (ADR-056, template 0.38.0, build clean, live verification pending)
+
+Replaces the single architecture-agent's feature-level
+`designFeature` + `reviewDesign` pass with a LangGraph
+StateGraph crew. Per-phase `designPhase` + `reviewPhaseDesign`
+remain on the single architecture-agent until Phase 2 of the
+migration.
+
+**Platform code (10 changes):**
+
+1. `@gestalt/agents-planning` adds three new dependencies:
+   `@langchain/langgraph@^0.2.0`,
+   `@langchain/langgraph-checkpoint-postgres@^0.0.1`,
+   `@langchain/core@^0.3.0`. `pnpm install` clean.
+2. `packages/agents/planning/src/graphs/architecture/state.ts`
+   — LangGraph `Annotation.Root({...})` schema with `feature`,
+   `existingArchitectureMd`, `goldenPrinciplesMd`,
+   `harnessConfig`, `projectRoot`, `correlationId` inputs;
+   `domainDesign` / `dataDesign` / `appDesign` parallel
+   specialist outputs; `finalArchitecture` chief output;
+   `errors[]` (with `[...a, ...b]` reducer) for specialist
+   failures; `tokensUsed` (with `a + b` reducer) cumulative
+   across all four agents.
+3. `graphs/architecture/types.ts` — `DomainDesign` /
+   `DataDesign` / `AppDesign` shapes (the LLM contract for
+   each specialist; the chief receives them as JSON in its
+   prompt).
+4. `graphs/architecture/prompts.ts` — strict ADR-042:
+   structural framing + JSON schemas only. Shared
+   `renderStackSection` / `renderGoldenPrinciplesSection` /
+   `renderExtensions` / `renderArchExcerpt` / `renderFeatureBlock`
+   helpers reused across all four prompts. Each specialist
+   prompt explicitly notes which slice it owns and which
+   slices it must NOT touch.
+5. `graphs/architecture/agents.ts` — `DomainArchitectAgent` /
+   `DataArchitectAgent` / `AppArchitectAgent` /
+   `ChiefArchitectAgent` classes, each extending
+   `BaseLLMAgent`. Token management (ADR-057) +
+   `lastTokensUsed` accumulator + `agents.yaml`/`HARNESS.json`
+   loading inherited automatically. JSON parsers mirror the
+   patterns in `agents/architecture-agent.ts`.
+6. `graphs/architecture/nodes.ts` — four LangGraph node
+   wrappers. Each calls its agent's `design()`/`review()`
+   method, logs the result (entity / module / phase counts +
+   tokens), and returns a `Partial<state>` for LangGraph's
+   reducer to merge. Specialist errors surface as
+   `state.errors[...]` instead of throwing — the chief can
+   reconcile around a missing slice.
+7. `graphs/architecture/graph.ts` — compiled `StateGraph`:
+   `START` → `[domain || data || app]` → `chief` → `END`
+   (LangGraph's fan-out + fan-in). Identical `RetryPolicy`
+   on every specialist (3 attempts, exponential backoff,
+   `retryOn` matches timeouts / sockets / 5xx / 429); chief
+   capped at 2 attempts. Compiled graph cached at module
+   scope. `runArchitectureGraph(input)` is the public
+   interface — throws when the chief produces empty output
+   so the orchestrator's outer catch blocks the feature.
+8. `graphs/checkpointer.ts` — singleton `PostgresSaver`
+   (process-wide because it owns a `pg.Pool`). Reads
+   `DATABASE_URL` via `loadConfig()`. `setup()` is
+   idempotent; LangGraph creates its own `checkpoints` +
+   `checkpoint_writes` tables on first call — no Gestalt
+   migration needed.
+9. `packages/core/src/types.ts` — `AgentRole` literal union
+   gains four new values: `domain-architect-agent` /
+   `data-architect-agent` / `app-architect-agent` /
+   `chief-architect-agent`.
+10. `packages/core/src/agents/agent-config-loader.ts` —
+    `PER_ROLE_DEFAULTS` gains entries for the four new roles
+    (temperature 0.1; specialists 6k max_tokens; chief 12k;
+    no file tools — the crew works from prompt context only,
+    the orchestrator already provides cloned-tree files).
+11. `orchestrator/planning-orchestrator.ts` — `handlePlanningStart`
+    swaps `architectureAgent.designFeature(...)` +
+    `architectureAgent.reviewDesign(...)` for a single
+    `runArchitectureGraph({...})` call. The orchestrator
+    logs specialist errors when present but proceeds —
+    the chief reconciles around them. `buildStackSubstitutions`
+    (TR_044) stays on the single architecture-agent class
+    because it's a dedicated one-shot classification, not an
+    architectural reasoning task.
+12. `agents/architecture-agent.ts` — `designFeature` +
+    `reviewDesign` marked `@deprecated` (TR_051 / ADR-056
+    Phase 1) but retained as fallback. `designPhase` +
+    `reviewPhaseDesign` untouched — Phase 2 absorbs them.
+13. `src/index.ts` — public exports added for
+    `runArchitectureGraph`, the four agent classes, and the
+    three specialist `Design` types.
+
+**HARNESS (template + trackeros):**
+
+14. New `agentConfig.domain-architect-agent.rules` —
+    define entities + lifecycle states, never persistence,
+    everything in domainNotes.
+15. New `agentConfig.data-architect-agent.rules` — every
+    persistent entity gets a complete CREATE TABLE; every
+    repository names its concrete backing implementation.
+16. New `agentConfig.app-architect-agent.rules` — layer
+    boundaries, inward-only dependency direction, no
+    circular deps.
+17. New `agentConfig.chief-architect-agent.rules` —
+    reconciliation, not regeneration; resolve symbol-name
+    conflicts; verify stack compliance; reconcile around
+    missing specialist slices.
+
+**agents.yaml (template + trackeros):**
+
+18. Four new agent entries with `prompt_extensions`.
+    Template uses `model: ~` (platform default). trackeros
+    binds the specialists to `deepseek-ai/DeepSeek-V3.2`
+    (TR_050's stable choice on DeepInfra, max 6k) and the
+    chief to `moonshotai/Kimi-K2.6` (max 12k — same budget
+    as TR_050's single-agent setting; Kimi is better at
+    producing direct structured reconciliation output than
+    DeepSeek per TR_050 verification cycles).
+
+Template `0.35.0 → 0.38.0`. No new Gestalt migration.
+`pnpm -r build` clean across all 13 packages.
+
+**Live verification pending — recipe:**
+
+```bash
+docker-compose up -d --build
+docker-compose logs server | grep -E "architecture-graph|langgraph|checkpoint"
+
+gestalt feature submit \
+  "Build the leave management module. Employees apply for
+   annual, sick, and emergency leave. Managers approve or
+   reject. System tracks leave balances." \
+  --project trackeros
+
+gestalt feature status <featureId> --watch
+```
+
+Then in psql:
+
+```sql
+SELECT table_name FROM information_schema.tables
+WHERE table_name LIKE 'checkpoint%';
+-- expect: checkpoints, checkpoint_writes (LangGraph-created)
+
+SELECT agent_role, COUNT(*) FROM agent_executions
+WHERE created_at > NOW() - INTERVAL '10 minutes'
+GROUP BY agent_role ORDER BY agent_role;
+-- expect: 1 row per architecture-crew agent per feature
+```
+
+Expected: all three specialist nodes fire in parallel (logs
+within ~1s of each other); chief fires after; final feature
+architecture richer than single-agent output (named
+concrete repository implementations + full SQL schema +
+explicit lifecycle states).
+
+**Operator action — trackeros:** my edits to
+`/Users/amrmohamed/Work/trackeros/HARNESS.json` and
+`/Users/amrmohamed/Work/trackeros/agents.yaml` are unpushed.
+The operator should review + commit + push so the next
+planning cycle picks them up. The new specialist + chief
+blocks are abstract / language-agnostic and should not
+conflict with the project linter's existing rule format.
+
+**Operator action — other projects:** Existing projects
+inherit the architecture-crew defaults via
+`PER_ROLE_DEFAULTS` automatically. Projects that want to
+override per-agent prompt_extensions or LLM bindings add
+the four new entries to their `agents.yaml` + (optional)
+HARNESS rules. Template auto-refreshes to `0.38.0` at next
+server boot.
 
 ### TR_050 — DeepInfra integration + Aider as the only code-generation backend + 5 cascading timeout fixes (template 0.35.0, build clean, Phase 1 deployed end-to-end on Kimi-K2.6/DeepSeek-V3.2/Aider for the FIRST EVER autonomous source-file generation on DeepInfra)
 

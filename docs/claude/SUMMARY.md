@@ -11,7 +11,7 @@ _Concise capability snapshot. For HOW each capability was built,
 see [sessions/RECENT.md](./sessions/RECENT.md) (last 3 sessions) or
 the `sessions/archive/` files (everything older)._
 
-**Last updated:** 2026-06-13 (after TR_053 — **LangGraph migration Phase 2 (ADR-056) landed** as a parallel rollout + **all three TR_052 NRBs fixed**. **PlanningGraph** is the new `StateGraph` in `packages/agents/planning/src/graphs/planning/` — 6 nodes (architecture/planner/phase-dispatch/await-phase/phase-evaluator/human-feedback) plus conditional edges (continue|adjust|complete|escalate). The await-phase + human-feedback nodes use LangGraph `interrupt()`; resume happens via `Command({resume})` on a new BullMQ task `planning:graph-resume` dispatched by the existing event-bus subscriber when a feature checkpoint exists. The graph runs **alongside** the legacy `planning-orchestrator` three-task chain, gated by `harnessConfig.planner.useLangGraph` (default `false`). Two new BullMQ task types (`planning:graph-start` + `planning:graph-resume`) in `@gestalt/core` `TaskType` union. `HarnessConfig.planner.useLangGraph?: boolean` added. `ExecutionStatus` gains `'completed-with-warning'` for **NRB-1**. **NRB-2**: architecture-graph parsers now throw `SpecialistResponseError` on JSON-parse failure OR parsed-to-empty Designs; nodes catch and emit structured sentinel into `state.errors[]`; chief logs slice presence + priorErrors before reconciling. **NRB-3**: `ArchitectureAgent.buildStackSubstitutions` + `buildStackSubstitutionPrompt` + `applyStackSubstitutions` + the two orchestrator call sites all deleted (the architecture crew enforces stack compliance structurally — substitution machinery was redundant after TR_051 + failed on DeepInfra anyway). `FeatureArchitecture.stackSubstitutions` kept as `@deprecated` for back-compat with persisted JSON. Template `0.38.0 → 0.39.0`. trackeros HARNESS gains `"useLangGraph": false`. No new platform migration (LangGraph checkpointer reused from TR_051; `agent_executions.status` column has no CHECK constraint so the new ExecutionStatus value is additive). `pnpm -r build` clean across all 13 packages. **Live verification = TR_054 carryover** — current trackeros feature still on legacy path; operator flips `useLangGraph: true` to test the graph path on next submission. Reviewer-layering nuance: brief asked for promotion-agent to invoke the planning graph directly, but the event-bus subscriber routing (checkpoint lookup) keeps deploy decoupled from planning's internals — same outcome, cleaner layering. **Earlier (TR_052 — TR_051 ArchitectureGraph LIVE-VERIFIED end-to-end** on trackeros feature `e1ee9e5c`. Crew fires as designed: three specialist nodes ran in parallel (all started at 11:14:35 server time, all done within 67s; ~3× wall-clock saving vs serial); chief reconciled afterwards (Kimi-K2.6, 198s, 15,607 tokens, 6 entities + 5 modules + 7 dependency edges + 5 recommended phases + **6 first-class `sqlSchemas[]` CREATE TABLE statements** + AuditLog as a 6th entity surfacing structurally from GOLDEN_PRINCIPLES.md GP-002). **TR_036→TR_050 rigor bar accretion structurally absorbed** — intent-agent passed Phase 1 cleanly on first attempt with zero HARNESS rule intervention. **Phase 1 deployed in 19m 27s** (vs TR_050's 20m for Phase 1 alone). LangGraph `PostgresSaver` created its own 4 tables on first call (`checkpoints`, `checkpoint_writes`, `checkpoint_blobs`, `checkpoint_migrations` — LangGraph 0.2 emits two more than the AGENT_TEAMS.md blueprint stated). Three new rigor bars surfaced as follow-ups: NRB-1 (review-agent silent failure on noop-adapter gate — constraint-agent's pass was sufficient but the failed review-agent row is a confusing observable), NRB-2 (specialist parse-to-empty leaves `state.errors` empty — operators can't see which slice dropped), NRB-3 (TR_044 `buildStackSubstitutions` hardcoded to gpt-4o-mini still fails on DeepInfra registry — now redundant since chief enforces stack compliance structurally; candidate for removal). Pipeline continues in background; feature still `in-progress` at report-final (Phase 2 mid-flight; phases 3-10 pending; full completion verification deferred to TR_053). Full report in `docs/claude/TEST_REPORT_052.md`. **Earlier (TR_051 — LangGraph migration Phase 1 (ADR-056) landed**. The single architecture-agent's feature-level `designFeature` + `reviewDesign` pass is replaced by a LangGraph `StateGraph` crew in `packages/agents/planning/src/graphs/architecture/`: `DomainArchitectNode` + `DataArchitectNode` + `AppArchitectNode` fan out from START in parallel; `ChiefArchitectNode` reconciles. Per-agent `RetryPolicy` on every node (3 attempts specialists, 2 chief; backoff on timeouts / sockets / 5xx / 429). PostgreSQL checkpointer (`@langchain/langgraph-checkpoint-postgres`) reuses `DATABASE_URL`; LangGraph creates its own `checkpoints` + `checkpoint_writes` tables on first `setup()` call — no Gestalt migration needed. **4 new AgentRoles** (`domain-architect-agent` / `data-architect-agent` / `app-architect-agent` / `chief-architect-agent`) added to `@gestalt/core` `types.ts` + `PER_ROLE_DEFAULTS`. **4 new `agentConfig` blocks** (template + trackeros HARNESS.json) with rules per the brief. **4 new agents.yaml entries** — template uses platform default; trackeros binds specialists to `deepseek-ai/DeepSeek-V3.2` (6k max_tokens) and chief to `moonshotai/Kimi-K2.6` (12k max_tokens). Planning orchestrator's `handlePlanningStart` swaps `architectureAgent.designFeature + reviewDesign` for a single `runArchitectureGraph(...)` call. `ArchitectureAgent.designFeature + reviewDesign` marked `@deprecated` but retained as fallback — `designPhase + reviewPhaseDesign` remain in use (Phase 2 of the migration absorbs those). Template `0.35.0 → 0.38.0`. No new platform migration. `pnpm -r build` clean across all 13 packages. **Live verification pending** — see TR_051 entry in `BUILD.md` for the recipe. **Earlier (TR_050 — multi-stage infrastructure migration to DeepInfra, Aider promoted to the only code-generation backend, and 5 cascading timeout / config fixes that finally let Aider produce real source files end-to-end on Kimi-K2.6 via DeepInfra. **Operator action**: 3 DeepInfra LLMs registered (`deepinfra-kimi-k2` / `deepinfra-deepseek-v3` / `deepinfra-qwen-tiny`, all `chat-completions` apiShape on `https://api.deepinfra.com/v1/openai`), `DEEPINFRA_API_KEY` added to `.env`. Platform default flipped to `deepinfra-deepseek-v3` via `gestalt platform llms set-default`. **9-agent trackeros agents.yaml matrix swap** to DeepInfra: architecture-agent on DeepSeek-V3.2 (after Kimi's 12k-token design call hit 50% timeout rate), self-healing on Kimi-K2.6, planner/phase-evaluator/constraint/review/intent/design on DeepSeek-V3.2, code-agent (Aider) on Kimi-K2.6 (DeepSeek wouldn't emit Aider's SEARCH/REPLACE blocks reliably); `reasoning_effort` fields removed (DeepInfra OpenAI-compat doesn't support). **Platform code (8 changes)**: (1) Aider is now the platform default code-generation backend — `orchestrator.ts` both `aiderBackend` checks coalesce absent `codeGeneration.backend` to `'aider'`; `harness/index.ts` JSDoc rewritten ("gestalt" backend deprecated, retained for backwards compat); template + trackeros HARNESS add explicit `codeGeneration.backend: 'aider'` block. (2) `.env` fixed `LLM_MOCEL` typo → `LLM_MODEL`, set `LLM_API_KEY` to DeepInfra key (loadConfig requires both, server was in restart loop). (3) `LLM_TIMEOUT_MS=300000` (5 min, was 120s). (4) BullMQ Worker: `lockDuration: 600000` + `maxStalledCount: 0` in `queue/index.ts` — closes duplicate-handler bug where long planning:start was retried under default 30s stall detection. (5) `classifyError` in `llm/index.ts` treats `TypeError: fetch failed` + standard socket errors as retryable — closes TR_033 follow-up. (6) Aider litellm provider prefix: `aider-adapter.ts` prepends `openai/` when model lacks one of 17 known litellm provider prefixes; closes the `LLM Provider NOT provided` error that killed all DeepInfra/Aider routing. (7) Aider subprocess timeout cascade — three nested ceilings each needed bumping: `DEFAULT_AIDER_TIMEOUT_MS` 120k→900k (adapter ceiling); `--timeout 600` CLI flag (Aider's per-LLM HTTP timeout); `MAX_SCRIPT_TIMEOUT_MS` in `core/src/tools/file-tools.ts` 120k→900k — THE actual ceiling that was silently clamping every Aider run to 120s. Template `0.34.0 → 0.35.0`. Build clean. **Verified end-to-end on trackeros feature `523e9824`**: **Phase 1 DEPLOYED in 20m 03s — the FIRST EVER autonomous source-file generation cycle on DeepInfra/Aider across TR_036 → TR_050**. Path: intent (DeepSeek) → design (DeepSeek) → context (DeepSeek) → code-agent (Aider/Kimi — REAL files written) → test-agent (skipped per Aider backend) → pr-agent → pipeline-agent (noop) → constraint-agent (DeepSeek, PASSED) → review-agent (DeepSeek, PASSED) → promotion. Architecture: 3 interfaces + 7 criteria. Plan: 6 phases. Session ran 10 cycles total; each one identified a different layer in the timeout/config cascade until the final stack worked. **Phase 2 escalated 1m 50s after dispatch on three new intent-agent rigor bars** (Jest/Vitest framework regression, missing approve/reject methods in interface vs scope, transaction approach not pinned) — same class as TR_036-TR_047, surfacing again on DeepSeek-V3.2-driven architecture (doesn't internalise HARNESS rules as crisply as gpt-5.5). Deferred to TR_051. **Earlier (TR_049 — mandatory SQL schema for relational-DB stacks)** — two changes (one HARNESS rule + one platform-code review-checklist item) closing TR_048's 10th intent-agent rigor bar end-to-end. **Fix 1**: appended to `agentConfig.architecture-agent.rules` (template + trackeros HARNESS): "When the declared stack includes a relational database, you MUST include a complete SQL schema in your output for every persistent domain entity you define. A domain entity without a corresponding table definition is incomplete." Abstract — no DB names hardcoded. **Fix 2**: 9th review-checklist item ("SQL schema completeness — if the declared stack includes a relational database, verify that every persistent domain entity defined in this architecture has a corresponding SQL table definition.") added to both `buildArchitectureReviewPrompt` (closes "all eight checks") and `buildPhaseArchitectureReviewPrompt` (closes "all nine checks"). Template `0.33.0 → 0.34.0`. No new migration. Build clean across all 13 packages. **Verified end-to-end on trackeros feature `dca0cb06`**: architecture-agent emitted SIX CREATE TABLE statements in `architectureMdUpdate` (employees, leave_policies, leave_balances, leave_requests, notifications, audit_records) vs TR_048's zero. **TR_048's canonical-schema-reuse machinery FIRED for the first time across the sequence** — server logs show "TR_048 — injecting canonical SQL schemas into per-phase prompts" three times. Phase 1 and Phase 2 each have populated `sqlSchema` fields matching the feature-level canonical. Plan: 10 phases (architect fanned out persistence per-entity). Phase 1: 3 interfaces + 7 criteria. **Phase 1 cleared the FULL Gestalt agent pipeline end-to-end** — intent-agent → design → code (Aider) → CI → pr-agent → constraint-agent PASSED → review-agent PASSED → promotion. **First phase across TR_036 → TR_049 to make it intent → promotion without escalation.** Wall-clock 7m 03s. **Caveat**: trackeros pipeline adapter is on `noop` since TR_043, so no actual PR landed on GitHub; agent-cycle validation is real, deploy is noop. Phase 2 escalated on a NEW 11th rigor bar: `PostgreSqlAuditRepository` defined as abstract class in high-level architectureMdUpdate vs concrete class with stubbed methods in per-phase architecture — class shape drift across phases. The fix-intent went all the way through to review-agent before clarification escalated. New HIGH follow-up: architecture-agent must keep class shape + method-body status identical across high-level + per-phase views of the same class; OR per-phase architecture is authoritative for the phase that CREATES the class. New MEDIUM operator action: switch trackeros pipeline adapter back to `github-actions` to verify full deploy chain. **Earlier (TR_048 — three platform fixes + one HARNESS rule closing TR_047's 9th intent-agent rigor bar (architecture-agent emitted two views of the same `leave_requests` table with drifted column types). Single source of truth for SQL schema: feature-level is canonical; per-phase references it instead of redefining. **Fix 1a**: `extractCanonicalSqlSchemas(json)` helper in `architecture-prompt.ts` reads either an explicit `sqlSchemas[]` field (forward-compatible) or regex `/CREATE\s+TABLE[\s\S]+?;/gi` against `architectureMdUpdate`; empty array on any failure path. New `renderCanonicalSqlSchemaSection` helper renders the "## Canonical SQL schemas (already defined — use these exactly)" block (omitted when empty). Both `buildPhaseArchitecturePrompt` and `buildPhaseArchitectureReviewPrompt` accept new last-positional `canonicalSqlSchemas: string[] = []` parameter and inject the section between goldenPrinciples and the task. **Fix 1b**: `ArchitectureAgent.designPhase` + `reviewPhaseDesign` accept the same parameter; `runPerPhaseArchitecture` orchestrator extracts once per phase via `extractCanonicalSqlSchemas(feature.architecture)` and passes to BOTH. Logs schemaCount when > 0. **Fix 2**: 8th review-checklist item ("Schema consistency — if a `## Canonical SQL schemas` block was provided above, your `sqlSchema` field MUST use the EXACT same column names, types, and constraints…") + closing line updated to "all EIGHT checks". **Fix 3**: `agentConfig.architecture-agent.rules` in template + trackeros HARNESS gains: "When a canonical schema is provided for a table, use it exactly. Do not redefine column types, sizes, or constraints. A table must have one definition across all architecture views." Template `0.32.0 → 0.33.0`. No new migration. Build clean across all 13 packages. **Verified live on trackeros feature `f070332a`**: TR_048 PLUMBING wired correctly — `runPerPhaseArchitecture` ran cleanly without errors; `extractCanonicalSqlSchemas` correctly returned an empty array (no "TR_048 — injecting canonical SQL schemas" log line) because the architect emitted NO SQL at all. DB inspection confirms `architectureMdUpdate` has zero CREATE TABLE statements and `feature_phases[0].architecture` has no `sqlSchema` field. **Plan shrunk to 5 phases (tightest yet across TR_036 → TR_048)** vs TR_047's 8, TR_046's 6, TR_045's 7, TR_044's 10. Phase 1 architecture: 4 interfaces + 6 criteria (1 criterion explicitly states atomic single-transaction semantics — TR_047 checklist surfacing). **Cycle did NOT reach the gate** — blocked at intent-agent on a 10th rigor bar: amb-001 "The exact PostgreSQL schema and table definitions for LeaveRequest and LeaveAuditRecord persistence are not specified" — the first bar where the prior fix's machinery worked correctly but had no input to act on. **TR_048 machinery is ready**; the upstream gap is now a required-output rule. New HIGH follow-up: architecture-agent must categorically produce CREATE TABLE for every persisted entity when the project stack declares a relational database (currently architectureGuidance says "SQL schema if needed" which the LLM treats as optional). Options: (a) architectureGuidance rule forcing CREATE TABLE for every persisted entity; (b) promote `sqlSchemas?: string[]` to a first-class field on `FeatureArchitecture` with required output for relational stacks; (c) per-phase review's 8th item promoted to "if sqlSchema is empty on a phase that creates persistence interfaces, REQUEST the canonical schema or write one here". **Earlier (TR_047 — TR_046's 8th bar CLOSED by structural redesign, gate reached 3rd time)** — one HARNESS rule + one platform-code rule closing TR_046's 8th intent-agent rigor bar (architecture-agent bundled `LeaveRequest` + `AuditRecord` mutations into Phase 1 without explicit transaction semantics (architecture-agent bundled `LeaveRequest` + `AuditRecord` mutations into Phase 1 without explicit transaction semantics). **Fix 1**: appended to `agentConfig.architecture-agent.rules` (template + trackeros HARNESS): "When a phase includes multiple domain mutations that must be coordinated (a primary operation plus a cross-cutting concern such as audit logging, event publishing, or cache invalidation), explicitly state the transaction semantics: whether the operations execute atomically in a single transaction, as separate transactions, or via a compensating pattern. Do not leave transaction behavior implicit." Abstract — no specific patterns hardcoded. **Fix 2**: 7th checklist item ("Transaction semantics") added to both `buildArchitectureReviewPrompt` and `buildPhaseArchitectureReviewPrompt`. Template `0.31.0 → 0.32.0`. Build clean. **Verified end-to-end on trackeros feature `d90d14b5`**: TR_046's 8th bar CLOSED by structural redesign — the architect SPLIT AuditRecord into its own Phase 2 (separate from Phase 1's LeaveRequest), making Phase 1 a clean single-mutation phase with no transaction-semantics question to answer. Phase 1 architecture: 4 interfaces + 7 criteria (the 7th is the new TR_047 transaction-semantics check). Plan: 8 phases. **Cycle reached the gate — third time across TR_036 → TR_047** with verdicts 6 → **1** → **1** CONSTRAINT_VIOLATION. Two consecutive 1-violation gate runs — closest the cycle has ever been to a clean gate pass. Cycle still blocked on the 9th and narrowest rigor bar yet: "The provided SQL schemas conflict on column types and sizes: one version uses TIMESTAMP and VARCHAR(32), while another uses DATE/TIMESTAMPTZ and VARCHAR(20)" — architecture-agent emitted two views of the same `leave_requests` table with drifted column types. New HIGH follow-up: schema-consistency rule + 8th review-checklist item that pins identical column types/sizes for the same table across feature-level and per-phase architecture outputs. **Earlier (TR_046 — TR_045's 7th bar CLOSED, cycle reached gate 2nd time)** — one HARNESS rule + one platform-code rule closing TR_045's 7th intent-agent rigor bar (architecture-agent introduced `CANCELLED` to support a cancel workflow phase but the project context's documented lifecycle had only Pending/Approved/Rejected). **Fix 1**: appended to `agentConfig.architecture-agent.rules` (template + trackeros HARNESS): "When your architecture introduces any new domain concept that does not appear in the existing project documentation (new lifecycle states, new enum values, new entity types, new relationships), you MUST include it in architectureMdUpdate." **Fix 2**: 6th checklist item ("Documentation consistency") added to both `buildArchitectureReviewPrompt` and `buildPhaseArchitectureReviewPrompt`. Template `0.30.0 → 0.31.0`. Build clean. **Verified end-to-end on trackeros feature `795e1069`**: architecture-agent did NOT introduce `CANCELLED` this cycle — `architectureMdUpdate` documents the lifecycle exactly as the project context defines it (Pending/Approved/Rejected); plan tightened to 6 phases (vs TR_045's 7, TR_044's 10) with Phase 1 bundling `LeaveRequest AND AuditRecord` (cross-cutting concern integration paying off). Phase 1 per-phase architecture: 5 interfaces + 6 criteria (richest yet — 6th criterion is the new doc-consistency item). **The cycle REACHED THE GATE for the SECOND time across the TR_036 → TR_046 sequence** (first was TR_039). Gate ran 6 times across two phase-retry attempts with violation counts trending 5 → 4 → **1** → 3 → 3 → 3 CONSTRAINT_VIOLATION — the single-violation run is the closest the cycle has ever been to a gate pass. Cycle still blocked on an 8th intent-agent rigor bar: "Transaction behavior for createLeaveRequest and AuditRecord creation is not explicitly defined" — a genuine architectural concern when two domain mutations land in the same phase. New HIGH follow-up: architecture-agent should explicitly state transaction semantics (atomic/non-atomic/compensating) for cross-cutting operations bundled with primary domain mutations. **Earlier (TR_045 — interface-signatures rigor closed)** — single abstract rule appended to `agentConfig.intent-agent.rules` in template + trackeros HARNESS: "Interface method signatures in per-phase architecture specifications are CONTRACTS to be implemented by the code-agent during this phase. They are not stubs. An interface showing method signatures without bodies is correct and complete — do not flag missing method bodies as ambiguity or missing implementation." Abstract — no TypeScript-specific language. Template `0.29.0 → 0.30.0`. No platform code change, no migration. Build clean. **Verified end-to-end on trackeros feature `48aa490e`**: TR_044's 6th rigor bar CLOSED — intent-agent did not escalate on interface-signatures-as-stubs (Phase 1 intent went `pending → generating` immediately). Tightened plan to 7 phases (Phase 2 bundles "Create AND cancel leave requests"; Phase 7 bundles "Employee integration, RBAC, balance consumption, and compliance coverage"). Phase 1 per-phase architecture: 5 interfaces + 5 criteria — richest yet across the TR_036 → TR_045 sequence. **Cycle still blocked on a 7th distinct intent-agent rigor bar**: "The project context defines LeaveRequest lifecycle states as Pending, Approved, Rejected, while the phase architecture specifies repository model status values PENDING, APPROVED, REJECTED, and CANCELLED." Architecture-agent introduced `CANCELLED` to support Phase 2's cancel workflow, but the documented project lifecycle has only the three other states. New HIGH follow-up: architecture-agent should update `architectureMdUpdate` in lockstep with new lifecycle states, OR intent-agent should treat states implied by the feature scope as consistent. **Earlier (TR_044 — per-phase framework leak CLOSED end-to-end)** — two fixes against TR_042's two HIGH NEW follow-ups. **Fix 1**: LLM-generated `<canonical>→[alternatives]` substitution map (gpt-4o-mini one-shot classification, generated once per feature, cached on `FeatureArchitecture.stackSubstitutions`) + a pure `applyStackSubstitutions` utility that runs as a deterministic post-process on every `reviewPhaseDesign` output before persistence. Closes the per-phase Vitest leak TR_040/TR_041/TR_042 couldn't fix via LLM-only prompts. **Fix 2**: read `docs/GOLDEN_PRINCIPLES.md` from the cloned tree at planning:start AND on every planning:phase, thread `goldenPrinciplesMd` through all four architecture-agent prompts (designFeature / reviewDesign / designPhase / reviewPhaseDesign) — gives architecture-agent the same cross-cutting visibility (audit logging, RBAC, etc.) intent-agent already had. Template `0.28.0 → 0.29.0`. Build clean. **Verified end-to-end on trackeros feature `fc99779a`**: per-phase framework leak CLOSED (DB query `jest=0 vitest=0 fastify=0 express=0` in Phase 1, vs TR_042's `Vitest=2 vitest=1`); golden-principles injection observably shaped the plan — Phase 3 "Create AuditRecord domain model and repository" (the exact concern TR_042 surfaced), Phase 7 RBAC, Phase 10 E2E coverage. 10-phase plan vs TR_042's 8. Cycle still blocked at intent-agent on a 6th distinct rigor bar: "intent refers to PostgreSQL-backed repository operations, while the provided architecture shows method stubs throwing 'Not implemented'" — intent-agent reads abstract TypeScript interface signatures (no method bodies, CORRECT for an architecture phase) as evidence the implementation is missing. New HIGH follow-up: intent-agent rule injection telling it interface signatures are contracts, not stubs. **Earlier (TR_043 — operator's parallel reasoning_effort feature)** — `reasoning_effort` parameter wired per agent. GPT-5.5+ family supports `reasoning_effort: xhigh|high|medium|low|non-reasoning`. **Part 1**: `AgentLlmConfig` (in `packages/core/src/agents/agent-config.ts`) gains a `reasoningEffort?: ReasoningEffort` field + a new `VALID_REASONING_EFFORTS` runtime set; the `agent-config-loader.ts` accepts both `reasoning_effort` (snake_case, matches the OpenAI wire field) and `reasoningEffort` (camelCase) from YAML; unknown values fall through silently. `normaliseCustomAgent` (ADR-037 custom agents) inherits the same parser. **Part 2**: `LLMRequest` + `CompleteWithToolsRequest` in `packages/core/src/llm/index.ts` gain `reasoningEffort?`; a new `reasoningEffortField(apiShape, reasoningEffort)` helper alongside `temperatureField`/`tokenLimitField` emits `reasoning_effort: <value>` ONLY when `apiShape === 'responses'` AND a value was supplied. Both `callProvider` (single-turn) and `callProviderWithTools` (function-calling loop) spread the helper into the request body. Standard chat-completions clients remain byte-for-byte identical. **Part 3**: `BaseLLMAgent.callLLMWithMessages` and `runToolLoop` spread `agentConfig.llm.reasoningEffort` into `client.complete(...)` / `client.completeWithTools(...)`. `TokenManagementLog` + `TokenManagementLogRecord` extended with `reasoningEffort: 'xhigh' | 'high' | 'medium' | 'low' | 'non-reasoning' | null` so per-call telemetry is observable through `agent_execution_logs.token_management` JSONB (no migration — additive on a JSONB column). Generate + maintenance orchestrators pass `agent.lastTokenManagement` through verbatim; the gate orchestrator's inline structural mirror was extended to include the new field. **Part 4**: template `agents.yaml` preamble documents `reasoning_effort` (valid values + apiShape gating + per-level rationale: high for high-stakes, medium for planning, low for deterministic gate checks, omit for non-reasoning agents). **Part 5 (per-agent matrix on trackeros)**: trackeros `agents.yaml` bound to `gpt-5.5` on every framework agent and `gpt-5.5-pro` on `self-healing-agent` — architecture-agent: temp 0.1, max 12000, **high**; self-healing-agent: temp 0.0, max 6000, **high**; planner-agent: temp 0.1, max 12000, **medium**; phase-evaluator-agent: temp 0.1, max 8000, **medium**; constraint-agent (NEW entry — was inheriting PER_ROLE_DEFAULTS): temp 0.0, max 2000, **low**; review-agent: temp 0.0, max 4000, **low**; code-agent: temp 0.1, max 8000, **no reasoning_effort** (Aider drives its own reasoning loop). Template `0.27.0 → 0.28.0`. Build clean across all 13 packages. **Live verification pending** — the brief's recipe is: run `gestalt feature submit "Build the leave management module..." --project trackeros` and query `SELECT agent_role, token_management->>'reasoningEffort' FROM agent_execution_logs ORDER BY created_at DESC LIMIT 20;` to confirm `reasoningEffort: "high"` is logged for `architecture-agent`. **Earlier (TR_042 — review-pass plumbing verified, planner file-count rule worked, Vitest still leaks at per-phase scale)** — two stopgap fixes extending TR_041's TOP-positioned stack compliance treatment from the FEATURE-level architecture pass to the PER-PHASE architecture pass. **Fix 1a**: new `buildPhaseArchitectureReviewPrompt` in `architecture-prompt.ts` mirroring `buildArchitectureReviewPrompt` for the `PhaseArchitecture` shape (interfaces / importStatements / sqlSchema / successCriteria) with stack compliance rendered FIRST + 5-point review checklist. **Fix 1b**: `ArchitectureAgent.reviewPhaseDesign` method with same safety semantics as `reviewDesign` — returns original draft on any failure path; logs before/after counts. **Fix 1c**: orchestrator wires `designPhase → reviewPhaseDesign → persist` with a STOPGAP (ADR-056) comment block. **Fix 2**: two new abstract `planner-agent.phaseScopingRules` items in template + trackeros HARNESS — "file list in each phase scope is an estimate; the architecture agent will produce the authoritative file list … your scope text must not contradict the architecture output". Template `0.26.0 → 0.28.0`. Build clean. **Verified live on trackeros feature `ec42e085`** — **MIXED**: `reviewPhaseDesign` log fires correctly (4s after designPhase, before/after counts 3→3 interfaces / 3→3 imports / 5→5 criteria); Fix 2 (planner file-count mirroring) WORKED end-to-end (intent-agent did NOT escalate on a file-count mismatch this cycle, closing TR_041's HIGH follow-up). But per-phase Vitest STILL leaks (`Vitest=2 vitest=1` in Phase 1 architecture) — even with the same TOP-positioned stack compliance check that cleaned the feature-level pass, the per-phase LLM judged the draft compliant and didn't rewrite the framework references. Cycle blocked at intent-agent on a NEW (fifth) rigor bar: "Platform standards require audit records for state-changing operations, but no audit module, interface, or file scope is provided for this phase". New HIGH follow-ups: regex post-processing for per-phase framework binding; feed goldenPrinciples into architecture-agent so it can pre-empt cross-cutting concerns like audit logging. **Earlier (TR_041 — TOP-positioning works end-to-end on the feature-level pipeline)** — three fixes building on TR_040's partial result. **Fix 1**: `buildArchitectureReviewPrompt` restructured — the `## Stack compliance check (read this first)` block moves from the END of the prompt to the FIRST position (before persona / harness section / draft / feature description), and its language strengthened to "REWRITE the relevant field with the declared stack value. Do not preserve the original". **Fix 2**: 5th checklist item added to `reviewDesign`'s review task — "Lifecycle coverage — for every entity whose state changes during the feature lifecycle, verify that at least one phase includes a method to perform that mutation. If a state transition exists in the feature description but no phase adds the corresponding mutation method, ADD it to the most appropriate phase." **Fix 3**: matching abstract architectureGuidance rule in template + trackeros HARNESS — "Every state transition described in the feature must have a corresponding method in at least one phase." Template `0.25.0 → 0.26.0`. Build clean. **Verified live on trackeros feature `595033ff`** — **TR_041 Fix 1 (top-of-prompt) works end-to-end on the FEATURE-level pipeline**: post-review architecture is framework-free (`jest=0 vitest=0 fastify=0 express=0` — no framework names at all, vs TR_040 which had `vitest=1 fastify=1`); planner's Phase 1 scope text says "Jest" (not "Vitest" or hedge); 8-phase bottom-up dependency-ordered plan (Employee → LeavePolicy → LeaveBalance → balance ops → LeaveRequest → submission → approval → notification) — Phase 7 IS the mutation phase the lifecycle-coverage rule asked for. **Cycle still blocked at intent-agent**: (a) per-phase `designPhase` STILL emits "Vitest tests" in success criteria because the review enhancements apply only to `reviewDesign` (feature-level), not `designPhase` (per-phase); (b) intent-agent caught a scope-vs-architecture file-count mismatch — planner scope text lists 2 files, per-phase architecture lists 3 + SQL schema. NEW HIGH follow-ups: `reviewPhaseDesign` for the per-phase pass; planner-agent must mirror architecture-agent's file list verbatim. **Earlier (TR_040 — Fastify binding worked end-to-end, Vitest binding did NOT)** — two changes binding architecture-agent's output to `HARNESS.stack`. **Fix 1**: two new abstract `architectureGuidance` rules in template + trackeros HARNESS (stack is the authoritative source for all technology choices; verify every framework reference matches the declared stack before emitting). **Fix 2**: `buildArchitectureReviewPrompt` gains a `## Stack compliance check` block rendered immediately before the JSON output schema, listing `HARNESS.stack` and telling the agent to correct any mismatch in success criteria, interface names, or implementation notes. Empty string when `HARNESS.stack` is absent. Template `0.24.0 → 0.25.0`. Build clean. **Verified live on trackeros feature `8900ab21`** — **PARTIAL**: Fastify binding worked end-to-end (architecture used Fastify vs prior Express; DB confirms `fastify=1 express=0` in post-review architecture; Phase 8 title reads "Expose Fastify APIs..."); Vitest binding did NOT work (`jest=0 vitest=1`; Phase 1 success criteria still says "Vitest tests..."; scope text hedge "Include Jest or Vitest unit tests"). reviewDesign ran 5s with same entity counts — the LLM didn't act on the test-framework correction. Cycle blocked at intent-agent on a separate, real architectural gap: `LeaveRequestRepository` has only `create + findById` and no later phase ever adds `update` even though Phase 5 needs to mutate `LeaveRequest.status` for the approval workflow. Architecture-agent REGRESSED on coverage vs TR_038/039 — possibly misreading TR_039's deferred-section as a license to minimize Phase 1's interface. New HIGH follow-ups: Vitest binding (move check to top of review prompt + regex post-processing); lifecycle-coverage rule (every state transition implied by the feature must have a phase that adds the corresponding repository method). **Earlier (TR_039 — TR_038 follow-up CLOSED, cycle reached gate for first time)** — planning orchestrator appends a `## Deferred to later phases` section to every phase intent text, listing each later-pending phase as `- Phase N — <title>: <scope snippet>`; new `agentConfig.intent-agent` block in template + trackeros HARNESS with two abstract rules telling intent-agent that deferred items are out of scope. Template `0.23.0 → 0.24.0`. Build clean. **Verified end-to-end on trackeros feature `61953f63`**: all 3 Phase-1 attempt-intents contain the Deferred section; intent-agent passed cleanly on every attempt (no escalation on deferred CRUD operations — the TR_038 follow-up is CLOSED); **the cycle reached the GATE for the first time across the TR_036 → TR_039 sequence**. Gate ran 6 times. All TR_036 mechanisms verified live as a side-effect: project-structure brief present in every gate-agent prompt (DB-confirmed); zero false-positive `pool.query`/`new Pool` violations on the shared/db connection file (TR_036 Fix 1 abstract rules working); `feature-blocked` alert visible in `gestalt alerts list` (TR_036 Fix 3 alert path observed). TR_022 maxPhaseRetries fired 2/2 correctly. Cycle still blocked, but NOW at the gate's review-agent on a real configuration drift: architecture-agent emits Vitest in success-criteria text on a fully-Jest-aligned project (HARNESS.stack.testFramework: Jest, agents.yaml goal: Jest, package.json: jest). NEW HIGH follow-up: bind framework choice in architecture-agent's output to HARNESS.stack values. **Earlier (TR_038 — TR_037 HIGH follow-up CLOSED)** — two stopgap fixes ahead of the LangGraph architecture-crew migration (ADR-056). **Fix 1**: `renderStackSection(harnessConfig)` helper in `architecture-prompt.ts` injects `HARNESS.stack` into both `buildFeatureArchitecturePrompt` and `buildPhaseArchitecturePrompt`; new architectureGuidance rule on template + trackeros tells the agent to name concrete implementations for every interface. **Fix 2**: new `buildArchitectureReviewPrompt` + `ArchitectureAgent.reviewDesign(draft, feature, projectRoot, harnessConfig, correlationId)` — single-agent self-review pass that re-reads the draft and checks completeness / consistency / ambiguity / feasibility. Returns the original draft on any failure path (loadAgentConfig throw, callLLM throw, parse-to-empty) so the pipeline is never blocked on a review-only error. Orchestrator wires `designFeature → reviewDesign → save` with a STOPGAP comment block telling the next session to delete this when the LangGraph architecture crew lands. New review rule on template + trackeros: "When reviewing a draft architecture: check that every interface or abstraction has a named concrete implementation, all symbol names are consistent, and no implementation choice is left open for a developer to decide." Template `0.22.0 → 0.23.0`. Build clean across all 13 packages. **Verified end-to-end on trackeros feature `d0513f28`**: `reviewDesign` log fires at 14:04:37 (6s after designFeature) with before/after counts logged (5→5 entities + 5→5 modules); Phase 1 persisted architecture now names `PostgresLeaveRepository` as the concrete class, imports `Pool` from `pg`, references `src/shared/db/connection.ts`, includes a SQL schema with CHECK constraints + indices — exactly what TR_037's HIGH NEW follow-up asked for. **Cycle still blocked at intent-agent on a THIRD different ambiguity**: "The intent mentions repository CRUD behavior, but the specified LeaveRepository interface only defines create and findById methods". The architecture-agent legitimately scoped Phase 1 to create+findById (later phases extend), but intent-agent reads "leave management" as implying full CRUD on every repository upfront. **Earlier (TR_037 — symbol-name conflict resolved end-to-end)** — planner-agent now injects architecture-agent's full JSON as a "Canonical type and symbol names" block at the top of its prompt, plus a HARNESS rule telling the planner to use those exact names. Architecture flows from architecture-agent → planner-agent → intent-agent without symbol-name drift. **Verified end-to-end on trackeros feature `ce9d1b80`**: planner-agent emitted Phase 1 scope "Create … defining the **canonical LeaveRequest type** … using the **fields id, employeeId, leaveType, startDate, endDate, and status**" matching architecture-agent's emitted entity verbatim; 5-phase plan (vs prior 7-8) with 4 interfaces + 5 success criteria + SQL schema in Phase 1's per-phase architecture; intent-agent did NOT escalate on a symbol-name conflict. Cycle still blocked at intent-agent, but on a DIFFERENT, more nuanced ambiguity — "The concrete persistence implementation backing LeaveRepository is not specified" — i.e. architecture-agent defined the `LeaveRepository` interface but didn't pin the concrete DB driver. New HIGH follow-up: architecture-agent should specify the concrete persistence implementation (e.g. `pg` Pool) from `HARNESS.stack.database`. Template `0.21.0 → 0.22.0`. Build clean across all 13 packages. **Earlier (TR_036 — gate-side fixes shipped, verification blocked at intent-agent before reaching the gate)** — four fixes against TR_035 verification findings. (Fix 1) Constraint-agent + review-agent rules in HARNESS rewritten to abstract layer-role language ("data access layer", "business logic layer"); concrete `pool.query` / `*.repository.ts` matchers removed. Both verificationGuidance blocks rewritten to "read ARCHITECTURE.md first; a finding is only valid if it violates a rule given the actual structure of this project". (Fix 2) New `buildProjectStructureBrief(projectRoot)` helper in `gate-orchestrator.ts` reads ARCHITECTURE.md (truncated to 2000 chars) + enumerates a depth-2 directory tree under `src/` using Node's `readdir` (equivalent to `find src -maxdepth 2 -type d`, bounded to 30 entries). The brief is set on `GateTask.projectStructureBrief` (new optional field on the type); constraint-agent's `buildVerificationPrompt` injects it before the rules section, llm-review-agent's `buildReviewPrompt` injects it at the top of the prompt. (Fix 3) Planner's `maxPhaseRetries` exhaustion path in `planning-orchestrator.ts` now creates a `feature-blocked` alert + emits `alert.created` SSE — previously it marked the feature `blocked` silently and operators only saw the failure via `gestalt feature show`. (Fix 4) trackeros `agents.yaml` `test-agent.goal` switched Vitest → Jest to align with the rest of the project's already-Jest tooling. Template `0.20.0 → 0.21.0`. Build clean across all 13 packages. **Live verification cycle escalated at intent-agent on a planner/architecture-agent symbol-name inconsistency BEFORE reaching the gate**, so Fixes 1+2 (gate-side) didn't get an LLM-level test; Fix 3's new alert call didn't fire (the cycle escalated via the existing TR_033 `waiting-for-clarification` path which already has its own alert). New HIGH follow-up: cross-check planner-agent vs architecture-agent symbol names. **Earlier (TR_035 — mechanisms 6/8 PASS, feature blocked by orthogonal gate constraint-agent false-positives)** — dynamic five-layer token budget management + phase-evaluator git detection via squash-merge SHA + architecture-agent 12k fallback floor. ADR-057 appended to `docs/DECISIONS.md` before implementing. **Part A**: `BaseLLMAgent` gains a five-layer pipeline on every LLM call. Layer 1 — model-aware defaults (reasoning models `o1`/`o3`/`gpt-5*` get 8k vs 2k standard). Layer 2 — dynamic budget (input × 1.5 for reasoning, × 0.5 standard, clamped by per-model hard limits). Layer 3 — scope reduction with three structural rewrites (`summarisePriorPhaseHistory`, `compressRulesSection`, `trimArchitectureContext`) when estimated input tokens exceed the configurable threshold (default 6000). Layer 4 — JSON response guard (`addJsonResponseGuard()` appended to prompts by the six structured-output agents: architecture-agent's `designFeature`+`designPhase`, planner-agent, phase-evaluator-agent, constraint-agent, review-agent, self-healing-agent). Layer 5 — truncation retry (re-issues the call on `finish_reason: 'length'` with a doubled budget, up to 3 attempts). `LLMResponse` extended with `finishReason`. New `HarnessConfig.tokenManagement` block (`promptCompressionThreshold` / `maxRetryBudgetMultiplier` / `enableDynamicBudget` / `enableScopeReduction`) tunes thresholds per project. Per-call telemetry persisted into `agent_execution_logs.token_management` (JSONB; migration 029). **Part B**: (B1) `architecture-agent.max_tokens` bumped 6k → 12k in trackeros `agents.yaml` as the fallback floor; Layers 2 + 5 handle higher cases. (B2) Phase-evaluator now prefers `git show --name-only --format= <mergeCommitSha>` over `git diff` — the existing `mergePullRequest` already returns the squash-merge SHA, so the promotion-agent's `maybeAutoMerge` now resolves `findPhaseByIntent → updatePhaseMergeCommit(phase.id, sha)` after the merge succeeds. New `FeaturePhaseRecord.mergeCommitSha` column (migration 029) + `FeatureRepository.updatePhaseMergeCommit` (postgres impl + oracle/mssql stubs). `PhaseBranchContext` extended; `evaluator-prompt.ts` prefers `git show` when SHA present, falls back gracefully. HARNESS template + trackeros `phase-evaluator-agent.rules` updated to teach the agent the new command. Template 0.19.0 → 0.20.0. Build: `pnpm -r build` clean across all 13 packages. **Live verification pending** for all 10 parts — needs `gestalt feature submit` cycle on trackeros to observe Layer N firings + `git show` path.
+**Last updated:** 2026-06-13 (after TR_053 amendment — **8 correctness fixes to the LangGraph PlanningGraph + refined event-based resume plumbing**. Step 0 trace report determined `featureId` is NOT propagated through deploy payloads — reconstructed via `feature_phases` JOIN at the planning subscriber. User chose event-based routing (Refined Option 2): new `intents.parent_context JSONB` column (migration 030) carries `{kind:'planning-phase', featureId, phaseIndex}`; `phaseDispatchNode` stamps it at intent create time; `transitionIntent` (deploy + gate + generate copies) enriches the `intent.status-changed` event payload with the column; the planning subscriber routes WITHOUT a DB JOIN. **Fix 1 (resume API)**: `Command({resume})` is the correct API in `@langchain/langgraph@0.2.74`; smoke-tested with a throwaway 2-node graph (PASSED). Interrupt detection corrected — NOT `result.__interrupt__` (not surfaced on invoke return), instead `graph.getState(cfg).tasks[*].interrupts` + `state.next`. **Fix 2 (both terminal outcomes resume)**: subscriber dispatches `planning:graph-resume` on `deployed` (success:true) AND on failed/escalated/waiting-for-clarification (success:false + failureReason); `phaseEvaluatorNode` handles the success:false branch via the `maxPhaseRetries` budget. **Fix 3 (single engine, default langgraph)**: `harnessConfig.planner.engine: 'langgraph'|'orchestrator'` (default `langgraph`) replaces the deprecated `useLangGraph` flag; `handlePlanningStart` logs `planning engine selected: <engine>` and re-dispatches as `planning:graph-start` when langgraph; legacy `planning:phase`/`planning:evaluate` genuinely inert for graph features. **Fix 4 (resume in planning worker via queue)**: confirmed — already implemented via `planning:graph-resume` BullMQ task; deploy layer stays decoupled. **Fix 5 (interrupt return = job success)**: confirmed at `core/src/queue/index.ts:184-189` — BullMQ marks COMPLETED on any non-throwing return; `runPlanningGraph` returns normally on both END and interrupt paths; comment block in `handleGraphStart` locks in the rule. **Fix 6 (no side effects before interrupt)**: `humanFeedbackNode`'s alert creation moved to `phaseEvaluatorNode`'s `escalate` branch (the deciding node, runs exactly once); `awaitPhaseNode` reduced to log + interrupt only; explicit rule comments on both interrupt nodes. **Fix 7 (adjust/continue/escalate semantics)**: explicit comment block on `phaseEvaluatorNode`; `planningAction` now returns `'adjust'` (vs `'continue'`) when evaluator applied scope adjustments; both advance the index; observability-only distinction. **Fix 8 (architecture function-call vs subgraph)**: documented in AGENT_TEAMS.md as a conscious tradeoff — function-call wins on simplicity (independent thread_id) at the cost of non-resumable architecture (~4 min re-work on restart). **Verification step 1 (throwaway script) PASSED**. **Verification step 2 (graph parks + checkpoint written) PASSED** on trackeros feature `ff4e32f4`: engine selection logged, ArchitectureGraph fired (Kimi chief flaked twice → operator switched chief to DeepSeek-V3.2 for verification — committed to trackeros agents.yaml), planner ran, Phase 1 intent dispatched with `parent_context` JSONB correctly populated, `awaitPhaseNode interrupting` log fired, `Task completed` confirms BullMQ saw success. **Verification step 3 (Phase 1 deploys + resume + Phase 2 dispatched)** IN FLIGHT at report-final — `p1_intent_count=1` (Phase 1 dispatched exactly once; Fix 6 working). **Discovered live**: BullMQ `lockDuration: 600000` (10min, tuned for legacy planning:start) was too short for `planning:graph-start` (~24 min wall-clock incl. ArchitectureGraph) — marked the job `failed:stalled` AFTER successful handler return (observability noise; not retried due to `maxStalledCount: 0`). **Bumped** `lockDuration` to 1800000 (30 min) on the planning queue worker. **Verification steps 3-5 + full feature run + template 0.39.0 bump = TR_054 carryover**. **Earlier (TR_053 initial — **LangGraph migration Phase 2 (ADR-056) landed** as a parallel rollout + **all three TR_052 NRBs fixed**. **PlanningGraph** is the new `StateGraph` in `packages/agents/planning/src/graphs/planning/` — 6 nodes (architecture/planner/phase-dispatch/await-phase/phase-evaluator/human-feedback) plus conditional edges (continue|adjust|complete|escalate). The await-phase + human-feedback nodes use LangGraph `interrupt()`; resume happens via `Command({resume})` on a new BullMQ task `planning:graph-resume` dispatched by the existing event-bus subscriber when a feature checkpoint exists. The graph runs **alongside** the legacy `planning-orchestrator` three-task chain, gated by `harnessConfig.planner.useLangGraph` (default `false`). Two new BullMQ task types (`planning:graph-start` + `planning:graph-resume`) in `@gestalt/core` `TaskType` union. `HarnessConfig.planner.useLangGraph?: boolean` added. `ExecutionStatus` gains `'completed-with-warning'` for **NRB-1**. **NRB-2**: architecture-graph parsers now throw `SpecialistResponseError` on JSON-parse failure OR parsed-to-empty Designs; nodes catch and emit structured sentinel into `state.errors[]`; chief logs slice presence + priorErrors before reconciling. **NRB-3**: `ArchitectureAgent.buildStackSubstitutions` + `buildStackSubstitutionPrompt` + `applyStackSubstitutions` + the two orchestrator call sites all deleted (the architecture crew enforces stack compliance structurally — substitution machinery was redundant after TR_051 + failed on DeepInfra anyway). `FeatureArchitecture.stackSubstitutions` kept as `@deprecated` for back-compat with persisted JSON. **Template version held at 0.38.0** (TR_053 initial briefly proposed bumping to 0.39.0; TR_053 amendment + TR_054 keep it at 0.38.0 until the staged verification passes — only then does the bump land). No new platform migration (LangGraph checkpointer reused from TR_051; `agent_executions.status` column has no CHECK constraint so the new ExecutionStatus value is additive). `pnpm -r build` clean across all 13 packages. **Engine routing — current as-shipped**: TR_053 amendment renamed `useLangGraph: boolean` → `planner.engine: 'langgraph' | 'orchestrator'` (default `'langgraph'`); `useLangGraph` retained as deprecated alias for forward compatibility. **Live verification = TR_054 carryover** — operator sets `planner.engine: 'langgraph'` in HARNESS (or accepts the default) to take the graph path. Reviewer-layering nuance: brief asked for promotion-agent to invoke the planning graph directly, but the event-bus subscriber routing (checkpoint lookup) keeps deploy decoupled from planning's internals — same outcome, cleaner layering. **Earlier (TR_052 — TR_051 ArchitectureGraph LIVE-VERIFIED end-to-end** on trackeros feature `e1ee9e5c`. Crew fires as designed: three specialist nodes ran in parallel (all started at 11:14:35 server time, all done within 67s; ~3× wall-clock saving vs serial); chief reconciled afterwards (Kimi-K2.6, 198s, 15,607 tokens, 6 entities + 5 modules + 7 dependency edges + 5 recommended phases + **6 first-class `sqlSchemas[]` CREATE TABLE statements** + AuditLog as a 6th entity surfacing structurally from GOLDEN_PRINCIPLES.md GP-002). **TR_036→TR_050 rigor bar accretion structurally absorbed** — intent-agent passed Phase 1 cleanly on first attempt with zero HARNESS rule intervention. **Phase 1 deployed in 19m 27s** (vs TR_050's 20m for Phase 1 alone). LangGraph `PostgresSaver` created its own 4 tables on first call (`checkpoints`, `checkpoint_writes`, `checkpoint_blobs`, `checkpoint_migrations` — LangGraph 0.2 emits two more than the AGENT_TEAMS.md blueprint stated). Three new rigor bars surfaced as follow-ups: NRB-1 (review-agent silent failure on noop-adapter gate — constraint-agent's pass was sufficient but the failed review-agent row is a confusing observable), NRB-2 (specialist parse-to-empty leaves `state.errors` empty — operators can't see which slice dropped), NRB-3 (TR_044 `buildStackSubstitutions` hardcoded to gpt-4o-mini still fails on DeepInfra registry — now redundant since chief enforces stack compliance structurally; candidate for removal). Pipeline continues in background; feature still `in-progress` at report-final (Phase 2 mid-flight; phases 3-10 pending; full completion verification deferred to TR_053). Full report in `docs/claude/TEST_REPORT_052.md`. **Earlier (TR_051 — LangGraph migration Phase 1 (ADR-056) landed**. The single architecture-agent's feature-level `designFeature` + `reviewDesign` pass is replaced by a LangGraph `StateGraph` crew in `packages/agents/planning/src/graphs/architecture/`: `DomainArchitectNode` + `DataArchitectNode` + `AppArchitectNode` fan out from START in parallel; `ChiefArchitectNode` reconciles. Per-agent `RetryPolicy` on every node (3 attempts specialists, 2 chief; backoff on timeouts / sockets / 5xx / 429). PostgreSQL checkpointer (`@langchain/langgraph-checkpoint-postgres`) reuses `DATABASE_URL`; LangGraph creates its own `checkpoints` + `checkpoint_writes` tables on first `setup()` call — no Gestalt migration needed. **4 new AgentRoles** (`domain-architect-agent` / `data-architect-agent` / `app-architect-agent` / `chief-architect-agent`) added to `@gestalt/core` `types.ts` + `PER_ROLE_DEFAULTS`. **4 new `agentConfig` blocks** (template + trackeros HARNESS.json) with rules per the brief. **4 new agents.yaml entries** — template uses platform default; trackeros binds specialists to `deepseek-ai/DeepSeek-V3.2` (6k max_tokens) and chief to `moonshotai/Kimi-K2.6` (12k max_tokens). Planning orchestrator's `handlePlanningStart` swaps `architectureAgent.designFeature + reviewDesign` for a single `runArchitectureGraph(...)` call. `ArchitectureAgent.designFeature + reviewDesign` marked `@deprecated` but retained as fallback — `designPhase + reviewPhaseDesign` remain in use (Phase 2 of the migration absorbs those). Template `0.35.0 → 0.38.0`. No new platform migration. `pnpm -r build` clean across all 13 packages. **Live verification pending** — see TR_051 entry in `BUILD.md` for the recipe. **Earlier (TR_050 — multi-stage infrastructure migration to DeepInfra, Aider promoted to the only code-generation backend, and 5 cascading timeout / config fixes that finally let Aider produce real source files end-to-end on Kimi-K2.6 via DeepInfra. **Operator action**: 3 DeepInfra LLMs registered (`deepinfra-kimi-k2` / `deepinfra-deepseek-v3` / `deepinfra-qwen-tiny`, all `chat-completions` apiShape on `https://api.deepinfra.com/v1/openai`), `DEEPINFRA_API_KEY` added to `.env`. Platform default flipped to `deepinfra-deepseek-v3` via `gestalt platform llms set-default`. **9-agent trackeros agents.yaml matrix swap** to DeepInfra: architecture-agent on DeepSeek-V3.2 (after Kimi's 12k-token design call hit 50% timeout rate), self-healing on Kimi-K2.6, planner/phase-evaluator/constraint/review/intent/design on DeepSeek-V3.2, code-agent (Aider) on Kimi-K2.6 (DeepSeek wouldn't emit Aider's SEARCH/REPLACE blocks reliably); `reasoning_effort` fields removed (DeepInfra OpenAI-compat doesn't support). **Platform code (8 changes)**: (1) Aider is now the platform default code-generation backend — `orchestrator.ts` both `aiderBackend` checks coalesce absent `codeGeneration.backend` to `'aider'`; `harness/index.ts` JSDoc rewritten ("gestalt" backend deprecated, retained for backwards compat); template + trackeros HARNESS add explicit `codeGeneration.backend: 'aider'` block. (2) `.env` fixed `LLM_MOCEL` typo → `LLM_MODEL`, set `LLM_API_KEY` to DeepInfra key (loadConfig requires both, server was in restart loop). (3) `LLM_TIMEOUT_MS=300000` (5 min, was 120s). (4) BullMQ Worker: `lockDuration: 600000` + `maxStalledCount: 0` in `queue/index.ts` — closes duplicate-handler bug where long planning:start was retried under default 30s stall detection. (5) `classifyError` in `llm/index.ts` treats `TypeError: fetch failed` + standard socket errors as retryable — closes TR_033 follow-up. (6) Aider litellm provider prefix: `aider-adapter.ts` prepends `openai/` when model lacks one of 17 known litellm provider prefixes; closes the `LLM Provider NOT provided` error that killed all DeepInfra/Aider routing. (7) Aider subprocess timeout cascade — three nested ceilings each needed bumping: `DEFAULT_AIDER_TIMEOUT_MS` 120k→900k (adapter ceiling); `--timeout 600` CLI flag (Aider's per-LLM HTTP timeout); `MAX_SCRIPT_TIMEOUT_MS` in `core/src/tools/file-tools.ts` 120k→900k — THE actual ceiling that was silently clamping every Aider run to 120s. Template `0.34.0 → 0.35.0`. Build clean. **Verified end-to-end on trackeros feature `523e9824`**: **Phase 1 DEPLOYED in 20m 03s — the FIRST EVER autonomous source-file generation cycle on DeepInfra/Aider across TR_036 → TR_050**. Path: intent (DeepSeek) → design (DeepSeek) → context (DeepSeek) → code-agent (Aider/Kimi — REAL files written) → test-agent (skipped per Aider backend) → pr-agent → pipeline-agent (noop) → constraint-agent (DeepSeek, PASSED) → review-agent (DeepSeek, PASSED) → promotion. Architecture: 3 interfaces + 7 criteria. Plan: 6 phases. Session ran 10 cycles total; each one identified a different layer in the timeout/config cascade until the final stack worked. **Phase 2 escalated 1m 50s after dispatch on three new intent-agent rigor bars** (Jest/Vitest framework regression, missing approve/reject methods in interface vs scope, transaction approach not pinned) — same class as TR_036-TR_047, surfacing again on DeepSeek-V3.2-driven architecture (doesn't internalise HARNESS rules as crisply as gpt-5.5). Deferred to TR_051. **Earlier (TR_049 — mandatory SQL schema for relational-DB stacks)** — two changes (one HARNESS rule + one platform-code review-checklist item) closing TR_048's 10th intent-agent rigor bar end-to-end. **Fix 1**: appended to `agentConfig.architecture-agent.rules` (template + trackeros HARNESS): "When the declared stack includes a relational database, you MUST include a complete SQL schema in your output for every persistent domain entity you define. A domain entity without a corresponding table definition is incomplete." Abstract — no DB names hardcoded. **Fix 2**: 9th review-checklist item ("SQL schema completeness — if the declared stack includes a relational database, verify that every persistent domain entity defined in this architecture has a corresponding SQL table definition.") added to both `buildArchitectureReviewPrompt` (closes "all eight checks") and `buildPhaseArchitectureReviewPrompt` (closes "all nine checks"). Template `0.33.0 → 0.34.0`. No new migration. Build clean across all 13 packages. **Verified end-to-end on trackeros feature `dca0cb06`**: architecture-agent emitted SIX CREATE TABLE statements in `architectureMdUpdate` (employees, leave_policies, leave_balances, leave_requests, notifications, audit_records) vs TR_048's zero. **TR_048's canonical-schema-reuse machinery FIRED for the first time across the sequence** — server logs show "TR_048 — injecting canonical SQL schemas into per-phase prompts" three times. Phase 1 and Phase 2 each have populated `sqlSchema` fields matching the feature-level canonical. Plan: 10 phases (architect fanned out persistence per-entity). Phase 1: 3 interfaces + 7 criteria. **Phase 1 cleared the FULL Gestalt agent pipeline end-to-end** — intent-agent → design → code (Aider) → CI → pr-agent → constraint-agent PASSED → review-agent PASSED → promotion. **First phase across TR_036 → TR_049 to make it intent → promotion without escalation.** Wall-clock 7m 03s. **Caveat**: trackeros pipeline adapter is on `noop` since TR_043, so no actual PR landed on GitHub; agent-cycle validation is real, deploy is noop. Phase 2 escalated on a NEW 11th rigor bar: `PostgreSqlAuditRepository` defined as abstract class in high-level architectureMdUpdate vs concrete class with stubbed methods in per-phase architecture — class shape drift across phases. The fix-intent went all the way through to review-agent before clarification escalated. New HIGH follow-up: architecture-agent must keep class shape + method-body status identical across high-level + per-phase views of the same class; OR per-phase architecture is authoritative for the phase that CREATES the class. New MEDIUM operator action: switch trackeros pipeline adapter back to `github-actions` to verify full deploy chain. **Earlier (TR_048 — three platform fixes + one HARNESS rule closing TR_047's 9th intent-agent rigor bar (architecture-agent emitted two views of the same `leave_requests` table with drifted column types). Single source of truth for SQL schema: feature-level is canonical; per-phase references it instead of redefining. **Fix 1a**: `extractCanonicalSqlSchemas(json)` helper in `architecture-prompt.ts` reads either an explicit `sqlSchemas[]` field (forward-compatible) or regex `/CREATE\s+TABLE[\s\S]+?;/gi` against `architectureMdUpdate`; empty array on any failure path. New `renderCanonicalSqlSchemaSection` helper renders the "## Canonical SQL schemas (already defined — use these exactly)" block (omitted when empty). Both `buildPhaseArchitecturePrompt` and `buildPhaseArchitectureReviewPrompt` accept new last-positional `canonicalSqlSchemas: string[] = []` parameter and inject the section between goldenPrinciples and the task. **Fix 1b**: `ArchitectureAgent.designPhase` + `reviewPhaseDesign` accept the same parameter; `runPerPhaseArchitecture` orchestrator extracts once per phase via `extractCanonicalSqlSchemas(feature.architecture)` and passes to BOTH. Logs schemaCount when > 0. **Fix 2**: 8th review-checklist item ("Schema consistency — if a `## Canonical SQL schemas` block was provided above, your `sqlSchema` field MUST use the EXACT same column names, types, and constraints…") + closing line updated to "all EIGHT checks". **Fix 3**: `agentConfig.architecture-agent.rules` in template + trackeros HARNESS gains: "When a canonical schema is provided for a table, use it exactly. Do not redefine column types, sizes, or constraints. A table must have one definition across all architecture views." Template `0.32.0 → 0.33.0`. No new migration. Build clean across all 13 packages. **Verified live on trackeros feature `f070332a`**: TR_048 PLUMBING wired correctly — `runPerPhaseArchitecture` ran cleanly without errors; `extractCanonicalSqlSchemas` correctly returned an empty array (no "TR_048 — injecting canonical SQL schemas" log line) because the architect emitted NO SQL at all. DB inspection confirms `architectureMdUpdate` has zero CREATE TABLE statements and `feature_phases[0].architecture` has no `sqlSchema` field. **Plan shrunk to 5 phases (tightest yet across TR_036 → TR_048)** vs TR_047's 8, TR_046's 6, TR_045's 7, TR_044's 10. Phase 1 architecture: 4 interfaces + 6 criteria (1 criterion explicitly states atomic single-transaction semantics — TR_047 checklist surfacing). **Cycle did NOT reach the gate** — blocked at intent-agent on a 10th rigor bar: amb-001 "The exact PostgreSQL schema and table definitions for LeaveRequest and LeaveAuditRecord persistence are not specified" — the first bar where the prior fix's machinery worked correctly but had no input to act on. **TR_048 machinery is ready**; the upstream gap is now a required-output rule. New HIGH follow-up: architecture-agent must categorically produce CREATE TABLE for every persisted entity when the project stack declares a relational database (currently architectureGuidance says "SQL schema if needed" which the LLM treats as optional). Options: (a) architectureGuidance rule forcing CREATE TABLE for every persisted entity; (b) promote `sqlSchemas?: string[]` to a first-class field on `FeatureArchitecture` with required output for relational stacks; (c) per-phase review's 8th item promoted to "if sqlSchema is empty on a phase that creates persistence interfaces, REQUEST the canonical schema or write one here". **Earlier (TR_047 — TR_046's 8th bar CLOSED by structural redesign, gate reached 3rd time)** — one HARNESS rule + one platform-code rule closing TR_046's 8th intent-agent rigor bar (architecture-agent bundled `LeaveRequest` + `AuditRecord` mutations into Phase 1 without explicit transaction semantics (architecture-agent bundled `LeaveRequest` + `AuditRecord` mutations into Phase 1 without explicit transaction semantics). **Fix 1**: appended to `agentConfig.architecture-agent.rules` (template + trackeros HARNESS): "When a phase includes multiple domain mutations that must be coordinated (a primary operation plus a cross-cutting concern such as audit logging, event publishing, or cache invalidation), explicitly state the transaction semantics: whether the operations execute atomically in a single transaction, as separate transactions, or via a compensating pattern. Do not leave transaction behavior implicit." Abstract — no specific patterns hardcoded. **Fix 2**: 7th checklist item ("Transaction semantics") added to both `buildArchitectureReviewPrompt` and `buildPhaseArchitectureReviewPrompt`. Template `0.31.0 → 0.32.0`. Build clean. **Verified end-to-end on trackeros feature `d90d14b5`**: TR_046's 8th bar CLOSED by structural redesign — the architect SPLIT AuditRecord into its own Phase 2 (separate from Phase 1's LeaveRequest), making Phase 1 a clean single-mutation phase with no transaction-semantics question to answer. Phase 1 architecture: 4 interfaces + 7 criteria (the 7th is the new TR_047 transaction-semantics check). Plan: 8 phases. **Cycle reached the gate — third time across TR_036 → TR_047** with verdicts 6 → **1** → **1** CONSTRAINT_VIOLATION. Two consecutive 1-violation gate runs — closest the cycle has ever been to a clean gate pass. Cycle still blocked on the 9th and narrowest rigor bar yet: "The provided SQL schemas conflict on column types and sizes: one version uses TIMESTAMP and VARCHAR(32), while another uses DATE/TIMESTAMPTZ and VARCHAR(20)" — architecture-agent emitted two views of the same `leave_requests` table with drifted column types. New HIGH follow-up: schema-consistency rule + 8th review-checklist item that pins identical column types/sizes for the same table across feature-level and per-phase architecture outputs. **Earlier (TR_046 — TR_045's 7th bar CLOSED, cycle reached gate 2nd time)** — one HARNESS rule + one platform-code rule closing TR_045's 7th intent-agent rigor bar (architecture-agent introduced `CANCELLED` to support a cancel workflow phase but the project context's documented lifecycle had only Pending/Approved/Rejected). **Fix 1**: appended to `agentConfig.architecture-agent.rules` (template + trackeros HARNESS): "When your architecture introduces any new domain concept that does not appear in the existing project documentation (new lifecycle states, new enum values, new entity types, new relationships), you MUST include it in architectureMdUpdate." **Fix 2**: 6th checklist item ("Documentation consistency") added to both `buildArchitectureReviewPrompt` and `buildPhaseArchitectureReviewPrompt`. Template `0.30.0 → 0.31.0`. Build clean. **Verified end-to-end on trackeros feature `795e1069`**: architecture-agent did NOT introduce `CANCELLED` this cycle — `architectureMdUpdate` documents the lifecycle exactly as the project context defines it (Pending/Approved/Rejected); plan tightened to 6 phases (vs TR_045's 7, TR_044's 10) with Phase 1 bundling `LeaveRequest AND AuditRecord` (cross-cutting concern integration paying off). Phase 1 per-phase architecture: 5 interfaces + 6 criteria (richest yet — 6th criterion is the new doc-consistency item). **The cycle REACHED THE GATE for the SECOND time across the TR_036 → TR_046 sequence** (first was TR_039). Gate ran 6 times across two phase-retry attempts with violation counts trending 5 → 4 → **1** → 3 → 3 → 3 CONSTRAINT_VIOLATION — the single-violation run is the closest the cycle has ever been to a gate pass. Cycle still blocked on an 8th intent-agent rigor bar: "Transaction behavior for createLeaveRequest and AuditRecord creation is not explicitly defined" — a genuine architectural concern when two domain mutations land in the same phase. New HIGH follow-up: architecture-agent should explicitly state transaction semantics (atomic/non-atomic/compensating) for cross-cutting operations bundled with primary domain mutations. **Earlier (TR_045 — interface-signatures rigor closed)** — single abstract rule appended to `agentConfig.intent-agent.rules` in template + trackeros HARNESS: "Interface method signatures in per-phase architecture specifications are CONTRACTS to be implemented by the code-agent during this phase. They are not stubs. An interface showing method signatures without bodies is correct and complete — do not flag missing method bodies as ambiguity or missing implementation." Abstract — no TypeScript-specific language. Template `0.29.0 → 0.30.0`. No platform code change, no migration. Build clean. **Verified end-to-end on trackeros feature `48aa490e`**: TR_044's 6th rigor bar CLOSED — intent-agent did not escalate on interface-signatures-as-stubs (Phase 1 intent went `pending → generating` immediately). Tightened plan to 7 phases (Phase 2 bundles "Create AND cancel leave requests"; Phase 7 bundles "Employee integration, RBAC, balance consumption, and compliance coverage"). Phase 1 per-phase architecture: 5 interfaces + 5 criteria — richest yet across the TR_036 → TR_045 sequence. **Cycle still blocked on a 7th distinct intent-agent rigor bar**: "The project context defines LeaveRequest lifecycle states as Pending, Approved, Rejected, while the phase architecture specifies repository model status values PENDING, APPROVED, REJECTED, and CANCELLED." Architecture-agent introduced `CANCELLED` to support Phase 2's cancel workflow, but the documented project lifecycle has only the three other states. New HIGH follow-up: architecture-agent should update `architectureMdUpdate` in lockstep with new lifecycle states, OR intent-agent should treat states implied by the feature scope as consistent. **Earlier (TR_044 — per-phase framework leak CLOSED end-to-end)** — two fixes against TR_042's two HIGH NEW follow-ups. **Fix 1**: LLM-generated `<canonical>→[alternatives]` substitution map (gpt-4o-mini one-shot classification, generated once per feature, cached on `FeatureArchitecture.stackSubstitutions`) + a pure `applyStackSubstitutions` utility that runs as a deterministic post-process on every `reviewPhaseDesign` output before persistence. Closes the per-phase Vitest leak TR_040/TR_041/TR_042 couldn't fix via LLM-only prompts. **Fix 2**: read `docs/GOLDEN_PRINCIPLES.md` from the cloned tree at planning:start AND on every planning:phase, thread `goldenPrinciplesMd` through all four architecture-agent prompts (designFeature / reviewDesign / designPhase / reviewPhaseDesign) — gives architecture-agent the same cross-cutting visibility (audit logging, RBAC, etc.) intent-agent already had. Template `0.28.0 → 0.29.0`. Build clean. **Verified end-to-end on trackeros feature `fc99779a`**: per-phase framework leak CLOSED (DB query `jest=0 vitest=0 fastify=0 express=0` in Phase 1, vs TR_042's `Vitest=2 vitest=1`); golden-principles injection observably shaped the plan — Phase 3 "Create AuditRecord domain model and repository" (the exact concern TR_042 surfaced), Phase 7 RBAC, Phase 10 E2E coverage. 10-phase plan vs TR_042's 8. Cycle still blocked at intent-agent on a 6th distinct rigor bar: "intent refers to PostgreSQL-backed repository operations, while the provided architecture shows method stubs throwing 'Not implemented'" — intent-agent reads abstract TypeScript interface signatures (no method bodies, CORRECT for an architecture phase) as evidence the implementation is missing. New HIGH follow-up: intent-agent rule injection telling it interface signatures are contracts, not stubs. **Earlier (TR_043 — operator's parallel reasoning_effort feature)** — `reasoning_effort` parameter wired per agent. GPT-5.5+ family supports `reasoning_effort: xhigh|high|medium|low|non-reasoning`. **Part 1**: `AgentLlmConfig` (in `packages/core/src/agents/agent-config.ts`) gains a `reasoningEffort?: ReasoningEffort` field + a new `VALID_REASONING_EFFORTS` runtime set; the `agent-config-loader.ts` accepts both `reasoning_effort` (snake_case, matches the OpenAI wire field) and `reasoningEffort` (camelCase) from YAML; unknown values fall through silently. `normaliseCustomAgent` (ADR-037 custom agents) inherits the same parser. **Part 2**: `LLMRequest` + `CompleteWithToolsRequest` in `packages/core/src/llm/index.ts` gain `reasoningEffort?`; a new `reasoningEffortField(apiShape, reasoningEffort)` helper alongside `temperatureField`/`tokenLimitField` emits `reasoning_effort: <value>` ONLY when `apiShape === 'responses'` AND a value was supplied. Both `callProvider` (single-turn) and `callProviderWithTools` (function-calling loop) spread the helper into the request body. Standard chat-completions clients remain byte-for-byte identical. **Part 3**: `BaseLLMAgent.callLLMWithMessages` and `runToolLoop` spread `agentConfig.llm.reasoningEffort` into `client.complete(...)` / `client.completeWithTools(...)`. `TokenManagementLog` + `TokenManagementLogRecord` extended with `reasoningEffort: 'xhigh' | 'high' | 'medium' | 'low' | 'non-reasoning' | null` so per-call telemetry is observable through `agent_execution_logs.token_management` JSONB (no migration — additive on a JSONB column). Generate + maintenance orchestrators pass `agent.lastTokenManagement` through verbatim; the gate orchestrator's inline structural mirror was extended to include the new field. **Part 4**: template `agents.yaml` preamble documents `reasoning_effort` (valid values + apiShape gating + per-level rationale: high for high-stakes, medium for planning, low for deterministic gate checks, omit for non-reasoning agents). **Part 5 (per-agent matrix on trackeros)**: trackeros `agents.yaml` bound to `gpt-5.5` on every framework agent and `gpt-5.5-pro` on `self-healing-agent` — architecture-agent: temp 0.1, max 12000, **high**; self-healing-agent: temp 0.0, max 6000, **high**; planner-agent: temp 0.1, max 12000, **medium**; phase-evaluator-agent: temp 0.1, max 8000, **medium**; constraint-agent (NEW entry — was inheriting PER_ROLE_DEFAULTS): temp 0.0, max 2000, **low**; review-agent: temp 0.0, max 4000, **low**; code-agent: temp 0.1, max 8000, **no reasoning_effort** (Aider drives its own reasoning loop). Template `0.27.0 → 0.28.0`. Build clean across all 13 packages. **Live verification pending** — the brief's recipe is: run `gestalt feature submit "Build the leave management module..." --project trackeros` and query `SELECT agent_role, token_management->>'reasoningEffort' FROM agent_execution_logs ORDER BY created_at DESC LIMIT 20;` to confirm `reasoningEffort: "high"` is logged for `architecture-agent`. **Earlier (TR_042 — review-pass plumbing verified, planner file-count rule worked, Vitest still leaks at per-phase scale)** — two stopgap fixes extending TR_041's TOP-positioned stack compliance treatment from the FEATURE-level architecture pass to the PER-PHASE architecture pass. **Fix 1a**: new `buildPhaseArchitectureReviewPrompt` in `architecture-prompt.ts` mirroring `buildArchitectureReviewPrompt` for the `PhaseArchitecture` shape (interfaces / importStatements / sqlSchema / successCriteria) with stack compliance rendered FIRST + 5-point review checklist. **Fix 1b**: `ArchitectureAgent.reviewPhaseDesign` method with same safety semantics as `reviewDesign` — returns original draft on any failure path; logs before/after counts. **Fix 1c**: orchestrator wires `designPhase → reviewPhaseDesign → persist` with a STOPGAP (ADR-056) comment block. **Fix 2**: two new abstract `planner-agent.phaseScopingRules` items in template + trackeros HARNESS — "file list in each phase scope is an estimate; the architecture agent will produce the authoritative file list … your scope text must not contradict the architecture output". Template `0.26.0 → 0.28.0`. Build clean. **Verified live on trackeros feature `ec42e085`** — **MIXED**: `reviewPhaseDesign` log fires correctly (4s after designPhase, before/after counts 3→3 interfaces / 3→3 imports / 5→5 criteria); Fix 2 (planner file-count mirroring) WORKED end-to-end (intent-agent did NOT escalate on a file-count mismatch this cycle, closing TR_041's HIGH follow-up). But per-phase Vitest STILL leaks (`Vitest=2 vitest=1` in Phase 1 architecture) — even with the same TOP-positioned stack compliance check that cleaned the feature-level pass, the per-phase LLM judged the draft compliant and didn't rewrite the framework references. Cycle blocked at intent-agent on a NEW (fifth) rigor bar: "Platform standards require audit records for state-changing operations, but no audit module, interface, or file scope is provided for this phase". New HIGH follow-ups: regex post-processing for per-phase framework binding; feed goldenPrinciples into architecture-agent so it can pre-empt cross-cutting concerns like audit logging. **Earlier (TR_041 — TOP-positioning works end-to-end on the feature-level pipeline)** — three fixes building on TR_040's partial result. **Fix 1**: `buildArchitectureReviewPrompt` restructured — the `## Stack compliance check (read this first)` block moves from the END of the prompt to the FIRST position (before persona / harness section / draft / feature description), and its language strengthened to "REWRITE the relevant field with the declared stack value. Do not preserve the original". **Fix 2**: 5th checklist item added to `reviewDesign`'s review task — "Lifecycle coverage — for every entity whose state changes during the feature lifecycle, verify that at least one phase includes a method to perform that mutation. If a state transition exists in the feature description but no phase adds the corresponding mutation method, ADD it to the most appropriate phase." **Fix 3**: matching abstract architectureGuidance rule in template + trackeros HARNESS — "Every state transition described in the feature must have a corresponding method in at least one phase." Template `0.25.0 → 0.26.0`. Build clean. **Verified live on trackeros feature `595033ff`** — **TR_041 Fix 1 (top-of-prompt) works end-to-end on the FEATURE-level pipeline**: post-review architecture is framework-free (`jest=0 vitest=0 fastify=0 express=0` — no framework names at all, vs TR_040 which had `vitest=1 fastify=1`); planner's Phase 1 scope text says "Jest" (not "Vitest" or hedge); 8-phase bottom-up dependency-ordered plan (Employee → LeavePolicy → LeaveBalance → balance ops → LeaveRequest → submission → approval → notification) — Phase 7 IS the mutation phase the lifecycle-coverage rule asked for. **Cycle still blocked at intent-agent**: (a) per-phase `designPhase` STILL emits "Vitest tests" in success criteria because the review enhancements apply only to `reviewDesign` (feature-level), not `designPhase` (per-phase); (b) intent-agent caught a scope-vs-architecture file-count mismatch — planner scope text lists 2 files, per-phase architecture lists 3 + SQL schema. NEW HIGH follow-ups: `reviewPhaseDesign` for the per-phase pass; planner-agent must mirror architecture-agent's file list verbatim. **Earlier (TR_040 — Fastify binding worked end-to-end, Vitest binding did NOT)** — two changes binding architecture-agent's output to `HARNESS.stack`. **Fix 1**: two new abstract `architectureGuidance` rules in template + trackeros HARNESS (stack is the authoritative source for all technology choices; verify every framework reference matches the declared stack before emitting). **Fix 2**: `buildArchitectureReviewPrompt` gains a `## Stack compliance check` block rendered immediately before the JSON output schema, listing `HARNESS.stack` and telling the agent to correct any mismatch in success criteria, interface names, or implementation notes. Empty string when `HARNESS.stack` is absent. Template `0.24.0 → 0.25.0`. Build clean. **Verified live on trackeros feature `8900ab21`** — **PARTIAL**: Fastify binding worked end-to-end (architecture used Fastify vs prior Express; DB confirms `fastify=1 express=0` in post-review architecture; Phase 8 title reads "Expose Fastify APIs..."); Vitest binding did NOT work (`jest=0 vitest=1`; Phase 1 success criteria still says "Vitest tests..."; scope text hedge "Include Jest or Vitest unit tests"). reviewDesign ran 5s with same entity counts — the LLM didn't act on the test-framework correction. Cycle blocked at intent-agent on a separate, real architectural gap: `LeaveRequestRepository` has only `create + findById` and no later phase ever adds `update` even though Phase 5 needs to mutate `LeaveRequest.status` for the approval workflow. Architecture-agent REGRESSED on coverage vs TR_038/039 — possibly misreading TR_039's deferred-section as a license to minimize Phase 1's interface. New HIGH follow-ups: Vitest binding (move check to top of review prompt + regex post-processing); lifecycle-coverage rule (every state transition implied by the feature must have a phase that adds the corresponding repository method). **Earlier (TR_039 — TR_038 follow-up CLOSED, cycle reached gate for first time)** — planning orchestrator appends a `## Deferred to later phases` section to every phase intent text, listing each later-pending phase as `- Phase N — <title>: <scope snippet>`; new `agentConfig.intent-agent` block in template + trackeros HARNESS with two abstract rules telling intent-agent that deferred items are out of scope. Template `0.23.0 → 0.24.0`. Build clean. **Verified end-to-end on trackeros feature `61953f63`**: all 3 Phase-1 attempt-intents contain the Deferred section; intent-agent passed cleanly on every attempt (no escalation on deferred CRUD operations — the TR_038 follow-up is CLOSED); **the cycle reached the GATE for the first time across the TR_036 → TR_039 sequence**. Gate ran 6 times. All TR_036 mechanisms verified live as a side-effect: project-structure brief present in every gate-agent prompt (DB-confirmed); zero false-positive `pool.query`/`new Pool` violations on the shared/db connection file (TR_036 Fix 1 abstract rules working); `feature-blocked` alert visible in `gestalt alerts list` (TR_036 Fix 3 alert path observed). TR_022 maxPhaseRetries fired 2/2 correctly. Cycle still blocked, but NOW at the gate's review-agent on a real configuration drift: architecture-agent emits Vitest in success-criteria text on a fully-Jest-aligned project (HARNESS.stack.testFramework: Jest, agents.yaml goal: Jest, package.json: jest). NEW HIGH follow-up: bind framework choice in architecture-agent's output to HARNESS.stack values. **Earlier (TR_038 — TR_037 HIGH follow-up CLOSED)** — two stopgap fixes ahead of the LangGraph architecture-crew migration (ADR-056). **Fix 1**: `renderStackSection(harnessConfig)` helper in `architecture-prompt.ts` injects `HARNESS.stack` into both `buildFeatureArchitecturePrompt` and `buildPhaseArchitecturePrompt`; new architectureGuidance rule on template + trackeros tells the agent to name concrete implementations for every interface. **Fix 2**: new `buildArchitectureReviewPrompt` + `ArchitectureAgent.reviewDesign(draft, feature, projectRoot, harnessConfig, correlationId)` — single-agent self-review pass that re-reads the draft and checks completeness / consistency / ambiguity / feasibility. Returns the original draft on any failure path (loadAgentConfig throw, callLLM throw, parse-to-empty) so the pipeline is never blocked on a review-only error. Orchestrator wires `designFeature → reviewDesign → save` with a STOPGAP comment block telling the next session to delete this when the LangGraph architecture crew lands. New review rule on template + trackeros: "When reviewing a draft architecture: check that every interface or abstraction has a named concrete implementation, all symbol names are consistent, and no implementation choice is left open for a developer to decide." Template `0.22.0 → 0.23.0`. Build clean across all 13 packages. **Verified end-to-end on trackeros feature `d0513f28`**: `reviewDesign` log fires at 14:04:37 (6s after designFeature) with before/after counts logged (5→5 entities + 5→5 modules); Phase 1 persisted architecture now names `PostgresLeaveRepository` as the concrete class, imports `Pool` from `pg`, references `src/shared/db/connection.ts`, includes a SQL schema with CHECK constraints + indices — exactly what TR_037's HIGH NEW follow-up asked for. **Cycle still blocked at intent-agent on a THIRD different ambiguity**: "The intent mentions repository CRUD behavior, but the specified LeaveRepository interface only defines create and findById methods". The architecture-agent legitimately scoped Phase 1 to create+findById (later phases extend), but intent-agent reads "leave management" as implying full CRUD on every repository upfront. **Earlier (TR_037 — symbol-name conflict resolved end-to-end)** — planner-agent now injects architecture-agent's full JSON as a "Canonical type and symbol names" block at the top of its prompt, plus a HARNESS rule telling the planner to use those exact names. Architecture flows from architecture-agent → planner-agent → intent-agent without symbol-name drift. **Verified end-to-end on trackeros feature `ce9d1b80`**: planner-agent emitted Phase 1 scope "Create … defining the **canonical LeaveRequest type** … using the **fields id, employeeId, leaveType, startDate, endDate, and status**" matching architecture-agent's emitted entity verbatim; 5-phase plan (vs prior 7-8) with 4 interfaces + 5 success criteria + SQL schema in Phase 1's per-phase architecture; intent-agent did NOT escalate on a symbol-name conflict. Cycle still blocked at intent-agent, but on a DIFFERENT, more nuanced ambiguity — "The concrete persistence implementation backing LeaveRepository is not specified" — i.e. architecture-agent defined the `LeaveRepository` interface but didn't pin the concrete DB driver. New HIGH follow-up: architecture-agent should specify the concrete persistence implementation (e.g. `pg` Pool) from `HARNESS.stack.database`. Template `0.21.0 → 0.22.0`. Build clean across all 13 packages. **Earlier (TR_036 — gate-side fixes shipped, verification blocked at intent-agent before reaching the gate)** — four fixes against TR_035 verification findings. (Fix 1) Constraint-agent + review-agent rules in HARNESS rewritten to abstract layer-role language ("data access layer", "business logic layer"); concrete `pool.query` / `*.repository.ts` matchers removed. Both verificationGuidance blocks rewritten to "read ARCHITECTURE.md first; a finding is only valid if it violates a rule given the actual structure of this project". (Fix 2) New `buildProjectStructureBrief(projectRoot)` helper in `gate-orchestrator.ts` reads ARCHITECTURE.md (truncated to 2000 chars) + enumerates a depth-2 directory tree under `src/` using Node's `readdir` (equivalent to `find src -maxdepth 2 -type d`, bounded to 30 entries). The brief is set on `GateTask.projectStructureBrief` (new optional field on the type); constraint-agent's `buildVerificationPrompt` injects it before the rules section, llm-review-agent's `buildReviewPrompt` injects it at the top of the prompt. (Fix 3) Planner's `maxPhaseRetries` exhaustion path in `planning-orchestrator.ts` now creates a `feature-blocked` alert + emits `alert.created` SSE — previously it marked the feature `blocked` silently and operators only saw the failure via `gestalt feature show`. (Fix 4) trackeros `agents.yaml` `test-agent.goal` switched Vitest → Jest to align with the rest of the project's already-Jest tooling. Template `0.20.0 → 0.21.0`. Build clean across all 13 packages. **Live verification cycle escalated at intent-agent on a planner/architecture-agent symbol-name inconsistency BEFORE reaching the gate**, so Fixes 1+2 (gate-side) didn't get an LLM-level test; Fix 3's new alert call didn't fire (the cycle escalated via the existing TR_033 `waiting-for-clarification` path which already has its own alert). New HIGH follow-up: cross-check planner-agent vs architecture-agent symbol names. **Earlier (TR_035 — mechanisms 6/8 PASS, feature blocked by orthogonal gate constraint-agent false-positives)** — dynamic five-layer token budget management + phase-evaluator git detection via squash-merge SHA + architecture-agent 12k fallback floor. ADR-057 appended to `docs/DECISIONS.md` before implementing. **Part A**: `BaseLLMAgent` gains a five-layer pipeline on every LLM call. Layer 1 — model-aware defaults (reasoning models `o1`/`o3`/`gpt-5*` get 8k vs 2k standard). Layer 2 — dynamic budget (input × 1.5 for reasoning, × 0.5 standard, clamped by per-model hard limits). Layer 3 — scope reduction with three structural rewrites (`summarisePriorPhaseHistory`, `compressRulesSection`, `trimArchitectureContext`) when estimated input tokens exceed the configurable threshold (default 6000). Layer 4 — JSON response guard (`addJsonResponseGuard()` appended to prompts by the six structured-output agents: architecture-agent's `designFeature`+`designPhase`, planner-agent, phase-evaluator-agent, constraint-agent, review-agent, self-healing-agent). Layer 5 — truncation retry (re-issues the call on `finish_reason: 'length'` with a doubled budget, up to 3 attempts). `LLMResponse` extended with `finishReason`. New `HarnessConfig.tokenManagement` block (`promptCompressionThreshold` / `maxRetryBudgetMultiplier` / `enableDynamicBudget` / `enableScopeReduction`) tunes thresholds per project. Per-call telemetry persisted into `agent_execution_logs.token_management` (JSONB; migration 029). **Part B**: (B1) `architecture-agent.max_tokens` bumped 6k → 12k in trackeros `agents.yaml` as the fallback floor; Layers 2 + 5 handle higher cases. (B2) Phase-evaluator now prefers `git show --name-only --format= <mergeCommitSha>` over `git diff` — the existing `mergePullRequest` already returns the squash-merge SHA, so the promotion-agent's `maybeAutoMerge` now resolves `findPhaseByIntent → updatePhaseMergeCommit(phase.id, sha)` after the merge succeeds. New `FeaturePhaseRecord.mergeCommitSha` column (migration 029) + `FeatureRepository.updatePhaseMergeCommit` (postgres impl + oracle/mssql stubs). `PhaseBranchContext` extended; `evaluator-prompt.ts` prefers `git show` when SHA present, falls back gracefully. HARNESS template + trackeros `phase-evaluator-agent.rules` updated to teach the agent the new command. Template 0.19.0 → 0.20.0. Build: `pnpm -r build` clean across all 13 packages. **Live verification pending** for all 10 parts — needs `gestalt feature submit` cycle on trackeros to observe Layer N firings + `git show` path.
 
 **Earlier (TR_034 — mechanisms verified, autonomous completion not achieved)** — scoped per-phase architecture replaces the full architecture context in the Aider message. `buildAiderMessage` dropped `## Project architecture` and `## Design context` in favor of a `## Scoped architecture for this phase` block built from architecture-agent's `designPhase()` JSON. New `updatePhaseArchitecture` repo method persists the JSON; `aider-code-agent.loadPhaseArchitectureForCycle()` reads it back. Template 0.18.0 → 0.19.0. Verified live on trackeros feature `45fe91b3`: per-phase pass fires, `readFiles` includes real shared/db paths, `messageBytes` 5705 → 2922, Phase 1 deployed via PR #119. **Same TR_033 failure mode persisted**: gpt-5.5 + Aider produced zero source code; architecture-agent's `designPhase` returned empty arrays so the scoped block was empty and dropped — Aider got task + rules + readFiles only. TR_035 Part B1 raises the floor to 12k; TR_035 Layer 4 frames the JSON contract.
 
@@ -1076,24 +1076,58 @@ crew roster, project tunes/disables leaves."
 
 ## Operator caveats / pending actions
 
-### trackeros state (current)
+### trackeros state (current — refreshed in TR_054 A3)
 
-- **trackeros `main`** at commit `b99e1716` (post-TR_022
-  HARNESS.json restored — `architectureReviewPerPhase: false`,
-  `maxPhaseRetries: 2`). Pipeline adapter `github-actions` +
-  autoMerge true. tsconfig.json carries `resolveJsonModule` +
-  `allowSyntheticDefaultImports`.
-- **PR cleanup**: TR_019 + PLANNING_LAYER stranded PRs (#49–#52,
-  #57) closed with `--delete-branch` during TR_022. New PRs from
-  TR_022's verification cycles (#58–#62) currently open under
-  the blocked leave-management feature — leave until TR_023
-  lands the Aider DTO fix.
-- **Re-create vault secret for OpenAI API key** if the operator
-  wants vault-backed routing. Both LLMs currently in env-var
-  mode (`apiKeyEnv: 'LLM_API_KEY'`) and working.
-- **Open alerts to dismiss**: cycle alerts from TR_010–TR_019.
-  Dismissable with `gestalt alerts dismiss <id>`.
-- **`.env`**: `LLM_MODEL=gpt-4o` (operator default).
+- **trackeros `main` HEAD**: `6fa6c597 chore(TR_054): restore
+  pipeline adapter to github-actions + autoMerge` (TR_054 A2,
+  this session). Three commits ahead of the TR_053 entry:
+  `0404a6e9 chore(TR_053): switch planner.engine to langgraph`,
+  `df04b85a chore(TR_053-verify): switch chief-architect to
+  DeepSeek-V3.2`, and the new `6fa6c597`.
+- **HARNESS.json**: `planner.engine: "langgraph"` (TR_053
+  amendment naming; default for the `langgraph` engine);
+  `planner.maxPhaseRetries: 2`; `planner.architectureReviewPerPhase:
+  true`; **`pipeline.adapter: "github-actions"`**;
+  **`pipeline.autoMerge: true`**; `mergeMethod: "squash"`.
+- **agents.yaml on trackeros**:
+  - `architecture-agent`: `deepseek-ai/DeepSeek-V3.2`,
+    max_tokens 12000.
+  - `planner-agent`: `deepseek-ai/DeepSeek-V3.2`,
+    max_tokens 12000.
+  - `phase-evaluator-agent`: `deepseek-ai/DeepSeek-V3.2`,
+    max_tokens 8000.
+  - `intent-agent`, `design-agent`, `constraint-agent`,
+    `review-agent`: `deepseek-ai/DeepSeek-V3.2`.
+  - `code-agent`: `moonshotai/Kimi-K2.6` (TR_050 —
+    DeepSeek wouldn't emit Aider's SEARCH/REPLACE blocks
+    reliably).
+  - `self-healing-agent`: `moonshotai/Kimi-K2.6` (short
+    prompts).
+  - `domain-architect-agent` / `data-architect-agent` /
+    `app-architect-agent`: `deepseek-ai/DeepSeek-V3.2`,
+    max_tokens 6000 (TR_051 crew).
+  - `chief-architect-agent`: `deepseek-ai/DeepSeek-V3.2`,
+    max_tokens 12000 (switched from Kimi in TR_053
+    amendment verification — Kimi was timing out 50% of
+    the time on the 12k chief call).
+- **Gestalt `.env`** (workspace root): `LLM_BASE_URL=https://api.deepinfra.com/v1/openai`,
+  `LLM_MODEL=moonshotai/Kimi-K2.6` (fallback — most agents
+  override via `agents.yaml`).
+- **LLM registry (platform_llms table)**:
+  - `Platform default` (`chat-latest`, OpenAI) — present but
+    NOT default.
+  - `deepinfra-deepseek-v3` (`deepseek-ai/DeepSeek-V3.2`) — **`is_default = true`**.
+  - `deepinfra-kimi-k2` (`moonshotai/Kimi-K2.6`).
+  - `deepinfra-qwen-tiny` (`Qwen/Qwen3.5-0.8B`).
+- **Template version**: `0.38.0` (gestalt-side; held until
+  TR_054 B6 passes per the brief).
+- **Migrations applied**: `030_intent_parent_context` (latest,
+  added in TR_053 amendment).
+- **Open PRs cleanup**: prior-cycle planning-test PRs still
+  open under earlier blocked features. Leave until TR_054 B6
+  completes — the verification cycle creates new clean PRs.
+- **Open alerts**: TR_010 → TR_053 leftover alerts; dismiss
+  via `gestalt alerts dismiss <id>` once TR_054 completes.
 - **`master.key`** generated locally (workspace root, mode 600,
   gitignored) + mounted into the container via
   `docker-compose.yml`. Survives `docker compose up -d --build`.
@@ -1180,7 +1214,168 @@ None blocking the build. Areas to keep in mind:
 
 ## Pending operator actions
 
-### TR_053 — LangGraph migration Phase 2: PlanningGraph + three NRB fixes (ADR-056, template 0.39.0, parallel rollout, live verification = TR_054 carryover)
+### TR_053 amendment — 8 correctness fixes to the PlanningGraph + refined event-based resume plumbing (no template bump; verification steps 1-2 LIVE-PASSED, 3-5 + full run = TR_054 carryover)
+
+The TR_053 initial brief had architectural bugs in the
+interrupt/resume path. This amendment fixes them and ships the
+verification mechanics. Step 0 trace report determined that the
+deploy pipeline does NOT propagate the parent `featureId` to the
+promotion-agent; it's reconstructed via SQL JOIN at the planning
+subscriber. User chose event-based routing (Refined Option 2) over
+DB lookup.
+
+**Refined Option 2 — event-based resume plumbing:**
+
+- **Migration 030** — `intents.parent_context JSONB` column.
+  Discriminated envelope `{kind: 'planning-phase', featureId,
+  phaseIndex}` stamped by `phaseDispatchNode` at intent create
+  time. Existing intents (parent_context = NULL) fall back to the
+  JOIN.
+- **`@gestalt/core` `IntentRecord`** gains optional `parentContext`
+  field; new `IntentParentContext` discriminated-union type.
+- **`IntentRepository.create`** signature accepts optional
+  `parentContext`; postgres adapter writes via `db.json(...)`.
+- **`transitionIntent`** (3 copies — deploy, gate, generate) reads
+  the persisted column on its `intents.updateStatus` return value
+  and includes `parentContext` in the `intent.status-changed`
+  event payload.
+- **Planning subscriber** routes by `event.parentContext.kind`
+  WITHOUT any DB JOIN on the hot path. Legacy fallback retained
+  for older intents.
+
+**8 correctness fixes per the amendment brief:**
+
+- **Fix 1 (resume API)** — `Command({resume})` is the correct API
+  in `@langchain/langgraph@0.2.74`. Smoke-tested with a throwaway
+  2-node graph: `interrupt()` pauses, `Command({resume:value})`
+  resumes, node observes the value. The earlier code's check on
+  `result.__interrupt__` was wrong — that key is NOT surfaced on
+  the invoke return value in v0.2.74. Correct detection:
+  `graph.getState(cfg).tasks[*].interrupts[*]` or
+  `state.next` non-empty. `runPlanningGraph` fixed.
+- **Fix 2 (both terminal outcomes resume)** — the subscriber now
+  dispatches `planning:graph-resume` on `deployed`
+  (`success:true`) AND on `failed`/`escalated`/
+  `waiting-for-clarification` (`success:false` +
+  `failureReason`). `phaseEvaluatorNode` handles the
+  `success:false` branch via the `maxPhaseRetries` budget. The
+  previous "deployed only" routing would have left the graph
+  parked at `awaitPhaseNode` forever on phase failure — the same
+  indefinite-hang class fixed in TR_032/TR_036 for the legacy
+  orchestrator.
+- **Fix 3 (single engine, default langgraph)** —
+  `harnessConfig.planner.engine: 'langgraph'|'orchestrator'`
+  (default `'langgraph'`) replaces the deprecated
+  `useLangGraph` boolean. `handlePlanningStart` logs
+  `planning engine selected: <engine>` then re-dispatches as
+  `planning:graph-start` when `langgraph`. The unchosen engine is
+  inert for the feature — `planning:phase`/`planning:evaluate`
+  never dispatched for graph features;
+  `planning:graph-start`/`graph-resume` never dispatched for
+  orchestrator features.
+- **Fix 4 (resume runs in planning worker via queue)** —
+  confirmed by inspection. Already implemented in TR_053 initial:
+  `planning:graph-resume` is a BullMQ task on the planning queue;
+  the deploy layer only emits `intent.status-changed`; deploy and
+  planning stay decoupled.
+- **Fix 5 (interrupt return is BullMQ success)** — confirmed in
+  `packages/core/src/queue/index.ts:184-189`. The worker treats
+  any non-throwing handler return as job COMPLETED;
+  `result.status: 'failed'` is observability-only. `runPlanningGraph`
+  returns normally on both END and interrupt paths. Comment in
+  `handleGraphStart` locks in the rule for future readers.
+- **Fix 6 (no side effects before interrupt)** — `humanFeedbackNode`
+  was creating a feature-blocked alert (DB write + SSE) BEFORE
+  the `interrupt()` call; on resume LangGraph re-executes the
+  node from the top → duplicate alert. Moved the alert creation
+  to `phaseEvaluatorNode`'s `escalate` branch (the deciding node,
+  runs exactly once per phase outcome). `awaitPhaseNode` reduced
+  to log + interrupt only. Explicit rule comments on both
+  interrupt nodes documenting the constraint. `phaseDispatchNode`
+  audited for crash-mid-node idempotency; documented as
+  acceptable tradeoff during rollout (mid-node window is ~ms;
+  the verified scenario is server-restart-while-parked, where
+  await-phase is the running node).
+- **Fix 7 (adjust/continue/escalate index semantics)** — explicit
+  comment block on `phaseEvaluatorNode`. `planningAction` now
+  returns `'adjust'` (vs `'continue'`) when the evaluator
+  applied scope adjustments to remaining phases. Both advance
+  the index identically; the distinction is observability-only.
+  `escalate` does not advance.
+- **Fix 8 (architecture function-call vs subgraph)** —
+  documented in `AGENT_TEAMS.md` as a conscious tradeoff:
+  `runArchitectureGraph` keeps its own `thread_id =
+  correlationId` (separate checkpoint thread), trading
+  non-resumable architecture (~4 min re-work on restart) for
+  simpler debugging. Promotion to a true subgraph deferred until
+  empirical use surfaces the need.
+
+**BullMQ lockDuration bump (discovered during verification):**
+
+- The platform default `lockDuration: 600000` (10 min, tuned for
+  legacy `planning:start`) was too short for `planning:graph-start`
+  (~24 min on the trackeros baseline, including the
+  ArchitectureGraph crew). BullMQ marked the job
+  `failed:stalled` AFTER successful handler return (observability
+  noise; not retried due to `maxStalledCount: 0`). Bumped to
+  `1800000` (30 min) on the planning queue worker.
+
+**trackeros chief-architect switched to DeepSeek-V3.2:**
+
+- During verification, Kimi-K2.6 timed out twice in a row on the
+  12k chief reconciliation call (TR_050 known issue; ~50% timeout
+  rate observed). Operator committed an `agents.yaml` change to
+  switch the chief to DeepSeek-V3.2 for verification cycles.
+  Pushed to trackeros `origin/main` as
+  `df04b85a chore(TR_053-verify): switch chief-architect to DeepSeek-V3.2`.
+
+**Live verification status:**
+
+- **Step 1 (throwaway interrupt/resume script)** — **PASSED**.
+- **Step 2 (graph parks + checkpoint written)** — **PASSED** on
+  trackeros feature `ff4e32f4-9385-4244-af78-f49f2458500b`:
+  engine selection logged
+  (`planning engine selected: langgraph`); ArchitectureGraph
+  fired through chief; planner ran (6 phases); Phase 1 intent
+  dispatched with `parent_context` JSONB correctly populated
+  (DB-confirmed: `{"kind":"planning-phase","featureId":"...","phaseIndex":0}`);
+  `planning-graph awaitPhaseNode interrupting` log fired;
+  `PlanningGraph step complete` confirms graph returned at
+  interrupt; `Task completed` confirms BullMQ saw success.
+  `p1_intent_count=1` — Phase 1 intent dispatched exactly once
+  (Fix 6 working).
+- **Step 3 (Phase 1 deploys → resume → Phase 2 dispatched)** —
+  IN FLIGHT at report-final. Phase 1 generation underway.
+  Carryover to TR_054.
+- **Steps 4-5** — pending verification by TR_054. Code paths
+  exist and were audited (Fix 2 for failure branch, Fix 6 for
+  restart-resume idempotency).
+- **Template version stays at 0.38.0** per the brief's "bump
+  only after verification passes" rule. **Template 0.39.0 bump
+  + full feature run = TR_054**.
+
+**Build status:** `pnpm -r build` clean across all 13 packages.
+Migration 030 applied at server boot.
+
+**Operator action — trackeros:** my edits pushed.
+- `0404a6e9 chore(TR_053): switch planner.engine to langgraph`
+- `df04b85a chore(TR_053-verify): switch chief-architect to DeepSeek-V3.2`
+
+### TR_053 — LangGraph migration Phase 2: PlanningGraph + three NRB fixes (ADR-056)
+
+_**Note (TR_054 reconciliation):**_ this entry describes the
+**TR_053 initial** design where the engine flag was a boolean
+`planner.useLangGraph` (default `false`) and the template
+proposed a `0.38.0 → 0.39.0` bump. The **TR_053 amendment**
+within the same session renamed the flag to `planner.engine:
+'langgraph' | 'orchestrator'` (default `'langgraph'`) and held
+the template at `0.38.0` until verification passes (TR_054 B6).
+The old `useLangGraph` mentions below are retained as a record
+of the initial design; the live shipped surface uses
+`planner.engine`. See the TR_053 amendment block above for the
+current as-shipped semantics.
+
+
 
 **Three TR_052 NRB fixes — done and clean:**
 
@@ -3518,7 +3713,322 @@ Moved to [@docs/claude/ARCHITECTURE.md](./ARCHITECTURE.md#key-type-alignment-rul
 _Auto-maintained. The most recent session is prepended at the top; when this file exceeds 3 sessions, the oldest is moved to the correct `archive/<period>.md` file._
 
 ---
-### Session 2026-06-13 — Claude Code (TR_053: LangGraph migration Phase 2 — PlanningGraph code lands as a parallel rollout + all three TR_052 NRBs fixed; template 0.39.0; build clean across all 13 packages; live verification = TR_054 carryover)
+### Session 2026-06-13 — Claude Code (TR_053 amendment: 8 correctness fixes to the LangGraph PlanningGraph + refined event-based resume plumbing; migration 030; verification steps 1-2 LIVE-PASSED on trackeros feature ff4e32f4; steps 3-5 + full feature run + template 0.39.0 = TR_054 carryover)
+
+Brief: amendment to the Phase 2 PlanningGraph that fixed
+correctness bugs in the interrupt/resume path. Per the
+brief's instruction: trace the propagation of `featureId`
+to the promotion-agent BEFORE writing any code. Then 8
+specific fixes (Fix 1-8) and a 5-step verification
+protocol BEFORE any full feature run.
+
+**Step 0 trace report — featureId is RECONSTRUCTED, not propagated.**
+
+The promotion-agent's `DeployPromotionPayload` carries
+only `{intentId, projectId, targetEnvironment, prNumber,
+intentText}` — no featureId. The
+`intent.status-changed` event payload is `{intentId,
+status}`. The planning subscriber today reconstructs the
+parent via SQL JOIN: `feature_phases.intent_id ===
+intentId → phase.featureId`. User chose **Refined Option
+2** — make the event self-sufficient at the source via a
+small denormalization. Implementation:
+
+- **Migration 030** — `intents.parent_context JSONB`.
+  Discriminated envelope `{kind: 'planning-phase',
+  featureId, phaseIndex}` stamped by `phaseDispatchNode`
+  at intent create time. Legacy intents (column NULL) fall
+  back to the JOIN.
+- **`@gestalt/core` `IntentRecord`** gains optional
+  `parentContext` field; new `IntentParentContext`
+  discriminated-union type exported from public surface.
+- **`IntentRepository.create`** signature accepts
+  optional `parentContext`; postgres adapter writes via
+  `db.json(...)`. Oracle/MSSQL stubs updated.
+- **`transitionIntent`** (3 copies — deploy, gate,
+  generate) reads the column off `intents.updateStatus`
+  return and includes `parentContext` in the
+  `intent.status-changed` event payload.
+- **Planning subscriber** routes by
+  `event.parentContext.kind` WITHOUT any DB JOIN on the
+  hot path. Legacy fallback retained for intents created
+  before migration 030.
+
+**Fix 1 (CRITICAL — resume API) — `Command({resume})`.**
+
+The TR_053 initial code's interrupt detection was wrong:
+it checked `result.__interrupt__`, but in
+`@langchain/langgraph@0.2.74` that key is NOT surfaced on
+the invoke return value. Throwaway 2-node smoke test
+(`packages/agents/planning/_smoke_resume.mjs`,
+since removed) proved:
+
+- `interrupt(payload)` pauses; `result` returned from
+  `graph.invoke` is the partial state at interrupt with
+  NO `__interrupt__` key.
+- Correct detection: `graph.getState(cfg).tasks[*].interrupts[*]`
+  is populated, AND `state.next` is non-empty.
+- `graph.invoke(new Command({resume: value}), cfg)`
+  resumes from the interrupt; the node observes `value`
+  as the `interrupt()` return.
+- Smoke test PASSED.
+
+Fixed `runPlanningGraph`'s interrupt detection to use
+`getState` + `tasks.interrupts` instead of the wrong
+`__interrupt__` check.
+
+**Fix 2 (CRITICAL — both terminal outcomes resume).**
+
+Previously the planning subscriber only dispatched
+`planning:graph-resume` on `deployed`; failure terminal
+statuses short-circuited to the legacy
+`markFeatureBlockedAfterEscalation` helper which never
+notified the graph. The graph would have parked at
+`awaitPhaseNode` forever on phase failure — the same
+indefinite-hang class TR_032/TR_036 fixed for the legacy
+orchestrator. Restructured subscriber:
+
+- `deployed` → resume `{success:true, mergeCommitSha}`
+- `failed`/`escalated`/`waiting-for-clarification` →
+  resume `{success:false, failureReason}`
+- `phaseEvaluatorNode`'s existing `result.success: false`
+  branch honours `maxPhaseRetries`; exhaustion routes to
+  `human-feedback` interrupt.
+
+**Fix 3 (CRITICAL — single engine per feature).**
+
+Replaced the deprecated boolean `useLangGraph` with an
+explicit `harnessConfig.planner.engine:
+'langgraph'|'orchestrator'`, defaulting to `'langgraph'`.
+`useLangGraph` retained as a deprecated alias for
+forward compatibility. `handlePlanningStart` reads the
+engine via a shallow clone and logs the choice:
+
+```
+planning:start — planning engine selected: langgraph
+planning:start — re-dispatching as planning:graph-start
+                  (legacy planning:phase + planning:evaluate
+                   are inert for this feature)
+```
+
+The unchosen engine is **genuinely inert** for the
+feature — `planning:phase`/`planning:evaluate` are never
+dispatched for graph features;
+`planning:graph-start`/`graph-resume` are never
+dispatched for orchestrator features.
+
+**Fix 4 (CRITICAL — resume runs in planning worker via queue).**
+
+Confirmed by inspection. Already correct in TR_053
+initial: `planning:graph-resume` is a BullMQ task on the
+planning queue; the deploy layer only emits
+`intent.status-changed`. Deploy and planning stay
+decoupled.
+
+**Fix 5 (HIGH — interrupt return is BullMQ success).**
+
+Confirmed at `core/src/queue/index.ts:184-189`: the
+worker treats any non-throwing handler return as job
+COMPLETED. `runPlanningGraph` returns normally on both
+END and interrupt paths. Added explicit JSDoc comment to
+`handleGraphStart` locking in the invariant for future
+readers.
+
+**Fix 6 (HIGH — no side effects before interrupt).**
+
+`humanFeedbackNode` was creating a `feature-blocked` alert
+(DB write + SSE) BEFORE its `interrupt()` call. On
+resume, LangGraph re-executes the node from the top → the
+alert would be created TWICE. Moved alert creation to
+`phaseEvaluatorNode`'s `escalate` branch — the deciding
+node, runs exactly once per phase outcome. `awaitPhaseNode`
+and `humanFeedbackNode` reduced to log + interrupt only.
+Both interrupt nodes carry explicit rule comments stating
+the side-effect-free constraint. `phaseDispatchNode`'s
+side-effect surface audited and documented:
+
+- `phaseDispatchNode` runs once per
+  `phase-dispatch → await-phase` transition. On resume,
+  only `await-phase` re-runs (interrupt is there);
+  dispatch's intent.create + queue.dispatch don't replay.
+- Tradeoff documented: crash MID-NODE (between
+  intent.create and queue.dispatch) is a narrow window
+  (few ms of DB writes); crash-mid-node idempotency
+  (check `feature_phases.intent_id` at top, reuse if set)
+  is TR_054 follow-up. Primary scenario tested (server
+  restart while parked at await-phase) is already safe.
+
+**Fix 7 (MEDIUM — adjust vs continue vs escalate semantics).**
+
+Explicit comment block on `phaseEvaluatorNode` documenting
+the 3 outcomes:
+
+- `continue`: phase succeeded with NO adjustments to
+  remaining phases → advance index.
+- `adjust`: phase succeeded but evaluator rewrote remaining
+  phases → advance index, observability-only distinction
+  from `continue`.
+- `escalate`: do NOT advance; route to `human-feedback`.
+
+`planningAction` now returns `'adjust'` (vs `'continue'`)
+when adjustments are applied. Both advance identically;
+the distinction is the log line and the dashboard
+observable.
+
+**Fix 8 (MEDIUM — architecture function-call vs subgraph).**
+
+Documented as a conscious tradeoff in `AGENT_TEAMS.md`.
+`runArchitectureGraph` uses its own
+`thread_id = correlationId`, so mid-architecture crash
+re-runs architecture from scratch (~4 min). The
+alternative (true subgraph node under the parent feature
+thread) would let partial work survive restart but
+complicates `getState()` debugging. Accepted: architecture
+runs are short and rare relative to phase runs. Promote
+to subgraph if empirical use shows it's needed.
+
+**Discovered live during verification — BullMQ lockDuration bump.**
+
+The TR_050 default `lockDuration: 600000` (10 min, tuned
+for legacy `planning:start`) was too short for
+`planning:graph-start` which runs the full
+ArchitectureGraph + planner + per-phase architecture +
+phase-dispatch sequence inline (~24 min wall-clock on
+the trackeros baseline). BullMQ marked the job
+`failed:stalled` AFTER successful handler return —
+observability noise; not retried thanks to
+`maxStalledCount: 0`. Bumped to `1800000` (30 min) on
+the planning queue worker (added a `lockDuration`
+override in `createWorker` options in `startPlanningWorker`).
+
+**trackeros chief-architect switched to DeepSeek-V3.2
+during verification.**
+
+Kimi-K2.6 timed out twice in a row on the 12k chief
+reconciliation call (TR_050 known ~50% timeout rate).
+Operator committed `df04b85a chore(TR_053-verify): switch
+chief-architect to DeepSeek-V3.2` on trackeros to keep
+verification cycles flowing.
+
+**Verification status:**
+
+- **Step 1 (throwaway interrupt/resume script)** —
+  **PASSED**. Smoke test proved `Command({resume})` is
+  the resume API and `getState()` is the correct interrupt
+  detection.
+- **Step 2 (feature submit → graph parks at awaitPhase +
+  checkpoint written)** — **PASSED** on trackeros feature
+  `ff4e32f4-9385-4244-af78-f49f2458500b`. Engine
+  selection log fired. ArchitectureGraph fired through
+  chief on DeepSeek. Planner ran (6-phase plan). Phase 1
+  intent dispatched with `parent_context` JSONB populated
+  correctly (`{"kind":"planning-phase","featureId":"ff4e32f4-...","phaseIndex":0}`).
+  `planning-graph awaitPhaseNode interrupting` log fired.
+  `PlanningGraph step complete` confirms graph returned at
+  interrupt. `Task completed` confirms BullMQ saw success.
+  `p1_intent_count=1` — exactly one Phase 1 intent
+  created (Fix 6 working as designed).
+- **Step 3 (Phase 1 deploys → resume → Phase 2 dispatched
+  with intent ONCE)** — IN FLIGHT at report-final. Phase 1
+  generation underway. Carryover to TR_054.
+- **Steps 4-5 (server-restart resilience + force phase
+  failure → escalate)** — pending. Code paths audited
+  (Fix 2 for failure branch, Fix 6 for restart-resume
+  idempotency).
+- **Full feature run + template 0.39.0 bump** — pending.
+  Per the brief's "bump only after verification passes"
+  rule, template stays at 0.38.0 until TR_054 confirms.
+
+**Build status:** `pnpm -r build` clean across all 13
+packages. Migration 030 applied at server boot. No new
+env var.
+
+**Files changed (gestalt repo):**
+
+- `packages/adapters/postgres/src/migrations/030_intent_parent_context.sql`
+  (new)
+- `packages/core/src/repository/index.ts` (IntentRecord +
+  IntentParentContext + create signature)
+- `packages/core/src/index.ts` (export IntentParentContext)
+- `packages/core/src/harness/index.ts` (planner.engine
+  field; deprecate useLangGraph)
+- `packages/adapters/postgres/src/repositories/intents.ts`
+  (write parent_context)
+- `packages/adapters/oracle/src/repositories/intents.ts`
+  (stub signature)
+- `packages/adapters/mssql/src/repositories/intents.ts`
+  (stub signature)
+- `packages/agents/deploy/src/orchestrator/deploy-orchestrator.ts`
+  (transitionIntent reads + emits parentContext)
+- `packages/agents/quality-gate/src/orchestrator/gate-orchestrator.ts`
+  (same)
+- `packages/agents/generate/src/orchestrator/orchestrator.ts`
+  (same)
+- `packages/agents/planning/src/graphs/planning/state.ts`
+  (no functional change; types match)
+- `packages/agents/planning/src/graphs/planning/nodes.ts`
+  (Fix 6 + Fix 7: alert moved upstream;
+  awaitPhase/humanFeedback nodes reduced; phaseDispatch
+  stamps parentContext; phaseEvaluator returns
+  'adjust' vs 'continue')
+- `packages/agents/planning/src/graphs/planning/graph.ts`
+  (Fix 1: interrupt detection via getState)
+- `packages/agents/planning/src/orchestrator/planning-orchestrator.ts`
+  (Fix 3: planning.engine routing + log; Fix 2 + Refined
+  Option 2 subscriber rewrite; Fix 5 comment on
+  handleGraphStart; lockDuration bump to 1800000)
+- `templates/corporate-ops-web-mobile/harness/HARNESS.json`
+  (planner.engine: "langgraph")
+- `docs/claude/AGENT_TEAMS.md` (Fix 8 + amendment
+  documentation)
+- `docs/claude/STATE.md` (TR_053 amendment summary)
+- `docs/claude/BUILD.md` (TR_053 amendment section)
+
+**Files changed (trackeros repo, pushed):**
+
+- `HARNESS.json` (`0404a6e9 chore(TR_053): switch
+  planner.engine to langgraph`)
+- `agents.yaml` (`df04b85a chore(TR_053-verify): switch
+  chief-architect to DeepSeek-V3.2`)
+
+**Pending — TR_054 carryover:**
+
+- Verification step 3 — Phase 1 → resume → Phase 2.
+- Verification step 4 — server-restart-while-parked
+  resilience test.
+- Verification step 5 — force phase failure twice,
+  exhaust maxPhaseRetries, confirm escalate via
+  `phaseEvaluatorNode`.
+- Full feature run to `completed`.
+- Template 0.39.0 bump after all 5 verification steps
+  pass + full run.
+- TR_054 also: revisit chief-architect on Kimi vs
+  DeepSeek once DeepInfra Kimi stability improves.
+
+Live URLs:
+- Dashboard: http://localhost:3000/app/
+- Feature being verified:
+  http://localhost:3000/app/features/ff4e32f4-9385-4244-af78-f49f2458500b
+- Trackeros TR_053 engine flip:
+  https://github.com/afarahat-lab/trackeros/commit/0404a6e9
+- Trackeros TR_053-verify chief switch:
+  https://github.com/afarahat-lab/trackeros/commit/df04b85a
+
+---
+### Session 2026-06-13 — Claude Code (TR_053 initial: LangGraph migration Phase 2 — PlanningGraph code lands as a parallel rollout + all three TR_052 NRBs fixed; build clean across all 13 packages)
+
+> **Reconciliation note (TR_054):** the design described below is
+> the TR_053 **initial** brief. Within the same session, the
+> TR_053 amendment renamed the boolean `planner.useLangGraph`
+> (default `false`) to `planner.engine: 'langgraph' |
+> 'orchestrator'` (default `'langgraph'`) and held the template
+> at `0.38.0` until the staged verification passes (TR_054 B6).
+> The current as-shipped flag is `planner.engine`. References
+> to `useLangGraph: true/false` below describe the original
+> design, not the live shipped behaviour. See the TR_053
+> amendment session above (newer) for the current semantics.
+
+
 
 Brief: replace `planning-orchestrator` with a LangGraph
 StateGraph + add the three TR_052 NRB fixes. Per the
@@ -3910,345 +4420,6 @@ Live URLs:
   http://localhost:3000/app/features/e1ee9e5c-1afc-4909-891a-29a600c89ff1
 - trackeros TR_051 commit:
   https://github.com/afarahat-lab/trackeros/commit/1f498b5b
-
----
-### Session 2026-06-13 — Claude Code (TR_051: LangGraph migration Phase 1 — ArchitectureGraph crew lands; replaces single architecture-agent's feature-level designFeature + reviewDesign with DomainArchitect + DataArchitect + AppArchitect deliberating in parallel under a ChiefArchitect supervisor; PostgreSQL checkpointer reuses DATABASE_URL; template 0.38.0; build clean across all 13 packages; live verification pending)
-
-Brief: replace `architecture-agent.designFeature(...)` +
-`reviewDesign(...)` in the planning orchestrator's
-`handlePlanningStart` with a LangGraph `StateGraph` crew —
-`DomainArchitectNode` + `DataArchitectNode` + `AppArchitectNode`
-fan out from START in parallel, `ChiefArchitectNode`
-reconciles. Bring the same crew online on the new
-`agents.yaml` matrix.
-
-What changed (13 platform + 4 HARNESS + 4 agents.yaml):
-
-**LangGraph dependencies (1 change)**
-- `packages/agents/planning/package.json` gains
-  `@langchain/langgraph@^0.2.0`,
-  `@langchain/langgraph-checkpoint-postgres@^0.0.1`, and
-  `@langchain/core@^0.3.0`. `pnpm install` clean. The
-  `@langchain/openai` package is NOT pulled in — the
-  architecture crew reuses Gestalt's existing
-  `getLLMClient` routing (via `BaseLLMAgent.callLLM`), so
-  no extra LLM client surface is added.
-
-**ArchitectureGraph package layout**
-
-```
-packages/agents/planning/src/graphs/
-├── checkpointer.ts                 — singleton PostgresSaver
-└── architecture/
-    ├── state.ts                    — Annotation.Root schema
-    ├── types.ts                    — DomainDesign/DataDesign/AppDesign
-    ├── prompts.ts                  — structural framing + JSON schemas (ADR-042)
-    ├── agents.ts                   — 4 BaseLLMAgent subclasses
-    ├── nodes.ts                    — 4 LangGraph node wrappers
-    └── graph.ts                    — StateGraph + runArchitectureGraph
-```
-
-- **`state.ts`** — `ArchitectureGraphState = Annotation.Root({...})`
-  carries `feature` / `existingArchitectureMd` /
-  `goldenPrinciplesMd` / `harnessConfig` / `projectRoot` /
-  `correlationId` as inputs; `domainDesign` / `dataDesign` /
-  `appDesign` parallel specialist outputs;
-  `finalArchitecture` chief output; `errors[]` with
-  `[...a, ...b]` reducer for specialist failures;
-  `tokensUsed` with `a + b` reducer for cumulative
-  telemetry across all four LLM calls.
-- **`types.ts`** — Specialist contracts. `DomainDesign`
-  carries `domainEntities[].lifecycleStates` (TR_045's
-  contract honoured at the type level), `businessRules[]`,
-  and `domainNotes` markdown. `DataDesign` carries
-  `sqlSchemas[]` (TR_049 — categorical), `repositories[]`
-  with `interfaceName + concreteName + methods + backing`
-  (TR_038 — concrete impl), `dataNotes`. `AppDesign` carries
-  `modules[]`, `services[]`, `dependencyMap[]`,
-  `recommendedPhases[]`, `appNotes`. The chief receives
-  these as JSON in its prompt and produces the canonical
-  `FeatureArchitecture` shape unchanged.
-- **`prompts.ts`** — Strict ADR-042: structural framing +
-  JSON schemas only. Shared `renderStackSection`,
-  `renderGoldenPrinciplesSection`, `renderExtensions`,
-  `renderArchExcerpt`, `renderFeatureBlock` helpers reused
-  across all four prompts. Each specialist prompt
-  explicitly names which slice it owns AND which slices
-  belong to its peers — preventing overlap. Chief's prompt
-  receives the three slices verbatim + an optional
-  `## Specialist errors` section when any specialist
-  failed.
-- **`agents.ts`** — Four classes extending `BaseLLMAgent`:
-  `DomainArchitectAgent` / `DataArchitectAgent` /
-  `AppArchitectAgent` / `ChiefArchitectAgent`. Each
-  resets `lastTokensUsed` + calls `setHarnessConfigForRun`
-  + loads its `agentConfig` via the standard
-  `loadAgentConfig(projectRoot, role)` + wraps its prompt
-  in `addJsonResponseGuard` + calls `this.callLLM`. ADR-057
-  five-layer token management applies automatically.
-  Parsers mirror the patterns in
-  `architecture-agent.ts` — graceful empty fallbacks on
-  any parse failure, no thrown exceptions to the node
-  wrapper.
-- **`nodes.ts`** — Four LangGraph node functions. Each
-  reads state, calls its agent's `design()`/`review()`,
-  logs the result (entity / module / phase counts +
-  tokens), and returns a `Partial<state>`. Errors are
-  caught and surfaced via `state.errors[...]` — the chief
-  can reconcile around a missing specialist slice.
-- **`graph.ts`** — Compiled `StateGraph`:
-  `addNode → addEdge` chain runs
-  START → `[domain || data || app]` → chief → END. The
-  three specialist edges into the chief make LangGraph
-  fan-in: chief only runs after ALL three specialists
-  complete (regardless of their relative speeds).
-  Identical `RetryPolicy` on every specialist node — 3
-  attempts, exponential backoff (1s → 30s),
-  `retryOn` matches timeouts / sockets / 5xx / 429
-  (mirrors TR_050's `classifyError` fix at the
-  graph-orchestration layer rather than at the LLM
-  client). Chief capped at 2 attempts. Compiled graph
-  cached at module scope (compilation is pure-structural).
-  `runArchitectureGraph(input)` is the public entry —
-  throws when the chief produces empty output so the
-  orchestrator's outer `catch` blocks the feature
-  (matches the pre-migration safety semantics).
-- **`graphs/checkpointer.ts`** — Singleton `PostgresSaver`
-  (process-wide because it owns a `pg.Pool`). Reads
-  `DATABASE_URL` via `loadConfig()`. `setup()` is
-  idempotent; LangGraph creates its own `checkpoints` +
-  `checkpoint_writes` tables on first call — no Gestalt
-  migration needed. On setup failure the cache is cleared
-  so the next caller can retry.
-
-**Type-level support**
-
-- **`packages/core/src/types.ts`** — `AgentRole` literal
-  union gains four new values:
-  `domain-architect-agent` / `data-architect-agent` /
-  `app-architect-agent` / `chief-architect-agent`.
-- **`packages/core/src/agents/agent-config-loader.ts`** —
-  `PER_ROLE_DEFAULTS` gains four new entries. Specialists
-  default to temperature 0.1 + 6000 max_tokens; chief
-  defaults to 0.1 + 12000. No file tools (`builtin: []`)
-  — the crew works from prompt context only.
-
-**Wiring**
-
-- **`orchestrator/planning-orchestrator.ts`** —
-  `handlePlanningStart` swaps the two-call pair
-  `architectureAgent.designFeature(...) +
-  architectureAgent.reviewDesign(...)` for one
-  `runArchitectureGraph({feature, existingArchitectureMd,
-  goldenPrinciplesMd, projectRoot: workDir, harnessConfig,
-  correlationId})` call. Specialist errors are logged
-  (`graphResult.errors`) but the orchestrator proceeds —
-  the chief already reconciled around them. The TR_044
-  `buildStackSubstitutions` call stays on the single
-  `ArchitectureAgent` class because it's a dedicated
-  one-shot classification (gpt-4o-mini), not an
-  architectural reasoning task.
-- **`agents/architecture-agent.ts`** — `designFeature` +
-  `reviewDesign` marked `@deprecated (TR_051 / ADR-056
-  Phase 1)`. Kept callable as fallback so tests / CLI /
-  any non-orchestrator caller still compile. `designPhase`
-  + `reviewPhaseDesign` untouched — Phase 2 of the
-  migration absorbs them as per-phase subgraph nodes.
-- **`src/index.ts`** — public exports added for
-  `runArchitectureGraph`, the four agent classes, and the
-  three specialist `Design` types.
-
-**HARNESS.json (template + trackeros — 4 new blocks each)**
-
-- `domain-architect-agent.rules` — define entities +
-  lifecycle states, never persistence, every lifecycle
-  state must appear in `domainNotes`.
-- `data-architect-agent.rules` — every persistent entity
-  requires a complete CREATE TABLE; every repository
-  names its concrete backing implementation; use the
-  declared database client.
-- `app-architect-agent.rules` — clear layer boundaries;
-  dependencies flow inward; every public method defined
-  in an interface; no circular dependencies.
-- `chief-architect-agent.rules` — reconciliation, not
-  regeneration; resolve symbol-name conflicts; verify
-  stack compliance; reconcile around missing slices;
-  every lifecycle state introduced by the domain
-  architect must appear in `architectureMdUpdate`.
-
-**agents.yaml (template + trackeros — 4 new entries each)**
-
-- Template uses `model: ~` (platform default) across all
-  four — operators bind specific models per project.
-- trackeros binds the three specialists to
-  `deepseek-ai/DeepSeek-V3.2` (TR_050's stable choice on
-  DeepInfra, 6k max_tokens) and the chief to
-  `moonshotai/Kimi-K2.6` (12k max_tokens — same budget as
-  TR_050's single-agent setting; Kimi is better at
-  producing direct structured reconciliation output than
-  DeepSeek per TR_050 verification cycles).
-
-Template version bumped `0.35.0 → 0.38.0`. No new platform
-migration (LangGraph manages its own checkpoint DDL).
-`pnpm -r build` clean across all 13 packages.
-
-**What's structurally addressed by Phase 1 (vs the prior
-TR_036–TR_047 escalations):**
-
-- **Symbol-name consistency (TR_036)** — chief
-  reconciliation reads all three slices simultaneously
-  and chooses one canonical name; the specialists work in
-  parallel so name drift can't compound across rounds.
-- **Concrete-impl gap (TR_037, TR_038)** — data architect
-  contract requires `repositories[].concreteName +
-  backing`; the chief verifies completeness before
-  emitting the canonical `FeatureArchitecture`.
-- **Stack binding (TR_040, TR_041, TR_042, TR_044)** —
-  every prompt receives `renderStackSection` AND
-  per-agent rules that name the declared stack as
-  authoritative; chief verifies cross-slice stack
-  compliance before output.
-- **Lifecycle coverage (TR_041, TR_045, TR_046)** —
-  `DomainDesign.domainEntities[].lifecycleStates`
-  surfaces lifecycle states at the type level; the
-  domain architect must enumerate them; chief folds
-  them into `architectureMdUpdate`.
-- **SQL schema (TR_047, TR_048, TR_049)** —
-  `DataDesign.sqlSchemas[]` makes schema output
-  categorical in the type contract; data architect rules
-  require complete CREATE TABLE for every persistent
-  entity; the chief carries them forward into the
-  canonical `FeatureArchitecture.sqlSchemas` field.
-- **Cross-phase consistency (TR_049 11th bar)** — Phase 1
-  only addresses the FEATURE-level pass. The per-phase
-  `designPhase` / `reviewPhaseDesign` remain on the
-  single agent until Phase 2 of the migration; the 11th
-  rigor bar (class shape drift between high-level +
-  per-phase) is structurally addressed once Phase 2
-  brings the per-phase pass into the same crew.
-
-**Live verification pending — recipe:**
-
-```bash
-docker-compose up -d --build
-docker-compose logs server | grep -E "architecture-graph|langgraph|checkpoint"
-gestalt feature submit \
-  "Build the leave management module. Employees apply for
-   annual, sick, and emergency leave. Managers approve or
-   reject. System tracks leave balances." \
-  --project trackeros
-gestalt feature status <featureId> --watch
-```
-
-Then in psql:
-
-```sql
-SELECT table_name FROM information_schema.tables
-WHERE table_name LIKE 'checkpoint%';
--- expect: checkpoints, checkpoint_writes (LangGraph-created)
-
-SELECT agent_role, COUNT(*)
-FROM agent_executions
-WHERE created_at > NOW() - INTERVAL '10 minutes'
-GROUP BY agent_role ORDER BY agent_role;
--- expect rows for the four architecture-crew roles
-```
-
-Expected: all three specialist nodes fire in parallel
-(logs within ~1s of each other); chief fires after; final
-`feature.architecture` JSON richer than single-agent
-output — explicit `concreteName + backing` on every
-repository, complete CREATE TABLE statements, named
-lifecycle states. Phase 1 should reach intent-agent
-without the TR_036/TR_037/TR_038/TR_041 symbol /
-concrete-impl / framework / lifecycle escalations
-(structurally addressed by the crew).
-
-**Pending follow-ups (NEW from TR_051):**
-
-- **(HIGH — NEW)** Live verification on trackeros. Until
-  a real submission runs, the structural address of the
-  TR_036–TR_047 rigor bars is type-level only. The brief
-  also expects per-graph telemetry (specialist token
-  counts visible on the dashboard's Active Agents card);
-  the orchestrator currently logs `tokensUsed` from the
-  graph result but does not push it through to
-  `agent_executions.tokens_used` because the four
-  crew-agents aren't wrapped in the standard
-  `runAgent`/`completeAgentExecution` envelope. This is
-  the natural Phase 1 follow-up.
-- **(HIGH — NEW)** Phase 2 (PlanningGraph). The per-phase
-  `designPhase` + `reviewPhaseDesign` are still on the
-  single architecture-agent class and still rely on the
-  TR_048 canonical-schema-reuse machinery to align with
-  the new chief-driven feature architecture. Phase 2
-  brings them into the same crew so the high-level +
-  per-phase views can't drift structurally — closes the
-  TR_049 11th rigor bar.
-- **(MEDIUM — NEW)** Per-graph dashboard visualization
-  (HIGH — Dashboard: feature/intent tracking redesign in
-  STATE.md backlog). The current dashboard shows
-  agent-by-agent execution; LangGraph subgraphs need a
-  per-graph view (DomainArchitectNode running for 8s on
-  DeepSeek; ChiefArchitectNode running for 24s on Kimi).
-  Add `graph` and `node` fields to
-  `agent_executions` when LangGraph wraps the agent
-  call — feeds the redesigned dashboard.
-- **(LOW — NEW)** RetryPolicy duplicates TR_050's
-  `classifyError` fix at a different layer. After Phase 5
-  (self-healing graph) lands, the in-LLM-client retry
-  logic and the in-graph retry policy should be
-  reconciled so a single source of truth catches
-  transient failures.
-
-**Operator action — trackeros:** my edits to
-`/Users/amrmohamed/Work/trackeros/HARNESS.json` (4 new
-agentConfig blocks) and
-`/Users/amrmohamed/Work/trackeros/agents.yaml` (4 new
-architecture-crew entries) are unpushed. Operator should
-review + commit + push so the next planning cycle picks
-them up.
-
-**Operator action — other projects:** existing projects
-inherit the architecture-crew defaults via
-`PER_ROLE_DEFAULTS` automatically. Projects that want to
-override per-agent prompt_extensions or LLM bindings add
-the four new entries to their `agents.yaml` + (optional)
-HARNESS rules. Template auto-refreshes to `0.38.0` at
-next server boot.
-
-Build status: `pnpm -r build` clean across all 13 packages.
-
-Files changed (gestalt repo):
-- `packages/agents/planning/package.json` (3 LangGraph deps)
-- `packages/agents/planning/src/graphs/checkpointer.ts` (new)
-- `packages/agents/planning/src/graphs/architecture/state.ts` (new)
-- `packages/agents/planning/src/graphs/architecture/types.ts` (new)
-- `packages/agents/planning/src/graphs/architecture/prompts.ts` (new)
-- `packages/agents/planning/src/graphs/architecture/agents.ts` (new)
-- `packages/agents/planning/src/graphs/architecture/nodes.ts` (new)
-- `packages/agents/planning/src/graphs/architecture/graph.ts` (new)
-- `packages/agents/planning/src/agents/architecture-agent.ts`
-  (designFeature + reviewDesign marked @deprecated)
-- `packages/agents/planning/src/orchestrator/planning-orchestrator.ts`
-  (handlePlanningStart calls runArchitectureGraph)
-- `packages/agents/planning/src/index.ts` (new public exports)
-- `packages/core/src/types.ts` (4 new AgentRole values)
-- `packages/core/src/agents/agent-config-loader.ts` (4 PER_ROLE_DEFAULTS entries)
-- `templates/corporate-ops-web-mobile/harness/HARNESS.json` (4 agentConfig blocks)
-- `templates/corporate-ops-web-mobile/harness/agents.yaml` (4 agent entries)
-- `templates/corporate-ops-web-mobile/template.json` (version 0.38.0)
-- `docs/claude/AGENT_TEAMS.md` (Phase 1 marked complete)
-
-Files changed (trackeros repo, unpushed):
-- `HARNESS.json` (4 new agentConfig blocks)
-- `agents.yaml` (4 new architecture-crew entries on
-  DeepSeek + Kimi)
-
-Live URLs:
-- Dashboard: http://localhost:3000/app/
-- Planning package source tree: file
-  paths above in this repo.
 
 
 ---

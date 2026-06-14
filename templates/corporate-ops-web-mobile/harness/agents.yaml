@@ -209,6 +209,66 @@ agents:
       - "Example of correct output: 'The database connection is at src/shared/db/connection.ts and exports: export const pool: Pool. Import it as: import { pool } from \"../../shared/db/connection\"'"
       - "Example of incorrect output: 'Use the shared/db module'"
 
+  # ─── Architecture crew (TR_051 / ADR-056 Phase 1) ────────────────────
+  # Replaces the single architecture-agent's feature-level designFeature
+  # + reviewDesign pass with a LangGraph StateGraph crew. Three specialists
+  # deliberate in parallel; the chief reconciles. The architecture-agent
+  # entry above remains in use for per-phase designPhase + reviewPhaseDesign
+  # (Phase 2 of the migration will replace those too).
+  #
+  # model: ~ keeps these agents on the platform default LLM. Operators
+  # who want to bind a specific model (e.g. a stronger reasoning model
+  # for chief-architect-agent) override here.
+
+  domain-architect-agent:
+    role: "Domain architect"
+    goal: "Define the domain model: entities, relationships, lifecycle states, and business rules for this feature"
+    llm:
+      model: ~
+      temperature: 0.1
+      max_tokens: 6000
+    prompt_extensions:
+      - "Focus exclusively on domain concepts — entities, attributes, lifecycle states, business rules"
+      - "Do not specify persistence (data architect handles that) or modules / APIs (application architect handles that)"
+      - "Every lifecycle state must be named explicitly so the chief can fold it into architectureMdUpdate"
+
+  data-architect-agent:
+    role: "Data architect"
+    goal: "Define the persistence layer: SQL schema, indices, constraints, repository interfaces, and concrete implementations for this feature"
+    llm:
+      model: ~
+      temperature: 0.1
+      max_tokens: 6000
+    prompt_extensions:
+      - "Every persistent entity must have a complete SQL CREATE TABLE statement"
+      - "Every repository interface must name its concrete backing implementation using the declared stack"
+      - "Indices and constraints must reflect the entity's lifecycle and access patterns"
+
+  app-architect-agent:
+    role: "Application architect"
+    goal: "Define the application layer: module boundaries, service interfaces, dependency direction, and recommended phase decomposition"
+    llm:
+      model: ~
+      temperature: 0.1
+      max_tokens: 6000
+    prompt_extensions:
+      - "Dependencies flow inward only — outer layers toward inner layers; never the reverse"
+      - "No circular dependencies between modules — verify dependencyMap before returning"
+      - "Recommended phases should each fit within Aider's effective context window"
+
+  chief-architect-agent:
+    role: "Chief architect and design reviewer"
+    goal: "Reconcile the domain, data, and application designs into a single coherent architecture. Resolve conflicts, enforce stack compliance, ensure completeness."
+    llm:
+      model: ~
+      temperature: 0.1
+      max_tokens: 12000
+    prompt_extensions:
+      - "You receive three specialist designs. Your job is to reconcile them, not regenerate them."
+      - "Resolve naming conflicts by choosing the most semantically correct name and applying it consistently"
+      - "If any specialist missed a stack compliance requirement, correct it"
+      - "If a specialist slice is missing, supply the smallest reconciliation that keeps the feature buildable"
+
   planner-agent:
     role: "Technical project planner"
     goal: "Decompose a feature into a sequence of small, independently deployable phases that each fit within Aider's effective context window"

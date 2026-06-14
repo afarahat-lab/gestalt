@@ -40,7 +40,23 @@ export type AgentRole =
    */
   | 'architecture-agent'
   | 'planner-agent'
-  | 'phase-evaluator-agent';
+  | 'phase-evaluator-agent'
+  /**
+   * Architecture crew (TR_051, ADR-056 Phase 1). The single
+   * architecture-agent + self-review pass is replaced by a LangGraph
+   * StateGraph: three specialists deliberate in parallel, then a
+   * chief-architect supervisor reconciles. Wired into the planning
+   * orchestrator's `planning:start` task via `runArchitectureGraph`.
+   *
+   * - `domain-architect-agent`  entities, relationships, lifecycle states
+   * - `data-architect-agent`    SQL schema, persistence, repositories
+   * - `app-architect-agent`     layers, interfaces, dependency direction
+   * - `chief-architect-agent`   reconciles the three; final FeatureArchitecture
+   */
+  | 'domain-architect-agent'
+  | 'data-architect-agent'
+  | 'app-architect-agent'
+  | 'chief-architect-agent';
 
 // ─── Signal types ─────────────────────────────────────────────────────────────
 
@@ -79,7 +95,24 @@ export type TaskType =
    */
   | 'planning:start'
   | 'planning:phase'
-  | 'planning:evaluate';
+  | 'planning:evaluate'
+  /**
+   * Planning LangGraph task types (TR_053 / ADR-056 Phase 2).
+   * Opt in per project via `harnessConfig.planner.useLangGraph`.
+   *   - `planning:graph-start`   first invocation; runs ArchitectureGraph
+   *                               subgraph → planner → phase 0 dispatch →
+   *                               `interrupt()` (await intent completion).
+   *                               BullMQ job returns after the interrupt;
+   *                               LangGraph state checkpointed to postgres.
+   *   - `planning:graph-resume`  fired by the deploy promotion-agent after
+   *                               a phase intent deploys. Calls graph.invoke
+   *                               with `Command({resume: phaseResult})`;
+   *                               graph runs phase-evaluator → conditional
+   *                               edge → either next phase-dispatch + new
+   *                               interrupt, OR END.
+   */
+  | 'planning:graph-start'
+  | 'planning:graph-resume';
 
 export type TaskPriority = 'critical' | 'high' | 'normal' | 'background';
 

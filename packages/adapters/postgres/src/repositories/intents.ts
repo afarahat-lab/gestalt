@@ -26,10 +26,17 @@ export class PostgresIntentRepository implements IntentRepository {
     // create so self-healing-fix children carry the link from the
     // first INSERT. Regular intents pass undefined and the column
     // stays NULL.
+    //
+    // TR_053 amendment (migration 030) — accept optional parentContext
+    // envelope. PlanningGraph's `phaseDispatchNode` populates this
+    // with `{kind:'planning-phase', featureId, phaseIndex}` so the
+    // `intent.status-changed` event payload can carry the parent
+    // featureId without a downstream JOIN.
     const parentIntentId = intent.parentIntentId ?? null;
+    const parentContext = intent.parentContext ?? null;
     const [row] = await db<IntentRecord[]>`
       INSERT INTO intents (
-        id, correlation_id, project_id, text, status, source, priority, parent_intent_id
+        id, correlation_id, project_id, text, status, source, priority, parent_intent_id, parent_context
       ) VALUES (
         ${intent.id},
         ${intent.correlationId},
@@ -38,7 +45,8 @@ export class PostgresIntentRepository implements IntentRepository {
         ${intent.status},
         ${intent.source},
         ${intent.priority},
-        ${parentIntentId}
+        ${parentIntentId},
+        ${parentContext === null ? null : db.json(parentContext)}
       )
       RETURNING *
     `;

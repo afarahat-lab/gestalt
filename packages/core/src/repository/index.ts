@@ -115,7 +115,36 @@ export interface IntentRecord {
    */
   parentIntentId: string | null;
   onSuccessDispatch: Record<string, unknown> | null;
+  /**
+   * TR_053 amendment (migration 030) — parent-context envelope set
+   * at intent-create time. The PlanningGraph populates this when
+   * `phaseDispatchNode` creates a phase intent so the
+   * `intent.status-changed` event payload can carry the parent
+   * featureId without the subscriber JOINing `feature_phases`.
+   *
+   * Discriminated by the `kind` field:
+   *
+   *   { kind: 'planning-phase', featureId: string, phaseIndex: number }
+   *
+   * Other kinds may appear in the future (the legacy `parentIntentId`
+   * + `onSuccessDispatch` pair for self-healing stays untouched).
+   * Null on every intent that doesn't participate in a parent flow.
+   * Application code MUST check `kind` before reading the rest.
+   */
+  parentContext: IntentParentContext | null;
 }
+
+/**
+ * TR_053 amendment — discriminated parent-context envelope persisted
+ * on `intents.parent_context` (JSONB). Read by `transitionIntent` to
+ * enrich the `intent.status-changed` event payload so subscribers can
+ * route without a DB join.
+ */
+export type IntentParentContext = {
+  kind: 'planning-phase';
+  featureId: string;
+  phaseIndex: number;
+};
 
 /**
  * Persisted on `intents.last_resume_context` (JSONB) every time the
@@ -213,7 +242,10 @@ export interface IntentListFilters {
 }
 
 export interface IntentRepository extends BaseRepository {
-  create(intent: Omit<IntentRecord, 'createdAt' | 'updatedAt' | 'resolvedAt' | 'clarification' | 'branchName' | 'prNumber' | 'prUrl' | 'attemptCount' | 'lastResumeContext' | 'parentIntentId' | 'onSuccessDispatch'> & { parentIntentId?: string | null }): Promise<IntentRecord>;
+  create(intent: Omit<IntentRecord, 'createdAt' | 'updatedAt' | 'resolvedAt' | 'clarification' | 'branchName' | 'prNumber' | 'prUrl' | 'attemptCount' | 'lastResumeContext' | 'parentIntentId' | 'onSuccessDispatch' | 'parentContext'> & {
+    parentIntentId?: string | null;
+    parentContext?: IntentParentContext | null;
+  }): Promise<IntentRecord>;
   findById(id: string): Promise<IntentRecord | null>;
   findByCorrelationId(correlationId: string): Promise<IntentRecord | null>;
   updateStatus(id: string, status: IntentStatus): Promise<IntentRecord>;
@@ -302,7 +334,17 @@ export interface IntentRepository extends BaseRepository {
 
 // ─── Agent execution repository ───────────────────────────────────────────────
 
-export type ExecutionStatus = 'queued' | 'running' | 'completed' | 'failed' | 'skipped' | 'expired';
+/**
+ * `completed-with-warning` (TR_053 NRB Fix 1) — the agent run errored
+ * mid-flight but the surrounding orchestrator decided the failure was
+ * non-blocking (e.g. gate review-agent throws while constraint-agent's
+ * verdict was independently `pass`). The execution row is patched
+ * post-hoc by the orchestrator after the terminal verdict is known,
+ * so the dashboard shows a distinct visual state instead of a hard
+ * `failed` row that would imply the cycle stalled. No DB migration —
+ * `agent_executions.status` is `TEXT` with no CHECK constraint.
+ */
+export type ExecutionStatus = 'queued' | 'running' | 'completed' | 'completed-with-warning' | 'failed' | 'skipped' | 'expired';
 
 export interface AgentExecutionRecord {
   id: string;

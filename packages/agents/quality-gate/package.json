@@ -16,6 +16,8 @@
   "dependencies": {
     "@gestalt/core": "workspace:*",
     "@gestalt/agents-generate": "workspace:*",
+    "@langchain/core": "^0.3.0",
+    "@langchain/langgraph": "^0.2.0",
     "simple-git": "^3.23.0"
   },
   "devDependencies": {

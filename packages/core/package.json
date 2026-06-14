@@ -14,6 +14,7 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
+    "@langchain/langgraph-checkpoint-postgres": "^0.0.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "bullmq": "^5.7.0",
     "globby": "^14.0.0",

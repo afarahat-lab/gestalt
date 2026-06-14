@@ -1,11 +1,29 @@
 /**
  * Planning layer orchestrator — main BullMQ worker.
  *
+ * @deprecated TR_053 / ADR-056 Phase 2. The LangGraph
+ * `PlanningGraph` (`packages/agents/planning/src/graphs/planning/`)
+ * is the replacement. The legacy three-task chain
+ * (`planning:start` → `planning:phase` → `planning:evaluate`) stays
+ * the supported path on projects that don't opt in via
+ * `harnessConfig.planner.useLangGraph: true`. The worker also hosts
+ * the new `planning:graph-start` + `planning:graph-resume` task
+ * handlers (see `handleGraphStart` / `handleGraphResume` below) so
+ * both paths run in the same process and share the same event-bus
+ * subscriber, repositories, and PostgreSQL checkpointer.
+ *
+ * Delete this file once Phase 3 (GenerateGraph) verification
+ * confirms the graph path covers every legacy case end-to-end on a
+ * real feature.
+ *
  * Drives the feature decomposition + phased execution loop:
  *
  *   planning:start    — clone repo → architecture-agent (feature) →
  *                       planner-agent → write PLAN.md + commit → push →
  *                       dispatch planning:phase for phase 0
+ *                       (When `useLangGraph: true` the handler
+ *                       re-dispatches as `planning:graph-start` and
+ *                       returns.)
  *
  *   planning:phase    — clone repo → (optional) architecture-agent (phase) →
  *                       create intent row → dispatch generate:intent →
@@ -16,11 +34,22 @@
  *                       update + commit → push → dispatch next
  *                       planning:phase OR mark feature completed
  *
+ *   planning:graph-start (TR_053) — invokes the LangGraph PlanningGraph
+ *                                    in start mode; graph runs until
+ *                                    its first `interrupt()` and returns
+ *   planning:graph-resume (TR_053) — invokes the graph in resume mode
+ *                                    with the phase result; graph runs
+ *                                    phase-evaluator and either
+ *                                    interrupts again (next phase) or
+ *                                    reaches END (feature done)
+ *
  * The orchestrator also subscribes to the in-process event bus to
  * convert `intent.status-changed` events (status=deployed / failed)
  * into `planning:evaluate` dispatches when the intent belongs to a
  * planner-driven phase. This is the "deploy → planning" callback
- * without any coupling code in the deploy layer.
+ * without any coupling code in the deploy layer. TR_053 — when the
+ * feature has a LangGraph checkpoint in postgres, the same
+ * subscriber dispatches `planning:graph-resume` instead.
  *
  * Path-guarded mutations:
  *   - PLAN.md          → write at repo root only
@@ -48,7 +77,10 @@ import type {
 import { ArchitectureAgent } from '../agents/architecture-agent';
 import { PlannerAgent } from '../agents/planner-agent';
 import { PhaseEvaluatorAgent } from '../agents/phase-evaluator-agent';
-import { applyStackSubstitutions, extractCanonicalSqlSchemas } from '../prompts/architecture-prompt';
+import { extractCanonicalSqlSchemas } from '../prompts/architecture-prompt';
+import { runArchitectureGraph } from '../graphs/architecture/graph';
+import { runPlanningGraph } from '../graphs/planning/graph';
+import { getCheckpointer } from '../graphs/checkpointer';
 import type { FeatureArchitecture, FeaturePlan, PhaseEvaluation } from '../types';
 
 const log = createContextLogger({ module: 'planning-orchestrator' });
@@ -70,10 +102,18 @@ interface PlanningEvaluatePayload {
   intentDeployedSuccessfully: boolean;
 }
 
+interface PlanningGraphResumePayload {
+  featureId: string;
+  success: boolean;
+  mergeCommitSha?: string | null;
+  failureReason?: string;
+}
+
 type PlanningPayload =
   | PlanningStartPayload
   | PlanningPhasePayload
-  | PlanningEvaluatePayload;
+  | PlanningEvaluatePayload
+  | PlanningGraphResumePayload;
 
 // ─── Defaults — overridable per project via HARNESS.json.planner ────
 
@@ -195,7 +235,21 @@ export function startPlanningWorker(queueConfig: QueueConfig): void {
     QUEUE_NAMES.planning,
     handlePlanningTask,
     queueConfig,
-    { concurrency: 2 },
+    {
+      concurrency: 2,
+      // TR_053 amendment — `planning:graph-start` runs the full
+      // ArchitectureGraph + planner + per-phase architecture +
+      // phase-dispatch BEFORE hitting `awaitPhaseNode`'s interrupt.
+      // That's ~20-25 min wall-clock on the trackeros baseline. The
+      // platform default `lockDuration: 600000` (10 min, tuned for
+      // legacy planning:start) triggers BullMQ's stall detection
+      // partway through the run, which under `maxStalledCount: 0`
+      // drops the job AFTER the handler already returned
+      // successfully — observability noise without retry. Bump to
+      // 30 min so the lock keeps the job exclusive for the full
+      // graph-start window.
+      lockDuration: 1800000,
+    },
   );
 
   // Subscribe to `intent.status-changed` events. When a phase intent
@@ -215,7 +269,11 @@ export function startPlanningWorker(queueConfig: QueueConfig): void {
   // immediately.
   eventBus.subscribe(async (event) => {
     if (event.type !== 'intent.status-changed') return;
-    const payload = event.payload as { intentId?: string; status?: string };
+    const payload = event.payload as {
+      intentId?: string;
+      status?: string;
+      parentContext?: { kind?: string; featureId?: string; phaseIndex?: number } | null;
+    };
     const intentId = payload?.intentId;
     const status = payload?.status;
     if (!intentId || !status) return;
@@ -227,15 +285,98 @@ export function startPlanningWorker(queueConfig: QueueConfig): void {
     ) {
       return;
     }
+
     try {
+      // TR_053 amendment Refined Option 2 — read the parent context
+      // from the event payload directly (set at intent-create time by
+      // `phaseDispatchNode`; persisted to `intents.parent_context`;
+      // re-emitted by every `transitionIntent` call). The subscriber
+      // no longer needs to JOIN `feature_phases` to learn the parent
+      // featureId.
+      //
+      // Backwards compatibility: intents created before migration 030
+      // have parent_context = NULL. For those we fall back to the
+      // legacy JOIN via `findPhaseByIntent`. New intents (TR_053+)
+      // carry the context inline.
+      let parentFeatureId: string | null = null;
+      let parentPhaseIndex: number | null = null;
+      const ctx = payload?.parentContext;
+      if (ctx && ctx.kind === 'planning-phase' && typeof ctx.featureId === 'string') {
+        parentFeatureId = ctx.featureId;
+        parentPhaseIndex = typeof ctx.phaseIndex === 'number' ? ctx.phaseIndex : null;
+      } else {
+        // Legacy fallback — intent has no parentContext envelope.
+        const { features } = getRepositories();
+        const phase = await features.findPhaseByIntent(intentId);
+        if (!phase) return;  // Not a planner-driven intent — ignore.
+        parentFeatureId = phase.featureId;
+        parentPhaseIndex = phase.phaseIndex;
+      }
+      if (!parentFeatureId) return;
+
+      // TR_053 amendment Fix 3 — route by the project's engine
+      // selection. langgraph features have a checkpoint row;
+      // orchestrator features don't.
+      const usingGraph = await featureHasGraphCheckpoint(parentFeatureId);
+
+      if (usingGraph) {
+        // TR_053 amendment Fix 2 — both terminal outcomes resume.
+        // Previously only `deployed` dispatched a resume; failure
+        // statuses fell through to the legacy escalation path which
+        // would leave the graph parked at `awaitPhaseNode` forever.
+        // Map every terminal status to a resume value and let
+        // `phaseEvaluatorNode` decide retry vs escalate.
+        log.info(
+          {
+            featureId: parentFeatureId,
+            intentId,
+            status,
+            parentPhaseIndex,
+            resumePath: 'planning:graph-resume',
+          },
+          `RESUME-PATH planning:graph-resume — feature ${parentFeatureId} status=${status}`,
+        );
+        log.info(
+          { featureId: parentFeatureId, intentId, status, parentPhaseIndex },
+          'Planner phase intent terminal — feature on LangGraph engine; dispatching planning:graph-resume',
+        );
+        // The phase row may have the squash-merge SHA from the
+        // promotion-agent. Look it up only for the deployed branch
+        // (a failed/escalated intent has nothing to merge).
+        let mergeCommitSha: string | null = null;
+        if (status === 'deployed' && parentPhaseIndex !== null) {
+          const { features } = getRepositories();
+          const phase = await features
+            .findPhaseByIndex(parentFeatureId, parentPhaseIndex)
+            .catch(() => null);
+          mergeCommitSha = phase?.mergeCommitSha ?? null;
+        }
+        await dispatch<PlanningGraphResumePayload>({
+          id: crypto.randomUUID(),
+          correlationId: event.correlationId,
+          type: 'planning:graph-resume',
+          sourceAgent: 'orchestrator',
+          targetAgent: 'phase-evaluator-agent',
+          priority: 'normal',
+          payload: {
+            featureId: parentFeatureId,
+            success: status === 'deployed',
+            mergeCommitSha,
+            ...(status !== 'deployed' ? { failureReason: status } : {}),
+          },
+          createdAt: new Date(),
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+        }, getQueueConfig());
+        return;
+      }
+
+      // Legacy orchestrator engine. Keep the existing two routes:
+      // escalation-class statuses short-circuit to feature-blocked
+      // (no evaluation makes sense); deployed/failed dispatch
+      // planning:evaluate.
       const { features } = getRepositories();
       const phase = await features.findPhaseByIntent(intentId);
-      if (!phase) return;  // Not a planner-driven intent — ignore.
-
-      // TR_033 — escalation-class statuses are terminal failures for
-      // the phase. Don't dispatch planning:evaluate; the phase didn't
-      // produce evaluable output. Mark everything terminal in one
-      // sequence so the dashboard reflects reality immediately.
+      if (!phase) return;
       if (status === 'waiting-for-clarification' || status === 'escalated') {
         await markFeatureBlockedAfterEscalation({
           featureId: phase.featureId,
@@ -248,7 +389,16 @@ export function startPlanningWorker(queueConfig: QueueConfig): void {
         });
         return;
       }
-
+      log.info(
+        {
+          featureId: phase.featureId,
+          phaseId: phase.id,
+          intentId,
+          status,
+          resumePath: 'planning:evaluate',
+        },
+        `RESUME-PATH planning:evaluate — feature ${phase.featureId} status=${status}`,
+      );
       log.info(
         { featureId: phase.featureId, phaseId: phase.id, intentId, status },
         'Planner phase intent reached terminal status — dispatching planning:evaluate',
@@ -297,6 +447,13 @@ async function handlePlanningTask(
         break;
       case 'planning:evaluate':
         await handlePlanningEvaluate(message.payload as PlanningEvaluatePayload, correlationId, childLog);
+        break;
+      // TR_053 / ADR-056 Phase 2 — LangGraph PlanningGraph paths.
+      case 'planning:graph-start':
+        await handleGraphStart(message.payload as PlanningStartPayload, correlationId, childLog);
+        break;
+      case 'planning:graph-resume':
+        await handleGraphResume(message.payload as PlanningGraphResumePayload, correlationId, childLog);
         break;
       default:
         throw new Error(`Planning orchestrator received unknown task type: ${type}`);
@@ -361,6 +518,53 @@ async function handlePlanningStart(
   const token = await resolveProjectCredential(project);
   if (!token) throw new Error(`Project ${project.name} has no Git credential on file`);
 
+  // TR_053 amendment Fix 3 — single engine per feature, chosen at
+  // dispatch. `harnessConfig.planner.engine` selects exactly one of
+  // {`langgraph` (default), `orchestrator`}. Both engines share the
+  // planning queue + repos + event bus, but the dispatch decision
+  // here guarantees one and only one engine processes the feature
+  // end-to-end. The unchosen engine is inert: legacy `planning:phase`
+  // and `planning:evaluate` are never dispatched for a feature on the
+  // langgraph engine; `planning:graph-start` and
+  // `planning:graph-resume` are never dispatched for a feature on
+  // the orchestrator engine. Logged at chose-time so operators can
+  // confirm from `docker compose logs`.
+  const engine = await readPlanningEngine(project, correlationId, childLog);
+  // TR_054 A4 — single grep-friendly log line that identifies the
+  // path the feature took. The dispatch decision is right below; the
+  // pair of structured fields make silent fallback impossible to
+  // overlook. `grep "PLANNING-PATH"` shows one line per submission.
+  childLog.info(
+    {
+      featureId: feature.id,
+      planningEngine: engine,
+      planningPath: engine === 'langgraph' ? 'langgraph' : 'orchestrator',
+    },
+    `PLANNING-PATH ${engine} — feature ${feature.id}`,
+  );
+  if (engine === 'langgraph') {
+    childLog.info(
+      { featureId: feature.id, planningPath: 'langgraph' },
+      'planning:start — re-dispatching as planning:graph-start (legacy planning:phase + planning:evaluate are inert for this feature)',
+    );
+    await dispatch<PlanningStartPayload>({
+      id: crypto.randomUUID(),
+      correlationId,
+      type: 'planning:graph-start',
+      sourceAgent: 'orchestrator',
+      targetAgent: 'planner-agent',
+      priority: 'normal' as TaskPriority,
+      payload: { featureId: feature.id },
+      createdAt: new Date(),
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    }, getQueueConfig());
+    return;
+  }
+  childLog.info(
+    { featureId: feature.id, planningPath: 'orchestrator' },
+    'planning:start — running legacy three-task chain (planning:phase + planning:evaluate)',
+  );
+
   const workDir = await mkdtemp(join(tmpdir(), `gestalt-planning-${correlationId}-`));
   try {
     childLog.info({ featureId: feature.id, workDir }, 'Cloning project for planning:start');
@@ -387,44 +591,38 @@ async function handlePlanningStart(
 
     const bounds = boundsFromHarness(harnessConfig);
 
-    // ── 1. architecture-agent (feature-level) ─────────────────────
-    childLog.info({ featureId: feature.id }, 'Invoking architecture-agent for feature-level design');
-    const architectureAgent = new ArchitectureAgent();
-    const draftArchitecture = await architectureAgent.designFeature(
-      feature, archMd, workDir, harnessConfig, correlationId, goldenPrinciplesMd,
-    );
-
-    // STOPGAP (ADR-056): This single-agent review step is a
-    // lightweight stand-in for the LangGraph architecture crew
-    // (domain + data + application architects deliberating in
-    // parallel under a chief-architect supervisor) that Phase 1
-    // of the migration will introduce. When the crew lands,
-    // delete `reviewDesign()`, `buildArchitectureReviewPrompt`,
-    // and this call site.
-    childLog.info({ featureId: feature.id }, 'Invoking architecture-agent reviewDesign (TR_038 stopgap)');
-    const reviewedArchitecture = await architectureAgent.reviewDesign(
-      draftArchitecture, feature, workDir, harnessConfig, correlationId, goldenPrinciplesMd,
-    );
-
-    // TR_044 — Generate the substitution map ONCE per feature.
-    // LLM-only stack binding (TR_040 → TR_042) failed twice at the
-    // per-phase scale; the deterministic regex pass downstream
-    // closes that gap. The map is attached to `feature.architecture`
-    // so each `planning:phase` task reads it back without an extra
-    // LLM call.
-    childLog.info({ featureId: feature.id }, 'Invoking architecture-agent buildStackSubstitutions (TR_044)');
-    const substitutionsMap = await architectureAgent.buildStackSubstitutions(
-      harnessConfig?.stack, correlationId,
-    );
-    const stackSubstitutions: Record<string, string[]> = {};
-    for (const [alt, canonical] of substitutionsMap.entries()) {
-      if (!stackSubstitutions[canonical]) stackSubstitutions[canonical] = [];
-      stackSubstitutions[canonical].push(alt);
+    // ── 1. ArchitectureGraph (TR_051 / ADR-056 Phase 1) ──────────
+    // Replaces the single architecture-agent + reviewDesign stopgap
+    // with a LangGraph crew: DomainArchitect + DataArchitect +
+    // AppArchitect deliberating in parallel, then ChiefArchitect
+    // reconciling. The `architecture-agent` class is kept (Phase 2
+    // still uses designPhase + reviewPhaseDesign for per-phase work);
+    // only the FEATURE-level design + review pair is migrated here.
+    childLog.info({ featureId: feature.id }, 'Invoking ArchitectureGraph (TR_051 — replaces designFeature + reviewDesign)');
+    const graphResult = await runArchitectureGraph({
+      feature,
+      existingArchitectureMd: archMd,
+      goldenPrinciplesMd,
+      projectRoot: workDir,
+      harnessConfig,
+      correlationId,
+    });
+    const reviewedArchitecture = graphResult.architecture;
+    if (graphResult.errors.length > 0) {
+      childLog.warn(
+        { featureId: feature.id, errors: graphResult.errors },
+        'ArchitectureGraph completed with specialist errors — chief reconciled around the missing slices',
+      );
     }
-    const architecture: FeatureArchitecture = {
-      ...reviewedArchitecture,
-      stackSubstitutions,
-    };
+
+    // Removed in TR_053 NRB-3 — `buildStackSubstitutions` is gone.
+    // ChiefArchitectNode (TR_051) enforces stack compliance
+    // structurally via per-specialist HARNESS rules + the
+    // `renderStackSection` block, so the regex post-processing fallback
+    // is no longer needed. `feature.architecture` no longer carries
+    // a `stackSubstitutions` field; the per-phase pass below skips
+    // the substitution step cleanly.
+    const architecture: FeatureArchitecture = { ...reviewedArchitecture };
 
     await features.appendLog({
       featureId: feature.id,
@@ -659,48 +857,11 @@ async function runPerPhaseArchitecture(
       draftPa, phase, feature, workDir, harnessConfig, correlationId, goldenPrinciplesMd, canonicalSqlSchemas,
     );
 
-    // TR_044 — deterministic stack substitution. Read the
-    // substitution map cached on `feature.architecture` (generated
-    // ONCE at planning:start by `buildStackSubstitutions`) and
-    // apply it to the reviewed `PhaseArchitecture`. This is the
-    // belt-and-braces step that closes the per-phase Vitest leak
-    // TR_040 → TR_042 couldn't fix via LLM-only prompts.
-    let substitutions = new Map<string, string>();
-    if (feature.architecture) {
-      try {
-        const parsed = JSON.parse(feature.architecture) as { stackSubstitutions?: Record<string, string[]> };
-        const stored = parsed.stackSubstitutions;
-        if (stored) {
-          for (const [canonical, alternatives] of Object.entries(stored)) {
-            if (!Array.isArray(alternatives)) continue;
-            for (const alt of alternatives) {
-              if (typeof alt !== 'string') continue;
-              substitutions.set(alt.toLowerCase(), canonical);
-            }
-          }
-        }
-      } catch {
-        // feature.architecture is markdown (legacy) — not JSON.
-        // Substitution map is unavailable; pipeline proceeds without
-        // it.
-        substitutions = new Map();
-      }
-    }
-    const pa = substitutions.size > 0
-      ? applyStackSubstitutions(reviewedPa, substitutions)
-      : reviewedPa;
-    if (substitutions.size > 0) {
-      childLog.info(
-        {
-          featureId: feature.id,
-          phaseId: phase.id,
-          phaseIndex: phase.phaseIndex,
-          mapSize: substitutions.size,
-        },
-        'Applied TR_044 stack substitutions to per-phase architecture',
-      );
-    }
-
+    // Removed in TR_053 NRB-3 — `applyStackSubstitutions` is gone.
+    // ChiefArchitectNode now enforces stack compliance structurally
+    // at the feature-level architecture pass, so per-phase regex
+    // post-processing is no longer needed.
+    const pa = reviewedPa;
     const summary = JSON.stringify(pa);
     // TR_034 — persist the scoped PhaseArchitecture JSON onto
     // `feature_phases.architecture` so `aider-code-agent` can read it
@@ -1202,5 +1363,187 @@ async function readMaxPhaseRetries(
     return DEFAULT_MAX_PHASE_RETRIES;
   } finally {
     await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+// ─── TR_053 / ADR-056 Phase 2 — LangGraph routing helpers ────────────
+
+/**
+ * Returns `true` when a LangGraph PlanningGraph checkpoint exists in
+ * postgres for this feature (keyed by `thread_id = featureId`). The
+ * intent.status-changed subscriber uses this to decide between
+ * dispatching `planning:graph-resume` vs the legacy `planning:evaluate`
+ * — features that ran through the graph have a checkpoint; legacy
+ * features don't. Safe on any failure: returns `false` so the legacy
+ * path stays the default.
+ */
+async function featureHasGraphCheckpoint(featureId: string): Promise<boolean> {
+  try {
+    const checkpointer = await getCheckpointer();
+    const tuple = await checkpointer.getTuple({
+      configurable: { thread_id: featureId },
+    });
+    return tuple !== undefined;
+  } catch (err) {
+    log.warn(
+      { err: err instanceof Error ? err.message : String(err), featureId },
+      'featureHasGraphCheckpoint lookup failed — defaulting to legacy path',
+    );
+    return false;
+  }
+}
+
+/**
+ * TR_053 amendment Fix 3 — read `harnessConfig.planner.engine` from
+ * the project's HARNESS.json with the new default-to-langgraph rule.
+ *
+ *   `planner.engine` present and valid → use it verbatim.
+ *   `planner.engine` absent             → default to `'langgraph'`.
+ *   `planner.useLangGraph` present (deprecated alias) → respected as
+ *     `true → 'langgraph'`, `false → 'orchestrator'`.
+ *
+ * Shallow-clones (depth=1) to read the file. On any failure (missing
+ * token, parse error, network) returns the new default
+ * `'langgraph'` — the migration is no longer behind an opt-in toggle.
+ * Identical safety semantics to `readMaxPhaseRetries`.
+ */
+async function readPlanningEngine(
+  project: { gitUrl: string; defaultBranch: string; name: string; id: string },
+  correlationId: string,
+  childLog: ReturnType<typeof createContextLogger>,
+): Promise<'langgraph' | 'orchestrator'> {
+  const token = await resolveProjectCredential(project as Parameters<typeof resolveProjectCredential>[0]);
+  if (!token) return 'langgraph';
+  const workDir = await mkdtemp(join(tmpdir(), `gestalt-planning-engine-check-${correlationId}-`));
+  try {
+    const cloneUrl = authenticatedGitUrl(project.gitUrl, token);
+    await simpleGit().clone(cloneUrl, workDir, ['--depth=1']);
+    const raw = await readFile(join(workDir, 'HARNESS.json'), 'utf8');
+    const parsed = JSON.parse(raw) as {
+      planner?: {
+        engine?: 'langgraph' | 'orchestrator';
+        useLangGraph?: boolean;
+      };
+    };
+    const explicit = parsed.planner?.engine;
+    if (explicit === 'langgraph' || explicit === 'orchestrator') return explicit;
+    // Deprecated alias.
+    if (parsed.planner?.useLangGraph === true) return 'langgraph';
+    if (parsed.planner?.useLangGraph === false) return 'orchestrator';
+    return 'langgraph';
+  } catch (err) {
+    childLog.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'readPlanningEngine fell back to langgraph (default)',
+    );
+    return 'langgraph';
+  } finally {
+    await rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * `planning:graph-start` handler. Invokes the LangGraph PlanningGraph
+ * in start mode. The graph runs through architecture → planner →
+ * phase-dispatch and pauses at `awaitPhaseNode`'s `interrupt()`. This
+ * BullMQ handler returns normally once the graph pauses; the
+ * promotion-agent fires `planning:graph-resume` once the phase intent
+ * deploys.
+ *
+ * TR_053 amendment Fix 5 — interrupt return is success.
+ *   `runPlanningGraph()` returns normally whether the graph reached
+ *   END or paused at `interrupt()`. We do not throw on the interrupt
+ *   path. BullMQ marks the job COMPLETED on any non-throwing return
+ *   (see `core/src/queue/index.ts:184-189`), so the interrupted run
+ *   is treated as job success and no retry fires. Re-confirm this if
+ *   the handler ever gains conditional `throw` logic.
+ */
+async function handleGraphStart(
+  payload: PlanningStartPayload,
+  correlationId: string,
+  childLog: ReturnType<typeof createContextLogger>,
+): Promise<void> {
+  childLog.info(
+    { featureId: payload.featureId, correlationId },
+    'planning:graph-start — invoking PlanningGraph in start mode',
+  );
+  const result = await runPlanningGraph({
+    mode: 'start',
+    featureId: payload.featureId,
+    correlationId,
+  });
+  childLog.info(
+    {
+      featureId: payload.featureId,
+      planningAction: result.planningAction,
+      interrupted: result.interrupted,
+      reachedEnd: result.reachedEnd,
+      errorCount: result.errors.length,
+    },
+    'planning:graph-start — graph step returned',
+  );
+  if (result.errors.length > 0 && !result.interrupted && !result.reachedEnd) {
+    // The graph hit a node-level error without interrupting AND
+    // without finishing. Surface it on the feature log.
+    const { features } = getRepositories();
+    await features.appendLog({
+      featureId: payload.featureId,
+      phaseIndex: null,
+      eventType: 'feature-failed',
+      summary: `PlanningGraph start failed: ${result.errors.join('; ').slice(0, 500)}`,
+      detail: { errors: result.errors },
+    });
+  }
+}
+
+/**
+ * `planning:graph-resume` handler. Fired by the deploy promotion-agent
+ * after a phase intent reaches `deployed` on the LangGraph path. Calls
+ * `runPlanningGraph` in resume mode, which feeds the phase result back
+ * to the suspended `awaitPhaseNode` via `Command({resume})` and lets
+ * the graph proceed to `phaseEvaluatorNode` and the conditional edges.
+ */
+async function handleGraphResume(
+  payload: PlanningGraphResumePayload,
+  correlationId: string,
+  childLog: ReturnType<typeof createContextLogger>,
+): Promise<void> {
+  childLog.info(
+    {
+      featureId: payload.featureId,
+      success: payload.success,
+      mergeCommitSha: payload.mergeCommitSha ?? null,
+      correlationId,
+    },
+    'planning:graph-resume — invoking PlanningGraph in resume mode',
+  );
+  const result = await runPlanningGraph({
+    mode: 'resume',
+    featureId: payload.featureId,
+    resumeValue: {
+      success: payload.success,
+      mergeCommitSha: payload.mergeCommitSha ?? null,
+      ...(payload.failureReason ? { failureReason: payload.failureReason } : {}),
+    },
+  });
+  childLog.info(
+    {
+      featureId: payload.featureId,
+      planningAction: result.planningAction,
+      interrupted: result.interrupted,
+      reachedEnd: result.reachedEnd,
+      errorCount: result.errors.length,
+    },
+    'planning:graph-resume — graph step returned',
+  );
+  if (result.errors.length > 0 && !result.interrupted && !result.reachedEnd) {
+    const { features } = getRepositories();
+    await features.appendLog({
+      featureId: payload.featureId,
+      phaseIndex: null,
+      eventType: 'feature-failed',
+      summary: `PlanningGraph resume failed: ${result.errors.join('; ').slice(0, 500)}`,
+      detail: { errors: result.errors },
+    });
   }
 }

@@ -242,6 +242,41 @@ export const PER_ROLE_DEFAULTS: Record<string, AgentConfig> = {
     // instruction would fail and the agent would have no evidence.
     tools: { ...ALL_FILE_TOOLS_WITH_SCRIPT },
   },
+  // ─── Architecture crew (TR_051 / ADR-056 Phase 1) ──────────────
+  // Replaces the single architecture-agent + self-review pass.
+  // Three specialists deliberate in parallel, then a chief reconciles
+  // their outputs into the final FeatureArchitecture. No file tools
+  // — the crew works from the prompt context alone (the planning
+  // orchestrator already provides the cloned tree's
+  // ARCHITECTURE.md + GOLDEN_PRINCIPLES.md + harness).
+  'domain-architect-agent': {
+    role: 'Domain architect',
+    goal: 'Define the domain model: entities, relationships, lifecycle states, and business rules for this feature',
+    llm: { temperature: 0.1, maxTokens: 6000 },
+    promptExtensions: [],
+    tools: { builtin: [] },
+  },
+  'data-architect-agent': {
+    role: 'Data architect',
+    goal: 'Define the persistence layer: SQL schema, indices, constraints, repository interfaces, and concrete implementations for this feature',
+    llm: { temperature: 0.1, maxTokens: 6000 },
+    promptExtensions: [],
+    tools: { builtin: [] },
+  },
+  'app-architect-agent': {
+    role: 'Application architect',
+    goal: 'Define the application layer: module boundaries, service interfaces, dependency direction, and API surface for this feature',
+    llm: { temperature: 0.1, maxTokens: 6000 },
+    promptExtensions: [],
+    tools: { builtin: [] },
+  },
+  'chief-architect-agent': {
+    role: 'Chief architect and design reviewer',
+    goal: 'Reconcile the domain, data, and application designs into a single coherent FeatureArchitecture. Resolve conflicts, enforce stack compliance, ensure completeness.',
+    llm: { temperature: 0.1, maxTokens: 12000 },
+    promptExtensions: [],
+    tools: { builtin: [] },
+  },
 };
 
 function fallbackFor(agentRole: string): AgentConfig {
