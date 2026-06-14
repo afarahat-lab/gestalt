@@ -150,6 +150,99 @@ export async function dispatch<TPayload>(
 
 // ─── Worker factory ───────────────────────────────────────────────────────────
 
+/**
+ * ADR-058 clause 2 — per-queue transport defaults.
+ *
+ * Every queue's `lockDuration` MUST be at or above its worst-case
+ * synchronous in-process step, and every queue's `maxStalledCount`
+ * MUST be a deliberate choice (not the BullMQ default of 1).
+ *
+ * Worst-case reasoning per queue:
+ *
+ *   - `gestalt-planning` — 30 min. `planning:graph-start` runs the
+ *     full ArchitectureGraph + planner + per-phase architecture +
+ *     phase-dispatch before hitting `awaitPhaseNode`'s interrupt;
+ *     ~20–25 min on the trackeros baseline (TR_053 amendment).
+ *     Matches the in-orchestrator override at planning-orchestrator.ts
+ *     so the default and the override agree.
+ *
+ *   - `gestalt-generate` — 30 min. The handler runs Aider as a
+ *     subprocess via `executeScript`; the actual ceiling stack is:
+ *       Aider CLI `--timeout 600` (10 min per LLM call)
+ *       + multiple LLM turns in a single Aider run
+ *       + adapter `DEFAULT_AIDER_TIMEOUT_MS = 900_000` (15 min)
+ *       + `MAX_SCRIPT_TIMEOUT_MS = 900_000` (15 min) clamp.
+ *     TR_050 observed a code-agent run of 1233s (~20.5 min) on
+ *     trackeros. Add intent-agent / design-agent / context-agent
+ *     LLM calls (~1–2 min combined) + scope reduction retries.
+ *     Worst-case ~22 min; 30 min = ~36% headroom (TR_056-2c).
+ *
+ *   - `gestalt-deploy` — 30 min. `pipeline-agent` polls external CI
+ *     up to `DEFAULT_TIMEOUT_MS = 600_000` (10 min); on a
+ *     self-healing `extendTimeout` hint that doubles to 20 min.
+ *     pr-agent clone + PR-Agent subprocess adds ~30–60s; promotion-
+ *     agent adds ~1 min. Worst-case ~22 min; 30 min = ~36% headroom.
+ *     The under-configured 10-min ceiling was the trigger for
+ *     TR_054 #13.1 (TR_056-2c live demo: clone flake stalled
+ *     deploy past lockDuration, self-healing re-dispatched into
+ *     the same stall, ~95 min wall-clock lost without reaching gate).
+ *
+ *   - `gestalt-gate` — 10 min. Constraint-agent + review-agent
+ *     parallel LLM calls; gate's selfHealingNode (post TR_056-2c)
+ *     can pile on a diagnose call with truncation retries but the
+ *     loop's own LLM_TIMEOUT_MS ceiling caps each turn. Worst-case
+ *     ~6–8 min observed; 10 min headroom retained. Bumping deferred
+ *     until live evidence demands it.
+ *
+ *   - `gestalt-maintenance` — 10 min. Drift / alignment / gc /
+ *     evaluation runs are short scheduled LLM calls; the platform
+ *     default suffices.
+ *
+ * `maxStalledCount: 0` everywhere — DELIBERATE. The duplicate-handler
+ * risk is asymmetric: a non-zero value means a stalled job is
+ * re-dispatched into the SAME handler invocation while the previous
+ * one may still be making side effects (DB writes, BullMQ dispatches,
+ * intent-status transitions). TR_050 caught this on the planning
+ * queue: a stall under `maxStalledCount: 1` ran handlePlanningTask
+ * twice, both inserted feature_phases rows, the second hit the
+ * `unique(feature_id, phase_index)` constraint, and the cycle died
+ * with a duplicate-key error.
+ *
+ * The tradeoff: with `maxStalledCount: 0` a genuine stall (worker
+ * dies mid-handler) fails terminally instead of recovering. We
+ * accept that — ADR-058 puts long-term recoverability on the
+ * LangGraph checkpointer, not on BullMQ stall-retry. As more
+ * layers convert to subgraphs, restart-resume becomes the answer
+ * to "what happens if a worker dies", not a queue retry budget.
+ *
+ * Per-queue `lockDuration` here is the **default**; callers can
+ * still override via the `options` argument (e.g. planning's local
+ * override at planning-orchestrator.ts continues to win even though
+ * the default below matches it — defensive, no behaviour change).
+ */
+const QUEUE_LOCK_DURATIONS: Record<QueueName, number> = {
+  [QUEUE_NAMES.generate]:    1_800_000, // 30 min — Aider ~20 min + LLM steps + retries (TR_050/TR_056-2c)
+  [QUEUE_NAMES.gate]:          600_000, // 10 min — parallel constraint+review LLM calls
+  [QUEUE_NAMES.deploy]:      1_800_000, // 30 min — CI poll up to 20 min (extendTimeout) + clone + PR-Agent (TR_054 #13.1)
+  [QUEUE_NAMES.maintenance]:   600_000, // 10 min — short scheduled LLM calls
+  [QUEUE_NAMES.planning]:    1_800_000, // 30 min — ArchitectureGraph + planner + per-phase ~20-25 min (TR_053)
+};
+
+/**
+ * ADR-058 clause 2 — per-queue stalled-retry policy. All queues
+ * pin `maxStalledCount: 0` for the reason documented above. Kept
+ * as a per-queue map for future flexibility (a clearly diagnosed
+ * "transient stall, no side-effect risk" queue could be raised
+ * later with explicit reasoning).
+ */
+const QUEUE_MAX_STALLED_COUNT: Record<QueueName, number> = {
+  [QUEUE_NAMES.generate]:    0,
+  [QUEUE_NAMES.gate]:        0,
+  [QUEUE_NAMES.deploy]:      0,
+  [QUEUE_NAMES.maintenance]: 0,
+  [QUEUE_NAMES.planning]:    0,
+};
+
 export type TaskHandler<TPayload = unknown, TOutput = unknown> = (
   message: TaskMessage<TPayload>,
   jobId: string,
@@ -195,19 +288,18 @@ export function createWorker<TPayload = unknown, TOutput = unknown>(
     {
       ...buildConnection(config),
       concurrency: 1,
-      // TR_050 — bump the lock duration far above LLM call wall
-      // times. BullMQ's default `lockDuration: 30000` marks any
-      // job whose handler runs for more than ~30s as STALLED and
-      // requeues it; with LLM calls (DeepInfra Kimi/DeepSeek)
-      // routinely taking 5-25 minutes, this triggered duplicate
-      // execution of planning:start and broke the unique
-      // (feature_id, phase_index) constraint. 600000ms = 10 min
-      // covers the LLM_TIMEOUT_MS=300000 + retries + scope
-      // reduction headroom. `maxStalledCount: 0` blocks the
-      // stalled-retry mechanism entirely so a single stall is
-      // never re-dispatched into a duplicate handler invocation.
-      lockDuration: 600000,
-      maxStalledCount: 0,
+      // ADR-058 clause 2 — per-queue lockDuration + maxStalledCount.
+      // The map above documents the worst-case reasoning per queue.
+      // BullMQ's defaults (lockDuration: 30000, maxStalledCount: 1)
+      // mark any job whose handler runs > ~30s as STALLED and
+      // re-dispatch it into a duplicate handler invocation — exactly
+      // the asymmetric duplicate-handler risk that TR_050 caught on
+      // the planning queue's unique(feature_id, phase_index)
+      // constraint. The map sets the floor; callers may still
+      // override via `options` (planning-orchestrator.ts does so
+      // defensively even though the default below already matches).
+      lockDuration: QUEUE_LOCK_DURATIONS[queueName],
+      maxStalledCount: QUEUE_MAX_STALLED_COUNT[queueName],
       ...options,
     },
   );
