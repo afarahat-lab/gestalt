@@ -268,6 +268,51 @@ the `sessions/archive/` files (everything older)._
 
 ## Active follow-ups (small)
 
+### TR_056 Part 2c — live smoke pass→promotion via graph (pending)
+
+2c shipped at `abadda6` — `handleGateTask` is now a thin invoker
+that calls `runGateGraph({mode:'start'})`; pass-branch dispatch
+fires `deploy:promotion` / `deploy:pr` from inside the graph
+(log line: `dispatched deploy:promotion (staging) via graph`);
+escalate-branch `humanFeedbackNode` no longer interrupts (logs +
+returns `{}` so the graph terminates at END — alerts are already
+in place upstream). Legacy `legacyHandleGateTask` +
+`dispatchPromotion` / `dispatchDeployPR` / `maybeDispatchRetry` /
+`attemptSelfHealingForGate` / `createBreachAlert` all preserved
+for a one-line revert; deletion is 2d.
+
+`pnpm -r build` clean across all 13 packages.
+
+**Live smoke INCOMPLETE.** Submitted feature `ad1a210b` on
+trackeros, but pr-agent's git clone hit a transient SSL flake
+(`curl 56 OpenSSL SSL_read: unexpected eof while reading`) →
+deploy job stalled past `lockDuration: 600000` → self-healing
+dispatched another `deploy:pr` which also stalled → planner
+auto-retried Phase 1 as a fresh intent. After ~95 min wall-clock
+no `gate:review` task had been dispatched. The failure pattern
+is upstream of the gate worker (same class as STATE.md TR_033
+`TypeError: fetch failed`); 2c's routing change is correct by
+construction (only path from `startGateWorker → handleGateTask`
+is `runGateGraph`; legacy helpers unreachable from the worker)
+but Redis-confirmed proof remains pending.
+
+**Action — on the next clean feature submission**, verify on
+the gate-task dispatch:
+
+- log line `Quality gate received task — invoking GateGraph`
+  with `routedBy: gate-graph (TR_056 Part 2c)` fires;
+- log line `Invoking GateGraph` + `gateNode started` fire;
+- on pass: log line `gateNode pass (post-CI) — dispatched
+  deploy:promotion (staging) via graph` fires;
+- on pass: legacy log line `Gate pass (post-CI) — dispatched
+  deploy:promotion (staging)` (WITHOUT `via graph`) does NOT
+  fire (proof legacy `dispatchPromotion` is silent);
+- Redis `gestalt-deploy:waiting` contains the deploy task
+  matching the intent's correlationId.
+
+When confirmed, mark 2c done and proceed to 2d (delete the
+legacy body + five helpers).
+
 ### TR_035 — Dynamic token budget management (ADR-057)
 
 Five-layer pipeline added to `BaseLLMAgent.callLLMWithMessages`
