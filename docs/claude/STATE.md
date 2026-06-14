@@ -921,6 +921,59 @@ Prerequisites:
 - Implement before LangGraph migration since it maps
   cleanly to ArchitectureGraph retry edges in LangGraph
 
+#### MEDIUM — Per-project documentation emission (generated-from-source, folded into the generate pipeline)
+
+Capability: Gestalt produces the full documentation set for
+every project it builds — internal (architecture, golden
+principles, plan — partly produced today), generated-from-
+source (API reference from routes/handlers, DB schema from
+migrations, config reference), and external (README +
+usage/operator guide, narrative authored by an agent).
+
+Approach — DECIDED: option (B), folded into the existing
+pipeline. Doc emission is a responsibility of the generate /
+architecture phases — each phase emits or updates docs for
+what it built, and docs ship in the same PR as the code.
+NOT a separate trailing documentation-agent. Rationale:
+same Option-A / ADR-058 logic — a separate doc pass rebuilds
+a drift seam (doc-agent's view vs. actual code); folding
+emission into the phase that owns the change keeps one
+source of truth and ships docs atomically with code, so docs
+cannot lag.
+
+Two governing rules:
+1. Generate-from-source wherever the surface is mechanical
+   (API, schema, config) so it can't drift.
+2. Hand-author (by agent) only intent / usage / onboarding —
+   the discriminator is "does this doc say something the
+   source doesn't?"
+
+Builds on existing: extends ADR-046 (architecture-agent
+already updates ARCHITECTURE.md) and ADR-018 (maintenance
+changes flow through the generate loop).
+
+🔴 Prerequisite / sequencing: do NOT build until the first
+feature reaches `completed`. This adds a responsibility to
+the exact generate / architecture phases currently mid-
+LangGraph-conversion (TR_056) — build it after one clean
+end-to-end loop is proven, not during the conversion arc.
+
+ADR candidate: "Gestalt emits per-project documentation as
+a phase responsibility, generated-from-source (folded into
+generate, not a separate doc-agent)" — Accepted-in-principle,
+pending implementation, gated on the first `completed`
+milestone.
+
+#### LOW — Gestalt's own operator guide (platform-facing, separate from per-project docs)
+
+`docs/guides/` exists but is stale (pre-DeepInfra / pre-
+LangGraph era); audit and refresh, and generate CLI / config
+references from source. Separate item, separate audience
+(operators of Gestalt itself, not project consumers). LOW
+until a second operator needs it. Do NOT merge with the
+per-project documentation emission item above — different
+audience, different lifecycle.
+
 #### MEDIUM — LangGraph.js migration (ADR-056)
 
 Replace custom agent orchestration with LangGraph.js. See
