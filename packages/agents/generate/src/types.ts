@@ -182,6 +182,21 @@ export interface HarnessConfig {
    */
   codeGeneration?: {
     backend: 'gestalt' | 'aider';
+    /**
+     * Mirrors `HarnessConfig.codeGeneration.verification` in
+     * `@gestalt/core`. Verification commands the chosen code-agent
+     * backend runs after each edit, BEFORE declaring complete.
+     * Closes the CI-late-discovery failure mode.
+     *
+     * Absent → the platform supplies stack-derived defaults via
+     * `resolveVerification(harnessConfig)`; explicitly empty → that
+     * step is skipped.
+     */
+    verification?: {
+      buildCmd?: string;
+      testCmd?: string;
+      lintCmd?: string;
+    };
   };
 }
 

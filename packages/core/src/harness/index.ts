@@ -190,6 +190,32 @@ export interface HarnessConfig {
    */
   codeGeneration?: {
     backend: 'gestalt' | 'aider';
+    /**
+     * Verification commands the chosen code-agent backend runs after
+     * each edit, BEFORE declaring the cycle complete. Closes the
+     * failure mode where a code-agent backend exited 0 but `npm run
+     * build` / `npm test` then failed at CI time (the platform learnt
+     * about the failure only after PR-Agent → pipeline-agent ran the
+     * workflow; ~20 minutes of wasted cycle per surfacing).
+     *
+     * Each field is a literal shell command the backend forwards to
+     * its underlying tool (Aider sets them as `--test-cmd` + `--auto-
+     * test` and `--lint-cmd` + `--auto-lint`; Claude Code maps them
+     * to its built-in test-runner; etc.). Per-tool semantics live in
+     * each backend's adapter, not here.
+     *
+     * Absent → the platform supplies stack-derived defaults
+     * (`resolveDefaultVerification(stack)` — `npm run build` /
+     * `npm test` for Node, `pytest` for Python, `go test ./...` for
+     * Go, etc.). Explicitly set to empty string → that step is
+     * skipped (useful for stack overrides where, e.g., there's no
+     * separate build step).
+     */
+    verification?: {
+      buildCmd?: string;
+      testCmd?: string;
+      lintCmd?: string;
+    };
   };
   /**
    * Planning layer configuration (migration 024). Absent → planner

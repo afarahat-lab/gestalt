@@ -31,12 +31,12 @@ import { simpleGit } from 'simple-git';
 import type { AgentTask, AgentResult, GeneratedArtifact } from '../types';
 import { BaseLLMAgent } from './base-llm-agent';
 import { getLLMClientForModel, createContextLogger, getRepositories } from '@gestalt/core';
-import { runAider } from '../adapters/aider-adapter';
 import {
   buildAiderMessage,
   renderPhaseArchitecture,
 } from '../adapters/aider-message-builder';
 import type { PhaseArchitectureShape } from '../adapters/aider-message-builder';
+import { getCodeAgentBackend, resolveVerification } from '../backends';
 
 const log = createContextLogger({ module: 'aider-code-agent' });
 
@@ -90,26 +90,42 @@ export class AiderCodeAgent extends BaseLLMAgent {
     );
     this.lastPrompt = message;
 
+    // Resolve verification commands (build/test/lint) the backend
+    // should run after each edit. Explicit HARNESS override wins;
+    // absent → stack-derived defaults. The backend translates these
+    // to its tool's surface — Aider sets --test-cmd + --auto-test;
+    // future Claude Code / Cursor backends translate differently.
+    const verification = resolveVerification(task.contextSnapshot.harness);
+
+    // Resolve the backend by name from HARNESS. The orchestrator's
+    // 'aider' vs 'gestalt' branch already routed us here; for the
+    // 'aider' branch this returns the AiderBackend singleton. New
+    // backends register in backends/index.ts.
+    const backend = getCodeAgentBackend(
+      task.contextSnapshot.harness.codeGeneration?.backend ?? 'aider',
+    );
+
     log.info(
       {
         correlationId,
+        backend: backend.name,
         model: modelString,
         projectRoot,
         messageBytes: message.length,
         readFiles,
+        verification,
       },
-      'Running Aider code generation',
+      'Running code-agent backend',
     );
 
-    const result = await runAider(
+    const result = await backend.run({
       message,
-      projectRoot,
-      modelString,
-      apiKey,
-      baseUrl,
-      undefined,
+      workDir: projectRoot,
+      model: { name: modelString, apiKey, baseUrl },
       readFiles,
-    );
+      ...(verification ? { verification } : {}),
+      correlationId,
+    });
 
     // Aider's stdout becomes the row's `llm_response` — the dashboard
     // accordion renders it verbatim so operators see the narrative.
