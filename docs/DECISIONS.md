@@ -2003,3 +2003,142 @@ operators can tune them per project.
 layers run with the defaults in code. There is no opt-out
 for the layers themselves; individual layers can be disabled
 via the `enableDynamicBudget` / `enableScopeReduction` flags.
+
+## ADR-058 — LangGraph owns orchestration; BullMQ is pure transport
+
+Date: 2026-06
+Status: Accepted
+
+Context: Flow was managed by two systems with no shared
+liveness — BullMQ (queue jobs, locks, stall detection) and
+LangGraph (checkpoints, interrupts). Their models disagree
+at the seam: when a worker dies or a step exceeds its lock,
+the BullMQ job orphans while the LangGraph checkpoint
+survives, leaving the graph parked and the intent stuck.
+Surfaced as TR_054 finding #13.1 and demonstrated live in
+TR_056-2c — a transient `pr-agent` clone flake stalled
+`deploy:pr` past `lockDuration`, self-healing re-dispatched
+into the same stall, and ~95 minutes of wall-clock were
+lost without the cycle reaching the gate. Per-layer
+patching of this seam is throwaway work: each new layer
+that ships under the dual-liveness model re-imports the
+same problem and forces another round of stall-budget
+tuning that does not generalise.
+
+Decision — two binding clauses:
+
+**1. LangGraph owns 100% of flow control.** All routing,
+awaits, resume, success/failure branching, and escalation
+are LangGraph edges, `interrupt()`, and `Command({resume})`.
+No BullMQ dispatch may carry routing meaning between
+layers. No `intent.status-changed` event may drive flow —
+events remain for observability (SSE, dashboard, audit
+log) only. Generate, gate, deploy, planning, maintenance
+are subgraphs in one composed graph-of-graphs, sharing
+**one** PostgreSQL checkpointer and **one** thread per
+feature.
+
+**2. BullMQ is pure transport, with non-negotiable
+transport obligations.** Its only job is durable,
+concurrent, off-process execution of a graph invocation —
+one entry job per feature, maintenance run, or
+intervention. "Pure transport" forbids routing logic; it
+does not mean under-configuration. Every queue MUST set
+`lockDuration ≥` its worst-case synchronous in-process
+step **and** a deliberately chosen `maxStalledCount`.
+Transport correctness (locks, stall policy, concurrency)
+remains a first-class requirement because the queue still
+owns durable execution: an under-configured queue can
+silently retry or orphan a graph invocation, and that
+seam — `failed: stalled` after a successful handler
+return — was the first observed cost of #13.1.
+
+Rationale: Separates orchestration from transport;
+eliminates the dual-liveness seam by construction; uses
+each tool for its purpose. Keeps the execution layer as
+boring, self-hostable, audit-clean infrastructure with no
+dependency on an external orchestration runtime — the
+same bar that rejected Mastra/n8n during the LangGraph
+evaluation (ADR-056). Composability is the practical win:
+a single graph-of-graphs can be checkpointed end-to-end,
+interrupted at any node, and resumed from any prior
+checkpoint by replaying `Command({resume})` against the
+shared thread — no inter-layer payload threading, no
+"who owns this counter" ambiguity, no second source of
+truth for retry budgets.
+
+Option B (adopting LangGraph's own server/worker runtime
+in place of BullMQ) was considered and rejected. It moves
+a queue inside a runtime we would have to vet for
+air-gapped GCC/MENA embedding — unproven, opaque under
+the deployment model the platform sells. BullMQ + Redis
+is already vetted, already in the stack, already what
+operators run. The dual-liveness problem is solved by
+removing routing meaning from BullMQ, not by removing
+BullMQ itself.
+
+**Conformance** (applies to every layer):
+
+A layer is conformant when (a) its flow is graph edges,
+and (b) its BullMQ usage is a single transport invocation
+with no routing branches.
+
+Current conformance state at the time this ADR was
+authored:
+
+- ArchitectureGraph — ✅ conformant (TR_051).
+- PlanningGraph — 🟡 graph owns flow (TR_053 amendment);
+  restart-resume parity with the legacy orchestrator
+  unverified (TR_054 #40).
+- Gate — 🔵 converting (TR_056-2c shipped; live smoke
+  pending due to upstream pr-agent infra flake; 2d
+  deletes the legacy body once the smoke confirms).
+- Generate — ⚪ still BullMQ-routed; not yet conformant.
+- Deploy / Promotion — ⚪ still BullMQ-routed; not yet
+  conformant.
+- Maintenance — ⚪ still BullMQ-routed; not yet
+  conformant.
+
+This ADR is the **target and obligation** for unconverted
+layers, not a claim the seam is already gone. Until a
+layer converts, its dual-liveness seam persists, and its
+queue MUST meet the clause-2 `lockDuration` /
+`maxStalledCount` obligation as an interim safeguard.
+Future TRs that touch an unconverted layer's flow are
+expected to either convert it to a subgraph or
+demonstrably tighten its transport obligation; they are
+not expected to invent a third orchestration mechanism.
+
+**Immediate consequence** — `deploy` and `generate` queue
+`lockDuration` / `maxStalledCount` are currently
+under-configured for their worst-case synchronous step
+(TR_054 finding #13.2). That is a clause-2 violation in
+its own right and a fix that must land regardless of
+conversion timing.
+
+**Relation to prior ADRs:**
+
+- ADR-056 (Agent orchestration layer migrated to
+  LangGraph.js) authorised the migration; ADR-058
+  upgrades it from "we are migrating" to "LangGraph is
+  the only orchestration runtime; BullMQ has lost
+  routing authority".
+- ADR-050 (LLM-driven routing) remains compatible: the
+  diagnostician still picks `retry / fix-intent /
+  escalate`; ADR-058 only mandates that the **execution**
+  of those choices runs through graph edges + `Command`,
+  not through a BullMQ task type that itself encodes
+  routing.
+- ADR-051 (PR-Agent), ADR-053 / 054 / 055 (Qodo Gen /
+  SWE-agent / K8sGPT) — each is invoked as a node action
+  inside its owning subgraph; none is a layer boundary
+  in its own right.
+
+**Operator action:** none. This ADR records architectural
+intent for future work. Operators see no surface change
+from this commit. As individual layers convert per
+TR_056-style migrations, operators will notice that
+restart-resume becomes reliable (a server bounce in the
+middle of a feature stops re-orphaning generate / deploy
+tasks) and that the `failed: stalled` log-noise after
+successful handler returns disappears.
