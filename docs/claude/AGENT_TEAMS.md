@@ -194,6 +194,16 @@ Conditional edges:
 
 ## Gate graph
 
+_**Status: 🟡 PART 1 + PART 2a FOUNDATION LANDED** (TR_056 — commits `3728561` + `d396e76`). State + shared selfHealingNode + gateNode in place; `graph.ts` / thin-invoker refactor / dispatch-helper deletions / §5 forced-failure suite remain (TR_056 Part 2b / 2c). Legacy `handleGateTask` still routes 100% of traffic — safe rollback._
+
+_**As-implemented shape (TR_056 Part 1 + 2a):**_
+- `gateNode` (single supervisor node) runs constraint-agent + review-agent in parallel inside the node body (verbatim Promise.all + ADR-051 review-skip from `handleGateTask:397→675`); the brief's separate `ConstraintNode` + `PRAgentNode` + `GateVerdictNode` triple is deferred — the existing `synthesiseGateResult` already plays the verdict-supervisor role and lifting it as three nodes would have forced an `agent_executions` row-shape change. Revisit after the §5 suite passes.
+- `selfHealingNode` is layer-neutral (lives under `quality-gate/src/graphs/shared/` for now; promoted to `@gestalt/core/graphs/shared/` when generate session lands). Wraps `runSelfHealingLoop` — preserves UNRECOVERABLE / hallucination-loop / cascade-depth guards in their canonical order. **TR_020 absolute-cap check** runs as an explicit DB cross-check BEFORE the loop call so a checkpoint restore can never reset the budget.
+- **B-i fix-intent path** (TR_055b §4 + TR_056 prerequisite). Two `// TR_054-PENDING` markers in `shared/self-healing-node.ts` mark the eventual B-ii conversion once TR_054 #40 restart-resume is proven.
+- **GP_BREACH alert moved into `gateNode`** on `verdict === 'escalate'` per TR_053 Fix 6 — the deciding node owns the alert, never a future interrupt node.
+
+_**Blueprint shape (the originally planned topology, kept for the 2b/2c refactor reference):**_
+
 ```
 GateGraph
 ├── [Parallel nodes]

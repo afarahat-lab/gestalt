@@ -18,7 +18,7 @@ docker-compose logs -f server
 |---|---|
 | `pnpm -r build` | ✅ clean (13 packages) |
 | `docker-compose up -d` | ✅ healthy (server / postgres / redis) |
-| Migrations applied | 029 (latest: `029_token_management_and_phase_merge`) — no new Gestalt migration in TR_053 (PlanningGraph reuses TR_051 PostgresSaver tables; new `ExecutionStatus = 'completed-with-warning'` is additive on a column with no CHECK constraint) |
+| Migrations applied | 030 (latest: `030_intent_parent_context`) — TR_053 amendment Refined Option 2 added `intents.parent_context JSONB` so the planning subscriber routes resume signals without a DB JOIN. No new migration in TR_054 / TR_055 / TR_056 (graphs use the existing LangGraph PostgresSaver tables). |
 | Server reachable | `http://localhost:3000/health` returns 200 |
 | Dashboard | served at `http://localhost:3000/app/` |
 
